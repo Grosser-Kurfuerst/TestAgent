@@ -1,0 +1,7 @@
+{
+  "id": "sample_subtract_bug",
+  "source": "local",
+  "repo": "examples/sample_repo",
+  "task": "Fix the subtract function so it returns the first number minus the second number.",
+  "test_command": "pytest -q"
+}

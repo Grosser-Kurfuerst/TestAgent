@@ -1,0 +1,17 @@
+[project]
+name = "my-agent"
+version = "0.1.0"
+description = "A lightweight coding-agent skeleton with typed state and CLI scaffolding."
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0.0",
+]
+
+[project.scripts]
+my-agent = "my_agent.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
