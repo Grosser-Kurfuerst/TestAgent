@@ -51,6 +51,34 @@ class CliTests(unittest.TestCase):
         self.assertIn("Phase 4 placeholder", stream.getvalue())
         self.assertIn("sample_subtract_bug", stream.getvalue())
 
+    def test_cli_index_prints_repository_context(self) -> None:
+        repo = Path(__file__).resolve().parents[1] / "examples" / "sample_repo"
+        stream = io.StringIO()
+
+        with contextlib.redirect_stdout(stream):
+            exit_code = main(["index", "--repo", str(repo), "--query", "subtract"])
+
+        output = stream.getvalue()
+        self.assertEqual(exit_code, 0)
+        self.assertNotIn("placeholder", output.lower())
+        self.assertIn("# Repository tree", output)
+        self.assertIn("# Symbol index", output)
+        self.assertIn("calculator.py", output)
+        self.assertIn("function subtract", output)
+
+    def test_cli_retrieve_prints_related_context(self) -> None:
+        repo = Path(__file__).resolve().parents[1] / "examples" / "sample_repo"
+        stream = io.StringIO()
+
+        with contextlib.redirect_stdout(stream):
+            exit_code = main(["retrieve", "--repo", str(repo), "--query", "subtract", "--top-k", "1"])
+
+        output = stream.getvalue()
+        self.assertEqual(exit_code, 0)
+        self.assertIn("calculator.py", output)
+        self.assertIn("subtract", output)
+        self.assertIn("score=", output)
+
     def test_sample_repo_fixture_exists(self) -> None:
         repo = Path(__file__).resolve().parents[1] / "examples" / "sample_repo"
 

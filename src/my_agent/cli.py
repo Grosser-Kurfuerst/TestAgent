@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from my_agent.config import AgentConfig
+from my_agent.indexer import RepoIndexer
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -44,9 +45,15 @@ def build_parser() -> argparse.ArgumentParser:
     load_task_parser = subparsers.add_parser("load-task", help="Load and print a task manifest.")
     load_task_parser.add_argument("--task-file", default=str(DEFAULT_TASK_FILE), help="Path to a task JSON file.")
 
-    index_parser = subparsers.add_parser("index", help="Placeholder for Phase 2 repository indexing.")
+    index_parser = subparsers.add_parser("index", help="Preview repository context without calling an LLM.")
     index_parser.add_argument("--repo", required=True, help="Target repository path.")
     index_parser.add_argument("--query", default="", help="Optional retrieval query.")
+    index_parser.add_argument("--top-k", type=int, default=8, help="Number of retrieved files.")
+
+    retrieve_parser = subparsers.add_parser("retrieve", help="Run lightweight lexical retrieval over a repository.")
+    retrieve_parser.add_argument("--repo", required=True, help="Target repository path.")
+    retrieve_parser.add_argument("--query", required=True, help="Search query.")
+    retrieve_parser.add_argument("--top-k", type=int, default=5, help="Number of retrieved files.")
 
     run_parser = subparsers.add_parser("run", help="Placeholder for the future agent runtime.")
     run_parser.add_argument("--task-file", default=str(DEFAULT_TASK_FILE), help="Path to a task JSON file.")
@@ -55,6 +62,10 @@ def build_parser() -> argparse.ArgumentParser:
     config_parser.add_argument("--check-api-key", action="store_true", help="Validate provider and API key settings.")
 
     return parser
+
+
+def _section(title: str, body: str) -> str:
+    return f"# {title}\n{body}"
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -66,10 +77,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if args.command == "index":
-        print("Phase 2 placeholder: repository indexing is not implemented yet.")
-        print(f"repo: {args.repo}")
-        if args.query:
-            print(f"query: {args.query}")
+        snapshot = RepoIndexer(args.repo).snapshot(query=args.query, top_k=args.top_k)
+        print(_section("Repository tree", snapshot.tree))
+        print()
+        print(_section("Symbol index", snapshot.symbols))
+        print()
+        print(_section("Retrieval notes", snapshot.retrieval_notes))
+        print()
+        print(_section("Project rules", snapshot.project_rules))
+        print()
+        print(_section("Important file previews", snapshot.file_summaries))
+        return 0
+
+    if args.command == "retrieve":
+        print(RepoIndexer(args.repo).retrieve(query=args.query, top_k=args.top_k))
         return 0
 
     if args.command == "run":
