@@ -6,6 +6,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 
 IGNORED_DIRS = {
@@ -40,6 +41,7 @@ TEXT_EXTENSIONS = {
 }
 
 
+# 函数或类
 @dataclass(frozen=True)
 class SymbolRecord:
     kind: str
@@ -73,14 +75,22 @@ class RepoSnapshot:
 
 
 class RepoIndexer:
-    def __init__(self, repo_path: str | Path, max_files: int = 80, preview_chars: int = 1200):
+    def __init__(
+        self,
+        repo_path: str | Path,
+        max_files: int = 80,
+        preview_chars: int = 1200,
+        skip_predicate: Callable[[Path], bool] | None = None,
+    ):
         self.repo_path = Path(repo_path).resolve()
         self.max_files = max_files
         self.preview_chars = preview_chars
+        self.skip_predicate = skip_predicate
         if not self.repo_path.exists() or not self.repo_path.is_dir():
             raise ValueError(f"Repository path does not exist or is not a directory: {self.repo_path}")
 
     def snapshot(self, query: str | None = None, top_k: int = 8) -> RepoSnapshot:
+        top_k = _validate_top_k(top_k)
         files = self._collect_files()
         return RepoSnapshot(
             tree=self._build_tree(files),
@@ -91,6 +101,7 @@ class RepoIndexer:
         )
 
     def retrieve(self, query: str | None, top_k: int = 8, chars_per_file: int = 1400) -> str:
+        top_k = _validate_top_k(top_k)
         tokens = _tokenize(query or "")
         if not tokens:
             return "No retrieval query terms available."
@@ -121,16 +132,34 @@ class RepoIndexer:
     def _collect_files(self) -> list[Path]:
         files: list[Path] = []
         for root, dirnames, filenames in os.walk(self.repo_path):
-            dirnames[:] = sorted(name for name in dirnames if name not in IGNORED_DIRS)
             root_path = Path(root)
+            dirnames[:] = sorted(
+                name
+                for name in dirnames
+                if name not in IGNORED_DIRS and not (root_path / name).is_symlink()
+            )
             for filename in sorted(filenames):
                 path = root_path / filename
                 rel = path.relative_to(self.repo_path)
                 if any(part in IGNORED_DIRS for part in rel.parts):
                     continue
-                if path.is_file():
+                if self._is_safe_repo_file(path) and not self._should_skip(path):
                     files.append(path)
         return sorted(files, key=lambda item: item.relative_to(self.repo_path).as_posix())
+
+    def _is_safe_repo_file(self, path: Path) -> bool:
+        if path.is_symlink():
+            return False
+        try:
+            resolved = path.resolve(strict=True)
+        except OSError:
+            return False
+        return resolved.is_relative_to(self.repo_path) and path.is_file()
+
+    def _should_skip(self, path: Path) -> bool:
+        if self.skip_predicate is None:
+            return False
+        return self.skip_predicate(path)
 
     def _build_tree(self, files: list[Path]) -> str:
         lines: list[str] = []
@@ -185,10 +214,17 @@ class RepoIndexer:
         return "\n".join(record.render() for record in records[:120])
 
     def _read_project_rules(self) -> str:
+        unreadable_rule_found = False
         for filename in ("AGENT.md", "CLAUDE.md"):
             path = self.repo_path / filename
-            if path.exists() and path.is_file():
-                return path.read_text(encoding="utf-8", errors="replace")
+            if self._is_safe_repo_file(path):
+                try:
+                    return path.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    unreadable_rule_found = True
+                    continue
+        if unreadable_rule_found:
+            return "Project rules file exists but could not be read. Follow safe minimal-change defaults."
         return "No project-specific AGENT.md or CLAUDE.md found. Follow safe minimal-change defaults."
 
 
@@ -207,11 +243,20 @@ def _score_text(tokens: list[str], path: str, text: str) -> float:
     for token in tokens:
         body_count = lowered_text.count(token)
         path_count = lowered_path.count(token)
+        definition_count = len(re.findall(rf"\b(?:async\s+def|def|class)\s+{re.escape(token)}\b", lowered_text))
         if body_count:
             score += 1.0 + math.log1p(body_count)
         if path_count:
             score += 3.0 + math.log1p(path_count)
+        if definition_count:
+            score += 4.0 + math.log1p(definition_count)
     return score
+
+
+def _validate_top_k(top_k: int) -> int:
+    if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k < 1:
+        raise ValueError("top_k must be >= 1.")
+    return top_k
 
 
 def _best_excerpt(tokens: list[str], text: str, limit: int) -> str:

@@ -75,9 +75,21 @@ class CliTests(unittest.TestCase):
 
         output = stream.getvalue()
         self.assertEqual(exit_code, 0)
-        self.assertIn("calculator.py", output)
+        self.assertIn("## calculator.py", output)
+        self.assertNotIn("## tests/test_calculator.py", output)
         self.assertIn("subtract", output)
         self.assertIn("score=", output)
+
+    def test_cli_rejects_non_positive_top_k(self) -> None:
+        repo = Path(__file__).resolve().parents[1] / "examples" / "sample_repo"
+        stderr = io.StringIO()
+
+        with contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as caught:
+                main(["retrieve", "--repo", str(repo), "--query", "subtract", "--top-k", "0"])
+
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn("top_k must be >= 1", stderr.getvalue())
 
     def test_sample_repo_fixture_exists(self) -> None:
         repo = Path(__file__).resolve().parents[1] / "examples" / "sample_repo"

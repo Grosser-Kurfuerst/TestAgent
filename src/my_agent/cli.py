@@ -38,6 +38,16 @@ def format_task(task: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("top_k must be >= 1.") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("top_k must be >= 1.")
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Minimal coding-agent scaffold.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -48,12 +58,12 @@ def build_parser() -> argparse.ArgumentParser:
     index_parser = subparsers.add_parser("index", help="Preview repository context without calling an LLM.")
     index_parser.add_argument("--repo", required=True, help="Target repository path.")
     index_parser.add_argument("--query", default="", help="Optional retrieval query.")
-    index_parser.add_argument("--top-k", type=int, default=8, help="Number of retrieved files.")
+    index_parser.add_argument("--top-k", type=_positive_int, default=8, help="Number of retrieved files.")
 
     retrieve_parser = subparsers.add_parser("retrieve", help="Run lightweight lexical retrieval over a repository.")
     retrieve_parser.add_argument("--repo", required=True, help="Target repository path.")
     retrieve_parser.add_argument("--query", required=True, help="Search query.")
-    retrieve_parser.add_argument("--top-k", type=int, default=5, help="Number of retrieved files.")
+    retrieve_parser.add_argument("--top-k", type=_positive_int, default=5, help="Number of retrieved files.")
 
     run_parser = subparsers.add_parser("run", help="Placeholder for the future agent runtime.")
     run_parser.add_argument("--task-file", default=str(DEFAULT_TASK_FILE), help="Path to a task JSON file.")
