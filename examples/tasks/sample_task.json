@@ -3,5 +3,5 @@
   "source": "local",
   "repo": "examples/sample_repo",
   "task": "Fix the subtract function so it returns the first number minus the second number.",
-  "test_command": "pytest -q"
+  "test_command": "python -m unittest discover -s tests -q"
 }

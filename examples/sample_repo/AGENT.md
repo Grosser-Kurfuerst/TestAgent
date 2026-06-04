@@ -2,4 +2,4 @@
 
 - Make the smallest safe change.
 - Inspect files before editing.
-- Run `pytest -q` after changing code.
+- Run `python -m unittest discover -s tests -q` after changing code.

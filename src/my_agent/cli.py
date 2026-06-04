@@ -7,6 +7,7 @@ from typing import Any, Sequence
 
 from my_agent.config import AgentConfig
 from my_agent.indexer import RepoIndexer
+from my_agent.runtime import run_agent
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -38,13 +39,23 @@ def format_task(task: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _positive_int(value: str) -> int:
+def _positive_top_k(value: str) -> int:
     try:
         parsed = int(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError("top_k must be >= 1.") from exc
     if parsed < 1:
         raise argparse.ArgumentTypeError("top_k must be >= 1.")
+    return parsed
+
+
+def _positive_max_steps(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("max_steps must be >= 1.") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("max_steps must be >= 1.")
     return parsed
 
 
@@ -58,15 +69,20 @@ def build_parser() -> argparse.ArgumentParser:
     index_parser = subparsers.add_parser("index", help="Preview repository context without calling an LLM.")
     index_parser.add_argument("--repo", required=True, help="Target repository path.")
     index_parser.add_argument("--query", default="", help="Optional retrieval query.")
-    index_parser.add_argument("--top-k", type=_positive_int, default=8, help="Number of retrieved files.")
+    index_parser.add_argument("--top-k", type=_positive_top_k, default=8, help="Number of retrieved files.")
 
     retrieve_parser = subparsers.add_parser("retrieve", help="Run lightweight lexical retrieval over a repository.")
     retrieve_parser.add_argument("--repo", required=True, help="Target repository path.")
     retrieve_parser.add_argument("--query", required=True, help="Search query.")
-    retrieve_parser.add_argument("--top-k", type=_positive_int, default=5, help="Number of retrieved files.")
+    retrieve_parser.add_argument("--top-k", type=_positive_top_k, default=5, help="Number of retrieved files.")
 
-    run_parser = subparsers.add_parser("run", help="Placeholder for the future agent runtime.")
+    run_parser = subparsers.add_parser("run", help="Run the Phase 4 fake-LLM agent runtime.")
     run_parser.add_argument("--task-file", default=str(DEFAULT_TASK_FILE), help="Path to a task JSON file.")
+    run_parser.add_argument("--repo", help="Override repository path from the task file.")
+    run_parser.add_argument("--task", help="Override task text from the task file.")
+    run_parser.add_argument("--test-command", help="Override test command from the task file.")
+    run_parser.add_argument("--max-steps", type=_positive_max_steps, help="Maximum actor tool calls.")
+    run_parser.add_argument("--trace-dir", help="Directory for JSONL traces.")
 
     config_parser = subparsers.add_parser("config", help="Print resolved local configuration.")
     config_parser.add_argument("--check-api-key", action="store_true", help="Validate provider and API key settings.")
@@ -104,8 +120,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if args.command == "run":
-        print("Phase 4 placeholder: agent runtime is not implemented yet.")
-        print(format_task(load_task(args.task_file)))
+        task_payload = load_task(args.task_file)
+        config = AgentConfig.from_env()
+        repo_path = _resolve_repo_path(args.repo or task_payload["repo"])
+        test_command = args.test_command if args.test_command is not None else task_payload.get("test_command")
+        trace_dir = _resolve_trace_dir(args.trace_dir, config.trace_dir)
+        final_state = run_agent(
+            repo_path=repo_path,
+            task=args.task or task_payload["task"],
+            test_command=test_command,
+            config=config,
+            max_steps=args.max_steps or config.max_steps,
+            trace_dir=trace_dir,
+        )
+        print(_section("Plan", final_state.plan))
+        print()
+        print(_section("Final summary", final_state.final_answer))
+        print()
+        print(f"Trace: {final_state.trace_path}")
         return 0
 
     if args.command == "config":
@@ -133,6 +165,16 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     parser.error(f"Unknown command: {args.command}")
     return 2
+
+
+def _resolve_repo_path(value: str | Path) -> Path:
+    path = Path(value)
+    return path if path.is_absolute() else PROJECT_ROOT / path
+
+
+def _resolve_trace_dir(value: str | None, default: Path) -> Path:
+    path = Path(value) if value is not None else default
+    return path if path.is_absolute() else PROJECT_ROOT / path
 
 
 if __name__ == "__main__":

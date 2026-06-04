@@ -87,10 +87,12 @@ class AgentState:
     tool_history: list[ToolRecord] = field(default_factory=list)
     steps: int = 0
     max_steps: int = 8
+    invalid_tool_call_count: int = 0
     trace_path: Path | None = None
     review: str = ""
     final_answer: str = ""
     done: bool = False
+    stop_reason: str = ""
 
     @classmethod
     def initial(
