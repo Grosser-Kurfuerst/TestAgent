@@ -3,9 +3,11 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 try:
     from ._path import add_src_to_path
@@ -88,15 +90,83 @@ class CliTests(unittest.TestCase):
             trace_dir = base / "traces"
             stream = io.StringIO()
 
-            with contextlib.redirect_stdout(stream):
-                exit_code = main(["run", "--task-file", str(task_file), "--trace-dir", str(trace_dir)])
+            with mock.patch.dict(os.environ, {"MY_AGENT_LLM_PROVIDER": "fake"}, clear=True):
+                with contextlib.redirect_stdout(stream):
+                    exit_code = main(["run", "--task-file", str(task_file), "--trace-dir", str(trace_dir)])
 
             self.assertEqual(exit_code, 0)
             self.assertIn("# Plan", stream.getvalue())
+            self.assertIn("# Review", stream.getvalue())
             self.assertIn("# Final summary", stream.getvalue())
             self.assertIn("Tests: passed", stream.getvalue())
+            self.assertIn("Risks:", stream.getvalue())
             self.assertIn("return a - b", (repo / "calculator.py").read_text(encoding="utf-8"))
             self.assertEqual(len(list(trace_dir.glob("*.jsonl"))), 1)
+
+    def test_cli_run_without_api_key_returns_clear_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+            task_file = base / "task.json"
+            task_file.write_text(
+                json.dumps(
+                    {
+                        "id": "tmp",
+                        "source": "local",
+                        "repo": str(repo),
+                        "task": "Fix the subtract function so it returns a minus b.",
+                        "test_command": "python -m unittest discover -s tests -q",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            stderr = io.StringIO()
+
+            with mock.patch.dict(os.environ, {"MY_AGENT_LLM_PROVIDER": "openai"}, clear=True):
+                with contextlib.redirect_stderr(stderr):
+                    exit_code = main(["run", "--task-file", str(task_file), "--trace-dir", str(base / "traces")])
+
+            self.assertEqual(exit_code, 1)
+            self.assertIn("No API key configured", stderr.getvalue())
+
+    def test_cli_stats_prints_trace_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+            task_file = base / "task.json"
+            task_file.write_text(
+                json.dumps(
+                    {
+                        "id": "tmp",
+                        "source": "local",
+                        "repo": str(repo),
+                        "task": "Fix the subtract function so it returns a minus b.",
+                        "test_command": "python -m unittest discover -s tests -q",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            trace_dir = base / "traces"
+            run_output = io.StringIO()
+
+            with mock.patch.dict(os.environ, {"MY_AGENT_LLM_PROVIDER": "fake"}, clear=True):
+                with contextlib.redirect_stdout(run_output):
+                    self.assertEqual(main(["run", "--task-file", str(task_file), "--trace-dir", str(trace_dir)]), 0)
+
+            stats_output = io.StringIO()
+            with contextlib.redirect_stdout(stats_output):
+                exit_code = main(["stats", "--trace", str(trace_dir)])
+
+            self.assertEqual(exit_code, 0)
+            output = stats_output.getvalue()
+            self.assertIn("Tool success rate:", output)
+            self.assertIn("Test pass rate: 1/1", output)
+            self.assertIn("Edit count: 1", output)
+            self.assertIn("- run_tests: 1", output)
 
     def test_cli_index_prints_repository_context(self) -> None:
         repo = Path(__file__).resolve().parents[1] / "examples" / "sample_repo"

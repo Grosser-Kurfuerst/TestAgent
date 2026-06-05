@@ -7,7 +7,7 @@ from typing import Any
 
 from my_agent.config import AgentConfig
 from my_agent.indexer import RepoIndexer
-from my_agent.llm import AgentLLM, FakeLLM
+from my_agent.llm import AgentLLM, build_llm
 from my_agent.schema import AgentState, ToolCall, ToolRecord, ToolResult
 from my_agent.tools import RepoTools, should_skip_path
 from my_agent.tracing import TraceWriter
@@ -22,7 +22,7 @@ class CodingAgentRuntime:
         command_timeout: int | None = None,
     ):
         self.config = config or AgentConfig.from_env()
-        self.llm = llm or FakeLLM()
+        self.llm = llm or build_llm(self.config)
         self.trace_dir = Path(trace_dir) if trace_dir is not None else self.config.trace_dir
         self.command_timeout = command_timeout or self.config.command_timeout
 
@@ -47,6 +47,7 @@ class CodingAgentRuntime:
             self._act(state, tools, writer)
             self._verify(state, writer)
 
+        self._review(state, writer)
         self._summarize(state, writer)
         return state
 
@@ -187,8 +188,23 @@ class CodingAgentRuntime:
             )
         )
 
+    def _review(self, state: AgentState, writer: TraceWriter) -> None:
+        state.review = self.llm.review(state).strip()
+        writer.append(
+            state.trace_event(
+                "review",
+                {
+                    "review": state.review,
+                    "stop_reason": state.stop_reason,
+                    "steps": state.steps,
+                },
+            )
+        )
+
     def _summarize(self, state: AgentState, writer: TraceWriter) -> None:
-        state.final_answer = self.llm.summarize(state)
+        state.final_answer = self.llm.summarize(state).strip()
+        if state.trace_path and "Trace:" not in state.final_answer:
+            state.final_answer += f"\nTrace: {state.trace_path}"
         writer.append(state.trace_event("final_summary", {"summary": state.final_answer, "stop_reason": state.stop_reason}))
 
 

@@ -50,7 +50,7 @@ class RuntimeTests(unittest.TestCase):
             write_runtime_repo(repo)
 
             with self.assertRaisesRegex(ValueError, "max_steps must be >= 1"):
-                run_agent(repo_path=repo, task="Fix subtract.", max_steps=0, trace_dir=repo / "traces")
+                run_agent(repo_path=repo, task="Fix subtract.", llm=FakeLLM(), max_steps=0, trace_dir=repo / "traces")
 
     def test_fake_llm_repairs_sample_bug_and_writes_trace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -63,6 +63,7 @@ class RuntimeTests(unittest.TestCase):
                 repo_path=repo,
                 task="Fix the subtract function so it returns the first number minus the second number.",
                 test_command="python -m unittest discover -s tests -q",
+                llm=FakeLLM(),
                 max_steps=8,
                 trace_dir=base / "traces",
             )
@@ -73,11 +74,13 @@ class RuntimeTests(unittest.TestCase):
             self.assertTrue(any(record.call.tool == "run_tests" and record.result.ok for record in state.tool_history))
             self.assertTrue(any(record.call.tool == "finish" for record in state.tool_history))
             self.assertIn("Tests: passed", state.final_answer)
+            self.assertIn("Risks:", state.final_answer)
+            self.assertIn("Tests: passed", state.review)
 
             self.assertIsNotNone(state.trace_path)
             events = read_trace(state.trace_path)
             event_names = [str(event["event"]) for event in events]
-            for expected in ("repo_indexed", "plan", "tool_call", "verify", "final_summary"):
+            for expected in ("repo_indexed", "plan", "tool_call", "verify", "review", "final_summary"):
                 self.assertIn(expected, event_names)
             self.assertEqual({event["run_id"] for event in events}, {state.run_id})
 
@@ -183,6 +186,7 @@ class RuntimeTests(unittest.TestCase):
                 repo_path=repo,
                 task="Fix subtract.",
                 test_command="python -m unittest discover -s tests -q",
+                llm=FakeLLM(),
                 max_steps=2,
                 trace_dir=base / "traces",
             )
@@ -205,6 +209,7 @@ class RuntimeTests(unittest.TestCase):
                 repo_path=repo,
                 task="Find needle_secret without leaking credentials.",
                 test_command="python -m unittest discover -s tests -q",
+                llm=FakeLLM(),
                 max_steps=1,
                 trace_dir=base / "traces",
             )
