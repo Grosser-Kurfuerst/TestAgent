@@ -3,7 +3,6 @@ from __future__ import annotations
 import contextlib
 import io
 import json
-import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -89,8 +88,9 @@ class CliTests(unittest.TestCase):
             )
             trace_dir = base / "traces"
             stream = io.StringIO()
+            env_file = _write_env_file(base, "MY_AGENT_LLM_PROVIDER=fake\n")
 
-            with mock.patch.dict(os.environ, {"MY_AGENT_LLM_PROVIDER": "fake"}, clear=True):
+            with mock.patch("my_agent.config.DEFAULT_ENV_FILE", env_file):
                 with contextlib.redirect_stdout(stream):
                     exit_code = main(["run", "--task-file", str(task_file), "--trace-dir", str(trace_dir)])
 
@@ -123,13 +123,26 @@ class CliTests(unittest.TestCase):
                 encoding="utf-8",
             )
             stderr = io.StringIO()
+            env_file = _write_env_file(base, "MY_AGENT_LLM_PROVIDER=openai\n")
 
-            with mock.patch.dict(os.environ, {"MY_AGENT_LLM_PROVIDER": "openai"}, clear=True):
+            with mock.patch("my_agent.config.DEFAULT_ENV_FILE", env_file):
                 with contextlib.redirect_stderr(stderr):
                     exit_code = main(["run", "--task-file", str(task_file), "--trace-dir", str(base / "traces")])
 
             self.assertEqual(exit_code, 1)
             self.assertIn("No API key configured", stderr.getvalue())
+
+    def test_cli_config_without_dotenv_returns_clear_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / ".env"
+            stderr = io.StringIO()
+
+            with mock.patch("my_agent.config.DEFAULT_ENV_FILE", missing):
+                with contextlib.redirect_stderr(stderr):
+                    exit_code = main(["config"])
+
+            self.assertEqual(exit_code, 1)
+            self.assertIn("Configuration file not found", stderr.getvalue())
 
     def test_cli_stats_prints_trace_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -152,8 +165,9 @@ class CliTests(unittest.TestCase):
             )
             trace_dir = base / "traces"
             run_output = io.StringIO()
+            env_file = _write_env_file(base, "MY_AGENT_LLM_PROVIDER=fake\n")
 
-            with mock.patch.dict(os.environ, {"MY_AGENT_LLM_PROVIDER": "fake"}, clear=True):
+            with mock.patch("my_agent.config.DEFAULT_ENV_FILE", env_file):
                 with contextlib.redirect_stdout(run_output):
                     self.assertEqual(main(["run", "--task-file", str(task_file), "--trace-dir", str(trace_dir)]), 0)
 
@@ -214,6 +228,12 @@ class CliTests(unittest.TestCase):
         self.assertTrue((repo / "calculator.py").exists())
         self.assertTrue((repo / "tests" / "test_calculator.py").exists())
         self.assertTrue((repo / "AGENT.md").exists())
+
+
+def _write_env_file(base: Path, content: str) -> Path:
+    env_file = base / ".env"
+    env_file.write_text(content, encoding="utf-8")
+    return env_file
 
 
 if __name__ == "__main__":

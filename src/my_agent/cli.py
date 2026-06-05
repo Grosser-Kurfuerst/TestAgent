@@ -127,7 +127,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "run":
         task_payload = load_task(args.task_file)
-        config = AgentConfig.from_env()
+        try:
+            config = AgentConfig.from_env()
+        except (FileNotFoundError, ValueError, RuntimeError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
         repo_path = _resolve_repo_path(args.repo or task_payload["repo"])
         test_command = args.test_command if args.test_command is not None else task_payload.get("test_command")
         trace_dir = _resolve_trace_dir(args.trace_dir, config.trace_dir)
@@ -165,9 +169,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if args.command == "config":
-        config = AgentConfig.from_env()
-        if args.check_api_key:
-            config.require_api_key()
+        try:
+            config = AgentConfig.from_env()
+            if args.check_api_key:
+                config.require_api_key()
+        except (FileNotFoundError, ValueError, RuntimeError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
         print(
             json.dumps(
                 {

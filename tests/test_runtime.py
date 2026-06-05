@@ -12,6 +12,7 @@ except ImportError:  # unittest discover -s tests imports modules as top-level f
 
 add_src_to_path()
 
+from my_agent.config import AgentConfig
 from my_agent.llm import FakeLLM
 from my_agent.runtime import run_agent
 
@@ -43,6 +44,20 @@ def read_trace(path: Path) -> list[dict[str, object]]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
 
+def fake_config(trace_dir: Path | None = None) -> AgentConfig:
+    return AgentConfig(
+        provider="fake",
+        api_key="",
+        base_url=None,
+        model="fake",
+        temperature=0.0,
+        max_steps=8,
+        command_timeout=60,
+        trace_dir=trace_dir or Path("traces"),
+        use_fake_llm=True,
+    )
+
+
 class RuntimeTests(unittest.TestCase):
     def test_run_agent_rejects_zero_max_steps(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -50,7 +65,14 @@ class RuntimeTests(unittest.TestCase):
             write_runtime_repo(repo)
 
             with self.assertRaisesRegex(ValueError, "max_steps must be >= 1"):
-                run_agent(repo_path=repo, task="Fix subtract.", llm=FakeLLM(), max_steps=0, trace_dir=repo / "traces")
+                run_agent(
+                    repo_path=repo,
+                    task="Fix subtract.",
+                    config=fake_config(repo / "traces"),
+                    llm=FakeLLM(),
+                    max_steps=0,
+                    trace_dir=repo / "traces",
+                )
 
     def test_fake_llm_repairs_sample_bug_and_writes_trace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -63,6 +85,7 @@ class RuntimeTests(unittest.TestCase):
                 repo_path=repo,
                 task="Fix the subtract function so it returns the first number minus the second number.",
                 test_command="python -m unittest discover -s tests -q",
+                config=fake_config(base / "traces"),
                 llm=FakeLLM(),
                 max_steps=8,
                 trace_dir=base / "traces",
@@ -102,6 +125,7 @@ class RuntimeTests(unittest.TestCase):
                 repo_path=repo,
                 task="Fix subtract.",
                 test_command="python -m unittest discover -s tests -q",
+                config=fake_config(base / "traces"),
                 llm=FakeLLM(actor_responses=["this is not json", valid_read]),
                 max_steps=8,
                 trace_dir=base / "traces",
@@ -128,6 +152,7 @@ class RuntimeTests(unittest.TestCase):
                 repo_path=repo,
                 task="Fix subtract.",
                 test_command="python -m unittest discover -s tests -q",
+                config=fake_config(base / "traces"),
                 llm=FakeLLM(actor_responses=["first bad output", "second bad output"]),
                 max_steps=4,
                 trace_dir=base / "traces",
@@ -165,6 +190,7 @@ class RuntimeTests(unittest.TestCase):
                 repo_path=repo,
                 task="Fix subtract.",
                 test_command="python -m unittest discover -s tests -q",
+                config=fake_config(base / "traces"),
                 llm=FakeLLM(actor_responses=[run_tests, finish]),
                 max_steps=4,
                 trace_dir=base / "traces",
@@ -186,6 +212,7 @@ class RuntimeTests(unittest.TestCase):
                 repo_path=repo,
                 task="Fix subtract.",
                 test_command="python -m unittest discover -s tests -q",
+                config=fake_config(base / "traces"),
                 llm=FakeLLM(),
                 max_steps=2,
                 trace_dir=base / "traces",
@@ -209,6 +236,7 @@ class RuntimeTests(unittest.TestCase):
                 repo_path=repo,
                 task="Find needle_secret without leaking credentials.",
                 test_command="python -m unittest discover -s tests -q",
+                config=fake_config(base / "traces"),
                 llm=FakeLLM(),
                 max_steps=1,
                 trace_dir=base / "traces",

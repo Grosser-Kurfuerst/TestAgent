@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 try:
@@ -31,20 +33,30 @@ class _FakeResponse:
 
 class LLMTests(unittest.TestCase):
     def test_build_llm_uses_fake_provider_without_api_key(self) -> None:
-        config = AgentConfig.from_env(env={"MY_AGENT_LLM_PROVIDER": "fake"})
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / ".env"
+            env_file.write_text("MY_AGENT_LLM_PROVIDER=fake\n", encoding="utf-8")
+
+            config = AgentConfig.from_env(env_file=env_file)
 
         self.assertIsInstance(build_llm(config), FakeLLM)
 
     def test_openai_compatible_client_posts_chat_completion(self) -> None:
-        config = AgentConfig.from_env(
-            env={
-                "MY_AGENT_LLM_PROVIDER": "openai",
-                "MY_AGENT_API_KEY": "test-key",
-                "MY_AGENT_BASE_URL": "https://example.test/v1",
-                "MY_AGENT_MODEL": "test-model",
-                "MY_AGENT_TEMPERATURE": "0.2",
-            }
-        )
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / ".env"
+            env_file.write_text(
+                "\n".join(
+                    [
+                        "MY_AGENT_LLM_PROVIDER=openai",
+                        "MY_AGENT_API_KEY=test-key",
+                        "MY_AGENT_BASE_URL=https://example.test/v1",
+                        "MY_AGENT_MODEL=test-model",
+                        "MY_AGENT_TEMPERATURE=0.2",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            config = AgentConfig.from_env(env_file=env_file)
         client = OpenAICompatibleLLM(config, timeout=3)
 
         with mock.patch("urllib.request.urlopen") as urlopen:

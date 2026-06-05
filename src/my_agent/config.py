@@ -1,13 +1,16 @@
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
+from dotenv import dotenv_values
+
 
 TRUE_VALUES = {"1", "true", "yes", "on"}
 SUPPORTED_PROVIDERS = {"openai", "fake"}
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_ENV_FILE = PROJECT_ROOT / ".env"
 
 
 @dataclass(frozen=True)
@@ -23,8 +26,8 @@ class AgentConfig:
     use_fake_llm: bool
 
     @classmethod
-    def from_env(cls, env: Mapping[str, str] | None = None) -> "AgentConfig":
-        values = os.environ if env is None else env
+    def from_env(cls, env: Mapping[str, str] | None = None, env_file: str | Path | None = None) -> "AgentConfig":
+        values = _config_values(env=env, env_file=env_file)
         provider = values.get("MY_AGENT_LLM_PROVIDER", "openai").strip().lower()
         use_fake_llm = _as_bool(values.get("MY_AGENT_USE_FAKE_LLM", "")) or provider == "fake"
 
@@ -51,10 +54,24 @@ class AgentConfig:
             return
         if not self.api_key:
             raise RuntimeError(
-                "No API key configured. Set MY_AGENT_API_KEY or OPENAI_API_KEY, "
-                "or set MY_AGENT_LLM_PROVIDER=fake for local tests."
+                "No API key configured. Set MY_AGENT_API_KEY in .env, "
+                "or set MY_AGENT_LLM_PROVIDER=fake in .env for local tests."
             )
 
 
 def _as_bool(value: str) -> bool:
     return value.strip().lower() in TRUE_VALUES
+
+
+def _config_values(env: Mapping[str, str] | None, env_file: str | Path | None) -> dict[str, str]:
+    values = _read_env_file(Path(env_file) if env_file is not None else DEFAULT_ENV_FILE)
+    if env is None:
+        return values
+    values.update(env)
+    return values
+
+
+def _read_env_file(path: Path) -> dict[str, str]:
+    if not path.exists():
+        raise FileNotFoundError(f"Configuration file not found: {path}. Copy .env.example to .env and fill it in.")
+    return {key: value or "" for key, value in dotenv_values(path).items()}
