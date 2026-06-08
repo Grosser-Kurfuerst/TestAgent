@@ -77,6 +77,29 @@ class ToolRegistryTests(unittest.TestCase):
 
 
 class RepoToolsTests(unittest.TestCase):
+    def test_default_tool_descriptions_include_schemas_and_full_examples(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            descriptions = RepoTools(Path(tmp)).descriptions()
+
+        for tool_name in (
+            "list_files",
+            "read_file",
+            "grep",
+            "retrieve_context",
+            "replace_in_file",
+            "write_file",
+            "run_tests",
+            "git_diff",
+            "finish",
+        ):
+            self.assertIn(f'"tool":"{tool_name}"', descriptions)
+
+        self.assertIn("Arguments schema only", descriptions)
+        self.assertIn("top-level tool, arguments, and reason", descriptions)
+        self.assertIn("do not put reason inside arguments", descriptions)
+        self.assertIn("content must be a valid JSON string with escaped quotes and newlines", descriptions)
+        self.assertIn('"arguments":{}', descriptions)
+
     def test_read_search_and_retrieve_tools_work(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)

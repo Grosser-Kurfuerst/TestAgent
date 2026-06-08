@@ -141,6 +141,31 @@ class RuntimeTests(unittest.TestCase):
             tool_events = [event for event in events if event["event"] == "tool_call"]
             self.assertIn("No JSON object found", str(tool_events[0]["payload"]))
 
+    def test_missing_tool_reason_is_rejected_as_invalid_tool_call(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+            read_without_reason = json.dumps({"tool": "read_file", "arguments": {"path": "calculator.py"}})
+
+            state = run_agent(
+                repo_path=repo,
+                task="Fix subtract.",
+                test_command="python -m unittest discover -s tests -q",
+                config=fake_config(base / "traces"),
+                llm=FakeLLM(actor_responses=[read_without_reason]),
+                max_steps=8,
+                trace_dir=base / "traces",
+            )
+
+            self.assertTrue(state.done)
+            self.assertEqual(state.stop_reason, "finish_called")
+            self.assertEqual(state.tool_history[0].call.tool, "invalid_tool_call")
+            self.assertIn("ToolCall.reason must be a non-empty string", state.tool_history[0].result.reason)
+            self.assertEqual(state.tool_history[1].call.tool, "retrieve_context")
+            self.assertIn("return a - b", (repo / "calculator.py").read_text(encoding="utf-8"))
+
     def test_second_invalid_actor_json_stops_with_protocol_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)

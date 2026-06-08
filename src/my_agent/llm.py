@@ -242,6 +242,10 @@ def _actor_messages(state: AgentState, tool_descriptions: str) -> list[dict[str,
             "content": (
                 "You are a Claude Code style coding agent. Output exactly one JSON object and no markdown or prose. "
                 "The JSON schema is {\"tool\": string, \"arguments\": object, \"reason\": string}. "
+                "All three top-level keys are required. Never omit reason; reason must be a short non-empty sentence. "
+                "Valid example: {\"tool\":\"read_file\",\"arguments\":{\"path\":\"solution.py\",\"limit\":12000},"
+                "\"reason\":\"Inspect the current implementation before editing.\"}. "
+                "The tool-specific schemas below describe only the arguments object, not the outer wrapper. "
                 "Use only an available tool and choose one tool call at a time. "
                 "Use retrieve_context or grep to find relevant code before editing, then read files before changing them. "
                 "Prefer replace_in_file for focused edits; use write_file only when full-file replacement is safer. "

@@ -230,6 +230,8 @@ def run_agent(
 
 def _parse_tool_call(raw: str, allowed_tools: list[str]) -> ToolCall:
     payload = _extract_json_object(raw)
+    # if _missing_reason(payload):
+    #     payload = {**payload, "reason": _default_reason(payload)}
     return ToolCall.from_mapping(payload, allowed_tools=allowed_tools)
 
 
@@ -238,6 +240,18 @@ def _latest_test_failed(state: AgentState) -> bool:
         if record.call.tool == "run_tests":
             return not record.result.ok
     return False
+
+
+def _missing_reason(payload: dict[str, Any]) -> bool:
+    reason = payload.get("reason")
+    return reason is None or (isinstance(reason, str) and not reason.strip())
+
+
+def _default_reason(payload: dict[str, Any]) -> str:
+    tool = payload.get("tool")
+    if isinstance(tool, str) and tool.strip():
+        return f"Model omitted reason; proceeding with validated {tool.strip()} tool call."
+    return "Model omitted reason; proceeding with validated tool call."
 
 
 def _raw_excerpt(raw: str, limit: int = 500) -> str:
