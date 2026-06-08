@@ -226,7 +226,7 @@ MBPP 评测会：
 2. 为每条任务生成临时 Python repo。
 3. 调用 Agent 进行修复。
 4. 运行 pytest 判断是否通过。
-5. 写入逐题结果和汇总通过率。
+5. 写入逐题结果和汇总评分。
 
 准备依赖：
 
@@ -243,6 +243,8 @@ uv run python scripts/eval_mbpp.py \
   --max-steps 10
 ```
 
+默认情况下，LLM API 空响应、429/5xx、超时等 transient 错误会自动重试。重试耗尽后会记录为 `status=transient_error`，默认不计入解题能力评分分母。
+
 跑更多任务：
 
 ```bash
@@ -250,6 +252,16 @@ uv run python scripts/eval_mbpp.py \
   --limit 10 \
   --output-dir evaluationResults/mbpp_eval \
   --max-steps 10
+```
+
+如果要评估端到端稳定性，把 API 抖动也计入失败分母：
+
+```bash
+uv run python scripts/eval_mbpp.py \
+  --limit 10 \
+  --output-dir evaluationResults/mbpp_eval_e2e \
+  --max-steps 10 \
+  --count-transient-errors
 ```
 
 断点续跑：
@@ -262,6 +274,8 @@ uv run python scripts/eval_mbpp.py \
   --max-steps 10
 ```
 
+`--start 0` 会覆盖旧的 `results.jsonl`，避免新旧结果 schema 混合；`--start > 0` 会继续追加，适合断点续跑。
+
 结果文件：
 
 ```text
@@ -271,13 +285,20 @@ evaluationResults/mbpp_eval/results.jsonl
 每行包含：
 
 - `task_id`
-- `passed`
+- `status`: `passed`、`failed`、`error` 或 `transient_error`
+- `scored`: 是否计入解题能力评分分母
 - `test_output`
 - `agent_steps`
 - `agent_done`
 - `agent_stop_reason`
 - `error`
 - `elapsed_sec`
+- `attempts`
+
+汇总里同时输出：
+
+- `Solve rate`: `passed / scored`，默认剔除 API transient 错误，适合看解题能力。
+- `End-to-end rate`: `passed / total`，包含所有样本，适合看完整系统稳定性。
 
 ## 8. 数据构建测试
 

@@ -41,24 +41,28 @@ from my_agent.runtime import run_agent
 @dataclass
 class EvalResult:
     task_id: str
-    passed: bool
+    status: str
+    scored: bool = True
     test_output: str = ""
     agent_steps: int = 0
     agent_done: bool = False
     agent_stop_reason: str = ""
     error: str = ""
     elapsed_sec: float = 0.0
+    attempts: int = 1
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "task_id": self.task_id,
-            "passed": self.passed,
+            "status": self.status,
+            "scored": self.scored,
             "test_output": self.test_output[:2000],
             "agent_steps": self.agent_steps,
             "agent_done": self.agent_done,
             "agent_stop_reason": self.agent_stop_reason,
             "error": self.error,
             "elapsed_sec": round(self.elapsed_sec, 1),
+            "attempts": self.attempts,
         }
 
 
@@ -139,44 +143,138 @@ def run_one_task(
     base_dir: Path,
     config: AgentConfig,
     max_steps: int,
+    llm_retries: int = 2,
+    retry_delay_sec: float = 2.0,
+    count_transient_errors: bool = False,
 ) -> EvalResult:
     """对单个 MBPP 任务：建仓库 → 跑 Agent → 评测。"""
     task_id = str(row.get("task_id", "unknown"))
     text = str(row.get("text", "")).strip()
     t0 = time.monotonic()
+    max_attempts = max(1, llm_retries + 1)
+    last_transient_error = ""
 
-    try:
-        # 1. 建仓库
-        repo_path = build_mbpp_repo(row, base_dir)
+    for attempt in range(1, max_attempts + 1):
+        try:
+            # 1. 建仓库。每次重试都重建，避免上一轮部分编辑污染结果。
+            repo_path = build_mbpp_repo(row, base_dir)
 
-        # 2. 运行 Agent
-        state = run_agent(
-            repo_path=repo_path,
-            task=f"Implement the solution.py skeleton so that all tests pass. Task description: {text}",
-            test_command="python -m pytest -q",
-            config=config,
-            max_steps=max_steps,
-        )
+            # 2. 运行 Agent
+            state = run_agent(
+                repo_path=repo_path,
+                task=f"Implement the solution.py skeleton so that all tests pass. Task description: {text}",
+                test_command="python -m pytest -q",
+                config=config,
+                max_steps=max_steps,
+            )
 
-        # 3. 评测：运行 pytest
-        passed, test_output = evaluate_solution(repo_path)
+            # 3. 评测：运行 pytest
+            test_passed, test_output = evaluate_solution(repo_path)
 
-        return EvalResult(
-            task_id=task_id,
-            passed=passed,
-            test_output=test_output,
-            agent_steps=state.steps,
-            agent_done=state.done,
-            agent_stop_reason=state.stop_reason,
-            elapsed_sec=time.monotonic() - t0,
-        )
-    except Exception as e:
-        return EvalResult(
-            task_id=task_id,
-            passed=False,
-            error=f"{type(e).__name__}: {e}",
-            elapsed_sec=time.monotonic() - t0,
-        )
+            return EvalResult(
+                task_id=task_id,
+                status="passed" if test_passed else "failed",
+                scored=True,
+                test_output=test_output,
+                agent_steps=state.steps,
+                agent_done=state.done,
+                agent_stop_reason=state.stop_reason,
+                elapsed_sec=time.monotonic() - t0,
+                attempts=attempt,
+            )
+        except Exception as exc:  # noqa: BLE001 - evaluation boundary records all failures
+            message = f"{type(exc).__name__}: {exc}"
+            if _is_transient_llm_error(exc):
+                last_transient_error = message
+                if attempt < max_attempts:
+                    if retry_delay_sec > 0:
+                        time.sleep(retry_delay_sec)
+                    continue
+                return EvalResult(
+                    task_id=task_id,
+                    status="transient_error",
+                    scored=count_transient_errors,
+                    error=last_transient_error,
+                    elapsed_sec=time.monotonic() - t0,
+                    attempts=attempt,
+                )
+            return EvalResult(
+                task_id=task_id,
+                status="error",
+                scored=True,
+                error=message,
+                elapsed_sec=time.monotonic() - t0,
+                attempts=attempt,
+            )
+
+    return EvalResult(
+        task_id=task_id,
+        status="transient_error",
+        scored=count_transient_errors,
+        error=last_transient_error or "Transient LLM error",
+        elapsed_sec=time.monotonic() - t0,
+        attempts=max_attempts,
+    )
+
+
+def _is_transient_llm_error(exc: BaseException) -> bool:
+    message = f"{type(exc).__name__}: {exc}"
+    transient_markers = (
+        "LLM response message content was empty.",
+        "HTTP 429",
+        "HTTP 500",
+        "HTTP 502",
+        "HTTP 503",
+        "HTTP 504",
+        "timed out",
+        "timeout",
+        "temporarily unavailable",
+        "temporary failure",
+        "connection reset",
+        "connection aborted",
+        "remote end closed connection",
+    )
+    lowered = message.lower()
+    return any(marker.lower() in lowered for marker in transient_markers)
+
+
+def summarize_results(results: list[EvalResult]) -> dict[str, float | int]:
+    total = len(results)
+    scored_total = sum(1 for r in results if r.scored)
+    passed_count = sum(1 for r in results if r.status == "passed")
+    failed_count = sum(1 for r in results if r.status == "failed")
+    error_count = sum(1 for r in results if r.status == "error")
+    transient_excluded_count = sum(1 for r in results if r.status == "transient_error" and not r.scored)
+    transient_counted_count = sum(1 for r in results if r.status == "transient_error" and r.scored)
+    return {
+        "total": total,
+        "scored": scored_total,
+        "passed": passed_count,
+        "failed": failed_count,
+        "error": error_count,
+        "transient_excluded": transient_excluded_count,
+        "transient_counted": transient_counted_count,
+        "solve_rate": passed_count / scored_total * 100 if scored_total > 0 else 0.0,
+        "end_to_end_rate": passed_count / total * 100 if total > 0 else 0.0,
+    }
+
+
+def _status_label(result: EvalResult) -> str:
+    if result.status == "passed":
+        return "PASS"
+    if result.status == "failed":
+        return "FAIL"
+    if result.status == "transient_error":
+        return f"TRANSIENT ({result.error[:60]})" if result.error else "TRANSIENT"
+    if result.status == "error":
+        return f"ERROR ({result.error[:60]})" if result.error else "ERROR"
+    return result.status.upper()
+
+
+def _prepare_results_file(results_path: Path, start: int) -> None:
+    results_path.parent.mkdir(parents=True, exist_ok=True)
+    if start == 0:
+        results_path.write_text("", encoding="utf-8")
 
 
 def main() -> None:
@@ -186,6 +284,13 @@ def main() -> None:
     parser.add_argument("--max-steps", type=int, default=10, help="每个任务的 Agent 最大步数")
     parser.add_argument("--split", default="test", help="MBPP 数据集 split")
     parser.add_argument("--start", type=int, default=0, help="从第几个任务开始（断点续跑）")
+    parser.add_argument("--llm-retries", type=int, default=2, help="LLM transient 错误重试次数（默认 2）")
+    parser.add_argument("--retry-delay-sec", type=float, default=2.0, help="LLM transient 错误重试间隔秒数")
+    parser.add_argument(
+        "--count-transient-errors",
+        action="store_true",
+        help="把 API 抖动类 transient_error 计入解题评分分母。",
+    )
     args = parser.parse_args()
 
     # 准备
@@ -194,6 +299,7 @@ def main() -> None:
     repos_dir = output_dir / "repos"
     results_path = output_dir / "results.jsonl"
     repos_dir.mkdir(parents=True, exist_ok=True)
+    _prepare_results_file(results_path, args.start)
 
     # 加载数据集
     print(f"Loading MBPP ({args.split} split)...")
@@ -209,13 +315,19 @@ def main() -> None:
         task_id = str(row.get("task_id", idx))
         print(f"[{idx + 1}/{len(dataset)}] task_id={task_id} ... ", end="", flush=True)
 
-        result = run_one_task(row, repos_dir, config, max_steps=args.max_steps)
+        result = run_one_task(
+            row,
+            repos_dir,
+            config,
+            max_steps=args.max_steps,
+            llm_retries=max(0, args.llm_retries),
+            retry_delay_sec=max(0.0, args.retry_delay_sec),
+            count_transient_errors=args.count_transient_errors,
+        )
 
-        status = "PASS" if result.passed else "FAIL"
-        if result.error:
-            status = f"ERROR ({result.error[:60]})"
+        status = _status_label(result)
         print(
-            f"{status} | steps={result.agent_steps} | "
+            f"{status} | attempts={result.attempts} | steps={result.agent_steps} | "
             f"done={result.agent_done} | {result.elapsed_sec:.0f}s"
         )
 
@@ -226,19 +338,20 @@ def main() -> None:
             f.write(json.dumps(result.to_dict(), ensure_ascii=False) + "\n")
 
     # 汇总
-    passed = sum(1 for r in results if r.passed)
-    errored = sum(1 for r in results if r.error)
-    total = len(results)
-    rate = passed / total * 100 if total > 0 else 0
+    summary = summarize_results(results)
 
     print()
     print("=" * 60)
     print(f"MBPP Evaluation Results")
-    print(f"  Total:   {total}")
-    print(f"  Passed:  {passed}")
-    print(f"  Failed:  {total - passed - errored}")
-    print(f"  Error:   {errored}")
-    print(f"  Rate:    {rate:.1f}%")
+    print(f"  Total:              {summary['total']}")
+    print(f"  Scored:             {summary['scored']}")
+    print(f"  Passed:             {summary['passed']}")
+    print(f"  Failed:             {summary['failed']}")
+    print(f"  Error:              {summary['error']}")
+    print(f"  Transient excluded: {summary['transient_excluded']}")
+    print(f"  Transient counted:  {summary['transient_counted']}")
+    print(f"  Solve rate:         {summary['solve_rate']:.1f}%")
+    print(f"  End-to-end rate:    {summary['end_to_end_rate']:.1f}%")
     print(f"  Results: {results_path}")
     print("=" * 60)
 
