@@ -345,7 +345,77 @@ uv run python run_agent.py export-alpaca \
   --output-dir /tmp/my_agent_data/llamafactory
 ```
 
-## 9. 推荐测试顺序
+## 9. SFT 训练与协议评估
+
+Phase 7 依赖 Phase 6 导出的 LLaMA-Factory 数据目录，目录中至少需要：
+
+```text
+dataset_info.json
+train_alpaca.json
+val_alpaca.json
+dataset_stats.json
+```
+
+启动 LoRA SFT 训练：
+
+```bash
+DATASET_DIR=/tmp/my_agent_data/llamafactory \
+OUTPUT_DIR=/tmp/my_agent_sft_lora \
+BASE_MODEL=Qwen/Qwen2.5-Coder-7B-Instruct \
+BATCH_SIZE=1 \
+LEARNING_RATE=1e-4 \
+NUM_TRAIN_EPOCHS=1 \
+CUTOFF_LEN=4096 \
+bash scripts/train_llamafactory_lora.sh
+```
+
+训练脚本会调用本机已有的 `llamafactory-cli`。如果没有安装 LLaMA-Factory，脚本会直接报错，不会静默跳过。
+
+对比 base model 与 SFT adapter：
+
+```bash
+uv run python scripts/eval_sft_protocol.py \
+  --val-data /tmp/my_agent_data/llamafactory/val_alpaca.json \
+  --base-model Qwen/Qwen2.5-Coder-7B-Instruct \
+  --adapter-dir /tmp/my_agent_sft_lora \
+  --output-dir /tmp/my_agent_sft_eval \
+  --max-new-tokens 512
+```
+
+如果只想验证指标计算逻辑，可以使用预生成响应文件，不加载真实模型：
+
+```bash
+uv run python scripts/eval_sft_protocol.py \
+  --val-data /tmp/my_agent_data/llamafactory/val_alpaca.json \
+  --base-responses /tmp/my_agent_sft_eval/base_responses.json \
+  --sft-responses /tmp/my_agent_sft_eval/sft_responses.json \
+  --output-dir /tmp/my_agent_sft_eval_metric_only
+```
+
+评估输出：
+
+- `metrics_summary.json`：base、SFT 和 delta 的汇总指标。
+- `detailed_results.json`：每条样本的任务类型、参考输出、base 输出、SFT 输出和单样本指标。
+- `experiment_report.md`：自动生成的实验报告草稿。
+- `base_responses.json` / `sft_responses.json`：用于复现指标的原始响应。
+
+核心指标含义：
+
+- `json_valid_rate`：输出是否为严格 JSON object。
+- `field_hit_rate`：不同任务类型的必填字段是否完整。
+- `tool_accuracy`：工具调用样本中工具名是否和参考输出一致。
+- `file_mention_rate`：输出是否提到参考输出或输入里的关键文件路径。
+- `rouge_l`：与参考输出的弱文本相似度。
+
+报告模板在：
+
+```text
+templates/sft-experiment-report-template.md
+```
+
+注意：这些指标主要用于衡量结构化输出协议对齐，不直接证明复杂真实代码修复能力。端到端能力仍需要通过 agent 运行、diff 审查和测试结果单独验证。
+
+## 10. 推荐测试顺序
 
 第一次验证建议按这个顺序：
 
@@ -373,7 +443,7 @@ uv run python run_agent.py run --max-steps 8 --trace-dir traces
 uv run python scripts/eval_mbpp.py --limit 3 --output-dir /tmp/mbpp_eval --max-steps 10
 ```
 
-## 10. 常见问题
+## 11. 常见问题
 
 ### `Configuration file not found`
 
@@ -405,6 +475,20 @@ MY_AGENT_LLM_PROVIDER=fake
 ```bash
 uv sync --extra data
 ```
+
+### `llamafactory-cli` 找不到
+
+Phase 7 的训练脚本依赖外部安装的 LLaMA-Factory。先安装并确认命令可用：
+
+```bash
+llamafactory-cli version
+```
+
+也可以用 `LLAMAFACTORY_CMD` 指向自定义启动命令。
+
+### `torch`、`transformers` 或 `peft` 找不到
+
+`scripts/eval_sft_protocol.py` 只有在需要真实模型推理时才导入这些依赖。若只是检查指标，传入 `--base-responses` 和 `--sft-responses` 即可避免加载模型。
 
 ### `pytest` 找不到
 

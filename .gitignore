@@ -13,5 +13,6 @@ htmlcov/
 build/
 dist/
 *.egg-info/
+outputs/
 traces/
 evaluationResults/
