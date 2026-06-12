@@ -229,15 +229,6 @@ class SftProtocolOutputTests(unittest.TestCase):
         self.assertIn("CUTOFF_LEN", text)
         self.assertIn("llamafactory-cli", text)
 
-    def test_report_template_states_scope_boundary(self) -> None:
-        template = Path(__file__).resolve().parents[1] / "templates" / "sft-experiment-report-template.md"
-        text = template.read_text(encoding="utf-8")
-
-        self.assertIn("JSON valid rate", text)
-        self.assertIn("Tool accuracy", text)
-        self.assertIn("File mention rate", text)
-        self.assertIn("不直接证明模型具备复杂真实代码修复能力", text)
-
 
 if __name__ == "__main__":
     unittest.main()

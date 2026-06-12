@@ -48,6 +48,21 @@ def _tool_event(run_id: str, tool: str, ok: bool, blocked: bool = False, step: i
     }
 
 
+def _benchmark_event(run_id: str, status: str = "passed") -> dict:
+    return {
+        "run_id": run_id,
+        "event": "benchmark_result",
+        "payload": {
+            "benchmark": "mbpp",
+            "task_id": "1",
+            "status": status,
+            "scored": True,
+            "test_command": "python -m pytest -q",
+            "test_output": "ok",
+        },
+    }
+
+
 # ------- Trace → SFT -------------------------------------------------
 
 
@@ -63,6 +78,7 @@ class TracesToSftTests(unittest.TestCase):
                 _tool_event("r1", "replace_in_file", ok=True, step=3),
                 _tool_event("r1", "run_tests", ok=False, step=4),  # failed → skipped
                 _tool_event("r1", "finish", ok=True, step=5),        # finish → skipped
+                _benchmark_event("r1", "passed"),
             ]
             _write_jsonl(trace, events)
 
@@ -82,6 +98,39 @@ class TracesToSftTests(unittest.TestCase):
             tools = [s["output"]["tool"] for s in samples]
             self.assertEqual(tools, ["retrieve_context", "read_file", "replace_in_file"])
             self.assertNotIn("finish", tools)
+
+    def test_failed_benchmark_trace_outputs_no_samples(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trace = Path(tmp) / "trace.jsonl"
+            events = [
+                {"run_id": "r1", "event": "repo_indexed", "payload": {"task": "fix subtract bug"}},
+                {"run_id": "r1", "event": "plan", "payload": {"plan": "p"}},
+                _tool_event("r1", "read_file", ok=True, step=1),
+                _tool_event("r1", "write_file", ok=True, step=2),
+                _benchmark_event("r1", "failed"),
+            ]
+            _write_jsonl(trace, events)
+
+            output = Path(tmp) / "sft.jsonl"
+            report = traces_to_sft(trace, output)
+
+            self.assertEqual(report.written, 0)
+            self.assertEqual(_read_jsonl(output), [])
+
+    def test_legacy_trace_without_benchmark_result_outputs_no_samples(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trace = Path(tmp) / "trace.jsonl"
+            events = [
+                {"run_id": "r1", "event": "repo_indexed", "payload": {"task": "fix subtract bug"}},
+                _tool_event("r1", "read_file", ok=True, step=1),
+            ]
+            _write_jsonl(trace, events)
+
+            output = Path(tmp) / "sft.jsonl"
+            report = traces_to_sft(trace, output)
+
+            self.assertEqual(report.written, 0)
+            self.assertEqual(_read_jsonl(output), [])
 
     def test_empty_traces_produce_zero_samples(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -103,6 +152,7 @@ class TracesToSftTests(unittest.TestCase):
             trace.write_text(
                 "not json\n"
                 + json.dumps(_tool_event("r1", "grep", ok=True, step=1)) + "\n"
+                + json.dumps(_benchmark_event("r1", "passed")) + "\n"
                 + "\n",  # empty line
                 encoding="utf-8",
             )
@@ -121,6 +171,7 @@ class TracesToSftTests(unittest.TestCase):
             ]
             for i in range(10):
                 events.append(_tool_event("r1", "grep", ok=True, step=i + 1))
+            events.append(_benchmark_event("r1", "passed"))
             _write_jsonl(trace, events)
 
             output = Path(tmp) / "sft.jsonl"
@@ -475,6 +526,7 @@ class SftFormatValidationTests(unittest.TestCase):
                     {"run_id": "r1", "event": "repo_indexed", "payload": {"task": "t"}},
                     {"run_id": "r1", "event": "plan", "payload": {"plan": "p"}},
                     _tool_event("r1", "read_file", ok=True, step=1),
+                    _benchmark_event("r1", "passed"),
                 ],
             )
             sft_output = Path(tmp) / "sft.jsonl"

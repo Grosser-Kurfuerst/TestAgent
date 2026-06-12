@@ -218,11 +218,11 @@ uv run pytest -q
 
 这个层级主要验证代码实现、hook 边界、配置解析、CLI 和 trace 统计，不评估真实 LLM 修复能力。
 
-## 7. MBPP 真实评测
+## 7. MBPP / HumanEval 真实评测
 
-MBPP 评测会：
+MBPP 和 HumanEval 评测会：
 
-1. 从 HuggingFace 加载 MBPP 数据。
+1. 从 HuggingFace 加载 benchmark 数据。
 2. 为每条任务生成临时 Python repo。
 3. 调用 Agent 进行修复。
 4. 运行 pytest 判断是否通过。
@@ -243,6 +243,17 @@ uv run python scripts/eval_mbpp.py \
   --max-steps 10
 ```
 
+HumanEval 快速验证：
+
+```bash
+uv run python scripts/eval_humaneval.py \
+  --limit 3 \
+  --output-dir evaluationResults/humaneval_eval \
+  --max-steps 10
+```
+
+`eval_humaneval.py` 会为每道题生成 `solution.py` 和 `tests/test_solution.py`，运行 Agent 修改实现，再用测试结果统计通过率；参数和 `eval_mbpp.py` 基本一致。
+
 默认情况下，LLM API 空响应、429/5xx、超时等 transient 错误会自动重试。重试耗尽后会记录为 `status=transient_error`，默认不计入解题能力评分分母。
 
 跑更多任务：
@@ -251,6 +262,15 @@ uv run python scripts/eval_mbpp.py \
 uv run python scripts/eval_mbpp.py \
   --limit 10 \
   --output-dir evaluationResults/mbpp_eval \
+  --max-steps 10
+```
+
+HumanEval 同样建议使用独立输出目录，避免和其他 benchmark 结果混合：
+
+```bash
+uv run python scripts/eval_humaneval.py \
+  --limit 10 \
+  --output-dir evaluationResults/humaneval_eval \
   --max-steps 10
 ```
 
@@ -280,9 +300,10 @@ uv run python scripts/eval_mbpp.py \
 
 ```text
 evaluationResults/mbpp_eval/results.jsonl
+evaluationResults/humaneval_eval/results.jsonl
 ```
 
-每行包含：
+MBPP 与 HumanEval 的 `results.jsonl` 每行字段一致，包含：
 
 - `task_id`
 - `status`: `passed`、`failed`、`error` 或 `transient_error`
@@ -406,12 +427,6 @@ uv run python scripts/eval_sft_protocol.py \
 - `tool_accuracy`：工具调用样本中工具名是否和参考输出一致。
 - `file_mention_rate`：输出是否提到参考输出或输入里的关键文件路径。
 - `rouge_l`：与参考输出的弱文本相似度。
-
-报告模板在：
-
-```text
-templates/sft-experiment-report-template.md
-```
 
 注意：这些指标主要用于衡量结构化输出协议对齐，不直接证明复杂真实代码修复能力。端到端能力仍需要通过 agent 运行、diff 审查和测试结果单独验证。
 

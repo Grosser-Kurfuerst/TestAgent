@@ -2,6 +2,19 @@ from __future__ import annotations
 
 """Evaluation utilities for SFT protocol and later agent benchmarks."""
 
+from my_agent.evaluation.agent_benchmark import (
+    TEST_COMMAND,
+    BenchmarkSpec,
+    EvalResult,
+    is_transient_llm_error,
+    prepare_results_file,
+    run_benchmark,
+    run_import_test_fallback,
+    run_one_task,
+    run_pytest_or_fallback,
+    status_label,
+    summarize_results,
+)
 from my_agent.evaluation.protocol_metrics import (
     METRIC_KEYS,
     build_detailed_results,
@@ -19,6 +32,9 @@ from my_agent.evaluation.protocol_metrics import (
 from my_agent.evaluation.protocol_runner import load_response_file, load_samples, run_evaluation
 
 __all__ = [
+    "TEST_COMMAND",
+    "BenchmarkSpec",
+    "EvalResult",
     "METRIC_KEYS",
     "build_detailed_results",
     "compare_metrics",
@@ -28,10 +44,18 @@ __all__ = [
     "detect_task_type",
     "evaluate_responses",
     "is_valid_json",
+    "is_transient_llm_error",
     "load_response_file",
     "load_samples",
     "parse_json_object",
+    "prepare_results_file",
     "rouge_l_f1",
+    "run_benchmark",
+    "run_import_test_fallback",
     "run_evaluation",
+    "run_one_task",
+    "run_pytest_or_fallback",
     "score_response",
+    "status_label",
+    "summarize_results",
 ]

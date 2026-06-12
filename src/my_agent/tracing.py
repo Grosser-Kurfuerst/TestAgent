@@ -22,3 +22,25 @@ class TraceWriter:
     def append(self, event: TraceEvent) -> None:
         with self.path.open("a", encoding="utf-8") as file:
             file.write(event.to_json_line() + "\n")
+
+
+def append_benchmark_result(
+    trace_path: str | Path,
+    *,
+    run_id: str,
+    benchmark: str,
+    task_id: str,
+    status: str,
+    scored: bool,
+    test_command: str,
+    test_output: str,
+) -> None:
+    payload = {
+        "benchmark": benchmark,
+        "task_id": task_id,
+        "status": status,
+        "scored": scored,
+        "test_command": test_command,
+        "test_output": test_output[:2000],
+    }
+    TraceWriter(trace_path).append(TraceEvent(event="benchmark_result", payload=payload, run_id=run_id))

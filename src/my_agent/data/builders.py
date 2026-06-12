@@ -336,6 +336,8 @@ def traces_to_sft(
             errors.extend(read_result.errors)
             total += len(records) + read_result.skipped
             skipped += read_result.skipped
+            if not _trace_is_successful(records):
+                continue
             task = ""
             plan = ""
             history: list[dict[str, Any]] = []
@@ -396,6 +398,18 @@ def traces_to_sft(
         sft_path=output,
         extra={"trace_files": len(traces)},
     )
+
+
+def _trace_is_successful(records: list[tuple[int, dict[str, Any]]]) -> bool:
+    for _line_num, record in records:
+        if record.get("event") != "benchmark_result":
+            continue
+        payload = record.get("payload", {})
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("status") == "passed":
+            return True
+    return False
 
 
 def _take(items: Iterable[dict[str, Any]], limit: int) -> Iterable[dict[str, Any]]:

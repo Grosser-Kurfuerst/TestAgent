@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
-"""MBPP 评估脚本：用真实 MBPP 数据集运行 Agent 并统计测试通过率。
+"""HumanEval evaluation script: run the Agent on generated task repos and score tests.
 
-用法：
-    # 跑 10 个任务（快速验证）
-    uv run python scripts/eval_mbpp.py --limit 10
+Usage:
+    # Quick test
+    uv run python scripts/eval_humaneval.py --limit 3
 
-    # 跑全部 500 个任务
-    uv run python scripts/eval_mbpp.py --limit 500 --output-dir /tmp/mbpp_eval
+    # Larger run with an explicit output directory
+    uv run python scripts/eval_humaneval.py --limit 164 --output-dir /tmp/humaneval_eval
 
-工作流程：
-    1. 从 HuggingFace 加载 MBPP test split
-    2. 对每个任务：创建临时仓库 → 运行 Agent → 跑 pytest → 记录 pass/fail
-    3. 输出汇总分数和逐任务明细
+Workflow:
+    1. Load HumanEval rows.
+    2. For each task, create a temporary repo with solution.py and tests/test_solution.py.
+    3. Run the coding Agent against the repo.
+    4. Run pytest or a fallback import-based test runner.
+    5. Write results.jsonl and print score summaries.
 """
 
 from __future__ import annotations
@@ -22,16 +24,13 @@ import sys
 from pathlib import Path
 from typing import Any
 
-# --- 确保项目根目录在 sys.path 中 ---
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from my_agent.config import AgentConfig
-from my_agent.data.task_repos import (
-    python_skeleton_from_solution,
-    safe_id,
-    write_python_task_repo,
-)
+from my_agent.data.sources import load_humaneval_rows
+from my_agent.data.task_repos import safe_id, write_repo
 from my_agent.evaluation.agent_benchmark import (
     TEST_COMMAND,
     BenchmarkSpec,
@@ -48,42 +47,43 @@ from my_agent.evaluation.agent_benchmark import (
 from my_agent.runtime import run_agent
 
 
-def load_mbpp(split: str = "test") -> list[dict[str, Any]]:
-    """加载真实 MBPP 数据集（需要 datasets 包）。"""
-    try:
-        from datasets import load_dataset
-    except ImportError as exc:
-        raise RuntimeError(
-            "需要 datasets 包。安装: uv sync --extra data"
-        ) from exc
-    return list(load_dataset("google-research-datasets/mbpp", split=split))
+def load_humaneval(split: str = "test") -> list[dict[str, Any]]:
+    """Load HumanEval rows via the shared data loader."""
+    return load_humaneval_rows(split=split)
 
 
-def build_mbpp_repo(row: dict[str, Any], base_dir: Path) -> Path:
-    """为一个 MBPP 任务创建临时仓库，返回仓库路径。"""
+def build_humaneval_repo(row: dict[str, Any], base_dir: Path) -> Path:
+    """Create a small HumanEval repo for one task and return its path."""
     task_id = str(row.get("task_id", "unknown"))
-    code = str(row.get("code", "")).strip()
-    tests = row.get("test_list") or []
+    prompt = str(row.get("prompt", ""))
+    test = str(row.get("test", ""))
+    entry_point = str(row.get("entry_point", ""))
+    if not prompt or not test or not entry_point:
+        raise ValueError(f"HumanEval row {task_id!r} missing prompt, test, or entry_point")
 
-    repo_path = base_dir / f"mbpp_{safe_id(task_id)}"
+    repo_path = base_dir / f"humaneval_{safe_id(task_id)}"
     if repo_path.exists():
         shutil.rmtree(repo_path)
-    skeleton = python_skeleton_from_solution(code)
-    write_python_task_repo(repo_path, skeleton, tests)
+
+    skeleton = prompt.rstrip() + "\n    pass\n"
+    test_content = (
+        f"from solution import {entry_point}\n\n"
+        f"{test}\n\n"
+        f"def test_humaneval() -> None:\n"
+        f"    check({entry_point})\n"
+    )
+    write_repo(repo_path, {"solution.py": skeleton, "tests/test_solution.py": test_content})
     return repo_path
 
 
 def evaluate_solution(repo_path: Path) -> tuple[bool, str]:
-    """在仓库中运行 pytest，返回 (passed, output)。
-
-    优先使用 pytest；pytest 不可用时自动回退到 Python import 方式。
-    """
+    """Run HumanEval tests in *repo_path* and return (passed, output)."""
     return run_pytest_or_fallback(repo_path, evaluate_solution_fallback)
 
 
 def evaluate_solution_fallback(repo_path: Path) -> tuple[bool, str]:
-    """pytest 不可用时的回退方案：直接 import 并运行测试函数。"""
-    return run_import_test_fallback(repo_path, "test_mbpp_generated")
+    """Fallback when pytest is unavailable: import the generated test module."""
+    return run_import_test_fallback(repo_path, "test_humaneval")
 
 
 def run_one_task(
@@ -110,10 +110,10 @@ def run_one_task(
 
 def _benchmark_spec() -> BenchmarkSpec:
     return BenchmarkSpec(
-        name="mbpp",
-        display_name="MBPP",
+        name="humaneval",
+        display_name="HumanEval",
         test_command=TEST_COMMAND,
-        build_repo=build_mbpp_repo,
+        build_repo=build_humaneval_repo,
         task_id=_task_id,
         task_prompt=_task_prompt,
         evaluate_solution=evaluate_solution,
@@ -125,16 +125,16 @@ def _task_id(row: dict[str, Any]) -> str:
 
 
 def _task_prompt(row: dict[str, Any]) -> str:
-    text = str(row.get("text", "")).strip()
-    return f"Implement the solution.py skeleton so that all tests pass. Task description: {text}"
+    entry_point = str(row.get("entry_point", "function")).strip() or "function"
+    return f"Implement the {entry_point} function in solution.py so that the HumanEval test passes."
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="MBPP Agent 评估")
+    parser = argparse.ArgumentParser(description="HumanEval Agent 评估")
     parser.add_argument("--limit", type=int, default=10, help="评测任务数量（默认 10）")
-    parser.add_argument("--output-dir", default="/tmp/mbpp_eval", help="临时仓库和结果目录")
+    parser.add_argument("--output-dir", default="/tmp/humaneval_eval", help="临时仓库和结果目录")
     parser.add_argument("--max-steps", type=int, default=10, help="每个任务的 Agent 最大步数")
-    parser.add_argument("--split", default="test", help="MBPP 数据集 split")
+    parser.add_argument("--split", default="test", help="HumanEval 数据集 split")
     parser.add_argument("--start", type=int, default=0, help="从第几个任务开始（断点续跑）")
     parser.add_argument("--llm-retries", type=int, default=2, help="LLM transient 错误重试次数（默认 2）")
     parser.add_argument("--retry-delay-sec", type=float, default=2.0, help="LLM transient 错误重试间隔秒数")
@@ -145,7 +145,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    run_benchmark(args, _benchmark_spec(), load_mbpp)
+    run_benchmark(args, _benchmark_spec(), load_humaneval)
 
 
 if __name__ == "__main__":

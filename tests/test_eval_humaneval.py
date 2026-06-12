@@ -10,20 +10,25 @@ from types import SimpleNamespace
 from unittest import mock
 
 
-SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "eval_mbpp.py"
-SPEC = importlib.util.spec_from_file_location("eval_mbpp_script", SCRIPT_PATH)
+SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "eval_humaneval.py"
+SPEC = importlib.util.spec_from_file_location("eval_humaneval_script", SCRIPT_PATH)
 assert SPEC is not None
-eval_mbpp = importlib.util.module_from_spec(SPEC)
+eval_humaneval = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
-sys.modules[SPEC.name] = eval_mbpp
-SPEC.loader.exec_module(eval_mbpp)
+sys.modules[SPEC.name] = eval_humaneval
+SPEC.loader.exec_module(eval_humaneval)
 
 
 ROW = {
-    "task_id": "1",
-    "text": "Write a function that returns one.",
-    "code": "def one() -> int:\n    return 1\n",
-    "test_list": ["assert one() == 1"],
+    "task_id": "HumanEval/1",
+    "prompt": 'def add(a: int, b: int) -> int:\n    """Return a plus b."""\n',
+    "canonical_solution": "    return a + b\n",
+    "test": (
+        "def check(candidate):\n"
+        "    assert candidate(2, 3) == 5\n"
+        "    assert candidate(-1, 1) == 0\n"
+    ),
+    "entry_point": "add",
 }
 
 
@@ -41,27 +46,60 @@ def _read_events(path: Path) -> list[dict]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
-class EvalMbppRepoTests(unittest.TestCase):
-    def test_build_mbpp_repo_removes_previous_contents(self) -> None:
+class EvalHumanEvalRepoTests(unittest.TestCase):
+    def test_build_humaneval_repo_writes_solution_and_tests(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            base = Path(tmp)
-            repo = eval_mbpp.build_mbpp_repo(ROW, base)
-            extra = repo / "extra_generated.py"
-            extra.write_text("leftover = True\n", encoding="utf-8")
+            repo = eval_humaneval.build_humaneval_repo(ROW, Path(tmp))
 
-            rebuilt = eval_mbpp.build_mbpp_repo(ROW, base)
-            extra_exists = extra.exists()
+            solution = (repo / "solution.py").read_text(encoding="utf-8")
+            test_file = (repo / "tests" / "test_solution.py").read_text(encoding="utf-8")
 
-        self.assertEqual(rebuilt.name, repo.name)
-        self.assertFalse(extra_exists)
+        self.assertIn("def add", solution)
+        self.assertIn("pass", solution)
+        self.assertIn("from solution import add", test_file)
+        self.assertIn("check(add)", test_file)
+        self.assertTrue(repo.name.startswith("humaneval_HumanEval_1"))
+
+    def test_evaluate_solution_passes_for_correct_solution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = eval_humaneval.build_humaneval_repo(ROW, Path(tmp))
+            (repo / "solution.py").write_text(
+                ROW["prompt"].rstrip() + "\n" + ROW["canonical_solution"],
+                encoding="utf-8",
+            )
+
+            passed, output = eval_humaneval.evaluate_solution(repo)
+
+        self.assertTrue(passed, output)
+
+    def test_evaluate_solution_fails_for_skeleton(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = eval_humaneval.build_humaneval_repo(ROW, Path(tmp))
+
+            passed, output = eval_humaneval.evaluate_solution(repo)
+
+        self.assertFalse(passed)
+        self.assertTrue(output)
+
+    def test_fallback_evaluate_solution_passes_for_correct_solution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = eval_humaneval.build_humaneval_repo(ROW, Path(tmp))
+            (repo / "solution.py").write_text(
+                ROW["prompt"].rstrip() + "\n" + ROW["canonical_solution"],
+                encoding="utf-8",
+            )
+
+            passed, output = eval_humaneval.evaluate_solution_fallback(repo)
+
+        self.assertTrue(passed, output)
 
 
-class EvalMbppResultTests(unittest.TestCase):
+class EvalHumanEvalResultTests(unittest.TestCase):
     def test_passed_result_uses_status_and_drops_passed_field(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            with mock.patch.object(eval_mbpp, "run_agent", return_value=_state()):
-                with mock.patch.object(eval_mbpp, "evaluate_solution", return_value=(True, "ok")):
-                    result = eval_mbpp.run_one_task(
+            with mock.patch.object(eval_humaneval, "run_agent", return_value=_state()):
+                with mock.patch.object(eval_humaneval, "evaluate_solution", return_value=(True, "ok")):
+                    result = eval_humaneval.run_one_task(
                         ROW,
                         Path(tmp),
                         config=None,
@@ -78,9 +116,9 @@ class EvalMbppResultTests(unittest.TestCase):
 
     def test_failed_result_is_scored_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            with mock.patch.object(eval_mbpp, "run_agent", return_value=_state()):
-                with mock.patch.object(eval_mbpp, "evaluate_solution", return_value=(False, "assertion failed")):
-                    result = eval_mbpp.run_one_task(
+            with mock.patch.object(eval_humaneval, "run_agent", return_value=_state()):
+                with mock.patch.object(eval_humaneval, "evaluate_solution", return_value=(False, "assertion failed")):
+                    result = eval_humaneval.run_one_task(
                         ROW,
                         Path(tmp),
                         config=None,
@@ -95,9 +133,9 @@ class EvalMbppResultTests(unittest.TestCase):
     def test_passed_result_appends_benchmark_result_to_trace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             trace = Path(tmp) / "trace.jsonl"
-            with mock.patch.object(eval_mbpp, "run_agent", return_value=_state(trace_path=trace, run_id="run-1")):
-                with mock.patch.object(eval_mbpp, "evaluate_solution", return_value=(True, "ok")):
-                    result = eval_mbpp.run_one_task(
+            with mock.patch.object(eval_humaneval, "run_agent", return_value=_state(trace_path=trace, run_id="run-1")):
+                with mock.patch.object(eval_humaneval, "evaluate_solution", return_value=(True, "ok")):
+                    result = eval_humaneval.run_one_task(
                         ROW,
                         Path(tmp),
                         config=None,
@@ -109,8 +147,8 @@ class EvalMbppResultTests(unittest.TestCase):
         self.assertEqual(result.status, "passed")
         self.assertEqual(events[-1]["event"], "benchmark_result")
         self.assertEqual(events[-1]["run_id"], "run-1")
-        self.assertEqual(events[-1]["payload"]["benchmark"], "mbpp")
-        self.assertEqual(events[-1]["payload"]["task_id"], "1")
+        self.assertEqual(events[-1]["payload"]["benchmark"], "humaneval")
+        self.assertEqual(events[-1]["payload"]["task_id"], "HumanEval/1")
         self.assertEqual(events[-1]["payload"]["status"], "passed")
         self.assertTrue(events[-1]["payload"]["scored"])
         self.assertEqual(events[-1]["payload"]["test_command"], "python -m pytest -q")
@@ -118,9 +156,9 @@ class EvalMbppResultTests(unittest.TestCase):
     def test_failed_result_appends_benchmark_result_to_trace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             trace = Path(tmp) / "trace.jsonl"
-            with mock.patch.object(eval_mbpp, "run_agent", return_value=_state(trace_path=trace, run_id="run-2")):
-                with mock.patch.object(eval_mbpp, "evaluate_solution", return_value=(False, "assertion failed")):
-                    result = eval_mbpp.run_one_task(
+            with mock.patch.object(eval_humaneval, "run_agent", return_value=_state(trace_path=trace, run_id="run-2")):
+                with mock.patch.object(eval_humaneval, "evaluate_solution", return_value=(False, "assertion failed")):
+                    result = eval_humaneval.run_one_task(
                         ROW,
                         Path(tmp),
                         config=None,
@@ -136,8 +174,8 @@ class EvalMbppResultTests(unittest.TestCase):
 
     def test_non_transient_exception_is_scored_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            with mock.patch.object(eval_mbpp, "run_agent", side_effect=ValueError("bad config")):
-                result = eval_mbpp.run_one_task(
+            with mock.patch.object(eval_humaneval, "run_agent", side_effect=ValueError("bad config")):
+                result = eval_humaneval.run_one_task(
                     ROW,
                     Path(tmp),
                     config=None,
@@ -154,12 +192,12 @@ class EvalMbppResultTests(unittest.TestCase):
     def test_transient_error_retries_then_can_pass(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch.object(
-                eval_mbpp,
+                eval_humaneval,
                 "run_agent",
                 side_effect=[RuntimeError("LLM response message content was empty."), _state()],
             ) as run_mock:
-                with mock.patch.object(eval_mbpp, "evaluate_solution", return_value=(True, "ok")):
-                    result = eval_mbpp.run_one_task(
+                with mock.patch.object(eval_humaneval, "evaluate_solution", return_value=(True, "ok")):
+                    result = eval_humaneval.run_one_task(
                         ROW,
                         Path(tmp),
                         config=None,
@@ -176,11 +214,11 @@ class EvalMbppResultTests(unittest.TestCase):
     def test_transient_error_excluded_after_retries_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch.object(
-                eval_mbpp,
+                eval_humaneval,
                 "run_agent",
                 side_effect=RuntimeError("LLM response message content was empty."),
             ):
-                result = eval_mbpp.run_one_task(
+                result = eval_humaneval.run_one_task(
                     ROW,
                     Path(tmp),
                     config=None,
@@ -197,11 +235,11 @@ class EvalMbppResultTests(unittest.TestCase):
     def test_transient_error_can_be_counted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch.object(
-                eval_mbpp,
+                eval_humaneval,
                 "run_agent",
                 side_effect=RuntimeError("LLM response message content was empty."),
             ):
-                result = eval_mbpp.run_one_task(
+                result = eval_humaneval.run_one_task(
                     ROW,
                     Path(tmp),
                     config=None,
@@ -217,17 +255,17 @@ class EvalMbppResultTests(unittest.TestCase):
     def test_retry_rebuilds_task_repo(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch.object(
-                eval_mbpp,
-                "build_mbpp_repo",
+                eval_humaneval,
+                "build_humaneval_repo",
                 side_effect=[Path(tmp) / "attempt1", Path(tmp) / "attempt2"],
             ) as build_mock:
                 with mock.patch.object(
-                    eval_mbpp,
+                    eval_humaneval,
                     "run_agent",
                     side_effect=[RuntimeError("LLM response message content was empty."), _state()],
                 ):
-                    with mock.patch.object(eval_mbpp, "evaluate_solution", return_value=(True, "ok")):
-                        result = eval_mbpp.run_one_task(
+                    with mock.patch.object(eval_humaneval, "evaluate_solution", return_value=(True, "ok")):
+                        result = eval_humaneval.run_one_task(
                             ROW,
                             Path(tmp),
                             config=None,
@@ -240,17 +278,17 @@ class EvalMbppResultTests(unittest.TestCase):
         self.assertEqual(build_mock.call_count, 2)
 
 
-class EvalMbppSummaryTests(unittest.TestCase):
+class EvalHumanEvalSummaryTests(unittest.TestCase):
     def test_summary_uses_status_and_scored(self) -> None:
         results = [
-            eval_mbpp.EvalResult(task_id="1", status="passed", scored=True),
-            eval_mbpp.EvalResult(task_id="2", status="failed", scored=True),
-            eval_mbpp.EvalResult(task_id="3", status="error", scored=True),
-            eval_mbpp.EvalResult(task_id="4", status="transient_error", scored=False),
-            eval_mbpp.EvalResult(task_id="5", status="transient_error", scored=True),
+            eval_humaneval.EvalResult(task_id="1", status="passed", scored=True),
+            eval_humaneval.EvalResult(task_id="2", status="failed", scored=True),
+            eval_humaneval.EvalResult(task_id="3", status="error", scored=True),
+            eval_humaneval.EvalResult(task_id="4", status="transient_error", scored=False),
+            eval_humaneval.EvalResult(task_id="5", status="transient_error", scored=True),
         ]
 
-        summary = eval_mbpp.summarize_results(results)
+        summary = eval_humaneval.summarize_results(results)
 
         self.assertEqual(summary["total"], 5)
         self.assertEqual(summary["scored"], 4)
@@ -267,11 +305,11 @@ class EvalMbppSummaryTests(unittest.TestCase):
             path = Path(tmp) / "results.jsonl"
             path.write_text("old\n", encoding="utf-8")
 
-            eval_mbpp._prepare_results_file(path, start=0)
+            eval_humaneval._prepare_results_file(path, start=0)
             self.assertEqual(path.read_text(encoding="utf-8"), "")
 
             path.write_text("keep\n", encoding="utf-8")
-            eval_mbpp._prepare_results_file(path, start=2)
+            eval_humaneval._prepare_results_file(path, start=2)
             self.assertEqual(path.read_text(encoding="utf-8"), "keep\n")
 
 
