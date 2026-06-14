@@ -15,9 +15,12 @@ except ImportError:
 add_src_to_path()
 
 from my_agent.evaluation.agent_benchmark import (
+    BenchmarkSpec,
     EvalResult,
     is_transient_llm_error,
+    load_results_file,
     run_import_test_fallback,
+    run_benchmark_with_config,
     run_pytest_or_fallback,
     summarize_results,
 )
@@ -59,6 +62,63 @@ class AgentBenchmarkResultTests(unittest.TestCase):
         self.assertTrue(is_transient_llm_error(RuntimeError("HTTP 429 Too Many Requests")))
         self.assertTrue(is_transient_llm_error(RuntimeError("request timeout")))
         self.assertFalse(is_transient_llm_error(ValueError("bad task row")))
+
+    def test_load_results_file_supports_current_and_legacy_status_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "results.jsonl"
+            path.write_text(
+                '{"task_id":"old","passed":true}\n'
+                '{"task_id":"new","status":"failed","scored":true}\n',
+                encoding="utf-8",
+            )
+
+            results = load_results_file(path)
+
+        self.assertEqual([result.status for result in results], ["passed", "failed"])
+        self.assertEqual(summarize_results(results)["passed"], 1)
+
+    def test_run_benchmark_can_summarize_full_results_file_on_resume(self) -> None:
+        spec = BenchmarkSpec(
+            name="demo",
+            display_name="Demo",
+            test_command="python -m pytest -q",
+            build_repo=lambda row, base_dir: base_dir / str(row["task_id"]),
+            task_id=lambda row: str(row["task_id"]),
+            task_prompt=lambda row: str(row["task"]),
+            evaluate_solution=lambda repo_path: (True, "ok"),
+        )
+
+        def fake_agent_runner(**kwargs):
+            return SimpleNamespace(steps=1, done=True, stop_reason="finish_called", trace_path=None, run_id="")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            (output_dir / "results.jsonl").write_text(
+                '{"task_id":"0","status":"failed","scored":true}\n',
+                encoding="utf-8",
+            )
+
+            run = run_benchmark_with_config(
+                config=None,
+                output_dir=output_dir,
+                spec=spec,
+                load_rows=lambda split: [{"task_id": "0", "task": "old"}, {"task_id": "1", "task": "new"}],
+                split="test",
+                start=1,
+                limit=1,
+                max_steps=1,
+                llm_retries=0,
+                retry_delay_sec=0,
+                write_summary=True,
+                summary_scope="results_file",
+                agent_runner=fake_agent_runner,
+            )
+            written_summary = (output_dir / "summary.json").read_text(encoding="utf-8")
+
+        self.assertEqual(run.summary["total"], 2)
+        self.assertEqual(run.summary["passed"], 1)
+        self.assertEqual(run.summary["failed"], 1)
+        self.assertIn('"total": 2', written_summary)
 
 
 class AgentBenchmarkPytestTests(unittest.TestCase):

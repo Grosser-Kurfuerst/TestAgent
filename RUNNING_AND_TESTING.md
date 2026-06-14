@@ -430,7 +430,43 @@ uv run python scripts/eval_sft_protocol.py \
 
 注意：这些指标主要用于衡量结构化输出协议对齐，不直接证明复杂真实代码修复能力。端到端能力仍需要通过 agent 运行、diff 审查和测试结果单独验证。
 
-## 10. 推荐测试顺序
+## 10. SFT HumanEval API 端到端对比
+
+如果要比较 base model 和 LoRA SFT adapter 的完整 HumanEval 解题效果，可以让脚本顺序启动 LLaMA-Factory OpenAI-compatible API 服务并运行同一批 HumanEval：
+
+```bash
+uv run python scripts/eval_sft_humaneval_api.py \
+  --base-model Qwen/Qwen3.5-9B \
+  --adapter-dir /tmp/my_agent_sft_lora \
+  --output-dir evaluationResults/humaneval_base_vs_sft \
+  --limit 10 \
+  --max-steps 10 \
+  --template qwen \
+  --api-port 8000
+```
+
+脚本会先启动 base 服务并写入 `base/results.jsonl` 和 `base/summary.json`，然后关闭服务，启动带 adapter 的 SFT 服务并写入 `sft/results.jsonl` 和 `sft/summary.json`。最终汇总写入：
+
+```text
+evaluationResults/humaneval_base_vs_sft/comparison_summary.json
+evaluationResults/humaneval_base_vs_sft/experiment_report.md
+```
+
+如果要给 LLaMA-Factory API 透传额外推理参数：
+
+```bash
+uv run python scripts/eval_sft_humaneval_api.py \
+  --base-model Qwen/Qwen3.5-9B \
+  --adapter-dir /tmp/my_agent_sft_lora \
+  --output-dir evaluationResults/humaneval_base_vs_sft_vllm \
+  --limit 10 \
+  --infer-backend vllm \
+  --serve-override vllm_enforce_eager=true
+```
+
+这个脚本使用 HumanEval 测试通过率做对比，不复用 `eval_sft_protocol.py` 的 JSON 合法性指标。
+
+## 11. 推荐测试顺序
 
 第一次验证建议按这个顺序：
 
@@ -458,7 +494,7 @@ uv run python run_agent.py run --max-steps 8 --trace-dir traces
 uv run python scripts/eval_mbpp.py --limit 3 --output-dir /tmp/mbpp_eval --max-steps 10
 ```
 
-## 11. 常见问题
+## 12. 常见问题
 
 ### `Configuration file not found`
 

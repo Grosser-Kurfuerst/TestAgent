@@ -64,6 +64,14 @@ class BenchmarkSpec:
     evaluate_solution: EvaluateFn
 
 
+@dataclass(frozen=True)
+class BenchmarkRunResult:
+    results: list[EvalResult]
+    summary: dict[str, float | int]
+    output_dir: Path
+    results_path: Path
+
+
 def run_one_task(
     row: dict[str, Any],
     spec: BenchmarkSpec,
@@ -265,6 +273,58 @@ def summarize_results(results: list[EvalResult]) -> dict[str, float | int]:
     }
 
 
+def load_results_file(path: str | Path) -> list[EvalResult]:
+    results_path = Path(path)
+    results: list[EvalResult] = []
+    if not results_path.exists():
+        return results
+    for line_number, line in enumerate(results_path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{results_path}: line {line_number} is not valid JSON.") from exc
+        if not isinstance(payload, dict):
+            raise ValueError(f"{results_path}: line {line_number} must be a JSON object.")
+        results.append(_eval_result_from_record(payload, path=results_path, line_number=line_number))
+    return results
+
+
+def _eval_result_from_record(payload: dict[str, Any], *, path: Path, line_number: int) -> EvalResult:
+    status = payload.get("status")
+    if status is None and isinstance(payload.get("passed"), bool):
+        status = "passed" if payload["passed"] else "failed"
+    if not isinstance(status, str) or not status:
+        raise ValueError(f"{path}: line {line_number} missing result status.")
+    return EvalResult(
+        task_id=str(payload.get("task_id", "")),
+        status=status,
+        scored=bool(payload.get("scored", True)),
+        test_output=str(payload.get("test_output", "")),
+        agent_steps=_int_or_default(payload.get("agent_steps"), 0),
+        agent_done=bool(payload.get("agent_done", False)),
+        agent_stop_reason=str(payload.get("agent_stop_reason", "")),
+        error=str(payload.get("error", "")),
+        elapsed_sec=_float_or_default(payload.get("elapsed_sec"), 0.0),
+        attempts=_int_or_default(payload.get("attempts"), 1),
+    )
+
+
+def _int_or_default(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _float_or_default(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def status_label(result: EvalResult) -> str:
     if result.status == "passed":
         return "PASS"
@@ -285,20 +345,54 @@ def prepare_results_file(results_path: Path, start: int) -> None:
 
 def run_benchmark(args: Any, spec: BenchmarkSpec, load_rows: LoadRowsFn) -> None:
     config = AgentConfig.from_env()
-    output_dir = Path(args.output_dir)
+    run_benchmark_with_config(
+        config=config,
+        output_dir=args.output_dir,
+        spec=spec,
+        load_rows=load_rows,
+        split=args.split,
+        start=args.start,
+        limit=args.limit,
+        max_steps=args.max_steps,
+        llm_retries=args.llm_retries,
+        retry_delay_sec=args.retry_delay_sec,
+        count_transient_errors=args.count_transient_errors,
+    )
+
+
+def run_benchmark_with_config(
+    *,
+    config: AgentConfig,
+    output_dir: str | Path,
+    spec: BenchmarkSpec,
+    load_rows: LoadRowsFn,
+    split: str,
+    start: int,
+    limit: int,
+    max_steps: int,
+    llm_retries: int = 2,
+    retry_delay_sec: float = 2.0,
+    count_transient_errors: bool = False,
+    write_summary: bool = False,
+    summary_scope: str = "current",
+    agent_runner: AgentRunnerFn = run_agent,
+) -> BenchmarkRunResult:
+    if summary_scope not in {"current", "results_file"}:
+        raise ValueError("summary_scope must be one of: current, results_file.")
+    output_dir = Path(output_dir)
     repos_dir = output_dir / "repos"
     results_path = output_dir / "results.jsonl"
     repos_dir.mkdir(parents=True, exist_ok=True)
-    prepare_results_file(results_path, args.start)
+    prepare_results_file(results_path, start)
 
-    print(f"Loading {spec.display_name} ({args.split} split)...")
-    dataset = load_rows(args.split)
-    print(f"Loaded {len(dataset)} tasks, will evaluate {args.limit} (starting at #{args.start})\n")
+    print(f"Loading {spec.display_name} ({split} split)...")
+    dataset = load_rows(split)
+    print(f"Loaded {len(dataset)} tasks, will evaluate {limit} (starting at #{start})\n")
 
     results: list[EvalResult] = []
-    end = min(args.start + args.limit, len(dataset))
+    end = min(start + limit, len(dataset))
 
-    for idx in range(args.start, end):
+    for idx in range(start, end):
         row = dataset[idx]
         task_id = spec.task_id(row) or str(idx)
         print(f"[{idx + 1}/{len(dataset)}] task_id={task_id} ... ", end="", flush=True)
@@ -308,10 +402,11 @@ def run_benchmark(args: Any, spec: BenchmarkSpec, load_rows: LoadRowsFn) -> None
             spec,
             repos_dir,
             config,
-            max_steps=args.max_steps,
-            llm_retries=max(0, args.llm_retries),
-            retry_delay_sec=max(0.0, args.retry_delay_sec),
-            count_transient_errors=args.count_transient_errors,
+            max_steps=max_steps,
+            llm_retries=max(0, llm_retries),
+            retry_delay_sec=max(0.0, retry_delay_sec),
+            count_transient_errors=count_transient_errors,
+            agent_runner=agent_runner,
         )
 
         status = status_label(result)
@@ -324,10 +419,12 @@ def run_benchmark(args: Any, spec: BenchmarkSpec, load_rows: LoadRowsFn) -> None
         with results_path.open("a", encoding="utf-8") as file:
             file.write(json.dumps(result.to_dict(), ensure_ascii=False) + "\n")
 
-    summary = summarize_results(results)
+    summary_results = load_results_file(results_path) if summary_scope == "results_file" else results
+    summary = summarize_results(summary_results)
     print()
     print("=" * 60)
-    print(f"{spec.display_name} Evaluation Results")
+    title_suffix = " (cumulative)" if summary_scope == "results_file" else ""
+    print(f"{spec.display_name} Evaluation Results{title_suffix}")
     print(f"  Total:              {summary['total']}")
     print(f"  Scored:             {summary['scored']}")
     print(f"  Passed:             {summary['passed']}")
@@ -339,3 +436,6 @@ def run_benchmark(args: Any, spec: BenchmarkSpec, load_rows: LoadRowsFn) -> None
     print(f"  End-to-end rate:    {summary['end_to_end_rate']:.1f}%")
     print(f"  Results: {results_path}")
     print("=" * 60)
+    if write_summary:
+        (output_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    return BenchmarkRunResult(results=results, summary=summary, output_dir=output_dir, results_path=results_path)

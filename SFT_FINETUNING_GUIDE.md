@@ -179,10 +179,15 @@ bash scripts/train_llamafactory_lora.sh
 如果 base model 已经下载到本地：
 
 ```bash
-LOCAL_MODEL_DIR=/path/to/Qwen3.5-9B \
 DATASET_DIR=data/llamafactory \
 OUTPUT_DIR=outputs/coding_agent_lora \
+LOCAL_MODEL_DIR=/root/autodl-tmp/CodeAgent-SFT/models/Qwen3.5-9B \
 CUDA_VISIBLE_DEVICES=0 \
+BATCH_SIZE=1 \
+GRADIENT_ACCUMULATION_STEPS=16 \
+LEARNING_RATE=1e-4 \
+NUM_TRAIN_EPOCHS=1 \
+CUTOFF_LEN=4096 \
 bash scripts/train_llamafactory_lora.sh
 ```
 
@@ -355,7 +360,50 @@ uv run python scripts/eval_mbpp.py \
 
 建议每次评估使用新的 `--output-dir`，避免 `results.jsonl` 追加到旧结果里。
 
-## 9. 推荐实验顺序
+## 9. 使用微调模型跑 HumanEval 端到端对比
+
+如果要直接对比 base model 和 LoRA SFT adapter 的完整 Agent 修题能力，可以使用 `eval_sft_humaneval_api.py`。这个脚本会顺序启动两个 LLaMA-Factory OpenAI-compatible API 服务：先跑 base HumanEval，再关闭服务并启动带 adapter 的 SFT 服务跑同一批 HumanEval。
+
+```bash
+uv run python scripts/eval_sft_humaneval_api.py \
+  --base-model Qwen/Qwen3.5-9B \
+  --adapter-dir outputs/coding_agent_lora \
+  --output-dir evaluationResults/humaneval_base_vs_sft \
+  --limit 10 \
+  --max-steps 10 \
+  --template qwen \
+  --api-port 8000
+```
+
+如果使用 vLLM 后端，可以通过 override 透传 LLaMA-Factory 推理参数：
+
+```bash
+uv run python scripts/eval_sft_humaneval_api.py \
+  --base-model Qwen/Qwen3.5-9B \
+  --adapter-dir outputs/coding_agent_lora \
+  --output-dir evaluationResults/humaneval_base_vs_sft_vllm \
+  --limit 10 \
+  --infer-backend vllm \
+  --serve-override vllm_enforce_eager=true
+```
+
+输出目录：
+
+```text
+evaluationResults/humaneval_base_vs_sft/
+  base/results.jsonl
+  base/summary.json
+  base/server.log
+  sft/results.jsonl
+  sft/summary.json
+  sft/server.log
+  comparison_summary.json
+  experiment_report.md
+```
+
+这个评估复用 `eval_humaneval.py` 的完整 Agent 流程：构造 HumanEval repo、让 Agent 修改 `solution.py`、运行测试并统计通过率。它和 `eval_sft_protocol.py` 的区别是，前者评估端到端修题效果，后者只评估输出协议质量。
+
+## 10. 推荐实验顺序
 
 第一次跑通建议：
 
@@ -365,9 +413,10 @@ uv run python scripts/eval_mbpp.py \
 4. 跑 `eval_sft_protocol.py --limit 50`，检查协议指标。
 5. 如果协议指标有提升，再服务 LoRA 模型。
 6. 跑 `eval_mbpp.py --limit 10`，检查端到端通过率。
-7. 最后再扩大样本数、训练 epoch 和 MBPP 评测规模。
+7. 跑 `eval_sft_humaneval_api.py --limit 10`，对比 base/SFT 的 HumanEval 端到端通过率。
+8. 最后再扩大样本数、训练 epoch 和 MBPP/HumanEval 评测规模。
 
-## 10. 常见问题
+## 11. 常见问题
 
 ### `llamafactory-cli` 找不到
 
