@@ -5,7 +5,7 @@
 所有命令默认在仓库根目录执行：
 
 ```bash
-cd /home/kurfuerst/Coding/work/Coding-Agent/my-Agent
+cd /home/kurfuerst/Coding/work/Coding-Agent/SFT/my-Agent
 ```
 
 ## 1. 总体流程
@@ -38,6 +38,16 @@ uv sync --extra data --extra dev
 ```
 
 真实 LoRA 训练还需要安装 LLaMA-Factory，并确保命令可用：
+
+```bash
+# 新建一个虚拟环境，安装 LLaMA-Factory
+uv venv venv_train --python 3.12
+source venv_train/bin/activate
+
+git clone --depth 1 https://github.com/hiyouga/LLaMA-Factory.git
+cd LLaMA-Factory
+pip install -e ".[torch,metrics]"
+```
 
 ```bash
 llamafactory-cli version
@@ -154,7 +164,7 @@ cat data/llamafactory/dataset_stats.json
 ```bash
 DATASET_DIR=data/llamafactory \
 OUTPUT_DIR=outputs/coding_agent_lora \
-BASE_MODEL=Qwen/Qwen2.5-Coder-7B-Instruct \
+BASE_MODEL=Qwen/Qwen3.5-9B \
 CUDA_VISIBLE_DEVICES=0 \
 BATCH_SIZE=1 \
 GRADIENT_ACCUMULATION_STEPS=16 \
@@ -164,10 +174,12 @@ CUTOFF_LEN=4096 \
 bash scripts/train_llamafactory_lora.sh
 ```
 
+这里的 `BASE_MODEL=Qwen/Qwen3.5-9B` 指向 Hugging Face 上的原始 HuggingFace/Transformers 权重。也可以使用等价的本地 `safetensors` 模型目录。
+
 如果 base model 已经下载到本地：
 
 ```bash
-LOCAL_MODEL_DIR=/path/to/Qwen2.5-Coder-7B-Instruct \
+LOCAL_MODEL_DIR=/path/to/Qwen3.5-9B \
 DATASET_DIR=data/llamafactory \
 OUTPUT_DIR=outputs/coding_agent_lora \
 CUDA_VISIBLE_DEVICES=0 \
@@ -233,7 +245,7 @@ outputs/coding_agent_lora/
 ```bash
 uv run python scripts/eval_sft_protocol.py \
   --val-data data/llamafactory/val_alpaca.json \
-  --base-model Qwen/Qwen2.5-Coder-7B-Instruct \
+  --base-model Qwen/Qwen3.5-9B \
   --adapter-dir outputs/coding_agent_lora \
   --output-dir outputs/sft_protocol_eval \
   --limit 100 \
@@ -247,7 +259,7 @@ uv run python scripts/eval_sft_protocol.py \
 ```bash
 uv run python scripts/eval_sft_protocol.py \
   --val-data data/llamafactory/val_alpaca.json \
-  --base-model /path/to/Qwen2.5-Coder-7B-Instruct \
+  --base-model /path/to/Qwen3.5-9B \
   --adapter-dir outputs/coding_agent_lora \
   --output-dir outputs/sft_protocol_eval \
   --limit 100 \

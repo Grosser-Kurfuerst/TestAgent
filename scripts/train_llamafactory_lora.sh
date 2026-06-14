@@ -5,7 +5,7 @@ cd "$(dirname "$0")/.."
 
 DATASET_DIR="${DATASET_DIR:-data/llamafactory}"
 OUTPUT_DIR="${OUTPUT_DIR:-outputs/coding_agent_lora}"
-BASE_MODEL="${BASE_MODEL:-Qwen/Qwen2.5-Coder-7B-Instruct}"
+BASE_MODEL="${BASE_MODEL:-Qwen/Qwen3.5-9B}"
 LOCAL_MODEL_DIR="${LOCAL_MODEL_DIR:-}"
 MODEL_NAME_OR_PATH="${MODEL_NAME_OR_PATH:-${BASE_MODEL}}"
 

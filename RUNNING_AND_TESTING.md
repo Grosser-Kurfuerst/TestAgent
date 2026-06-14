@@ -382,7 +382,7 @@ dataset_stats.json
 ```bash
 DATASET_DIR=/tmp/my_agent_data/llamafactory \
 OUTPUT_DIR=/tmp/my_agent_sft_lora \
-BASE_MODEL=Qwen/Qwen2.5-Coder-7B-Instruct \
+BASE_MODEL=Qwen/Qwen3.5-9B \
 BATCH_SIZE=1 \
 LEARNING_RATE=1e-4 \
 NUM_TRAIN_EPOCHS=1 \
@@ -397,7 +397,7 @@ bash scripts/train_llamafactory_lora.sh
 ```bash
 uv run python scripts/eval_sft_protocol.py \
   --val-data /tmp/my_agent_data/llamafactory/val_alpaca.json \
-  --base-model Qwen/Qwen2.5-Coder-7B-Instruct \
+  --base-model Qwen/Qwen3.5-9B \
   --adapter-dir /tmp/my_agent_sft_lora \
   --output-dir /tmp/my_agent_sft_eval \
   --max-new-tokens 512
