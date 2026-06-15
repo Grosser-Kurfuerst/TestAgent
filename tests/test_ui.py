@@ -70,7 +70,9 @@ class ReplTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         text = output.getvalue()
-        self.assertIn("my-agent 0.1.0", text)
+        self.assertIn("TuraCLI", text)
+        self.assertIn("ReAct 工具闭环编码助手", text)
+        self.assertIn("version: 0.1.0", text)
         self.assertIn("/tools", text)
         self.assertIn("read_file", text)
         self.assertIn("compression trigger", text)

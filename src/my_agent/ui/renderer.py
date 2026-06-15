@@ -8,6 +8,19 @@ from typing import Protocol, TextIO
 from my_agent.tools import ToolExecutionResult, ToolInvocation
 
 
+TURA_CLI_BANNER = """\
+╔════════════════════════════════════════════════════════════════════════╗
+║         ████████╗██╗   ██╗██████╗  █████╗  ██████╗██╗     ██╗          ║
+║         ╚══██╔══╝██║   ██║██╔══██╗██╔══██╗██╔════╝██║     ██║          ║
+║            ██║   ██║   ██║██████╔╝███████║██║     ██║     ██║          ║
+║            ██║   ██║   ██║██╔══██╗██╔══██║██║     ██║     ██║          ║
+║            ██║   ╚██████╔╝██║  ██║██║  ██║╚██████╗███████╗██║          ║
+║            ╚═╝    ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝╚══════╝╚═╝          ║
+║                          TuraCLI   v0.1.0                              ║
+║                                                                        ║
+╚════════════════════════════════════════════════════════════════════════╝"""
+
+
 @dataclass(frozen=True)
 class StartupInfo:
     version: str
@@ -51,7 +64,8 @@ class PlainRenderer:
         self.output.write(
             "\n".join(
                 [
-                    f"my-agent {info.version}",
+                    TURA_CLI_BANNER,
+                    f"version: {info.version}",
                     f"repo: {info.repo_path}",
                     f"provider/model: {info.provider}/{info.model}",
                     f"tools: {info.tool_summary}",
