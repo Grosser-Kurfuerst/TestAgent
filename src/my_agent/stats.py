@@ -62,25 +62,21 @@ def collect_trace_stats(path: str | Path) -> TraceStats:
             run_id = event.get("run_id")
             if isinstance(run_id, str) and run_id:
                 run_ids.add(run_id)
-            if event.get("event") != "tool_call":
+            if event.get("event") != "tool.completed":
                 continue
 
             payload = event.get("payload", {})
             if not isinstance(payload, dict):
                 continue
-            call = payload.get("call", {})
-            result = payload.get("result", {})
-            if not isinstance(call, dict) or not isinstance(result, dict):
-                continue
 
-            tool = call.get("tool")
+            tool = payload.get("name")
             if not isinstance(tool, str) or not tool:
                 continue
 
             tool_calls += 1
             distribution[tool] += 1
-            ok = bool(result.get("ok"))
-            blocked = bool(result.get("blocked"))
+            ok = bool(payload.get("ok"))
+            blocked = bool(payload.get("blocked"))
             if ok:
                 successful_tool_calls += 1
             if blocked:

@@ -59,7 +59,10 @@ class ToolExecutionResult:
         timed_out: bool = False,
     ) -> "ToolExecutionResult":
         code = error_code
-        if not code and result.blocked:
+        timed_out = timed_out or result.reason == "timeout"
+        if not code and timed_out:
+            code = "tool_timeout"
+        elif not code and result.blocked:
             code = "blocked"
         elif not code and not result.ok:
             code = "tool_failed"

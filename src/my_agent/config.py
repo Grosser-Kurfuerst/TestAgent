@@ -28,6 +28,18 @@ class AgentConfig:
     tool_config_paths: tuple[Path, ...] = ()
     enable_project_tools: bool = False
     enable_project_plugins: bool = False
+    max_iterations: int = 50
+    max_tool_calls: int = 200
+    max_elapsed_seconds: int = 1800
+    token_budget: int | None = None
+    stagnation_window: int = 3
+    repeated_failure_window: int = 3
+    context_window: int = 128_000
+    response_reserve_tokens: int = 8_000
+    compression_buffer_tokens: int = 8_000
+    retain_recent_user_turns: int = 3
+    max_tool_result_chars: int = 12_000
+    max_summary_input_chars: int = 60_000
 
     @classmethod
     def from_env(
@@ -64,6 +76,18 @@ class AgentConfig:
             enable_project_plugins=_as_bool(
                 values.get("AGENTCLI_ENABLE_PROJECT_PLUGINS", values.get("MY_AGENT_ENABLE_PROJECT_PLUGINS", ""))
             ),
+            max_iterations=_as_int(values.get("MY_AGENT_MAX_ITERATIONS"), 50),
+            max_tool_calls=_as_int(values.get("MY_AGENT_MAX_TOOL_CALLS"), 200),
+            max_elapsed_seconds=_as_int(values.get("MY_AGENT_MAX_ELAPSED_SECONDS"), 1800),
+            token_budget=_as_optional_int(values.get("MY_AGENT_TOKEN_BUDGET")),
+            stagnation_window=_as_int(values.get("MY_AGENT_STAGNATION_WINDOW"), 3),
+            repeated_failure_window=_as_int(values.get("MY_AGENT_REPEATED_FAILURE_WINDOW"), 3),
+            context_window=_as_int(values.get("MY_AGENT_CONTEXT_WINDOW"), 128_000),
+            response_reserve_tokens=_as_int(values.get("MY_AGENT_RESPONSE_RESERVE_TOKENS"), 8_000),
+            compression_buffer_tokens=_as_int(values.get("MY_AGENT_COMPRESSION_BUFFER_TOKENS"), 8_000),
+            retain_recent_user_turns=_as_int(values.get("MY_AGENT_RETAIN_RECENT_TURNS"), 3),
+            max_tool_result_chars=_as_int(values.get("MY_AGENT_MAX_TOOL_RESULT_CHARS"), 12_000),
+            max_summary_input_chars=_as_int(values.get("MY_AGENT_MAX_SUMMARY_INPUT_CHARS"), 60_000),
         )
 
     def require_valid_provider(self) -> None:
@@ -84,6 +108,18 @@ class AgentConfig:
 
 def _as_bool(value: str) -> bool:
     return value.strip().lower() in TRUE_VALUES
+
+
+def _as_int(value: str | None, default: int) -> int:
+    if value is None or not value.strip():
+        return default
+    return int(value)
+
+
+def _as_optional_int(value: str | None) -> int | None:
+    if value is None or not value.strip():
+        return None
+    return int(value)
 
 
 def _config_values(

@@ -20,7 +20,7 @@ class TraceStatsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             trace = Path(tmp) / "trace.jsonl"
             events = [
-                {"run_id": "run-1", "event": "plan", "payload": {}},
+                {"run_id": "run-1", "event": "run.started", "payload": {}},
                 _tool_event("run-1", "read_file", True),
                 _tool_event("run-1", "replace_in_file", True),
                 _tool_event("run-1", "run_tests", True),
@@ -45,10 +45,14 @@ class TraceStatsTests(unittest.TestCase):
 def _tool_event(run_id: str, tool: str, ok: bool, blocked: bool = False) -> dict[str, object]:
     return {
         "run_id": run_id,
-        "event": "tool_call",
+        "event": "tool.completed",
         "payload": {
-            "call": {"tool": tool, "arguments": {}, "reason": "test"},
-            "result": {"ok": ok, "output": "", "blocked": blocked, "reason": ""},
+            "id": f"call_{tool}",
+            "name": tool,
+            "ok": ok,
+            "content": "",
+            "blocked": blocked,
+            "error_code": "",
         },
     }
 

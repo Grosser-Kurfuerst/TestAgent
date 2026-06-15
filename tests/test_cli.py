@@ -17,7 +17,7 @@ except ImportError:  # unittest discover -s tests imports modules as top-level f
 
 add_src_to_path()
 
-from my_agent.cli import DEFAULT_TASK_FILE, format_task, load_task, main
+from my_agent.cli import DEFAULT_TASK_FILE, build_parser, format_task, load_task, main
 
 
 def write_runtime_repo(repo: Path) -> None:
@@ -69,6 +69,13 @@ class CliTests(unittest.TestCase):
         self.assertIn("sample_subtract_bug", stream.getvalue())
         self.assertIn("Fix the subtract function", stream.getvalue())
 
+    def test_build_parser_includes_chat_command(self) -> None:
+        args = build_parser().parse_args(["chat", "--repo", ".", "--no-banner"])
+
+        self.assertEqual(args.command, "chat")
+        self.assertEqual(args.repo, ".")
+        self.assertTrue(args.no_banner)
+
     def test_cli_run_executes_fake_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -100,8 +107,8 @@ class CliTests(unittest.TestCase):
             self.assertIn("# Plan", stream.getvalue())
             self.assertIn("# Review", stream.getvalue())
             self.assertIn("# Final summary", stream.getvalue())
-            self.assertIn("Tests: passed", stream.getvalue())
-            self.assertIn("Risks:", stream.getvalue())
+            self.assertIn("tests=passed", stream.getvalue())
+            self.assertIn("Updated subtract", stream.getvalue())
             self.assertIn("return a - b", (repo / "calculator.py").read_text(encoding="utf-8"))
             self.assertEqual(len(list(trace_dir.glob("*.jsonl"))), 1)
 

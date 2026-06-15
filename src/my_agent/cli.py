@@ -21,6 +21,7 @@ from my_agent.indexer import RepoIndexer
 from my_agent.runtime import run_agent
 from my_agent.stats import collect_trace_stats, format_trace_stats
 from my_agent.tools import RepoTools
+from my_agent.ui import AgentRepl
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -96,6 +97,11 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--test-command", help="Override test command from the task file.")
     run_parser.add_argument("--max-steps", type=_positive_max_steps, help="Maximum actor tool calls.")
     run_parser.add_argument("--trace-dir", help="Directory for JSONL traces.")
+
+    chat_parser = subparsers.add_parser("chat", help="Start the interactive ReAct shell.")
+    chat_parser.add_argument("--repo", required=True, help="Target repository path.")
+    chat_parser.add_argument("--trace-dir", help="Directory for JSONL traces.")
+    chat_parser.add_argument("--no-banner", action="store_true", help="Do not print the startup banner.")
 
     stats_parser = subparsers.add_parser("stats", help="Summarize one trace file or a directory of JSONL traces.")
     stats_parser.add_argument("--trace", required=True, help="Trace JSONL file or directory.")
@@ -255,6 +261,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"Trace: {final_state.trace_path}")
         return 0
 
+    if args.command == "chat":
+        try:
+            config = AgentConfig.from_env(env=_tool_environment_overrides(os.environ))
+            repo_path = _resolve_repo_path(args.repo)
+            trace_dir = _resolve_trace_dir(args.trace_dir, config.trace_dir)
+            return AgentRepl(repo_path=repo_path, config=config, trace_dir=trace_dir).run(show_banner=not args.no_banner)
+        except (FileNotFoundError, ValueError, RuntimeError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+
     if args.command == "stats":
         try:
             stats = collect_trace_stats(args.trace)
@@ -290,6 +306,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "tool_config_paths": [str(path) for path in config.tool_config_paths],
                     "enable_project_tools": config.enable_project_tools,
                     "enable_project_plugins": config.enable_project_plugins,
+                    "max_iterations": config.max_iterations,
+                    "max_tool_calls": config.max_tool_calls,
+                    "max_elapsed_seconds": config.max_elapsed_seconds,
+                    "token_budget": config.token_budget,
+                    "context_window": config.context_window,
+                    "max_tool_result_chars": config.max_tool_result_chars,
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -393,6 +415,18 @@ def _tool_environment_overrides(env: Mapping[str, str]) -> dict[str, str]:
         "MY_AGENT_ENABLE_PROJECT_TOOLS",
         "MY_AGENT_ENABLE_PROJECT_PLUGINS",
         "MY_AGENT_TOOL_CONFIGS",
+        "MY_AGENT_MAX_ITERATIONS",
+        "MY_AGENT_MAX_TOOL_CALLS",
+        "MY_AGENT_MAX_ELAPSED_SECONDS",
+        "MY_AGENT_TOKEN_BUDGET",
+        "MY_AGENT_STAGNATION_WINDOW",
+        "MY_AGENT_REPEATED_FAILURE_WINDOW",
+        "MY_AGENT_CONTEXT_WINDOW",
+        "MY_AGENT_RESPONSE_RESERVE_TOKENS",
+        "MY_AGENT_COMPRESSION_BUFFER_TOKENS",
+        "MY_AGENT_RETAIN_RECENT_TURNS",
+        "MY_AGENT_MAX_TOOL_RESULT_CHARS",
+        "MY_AGENT_MAX_SUMMARY_INPUT_CHARS",
     }
     return {key: env[key] for key in keys if key in env}
 

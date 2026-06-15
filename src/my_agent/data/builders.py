@@ -341,31 +341,54 @@ def traces_to_sft(
             task = ""
             plan = ""
             history: list[dict[str, Any]] = []
+            pending_calls: dict[str, dict[str, Any]] = {}
             for _line_num, record in records:
                 event = record.get("event")
                 payload = record.get("payload", {})
                 if not isinstance(payload, dict):
                     continue
 
-                if event == "repo_indexed":
+                if event == "repo.indexed":
                     payload_task = payload.get("task")
                     if isinstance(payload_task, str):
                         task = payload_task
-                elif event == "plan":
-                    payload_plan = payload.get("plan")
-                    plan = payload_plan if isinstance(payload_plan, str) else ""
-                elif event == "tool_call":
-                    call = payload.get("call", {})
-                    result = payload.get("result", {})
-                    if not isinstance(call, dict) or not isinstance(result, dict):
+                elif event == "tool.started":
+                    call_id = payload.get("id")
+                    tool = payload.get("name")
+                    if not isinstance(call_id, str) or not isinstance(tool, str):
                         continue
+                    pending_calls[call_id] = {
+                        "tool": tool,
+                        "arguments": _decode_tool_arguments(payload.get("arguments")),
+                        "reason": "Native LLM tool_call.",
+                    }
+                elif event == "tool.completed":
+                    result_id = payload.get("id")
+                    if not isinstance(result_id, str):
+                        continue
+                    call = pending_calls.get(result_id)
+                    if not isinstance(call, dict):
+                        tool_name = payload.get("name")
+                        if not isinstance(tool_name, str):
+                            continue
+                        call = {
+                            "tool": tool_name,
+                            "arguments": _decode_tool_arguments(payload.get("arguments")),
+                            "reason": "Native LLM tool_call.",
+                        }
                     tool = call.get("tool")
                     if not isinstance(tool, str):
                         continue
+                    result = {
+                        "ok": bool(payload.get("ok")),
+                        "output": payload.get("content", ""),
+                        "blocked": bool(payload.get("blocked")),
+                        "reason": payload.get("error_code", ""),
+                    }
                     if tool == "finish":
                         history.append({"call": call, "result": result})
                         continue
-                    if bool(result.get("ok")):
+                    if bool(payload.get("ok")):
                         arguments = call.get("arguments", {})
                         if not isinstance(arguments, dict):
                             arguments = {}
@@ -382,7 +405,7 @@ def traces_to_sft(
                             metadata={
                                 "source": "Agent trace",
                                 "trace_file": str(trace_file),
-                                "step": payload.get("step"),
+                                "tool_call_id": result_id,
                             },
                         )
                         out.write(json.dumps(sample, ensure_ascii=False) + "\n")
@@ -410,6 +433,16 @@ def _trace_is_successful(records: list[tuple[int, dict[str, Any]]]) -> bool:
         if payload.get("status") == "passed":
             return True
     return False
+
+
+def _decode_tool_arguments(value: object) -> dict[str, Any]:
+    if not isinstance(value, str):
+        return {}
+    try:
+        parsed = json.loads(value or "{}")
+    except json.JSONDecodeError:
+        return {}
+    return dict(parsed) if isinstance(parsed, dict) else {}
 
 
 def _take(items: Iterable[dict[str, Any]], limit: int) -> Iterable[dict[str, Any]]:

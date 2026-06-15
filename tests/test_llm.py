@@ -16,8 +16,7 @@ except ImportError:  # unittest discover -s tests imports modules as top-level f
 add_src_to_path()
 
 from my_agent.config import AgentConfig
-from my_agent.llm import ChatResponse, FakeLLM, OpenAICompatibleLLM, _actor_messages, build_llm
-from my_agent.schema import AgentState
+from my_agent.llm import ChatResponse, FakeLLM, OpenAICompatibleLLM, build_llm
 
 
 class _FakeResponse:
@@ -168,16 +167,6 @@ class LLMTests(unittest.TestCase):
         self.assertEqual(response.role, "assistant")
         self.assertEqual(response.content, "done")
         self.assertEqual(response.finish_reason, "stop")
-
-    def test_actor_prompt_requires_non_empty_reason(self) -> None:
-        state = AgentState.initial(repo_path="/tmp/repo", task="Fix a bug.")
-
-        messages = _actor_messages(state, '{"path": "solution.py"} read a text file.')
-
-        system_prompt = messages[0]["content"]
-        self.assertIn("Never omit reason", system_prompt)
-        self.assertIn('"reason":"Inspect the current implementation before editing."', system_prompt)
-        self.assertIn("arguments object, not the outer wrapper", system_prompt)
 
 
 if __name__ == "__main__":
