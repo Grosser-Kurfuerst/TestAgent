@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 from typing import Mapping
 
@@ -24,10 +25,25 @@ class AgentConfig:
     command_timeout: int
     trace_dir: Path
     use_fake_llm: bool
+    tool_config_paths: tuple[Path, ...] = ()
+    enable_project_tools: bool = False
+    enable_project_plugins: bool = False
 
     @classmethod
-    def from_env(cls, env: Mapping[str, str] | None = None, env_file: str | Path | None = None) -> "AgentConfig":
-        values = _config_values(env=env, env_file=env_file)
+    def from_env(
+        cls,
+        env: Mapping[str, str] | None = None,
+        env_file: str | Path | None = None,
+        *,
+        require_env_file: bool = True,
+        include_environment: bool = False,
+    ) -> "AgentConfig":
+        values = _config_values(
+            env=env,
+            env_file=env_file,
+            require_env_file=require_env_file,
+            include_environment=include_environment,
+        )
         provider = values.get("MY_AGENT_LLM_PROVIDER", "openai").strip().lower()
         use_fake_llm = _as_bool(values.get("MY_AGENT_USE_FAKE_LLM", "")) or provider == "fake"
 
@@ -41,6 +57,13 @@ class AgentConfig:
             command_timeout=int(values.get("MY_AGENT_COMMAND_TIMEOUT", "60")),
             trace_dir=Path(values.get("MY_AGENT_TRACE_DIR", "traces")),
             use_fake_llm=use_fake_llm,
+            tool_config_paths=_tool_config_paths(values),
+            enable_project_tools=_as_bool(
+                values.get("AGENTCLI_ENABLE_PROJECT_TOOLS", values.get("MY_AGENT_ENABLE_PROJECT_TOOLS", ""))
+            ),
+            enable_project_plugins=_as_bool(
+                values.get("AGENTCLI_ENABLE_PROJECT_PLUGINS", values.get("MY_AGENT_ENABLE_PROJECT_PLUGINS", ""))
+            ),
         )
 
     def require_valid_provider(self) -> None:
@@ -63,15 +86,32 @@ def _as_bool(value: str) -> bool:
     return value.strip().lower() in TRUE_VALUES
 
 
-def _config_values(env: Mapping[str, str] | None, env_file: str | Path | None) -> dict[str, str]:
-    values = _read_env_file(Path(env_file) if env_file is not None else DEFAULT_ENV_FILE)
+def _config_values(
+    env: Mapping[str, str] | None,
+    env_file: str | Path | None,
+    *,
+    require_env_file: bool,
+    include_environment: bool,
+) -> dict[str, str]:
+    values = _read_env_file(Path(env_file) if env_file is not None else DEFAULT_ENV_FILE, required=require_env_file)
+    if include_environment:
+        values.update({key: value for key, value in os.environ.items()})
     if env is None:
         return values
     values.update(env)
     return values
 
 
-def _read_env_file(path: Path) -> dict[str, str]:
+def _read_env_file(path: Path, *, required: bool = True) -> dict[str, str]:
     if not path.exists():
+        if not required:
+            return {}
         raise FileNotFoundError(f"Configuration file not found: {path}. Copy .env.example to .env and fill it in.")
     return {key: value or "" for key, value in dotenv_values(path).items()}
+
+
+def _tool_config_paths(values: Mapping[str, str]) -> tuple[Path, ...]:
+    raw = values.get("AGENTCLI_TOOL_CONFIGS") or values.get("MY_AGENT_TOOL_CONFIGS")
+    if raw:
+        return tuple(Path(item).expanduser() for item in raw.split(os.pathsep) if item.strip())
+    return (Path("~/.config/agentcli/tools.json").expanduser(),)

@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from my_agent.config import AgentConfig
 from my_agent.data import (
@@ -19,6 +20,7 @@ from my_agent.data import (
 from my_agent.indexer import RepoIndexer
 from my_agent.runtime import run_agent
 from my_agent.stats import collect_trace_stats, format_trace_stats
+from my_agent.tools import RepoTools
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -101,6 +103,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     config_parser = subparsers.add_parser("config", help="Print resolved local configuration.")
     config_parser.add_argument("--check-api-key", action="store_true", help="Validate provider and API key settings.")
+
+    tools_parser = subparsers.add_parser("tools", help="Inspect and validate dynamically registered tools.")
+    tools_subparsers = tools_parser.add_subparsers(dest="tools_command", required=True)
+    tools_list_parser = tools_subparsers.add_parser("list", help="List tools available for a repository.")
+    tools_list_parser.add_argument("--repo", required=True, help="Target repository path.")
+    tools_validate_parser = tools_subparsers.add_parser("validate", help="Validate tool configuration for a repository.")
+    tools_validate_parser.add_argument("--repo", required=True, help="Target repository path.")
 
     _add_data_commands(subparsers)
 
@@ -218,7 +227,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "run":
         task_payload = load_task(args.task_file)
         try:
-            config = AgentConfig.from_env()
+            config = AgentConfig.from_env(env=_tool_environment_overrides(os.environ))
         except (FileNotFoundError, ValueError, RuntimeError) as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 1
@@ -278,12 +287,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "trace_dir": str(config.trace_dir),
                     "use_fake_llm": config.use_fake_llm,
                     "api_key_configured": bool(config.api_key),
+                    "tool_config_paths": [str(path) for path in config.tool_config_paths],
+                    "enable_project_tools": config.enable_project_tools,
+                    "enable_project_plugins": config.enable_project_plugins,
                 },
                 ensure_ascii=False,
                 indent=2,
             )
         )
         return 0
+
+    if args.command == "tools":
+        return _handle_tools_command(args)
 
     data_exit = _handle_data_command(args)
     if data_exit is not None:
@@ -336,6 +351,50 @@ def _handle_data_command(args: argparse.Namespace) -> int | None:
 
     print(result.render())
     return 0
+
+
+def _handle_tools_command(args: argparse.Namespace) -> int:
+    try:
+        config = AgentConfig.from_env(env=_tool_environment_overrides(os.environ), require_env_file=False)
+        repo_path = _resolve_repo_path(args.repo)
+        tools = RepoTools(repo_path, timeout=config.command_timeout, config=config)
+    except (FileNotFoundError, ValueError, RuntimeError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    if args.tools_command == "list":
+        print("name\tsource\trisk\tenabled\tdescription")
+        for tool in tools.registry.tools:
+            print(
+                "\t".join(
+                    [
+                        tool.spec.name,
+                        tool.spec.source,
+                        tool.spec.risk.value,
+                        "yes" if tool.spec.enabled else "no",
+                        tool.spec.description,
+                    ]
+                )
+            )
+        return 0
+
+    if args.tools_command == "validate":
+        print(f"Tools validation OK: {len(tools.registry.tools)} tools loaded.")
+        return 0
+
+    raise ValueError(f"Unknown tools command: {args.tools_command}")
+
+
+def _tool_environment_overrides(env: Mapping[str, str]) -> dict[str, str]:
+    keys = {
+        "AGENTCLI_ENABLE_PROJECT_TOOLS",
+        "AGENTCLI_ENABLE_PROJECT_PLUGINS",
+        "AGENTCLI_TOOL_CONFIGS",
+        "MY_AGENT_ENABLE_PROJECT_TOOLS",
+        "MY_AGENT_ENABLE_PROJECT_PLUGINS",
+        "MY_AGENT_TOOL_CONFIGS",
+    }
+    return {key: env[key] for key in keys if key in env}
 
 
 def _resolve_repo_path(value: str | Path) -> Path:

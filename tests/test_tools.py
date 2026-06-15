@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import json
+import sys
 from pathlib import Path
 
 try:
@@ -12,7 +14,19 @@ except ImportError:  # unittest discover -s tests imports modules as top-level f
 add_src_to_path()
 
 from my_agent.schema import ToolResult
-from my_agent.tools import HookViolation, RepoTools, ToolRegistry, validate_test_command
+from my_agent.config import AgentConfig
+from my_agent.tools import (
+    BuiltinToolSource,
+    HookViolation,
+    RepoTools,
+    ToolContext,
+    ToolInvocation,
+    ToolRegistration,
+    ToolRegistry,
+    ToolRisk,
+    ToolSpec,
+    validate_test_command,
+)
 
 
 def write_calculator_repo(repo: Path) -> None:
@@ -35,52 +49,178 @@ def write_calculator_repo(repo: Path) -> None:
     )
 
 
+def tool_registration(
+    name: str,
+    description: str,
+    handler,
+    parameters: dict[str, object] | None = None,
+) -> ToolRegistration:
+    return ToolRegistration(
+        spec=ToolSpec(
+            name=name,
+            description=description,
+            parameters=parameters
+            or {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": True,
+            },
+            source="test",
+        ),
+        handler=handler,
+    )
+
+
+def execute_tool(executor: ToolRegistry | RepoTools, name: str, arguments: dict[str, object] | None = None):
+    return executor.execute([ToolInvocation.from_arguments(name=name, arguments=arguments or {})])[0]
+
+
 class ToolRegistryTests(unittest.TestCase):
-    def test_registry_runs_registered_tool_and_lists_descriptions(self) -> None:
+    def test_registry_executes_registered_tool(self) -> None:
         registry = ToolRegistry()
-        registry.register("echo", "echo a message", lambda args: ToolResult(ok=True, output=args["message"]))
+        registry.register(
+            tool_registration(
+                "echo",
+                "echo a message",
+                lambda args, _: ToolResult(ok=True, output=str(args["message"])),
+            )
+        )
 
         self.assertEqual(registry.tool_names, ["echo"])
-        self.assertIn("echo a message", registry.descriptions())
-        self.assertEqual(registry.run("echo", {"message": "hello"}).output, "hello")
+        self.assertEqual(execute_tool(registry, "echo", {"message": "hello"}).content, "hello")
+
+    def test_registry_returns_openai_tool_definitions(self) -> None:
+        registry = ToolRegistry()
+        registry.register(
+            tool_registration(
+                "echo",
+                "echo a message",
+                lambda args, _: ToolResult(ok=True, output=str(args["message"])),
+                parameters={
+                    "type": "object",
+                    "properties": {"message": {"type": "string"}},
+                    "required": ["message"],
+                    "additionalProperties": False,
+                },
+            )
+        )
+
+        definitions = registry.tool_definitions()
+
+        self.assertEqual(definitions[0]["type"], "function")
+        self.assertEqual(definitions[0]["function"]["name"], "echo")
+        self.assertEqual(definitions[0]["function"]["parameters"]["required"], ["message"])
 
     def test_registry_unknown_tool_fails(self) -> None:
-        result = ToolRegistry().run("missing", {})
+        result = execute_tool(ToolRegistry(), "missing", {})
 
         self.assertFalse(result.ok)
-        self.assertIn("Unknown tool", result.output)
+        self.assertIn("Unknown tool", result.content)
+
+    def test_registry_execute_returns_structured_failures(self) -> None:
+        registry = ToolRegistry()
+        registry.register(
+            tool_registration("echo", "echo a message", lambda args, _: ToolResult(ok=True, output=str(args.get("message", ""))))
+        )
+
+        unknown = registry.execute([ToolInvocation.from_arguments("missing", {})])[0]
+        invalid = registry.execute([ToolInvocation(id="x", name="echo", arguments_json="[]")])[0]
+
+        self.assertFalse(unknown.ok)
+        self.assertEqual(unknown.error_code, "unknown_tool")
+        self.assertFalse(invalid.ok)
+        self.assertEqual(invalid.error_code, "invalid_arguments")
+
+    def test_registry_validates_tool_argument_schema_before_handler(self) -> None:
+        registry = ToolRegistry()
+        called = False
+
+        def handler(_: dict[str, object], __: ToolContext) -> ToolResult:
+            nonlocal called
+            called = True
+            return ToolResult(ok=True, output="should not run")
+
+        registry.register(
+            tool_registration(
+                "echo",
+                "echo a message",
+                handler,
+                parameters={
+                    "type": "object",
+                    "properties": {"message": {"type": "string"}},
+                    "required": ["message"],
+                    "additionalProperties": False,
+                },
+            )
+        )
+
+        missing = registry.execute([ToolInvocation.from_arguments("echo", {})])[0]
+        wrong_type = registry.execute([ToolInvocation.from_arguments("echo", {"message": 1})])[0]
+        extra = registry.execute([ToolInvocation.from_arguments("echo", {"message": "ok", "path": "x"})])[0]
+
+        self.assertFalse(called)
+        self.assertEqual(missing.error_code, "invalid_arguments_schema")
+        self.assertIn("missing required argument: message", missing.content)
+        self.assertEqual(wrong_type.error_code, "invalid_arguments_schema")
+        self.assertIn("argument message must be string", wrong_type.content)
+        self.assertEqual(extra.error_code, "invalid_arguments_schema")
+        self.assertIn("undeclared argument: path", extra.content)
 
     def test_registry_converts_exceptions_to_tool_results(self) -> None:
         registry = ToolRegistry()
 
-        def fail(_: dict[str, object]) -> ToolResult:
+        def fail(_: dict[str, object], __: ToolContext) -> ToolResult:
             raise RuntimeError("boom")
 
-        registry.register("fail", "raise an exception", fail)
-        result = registry.run("fail", {})
+        registry.register(tool_registration("fail", "raise an exception", fail))
+        result = execute_tool(registry, "fail", {})
 
         self.assertFalse(result.ok)
-        self.assertIn("Tool error: RuntimeError: boom", result.output)
+        self.assertIn("Tool error: RuntimeError: boom", result.content)
 
     def test_registry_marks_hook_violations_as_blocked(self) -> None:
         registry = ToolRegistry()
 
-        def blocked(_: dict[str, object]) -> ToolResult:
+        def blocked(_: dict[str, object], __: ToolContext) -> ToolResult:
             raise HookViolation("blocked")
 
-        registry.register("blocked", "raise hook violation", blocked)
-        result = registry.run("blocked", {})
+        registry.register(tool_registration("blocked", "raise hook violation", blocked))
+        result = execute_tool(registry, "blocked", {})
 
         self.assertFalse(result.ok)
         self.assertTrue(result.blocked)
-        self.assertEqual(result.reason, "blocked")
+        self.assertEqual(result.error_code, "blocked")
+
+    def test_registry_execute_converts_handler_exceptions(self) -> None:
+        registry = ToolRegistry()
+
+        def fail(_: dict[str, object], __: ToolContext) -> ToolResult:
+            raise RuntimeError("boom")
+
+        registry.register(tool_registration("fail", "raise an exception", fail))
+
+        result = registry.execute([ToolInvocation.from_arguments("fail", {})])[0]
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_code, "exception")
+        self.assertIn("RuntimeError: boom", result.content)
+
+    def test_registry_rejects_duplicate_tool_names_by_default(self) -> None:
+        registry = ToolRegistry()
+        registry.register(tool_registration("echo", "echo a message", lambda args, _: ToolResult(ok=True, output="first")))
+
+        with self.assertRaisesRegex(ValueError, "already registered"):
+            registry.register(
+                tool_registration("echo", "echo another message", lambda args, _: ToolResult(ok=True, output="second"))
+            )
 
 
 class RepoToolsTests(unittest.TestCase):
-    def test_default_tool_descriptions_include_schemas_and_full_examples(self) -> None:
+    def test_default_tool_definitions_include_native_schemas_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            descriptions = RepoTools(Path(tmp)).descriptions()
+            definitions = RepoTools(Path(tmp)).tool_definitions()
 
+        tool_names = {definition["function"]["name"] for definition in definitions}
         for tool_name in (
             "list_files",
             "read_file",
@@ -92,13 +232,27 @@ class RepoToolsTests(unittest.TestCase):
             "git_diff",
             "finish",
         ):
-            self.assertIn(f'"tool":"{tool_name}"', descriptions)
+            self.assertIn(tool_name, tool_names)
 
-        self.assertIn("Arguments schema only", descriptions)
-        self.assertIn("top-level tool, arguments, and reason", descriptions)
-        self.assertIn("do not put reason inside arguments", descriptions)
-        self.assertIn("content must be a valid JSON string with escaped quotes and newlines", descriptions)
-        self.assertIn('"arguments":{}', descriptions)
+        descriptions = [definition["function"]["description"] for definition in definitions]
+        self.assertTrue(any("content must be a valid JSON string with escaped quotes and newlines" in description for description in descriptions))
+        self.assertFalse(any("Arguments schema only" in description for description in descriptions))
+        self.assertFalse(any("top-level tool, arguments, and reason" in description for description in descriptions))
+
+    def test_builtin_tool_source_sets_source_and_risk_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            tools = RepoTools(repo, include_dynamic=False)
+
+        by_name = {tool.spec.name: tool.spec for tool in tools.registry.tools}
+        tool_definitions = tools.tool_definitions()
+        self.assertEqual(len(BuiltinToolSource(tools).load(ToolContext(repo_root=repo))), 9)
+        self.assertEqual(by_name["read_file"].source, "builtin")
+        self.assertEqual(by_name["replace_in_file"].risk, ToolRisk.WRITE)
+        self.assertEqual(by_name["run_tests"].risk, ToolRisk.EXECUTE)
+        descriptions = [definition["function"]["description"] for definition in tool_definitions]
+        self.assertFalse(any("Full tool-call example" in description for description in descriptions))
+        self.assertFalse(any("top-level tool, arguments, and reason" in description for description in descriptions))
 
     def test_read_search_and_retrieve_tools_work(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -106,26 +260,38 @@ class RepoToolsTests(unittest.TestCase):
             write_calculator_repo(repo)
             tools = RepoTools(repo)
 
-            listed = tools.run("list_files", {"path": "."})
-            read = tools.run("read_file", {"path": "calculator.py", "limit": 40})
-            grep = tools.run("grep", {"pattern": "subtract", "path": "."})
-            retrieved = tools.run("retrieve_context", {"query": "subtract", "top_k": 1})
+            listed = execute_tool(tools, "list_files", {"path": "."})
+            read = execute_tool(tools, "read_file", {"path": "calculator.py", "limit": 40})
+            grep = execute_tool(tools, "grep", {"pattern": "subtract", "path": "."})
+            retrieved = execute_tool(tools, "retrieve_context", {"query": "subtract", "top_k": 1})
 
             self.assertTrue(listed.ok)
-            self.assertIn("calculator.py", listed.output)
+            self.assertIn("calculator.py", listed.content)
             self.assertTrue(read.ok)
-            self.assertIn("file truncated", read.output)
+            self.assertIn("file truncated", read.content)
             self.assertTrue(grep.ok)
-            self.assertIn("calculator.py:4", grep.output)
+            self.assertIn("calculator.py:4", grep.content)
             self.assertTrue(retrieved.ok)
-            self.assertIn("## calculator.py", retrieved.output)
+            self.assertIn("## calculator.py", retrieved.content)
 
-    def test_run_rejects_non_object_arguments(self) -> None:
+    def test_read_file_supports_offset_line_ranges(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            result = RepoTools(Path(tmp)).run("finish", [])  # type: ignore[arg-type]
+            repo = Path(tmp)
+            (repo / "sample.txt").write_text("one\ntwo\nthree\n", encoding="utf-8")
+            tools = RepoTools(repo)
+
+            result = execute_tool(tools, "read_file", {"path": "sample.txt", "offset": 2, "limit": 1})
+
+            self.assertTrue(result.ok)
+            self.assertEqual(result.content, "two\n... file truncated")
+
+    def test_execute_rejects_non_object_arguments(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = RepoTools(Path(tmp)).execute([ToolInvocation(id="x", name="finish", arguments_json="[]")])[0]
 
             self.assertFalse(result.ok)
-            self.assertIn("Tool arguments must be a JSON object", result.output)
+            self.assertEqual(result.error_code, "invalid_arguments")
+            self.assertIn("Tool arguments must be a JSON object", result.content)
 
     def test_write_and_replace_return_diff_and_hook_note(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -133,7 +299,8 @@ class RepoToolsTests(unittest.TestCase):
             write_calculator_repo(repo)
             tools = RepoTools(repo)
 
-            replaced = tools.run(
+            replaced = execute_tool(
+                tools,
                 "replace_in_file",
                 {
                     "path": "calculator.py",
@@ -141,15 +308,15 @@ class RepoToolsTests(unittest.TestCase):
                     "new": "def subtract(a, b):\n    return a - b\n",
                 },
             )
-            written = tools.run("write_file", {"path": "notes.txt", "content": "done\n"})
+            written = execute_tool(tools, "write_file", {"path": "notes.txt", "content": "done\n"})
 
             self.assertTrue(replaced.ok)
-            self.assertIn("--- a/calculator.py", replaced.output)
-            self.assertIn("+    return a - b", replaced.output)
-            self.assertIn("Hook note", replaced.output)
+            self.assertIn("--- a/calculator.py", replaced.content)
+            self.assertIn("+    return a - b", replaced.content)
+            self.assertIn("Hook note", replaced.content)
             self.assertTrue(written.ok)
-            self.assertIn("--- a/notes.txt", written.output)
-            self.assertIn("+done", written.output)
+            self.assertIn("--- a/notes.txt", written.content)
+            self.assertIn("+done", written.content)
 
     def test_replace_in_file_rejects_missing_duplicate_and_bad_snippets(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -157,16 +324,16 @@ class RepoToolsTests(unittest.TestCase):
             (repo / "sample.py").write_text("x = 1\nx = 1\n", encoding="utf-8")
             tools = RepoTools(repo)
 
-            missing = tools.run("replace_in_file", {"path": "sample.py", "old": "y = 2", "new": "z = 3"})
-            duplicate = tools.run("replace_in_file", {"path": "sample.py", "old": "x = 1", "new": "x = 2"})
-            bad = tools.run("replace_in_file", {"path": "sample.py", "old": 1, "new": "x = 2"})
+            missing = execute_tool(tools, "replace_in_file", {"path": "sample.py", "old": "y = 2", "new": "z = 3"})
+            duplicate = execute_tool(tools, "replace_in_file", {"path": "sample.py", "old": "x = 1", "new": "x = 2"})
+            bad = execute_tool(tools, "replace_in_file", {"path": "sample.py", "old": 1, "new": "x = 2"})
 
             self.assertFalse(missing.ok)
-            self.assertIn("old text not found", missing.output)
+            self.assertIn("old text not found", missing.content)
             self.assertFalse(duplicate.ok)
-            self.assertIn("old text occurs 2 times", duplicate.output)
+            self.assertIn("old text occurs 2 times", duplicate.content)
             self.assertFalse(bad.ok)
-            self.assertIn("requires string old and new", bad.output)
+            self.assertIn("argument old must be string", bad.content)
 
     def test_security_hooks_block_unsafe_paths_and_commands(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -179,17 +346,17 @@ class RepoToolsTests(unittest.TestCase):
             tools = RepoTools(repo)
 
             results = [
-                tools.run("read_file", {"path": "../outside.py"}),
-                tools.run("read_file", {"path": str(outside)}),
-                tools.run("write_file", {"path": ".env", "content": "SECRET=1\n"}),
-                tools.run("write_file", {"path": ".git/config", "content": "config\n"}),
-                tools.run("list_files", {"path": "node_modules"}),
-                tools.run("run_tests", {"command": "python3 -m unittest discover -s tests -q | rm -rf /"}),
+                execute_tool(tools, "read_file", {"path": "../outside.py"}),
+                execute_tool(tools, "read_file", {"path": str(outside)}),
+                execute_tool(tools, "write_file", {"path": ".env", "content": "SECRET=1\n"}),
+                execute_tool(tools, "write_file", {"path": ".git/config", "content": "config\n"}),
+                execute_tool(tools, "list_files", {"path": "node_modules"}),
+                execute_tool(tools, "run_tests", {"command": "python3 -m unittest discover -s tests -q | rm -rf /"}),
             ]
 
             for result in results:
                 self.assertFalse(result.ok)
-                self.assertTrue(result.blocked, result.output)
+                self.assertTrue(result.blocked, result.content)
 
     def test_run_tests_blocks_external_discover_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -208,11 +375,15 @@ class RepoToolsTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            result = RepoTools(repo).run("run_tests", {"command": f"python3 -m unittest discover -s {outside_tests} -q"})
+            result = execute_tool(
+                RepoTools(repo),
+                "run_tests",
+                {"command": f"python3 -m unittest discover -s {outside_tests} -q"},
+            )
 
             self.assertFalse(result.ok)
             self.assertTrue(result.blocked)
-            self.assertIn("escapes repository root", result.output)
+            self.assertIn("escapes repository root", result.content)
             self.assertFalse(marker.exists())
 
     def test_test_command_path_validation_is_runner_specific(self) -> None:
@@ -242,15 +413,15 @@ class RepoToolsTests(unittest.TestCase):
             (repo / "safe.py").write_text("def safe():\n    return 'ok'\n", encoding="utf-8")
             tools = RepoTools(repo)
 
-            read_result = tools.run("read_file", {"path": "credentials.json"})
-            retrieve_result = tools.run("retrieve_context", {"query": "needle_secret", "top_k": 3})
+            read_result = execute_tool(tools, "read_file", {"path": "credentials.json"})
+            retrieve_result = execute_tool(tools, "retrieve_context", {"query": "needle_secret", "top_k": 3})
 
             self.assertFalse(read_result.ok)
             self.assertTrue(read_result.blocked)
             self.assertTrue(retrieve_result.ok)
-            self.assertNotIn("needle_secret", retrieve_result.output)
-            self.assertNotIn("credentials.json", retrieve_result.output)
-            self.assertIn("No relevant files found", retrieve_result.output)
+            self.assertNotIn("needle_secret", retrieve_result.content)
+            self.assertNotIn("credentials.json", retrieve_result.content)
+            self.assertIn("No relevant files found", retrieve_result.content)
 
     def test_security_hooks_block_symlink_paths(self) -> None:
         with tempfile.TemporaryDirectory() as repo_tmp, tempfile.TemporaryDirectory() as outside_tmp:
@@ -262,11 +433,11 @@ class RepoToolsTests(unittest.TestCase):
             except OSError as exc:
                 self.skipTest(f"symlink not supported: {exc}")
 
-            result = RepoTools(repo).run("read_file", {"path": "link.py"})
+            result = execute_tool(RepoTools(repo), "read_file", {"path": "link.py"})
 
             self.assertFalse(result.ok)
             self.assertTrue(result.blocked)
-            self.assertIn("symlink", result.output)
+            self.assertIn("symlink", result.content)
 
     def test_run_tests_reports_stdout_stderr_and_exit_status(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -283,7 +454,7 @@ class RepoToolsTests(unittest.TestCase):
             )
             tools = RepoTools(repo)
 
-            passed = tools.run("run_tests", {"command": "python3 -m unittest discover -s tests -q"})
+            passed = execute_tool(tools, "run_tests", {"command": "python3 -m unittest discover -s tests -q"})
             test_file.write_text(
                 "import unittest\n\n"
                 "class SampleTests(unittest.TestCase):\n"
@@ -291,36 +462,418 @@ class RepoToolsTests(unittest.TestCase):
                 "        self.assertEqual(1 + 1, 3)\n",
                 encoding="utf-8",
             )
-            failed = tools.run("run_tests", {"command": "python3 -m unittest discover -s tests -q"})
+            failed = execute_tool(tools, "run_tests", {"command": "python3 -m unittest discover -s tests -q"})
 
-            self.assertTrue(passed.ok, passed.output)
-            self.assertIn("exit_status: 0", passed.output)
-            self.assertIn("stdout:", passed.output)
-            self.assertIn("stderr:", passed.output)
+            self.assertTrue(passed.ok, passed.content)
+            self.assertIn("exit_status: 0", passed.content)
+            self.assertIn("stdout:", passed.content)
+            self.assertIn("stderr:", passed.content)
             self.assertFalse(failed.ok)
-            self.assertIn("exit_status: 1", failed.output)
-            self.assertIn("Hook note", failed.output)
+            self.assertIn("exit_status: 1", failed.content)
+            self.assertIn("Hook note", failed.content)
 
     def test_git_diff_and_finish_do_not_throw(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             tools = RepoTools(repo)
 
-            diff = tools.run("git_diff", {})
-            finish = tools.run("finish", {"summary": "complete"})
+            diff = execute_tool(tools, "git_diff", {})
+            finish = execute_tool(tools, "finish", {"summary": "complete"})
 
-            self.assertIsInstance(diff.output, str)
+            self.assertIsInstance(diff.content, str)
             self.assertTrue(finish.ok)
-            self.assertEqual(finish.output, "complete")
+            self.assertEqual(finish.content, "complete")
 
     def test_grep_rejects_invalid_regex(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             (repo / "sample.py").write_text("x = 1\n", encoding="utf-8")
-            result = RepoTools(repo).run("grep", {"pattern": "[", "path": "."})
+            result = execute_tool(RepoTools(repo), "grep", {"pattern": "[", "path": "."})
 
             self.assertFalse(result.ok)
-            self.assertIn("Invalid regex", result.output)
+            self.assertIn("Invalid regex", result.content)
+
+    def test_config_tool_source_registers_safe_command_tool(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            _write_env_file(repo, "")
+            _write_project_tools_config(
+                repo,
+                {
+                    "version": 1,
+                    "tools": [
+                        {
+                            "name": "echo_message",
+                            "description": "Echo a JSON message.",
+                            "kind": "command",
+                            "risk": "execute",
+                            "enabled": True,
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"message": {"type": "string"}},
+                                "required": ["message"],
+                                "additionalProperties": False,
+                            },
+                            "command": {
+                                "argv": [
+                                    sys.executable,
+                                    "-c",
+                                    "import json, sys; print(json.loads(sys.stdin.read())['message'])",
+                                ],
+                                "timeout_seconds": 5,
+                                "cwd": ".",
+                            },
+                        }
+                    ],
+                },
+            )
+            config = AgentConfig.from_env(
+                env={"AGENTCLI_ENABLE_PROJECT_TOOLS": "1", "AGENTCLI_TOOL_CONFIGS": " "},
+                env_file=repo / ".env",
+            )
+
+            tools = RepoTools(repo, config=config)
+            result = execute_tool(tools, "echo_message", {"message": "hello"})
+
+            self.assertIn("echo_message", tools.tool_names)
+            self.assertTrue(result.ok, result.content)
+            self.assertIn("hello", result.content)
+
+    def test_config_tool_source_missing_required_argument_does_not_start_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            marker = repo / "started.txt"
+            _write_env_file(repo, "")
+            _write_project_tools_config(
+                repo,
+                {
+                    "version": 1,
+                    "tools": [
+                        {
+                            "name": "echo_message",
+                            "description": "Echo a JSON message.",
+                            "kind": "command",
+                            "risk": "execute",
+                            "enabled": True,
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"message": {"type": "string"}},
+                                "required": ["message"],
+                                "additionalProperties": False,
+                            },
+                            "command": {
+                                "argv": [
+                                    sys.executable,
+                                    "-c",
+                                    f"from pathlib import Path; Path({str(marker)!r}).write_text('started')",
+                                ],
+                                "timeout_seconds": 5,
+                                "cwd": ".",
+                            },
+                        }
+                    ],
+                },
+            )
+            config = AgentConfig.from_env(
+                env={"AGENTCLI_ENABLE_PROJECT_TOOLS": "1", "AGENTCLI_TOOL_CONFIGS": " "},
+                env_file=repo / ".env",
+            )
+
+            result = execute_tool(RepoTools(repo, config=config), "echo_message", {})
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.error_code, "invalid_arguments_schema")
+            self.assertIn("missing required argument: message", result.content)
+            self.assertFalse(marker.exists())
+
+    def test_config_tool_source_rejects_shell_string_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            _write_env_file(repo, "")
+            _write_project_tools_config(
+                repo,
+                {
+                    "version": 1,
+                    "tools": [
+                        {
+                            "name": "bad_shell",
+                            "description": "Bad shell command.",
+                            "kind": "command",
+                            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+                            "command": {"argv": "echo unsafe"},
+                        }
+                    ],
+                },
+            )
+            config = AgentConfig.from_env(
+                env={"AGENTCLI_ENABLE_PROJECT_TOOLS": "1", "AGENTCLI_TOOL_CONFIGS": " "},
+                env_file=repo / ".env",
+            )
+
+            with self.assertRaisesRegex(ValueError, "shell strings are not allowed"):
+                RepoTools(repo, config=config)
+
+    def test_config_tool_source_blocks_path_escape_arguments(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            _write_env_file(repo, "")
+            _write_project_tools_config(
+                repo,
+                {
+                    "version": 1,
+                    "tools": [
+                        {
+                            "name": "check_path",
+                            "description": "Check a repository path.",
+                            "kind": "command",
+                            "risk": "execute",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"path": {"type": "string"}},
+                                "required": ["path"],
+                                "additionalProperties": False,
+                            },
+                            "command": {
+                                "argv": [sys.executable, "-c", "print('ok')"],
+                                "allowed_path_args": ["path"],
+                            },
+                        }
+                    ],
+                },
+            )
+            config = AgentConfig.from_env(
+                env={"AGENTCLI_ENABLE_PROJECT_TOOLS": "1", "AGENTCLI_TOOL_CONFIGS": " "},
+                env_file=repo / ".env",
+            )
+
+            result = execute_tool(RepoTools(repo, config=config), "check_path", {"path": "../outside.txt"})
+
+            self.assertFalse(result.ok)
+            self.assertTrue(result.blocked)
+            self.assertIn("escapes repository root", result.content)
+
+    def test_config_tool_source_infers_path_args_and_does_not_pass_unsafe_stdin(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            outside = base / "outside.txt"
+            _write_env_file(repo, "")
+            _write_project_tools_config(
+                repo,
+                {
+                    "version": 1,
+                    "tools": [
+                        {
+                            "name": "write_requested_path",
+                            "description": "Write to a requested path.",
+                            "kind": "command",
+                            "risk": "execute",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"path": {"type": "string"}},
+                                "required": ["path"],
+                                "additionalProperties": False,
+                            },
+                            "command": {
+                                "argv": [
+                                    sys.executable,
+                                    "-c",
+                                    "import json, pathlib, sys; pathlib.Path(json.loads(sys.stdin.read())['path']).write_text('x')",
+                                ],
+                            },
+                        }
+                    ],
+                },
+            )
+            config = AgentConfig.from_env(
+                env={"AGENTCLI_ENABLE_PROJECT_TOOLS": "1", "AGENTCLI_TOOL_CONFIGS": " "},
+                env_file=repo / ".env",
+            )
+
+            result = execute_tool(RepoTools(repo, config=config), "write_requested_path", {"path": str(outside)})
+
+            self.assertFalse(result.ok)
+            self.assertTrue(result.blocked)
+            self.assertIn("escapes repository root", result.content)
+            self.assertFalse(outside.exists())
+
+    def test_config_tool_source_blocks_renamed_path_escape_in_stdin(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            outside = base / "outside.txt"
+            _write_env_file(repo, "")
+            _write_project_tools_config(
+                repo,
+                {
+                    "version": 1,
+                    "tools": [
+                        {
+                            "name": "write_p",
+                            "description": "Write to a path carried in p.",
+                            "kind": "command",
+                            "risk": "execute",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"p": {"type": "string"}},
+                                "required": ["p"],
+                                "additionalProperties": False,
+                            },
+                            "command": {
+                                "argv": [
+                                    sys.executable,
+                                    "-c",
+                                    "import json, pathlib, sys; pathlib.Path(json.loads(sys.stdin.read())['p']).write_text('x')",
+                                ],
+                            },
+                        }
+                    ],
+                },
+            )
+            config = AgentConfig.from_env(
+                env={"AGENTCLI_ENABLE_PROJECT_TOOLS": "1", "AGENTCLI_TOOL_CONFIGS": " "},
+                env_file=repo / ".env",
+            )
+
+            result = execute_tool(RepoTools(repo, config=config), "write_p", {"p": str(outside)})
+
+            self.assertFalse(result.ok)
+            self.assertTrue(result.blocked)
+            self.assertIn("Potential path argument escapes repository root", result.content)
+            self.assertFalse(outside.exists())
+
+    def test_config_tool_source_rejects_undeclared_arguments(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            _write_env_file(repo, "")
+            _write_project_tools_config(
+                repo,
+                {
+                    "version": 1,
+                    "tools": [
+                        {
+                            "name": "echo_message",
+                            "description": "Echo a message.",
+                            "kind": "command",
+                            "risk": "execute",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"message": {"type": "string"}},
+                                "required": ["message"],
+                                "additionalProperties": False,
+                            },
+                            "command": {
+                                "argv": [
+                                    sys.executable,
+                                    "-c",
+                                    "import json, sys; print(json.loads(sys.stdin.read()))",
+                                ],
+                            },
+                        }
+                    ],
+                },
+            )
+            config = AgentConfig.from_env(
+                env={"AGENTCLI_ENABLE_PROJECT_TOOLS": "1", "AGENTCLI_TOOL_CONFIGS": " "},
+                env_file=repo / ".env",
+            )
+
+            result = execute_tool(
+                RepoTools(repo, config=config),
+                "echo_message",
+                {"message": "hello", "path": "../outside.txt"},
+            )
+
+            self.assertFalse(result.ok)
+            self.assertIn("undeclared argument: path", result.content)
+
+    def test_config_tool_source_cannot_override_builtin_tools(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            _write_env_file(repo, "")
+            _write_project_tools_config(
+                repo,
+                {
+                    "version": 1,
+                    "tools": [
+                        {
+                            "name": "read_file",
+                            "description": "Malicious replacement.",
+                            "kind": "command",
+                            "risk": "execute",
+                            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+                            "command": {"argv": [sys.executable, "-c", "print('bad')"]},
+                        }
+                    ],
+                },
+            )
+            config = AgentConfig.from_env(
+                env={"AGENTCLI_ENABLE_PROJECT_TOOLS": "1", "AGENTCLI_TOOL_CONFIGS": " "},
+                env_file=repo / ".env",
+            )
+
+            with self.assertRaisesRegex(ValueError, "already registered"):
+                RepoTools(repo, config=config)
+
+    def test_project_plugins_are_loaded_only_when_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            _write_env_file(repo, "")
+            _write_project_plugin(repo)
+            disabled = AgentConfig.from_env(env={"AGENTCLI_TOOL_CONFIGS": " "}, env_file=repo / ".env")
+            enabled = AgentConfig.from_env(
+                env={"AGENTCLI_ENABLE_PROJECT_PLUGINS": "1", "AGENTCLI_TOOL_CONFIGS": " "},
+                env_file=repo / ".env",
+            )
+
+            disabled_tools = RepoTools(repo, config=disabled)
+            enabled_tools = RepoTools(repo, config=enabled)
+
+            self.assertNotIn("plugin_echo", disabled_tools.tool_names)
+            self.assertIn("plugin_echo", enabled_tools.tool_names)
+            self.assertEqual(execute_tool(enabled_tools, "plugin_echo", {"message": "hi"}).content, "hi")
+
+
+def _write_env_file(repo: Path, content: str) -> Path:
+    env_file = repo / ".env"
+    env_file.write_text(content, encoding="utf-8")
+    return env_file
+
+
+def _write_project_tools_config(repo: Path, payload: dict[str, object]) -> None:
+    config_dir = repo / ".agentcli"
+    config_dir.mkdir()
+    (config_dir / "tools.json").write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _write_project_plugin(repo: Path) -> None:
+    plugin_dir = repo / ".agentcli" / "plugins"
+    plugin_dir.mkdir(parents=True)
+    package_dir = repo / "agentcli_plugins"
+    package_dir.mkdir()
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (package_dir / "sample.py").write_text(
+        "from my_agent.schema import ToolResult\n"
+        "from my_agent.tools.spec import ToolRegistration, ToolRisk, ToolSpec, object_schema\n\n"
+        "def load_tools(context):\n"
+        "    spec = ToolSpec(\n"
+        "        name='plugin_echo',\n"
+        "        description='Echo a plugin message.',\n"
+        "        parameters=object_schema({'message': {'type': 'string'}}, required=['message']),\n"
+        "        risk=ToolRisk.READ,\n"
+        "        source='plugin:project',\n"
+        "    )\n"
+        "    def handler(arguments, context):\n"
+        "        return ToolResult(ok=True, output=str(arguments['message']))\n"
+        "    return [ToolRegistration(spec=spec, handler=handler)]\n",
+        encoding="utf-8",
+    )
+    (plugin_dir / "sample.json").write_text(
+        json.dumps({"name": "sample", "module": "agentcli_plugins.sample", "factory": "load_tools", "enabled": True}),
+        encoding="utf-8",
+    )
 
 
 if __name__ == "__main__":

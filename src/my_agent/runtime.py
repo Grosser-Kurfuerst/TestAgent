@@ -9,7 +9,7 @@ from my_agent.config import AgentConfig
 from my_agent.indexer import RepoIndexer
 from my_agent.llm import AgentLLM, build_llm
 from my_agent.schema import AgentState, ToolCall, ToolRecord, ToolResult
-from my_agent.tools import RepoTools, should_skip_path
+from my_agent.tools import RepoTools, ToolExecutionResult, ToolInvocation, should_skip_path
 from my_agent.tracing import TraceWriter
 
 
@@ -34,7 +34,7 @@ class CodingAgentRuntime:
         writer = TraceWriter.create(self.trace_dir, state.run_id)
         state.trace_path = writer.path
 
-        tools = RepoTools(state.repo_path, timeout=self.command_timeout)
+        tools = RepoTools(state.repo_path, timeout=self.command_timeout, config=self.config)
         self._index_repo(state, writer)
         self._plan(state, tools, writer)
 
@@ -71,11 +71,11 @@ class CodingAgentRuntime:
         )
 
     def _plan(self, state: AgentState, tools: RepoTools, writer: TraceWriter) -> None:
-        state.plan = self.llm.plan(state, tools.descriptions())
+        state.plan = self.llm.plan(state, _tool_descriptions(tools))
         writer.append(state.trace_event("plan", {"plan": state.plan}))
 
     def _act(self, state: AgentState, tools: RepoTools, writer: TraceWriter) -> None:
-        raw = self.llm.act(state, tools.descriptions())
+        raw = self.llm.act(state, _tool_descriptions(tools))
         parse_error = ""
         try:
             call = _parse_tool_call(raw, tools.tool_names)
@@ -110,7 +110,8 @@ class CodingAgentRuntime:
                 reason=call.reason,
             )
 
-        result = tools.run(call.tool, call.arguments)
+        execution_result = tools.execute([ToolInvocation.from_arguments(name=call.tool, arguments=call.arguments)])[0]
+        result = _tool_result_from_execution(execution_result)
         self._record_tool_event(state, writer, raw, parse_error, call, result)
 
     def _record_tool_event(
@@ -233,6 +234,30 @@ def _parse_tool_call(raw: str, allowed_tools: list[str]) -> ToolCall:
     # if _missing_reason(payload):
     #     payload = {**payload, "reason": _default_reason(payload)}
     return ToolCall.from_mapping(payload, allowed_tools=allowed_tools)
+
+
+def _tool_descriptions(tools: RepoTools) -> str:
+    lines: list[str] = []
+    for definition in tools.tool_definitions():
+        function = definition.get("function", {})
+        name = function.get("name", "")
+        description = function.get("description", "")
+        parameters = function.get("parameters", {})
+        lines.append(
+            json.dumps(
+                {
+                    "name": name,
+                    "description": description,
+                    "parameters": parameters,
+                },
+                ensure_ascii=False,
+            )
+        )
+    return "\n".join(lines)
+
+
+def _tool_result_from_execution(result: ToolExecutionResult) -> ToolResult:
+    return ToolResult(ok=result.ok, output=result.content, blocked=result.blocked, reason=result.error_code)
 
 
 def _latest_test_failed(state: AgentState) -> bool:

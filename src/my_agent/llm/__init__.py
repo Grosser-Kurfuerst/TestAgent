@@ -2,15 +2,22 @@ from __future__ import annotations
 
 import json
 import re
+import time
 import urllib.error
 import urllib.request
 from typing import Any, Protocol, Sequence
 
 from my_agent.config import AgentConfig
+from my_agent.llm.types import ChatResponse, ChatUsage, MessageLike, messages_to_openai
 from my_agent.schema import AgentState, ToolRecord
 
 
 class AgentLLM(Protocol):
+    supports_tools: bool
+
+    def chat(self, messages: list[MessageLike], tools: list[dict[str, Any]] | None = None) -> ChatResponse:
+        ...
+
     def plan(self, state: AgentState, tool_descriptions: str) -> str:
         ...
 
@@ -37,8 +44,23 @@ def build_llm(config: AgentConfig) -> AgentLLM:
 class FakeLLM:
     """Deterministic local model used by tests and smoke runs."""
 
-    def __init__(self, actor_responses: Sequence[str] | None = None):
+    supports_tools = False
+
+    def __init__(
+        self,
+        actor_responses: Sequence[str] | None = None,
+        chat_responses: Sequence[ChatResponse | str] | None = None,
+    ):
         self._actor_responses = list(actor_responses or [])
+        self._chat_responses = list(chat_responses or [])
+
+    def chat(self, messages: list[MessageLike], tools: list[dict[str, Any]] | None = None) -> ChatResponse:
+        if self._chat_responses:
+            response = self._chat_responses.pop(0)
+            if isinstance(response, ChatResponse):
+                return response
+            return ChatResponse(content=response, finish_reason="stop")
+        return ChatResponse(content="FakeLLM response.", finish_reason="stop")
 
     def plan(self, state: AgentState, tool_descriptions: str) -> str:
         return (
@@ -136,13 +158,16 @@ class FakeLLM:
 class OpenAICompatibleLLM:
     """Small OpenAI-compatible chat-completions client implemented with stdlib HTTP."""
 
-    def __init__(self, config: AgentConfig, timeout: int = 60):
+    supports_tools = True
+
+    def __init__(self, config: AgentConfig, timeout: int = 60, max_retries: int = 2):
         config.require_api_key()
         self.api_key = config.api_key
         self.base_url = (config.base_url or "https://api.openai.com/v1").rstrip("/")
         self.model = config.model
         self.temperature = config.temperature
         self.timeout = timeout
+        self.max_retries = max(0, max_retries)
 
     def plan(self, state: AgentState, tool_descriptions: str) -> str:
         return self._chat(_planner_messages(state, tool_descriptions))
@@ -156,12 +181,28 @@ class OpenAICompatibleLLM:
     def summarize(self, state: AgentState) -> str:
         return self._chat(_summarizer_messages(state))
 
-    def _chat(self, messages: list[dict[str, str]]) -> str:
-        payload = {
+    def chat(self, messages: list[MessageLike], tools: list[dict[str, Any]] | None = None) -> ChatResponse:
+        payload: dict[str, Any] = {
             "model": self.model,
-            "messages": messages,
+            "messages": messages_to_openai(messages),
             "temperature": self.temperature,
         }
+        if tools is not None:
+            payload["tools"] = tools
+        body = self._post_chat_completion(payload)
+        try:
+            parsed = json.loads(body)
+            return ChatResponse.from_openai_payload(parsed)
+        except (ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"LLM response could not be parsed: {_excerpt(body)}") from exc
+
+    def _chat(self, messages: list[dict[str, str]], tools: list[dict[str, Any]] | None = None) -> str:
+        response = self.chat(messages, tools=tools)
+        if not response.content:
+            raise RuntimeError("LLM response message content was empty.")
+        return response.content
+
+    def _post_chat_completion(self, payload: dict[str, Any]) -> str:
         request = urllib.request.Request(
             f"{self.base_url}/chat/completions",
             data=json.dumps(payload).encode("utf-8"),
@@ -171,23 +212,27 @@ class OpenAICompatibleLLM:
             },
             method="POST",
         )
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                body = response.read().decode("utf-8")
-        except urllib.error.HTTPError as exc:
-            error_body = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"LLM request failed with HTTP {exc.code}: {_excerpt(error_body)}") from exc
-        except urllib.error.URLError as exc:
-            raise RuntimeError(f"LLM request failed: {exc.reason}") from exc
+        attempts = self.max_retries + 1
+        last_error = ""
+        for attempt in range(attempts):
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    return response.read().decode("utf-8")
+            except urllib.error.HTTPError as exc:
+                error_body = exc.read().decode("utf-8", errors="replace")
+                last_error = f"LLM request failed with HTTP {exc.code}: {_excerpt(error_body)}"
+                if not _is_retryable_http_error(exc.code) or attempt == attempts - 1:
+                    raise RuntimeError(last_error) from exc
+            except urllib.error.URLError as exc:
+                last_error = f"LLM request failed: {exc.reason}"
+                if attempt == attempts - 1:
+                    raise RuntimeError(last_error) from exc
+            time.sleep(min(0.25 * (2**attempt), 1.0))
+        raise RuntimeError(last_error or "LLM request failed.")
 
-        try:
-            parsed = json.loads(body)
-            content = parsed["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
-            raise RuntimeError(f"LLM response did not contain message content: {_excerpt(body)}") from exc
-        if not isinstance(content, str) or not content.strip():
-            raise RuntimeError("LLM response message content was empty.")
-        return content.strip()
+
+def _is_retryable_http_error(status_code: int) -> bool:
+    return status_code == 429 or status_code >= 500
 
 
 def _tool_json(tool: str, arguments: dict[str, object], reason: str) -> str:
@@ -341,7 +386,11 @@ def _history_for_prompt(state: AgentState, limit: int = 8) -> str:
 
 
 def _changed_tools(state: AgentState) -> list[str]:
-    return [record.call.tool for record in state.tool_history if record.call.tool in {"replace_in_file", "write_file"} and record.result.ok]
+    return [
+        record.call.tool
+        for record in state.tool_history
+        if record.call.tool in {"replace_in_file", "write_file"} and record.result.ok
+    ]
 
 
 def _test_status(state: AgentState) -> str:
@@ -366,3 +415,14 @@ def _risk_summary(state: AgentState) -> str:
 
 def _excerpt(text: str, limit: int = 500) -> str:
     return text if len(text) <= limit else text[:limit] + "\n... truncated"
+
+
+__all__ = [
+    "AgentLLM",
+    "ChatResponse",
+    "ChatUsage",
+    "FakeLLM",
+    "MessageLike",
+    "OpenAICompatibleLLM",
+    "build_llm",
+]

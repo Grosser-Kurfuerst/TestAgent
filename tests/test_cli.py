@@ -3,9 +3,11 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 try:
@@ -210,6 +212,74 @@ class CliTests(unittest.TestCase):
         self.assertNotIn("## tests/test_calculator.py", output)
         self.assertIn("subtract", output)
         self.assertIn("score=", output)
+
+    def test_cli_tools_list_loads_enabled_project_tools(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            config_dir = repo / ".agentcli"
+            config_dir.mkdir()
+            (config_dir / "tools.json").write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "tools": [
+                            {
+                                "name": "show_python_version",
+                                "description": "Show Python version.",
+                                "kind": "command",
+                                "risk": "execute",
+                                "enabled": True,
+                                "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+                                "command": {"argv": ["python", "--version"], "timeout_seconds": 10, "cwd": "."},
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            stream = io.StringIO()
+
+            with mock.patch.dict(
+                os.environ,
+                {"AGENTCLI_ENABLE_PROJECT_TOOLS": "1", "AGENTCLI_TOOL_CONFIGS": " "},
+                clear=True,
+            ):
+                with contextlib.redirect_stdout(stream):
+                    exit_code = main(["tools", "list", "--repo", str(repo)])
+
+        self.assertEqual(exit_code, 0)
+        output = stream.getvalue()
+        self.assertIn("show_python_version", output)
+        self.assertIn("config:project", output)
+
+    def test_cli_run_and_tools_use_same_dynamic_tool_environment_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            task_file = base / "task.json"
+            task_file.write_text(
+                json.dumps({"id": "tmp", "source": "local", "repo": str(repo), "task": "List tools."}),
+                encoding="utf-8",
+            )
+            env_file = _write_env_file(base, "MY_AGENT_LLM_PROVIDER=fake\n")
+            final_state = SimpleNamespace(plan="p", review="r", final_answer="f", trace_path=base / "trace.jsonl")
+            stream = io.StringIO()
+
+            with mock.patch.dict(
+                os.environ,
+                {"AGENTCLI_ENABLE_PROJECT_TOOLS": "1", "AGENTCLI_TOOL_CONFIGS": " "},
+                clear=True,
+            ):
+                with mock.patch("my_agent.config.DEFAULT_ENV_FILE", env_file):
+                    with mock.patch("my_agent.cli.run_agent", return_value=final_state) as run_agent_mock:
+                        with contextlib.redirect_stdout(stream):
+                            exit_code = main(["run", "--task-file", str(task_file)])
+
+        self.assertEqual(exit_code, 0)
+        config = run_agent_mock.call_args.kwargs["config"]
+        self.assertTrue(config.enable_project_tools)
+        self.assertEqual(config.tool_config_paths, ())
 
     def test_cli_rejects_non_positive_top_k(self) -> None:
         repo = Path(__file__).resolve().parents[1] / "examples" / "sample_repo"

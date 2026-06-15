@@ -92,6 +92,25 @@ class AgentConfigTests(unittest.TestCase):
         self.assertEqual(config.command_timeout, 12)
         self.assertEqual(str(config.trace_dir), "tmp-traces")
 
+    def test_tool_flags_default_off_and_can_be_enabled_from_env_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / ".env"
+            env_file.write_text("", encoding="utf-8")
+
+            default_config = AgentConfig.from_env(env_file=env_file)
+            enabled_config = AgentConfig.from_env(
+                env={
+                    "AGENTCLI_ENABLE_PROJECT_TOOLS": "1",
+                    "AGENTCLI_ENABLE_PROJECT_PLUGINS": "true",
+                },
+                env_file=env_file,
+            )
+
+        self.assertFalse(default_config.enable_project_tools)
+        self.assertFalse(default_config.enable_project_plugins)
+        self.assertTrue(enabled_config.enable_project_tools)
+        self.assertTrue(enabled_config.enable_project_plugins)
+
     def test_system_environment_does_not_override_dotenv_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             env_file = Path(tmp) / ".env"

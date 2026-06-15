@@ -10,204 +10,70 @@ from typing import Any
 
 from my_agent.indexer import RepoIndexer, TEXT_EXTENSIONS
 from my_agent.schema import ToolResult
+from my_agent.tools.execution import ToolExecutionResult, ToolInvocation
 from my_agent.tools.hooks import (
-    HookViolation,
     post_tool_check,
     should_skip_path,
     validate_read_path,
     validate_test_command,
-    validate_tool_call,
     validate_write_path,
 )
+from my_agent.tools.builtin import BuiltinToolSource
 from my_agent.tools.registry import ToolRegistry
+from my_agent.tools.spec import ToolContext
 
 
 class RepoTools:
-    def __init__(self, repo_path: str | Path, timeout: int = 60):
+    def __init__(self, repo_path: str | Path, timeout: int = 60, config: Any | None = None, include_dynamic: bool = True):
         self.repo_root = Path(repo_path).resolve()
         if not self.repo_root.exists() or not self.repo_root.is_dir():
             raise ValueError(f"Repository path does not exist or is not a directory: {self.repo_root}")
         self.timeout = timeout
-        self.registry = ToolRegistry()
+        self.config = config
+        self.context = ToolContext(repo_root=self.repo_root, timeout_seconds=timeout, config=config)
+        self.registry = ToolRegistry(context=self.context)
         self._register_defaults()
+        if include_dynamic:
+            self._register_dynamic_sources()
 
     @property
     def tool_names(self) -> list[str]:
         return self.registry.tool_names
 
-    def descriptions(self) -> str:
-        return self.registry.descriptions()
+    def tool_definitions(self) -> list[dict[str, Any]]:
+        return self.registry.tool_definitions()
 
-    def run(self, name: str, arguments: dict[str, Any] | None = None) -> ToolResult:
-        if arguments is None:
-            args: dict[str, Any] = {}
-        elif not isinstance(arguments, dict):
-            return ToolResult(ok=False, output="Tool arguments must be a JSON object.")
-        else:
-            args = arguments
-        try:
-            validate_tool_call(self.repo_root, name, args)
-        except HookViolation as exc:
-            return ToolResult(ok=False, output=str(exc), blocked=True, reason=str(exc))
+    def execute(self, invocations: list[ToolInvocation]) -> list[ToolExecutionResult]:
+        return [self._with_post_tool_note(result) for result in self.registry.execute(invocations)]
 
-        result = self.registry.run(name, args)
+    def _with_post_tool_note(self, result: ToolExecutionResult) -> ToolExecutionResult:
         if result.blocked:
             return result
-        note = post_tool_check(name, result.ok, result.output)
-        if note:
-            return ToolResult(
-                ok=result.ok,
-                output=f"{result.output}\n\nHook note: {note}",
-                blocked=result.blocked,
-                reason=result.reason,
-            )
-        return result
+        note = post_tool_check(result.name, result.ok, result.content)
+        if not note:
+            return result
+        return ToolExecutionResult(
+            id=result.id,
+            name=result.name,
+            ok=result.ok,
+            content=f"{result.content}\n\nHook note: {note}",
+            elapsed_ms=result.elapsed_ms,
+            error_code=result.error_code,
+            retryable=result.retryable,
+            blocked=result.blocked,
+            timed_out=result.timed_out,
+        )
 
     def _register_defaults(self) -> None:
-        self.registry.register(
-            "list_files",
-            _tool_description(
-                name="list_files",
-                arguments_schema='{"path":"."}',
-                purpose="List repository files under a file or directory path.",
-                requirements=(
-                    "path is optional and defaults to '.'.",
-                    "path must stay inside the repository and must not target ignored or protected paths.",
-                    "Use this before reading when you need to discover filenames.",
-                ),
-                example_arguments='{"path":"src"}',
-                example_reason="Find candidate source files before reading them.",
-            ),
-            self._list_files,
-        )
-        self.registry.register(
-            "read_file",
-            _tool_description(
-                name="read_file",
-                arguments_schema='{"path":"relative.py","limit":12000}',
-                purpose="Read a UTF-8 text file from the repository.",
-                requirements=(
-                    "path is required and must be a repository-relative file path.",
-                    "limit is optional and must be a positive integer.",
-                    "Inspect the current file content before editing it.",
-                ),
-                example_arguments='{"path":"solution.py","limit":12000}',
-                example_reason="Inspect the current implementation before editing.",
-            ),
-            self._read_file,
-        )
-        self.registry.register(
-            "grep",
-            _tool_description(
-                name="grep",
-                arguments_schema='{"pattern":"regex","path":"."}',
-                purpose="Search repository text files with a regular expression.",
-                requirements=(
-                    "pattern is required and must be a non-empty regex string.",
-                    "path is optional and may be a repository-relative file or directory.",
-                    "Use this to locate symbols, error text, tests, or repeated snippets.",
-                ),
-                example_arguments='{"pattern":"def subtract","path":"."}',
-                example_reason="Locate the function definition related to the task.",
-            ),
-            self._grep,
-        )
-        self.registry.register(
-            "retrieve_context",
-            _tool_description(
-                name="retrieve_context",
-                arguments_schema='{"query":"symbol or task","top_k":5}',
-                purpose="Retrieve relevant code snippets using lexical repository search.",
-                requirements=(
-                    "query is required and must be a non-empty search string.",
-                    "top_k is optional and must be a positive integer.",
-                    "This only retrieves context; it does not edit files or call an LLM.",
-                ),
-                example_arguments='{"query":"subtract function","top_k":5}',
-                example_reason="Gather relevant snippets before choosing an edit.",
-            ),
-            self._retrieve_context,
-        )
-        self.registry.register(
-            "replace_in_file",
-            _tool_description(
-                name="replace_in_file",
-                arguments_schema='{"path":"file.py","old":"exact existing text","new":"replacement text"}',
-                purpose="Make one exact text replacement in a repository file.",
-                requirements=(
-                    "path is required and must be a repository-relative file path.",
-                    "old and new are required strings; do not use fenced markdown.",
-                    "old must be copied from the file exactly and must match exactly one occurrence.",
-                ),
-                example_arguments='{"path":"calculator.py","old":"return a + b","new":"return a - b"}',
-                example_reason="Fix the incorrect arithmetic implementation.",
-            ),
-            self._replace_in_file,
-        )
-        self.registry.register(
-            "write_file",
-            _tool_description(
-                name="write_file",
-                arguments_schema='{"path":"file.py","content":"full file content"}',
-                purpose="Overwrite or create one repository file with complete content.",
-                requirements=(
-                    "path is required and must be a repository-relative file path.",
-                    "content is required and must be the full file content as one JSON string.",
-                    "content must be a valid JSON string with escaped quotes and newlines.",
-                ),
-                example_arguments='{"path":"solution.py","content":"def subtract(a, b):\\n    return a - b\\n"}',
-                example_reason="Replace the placeholder solution with a working implementation.",
-            ),
-            self._write_file,
-        )
-        self.registry.register(
-            "run_tests",
-            _tool_description(
-                name="run_tests",
-                arguments_schema='{"command":"pytest -q"}',
-                purpose="Run an allowlisted test command in the repository.",
-                requirements=(
-                    "command is optional and defaults to 'pytest -q'.",
-                    "Allowed commands include pytest, python -m pytest, python -m unittest, npm test, npm run test, pnpm test, and yarn test.",
-                    "Do not include shell control syntax such as pipes, redirects, semicolons, or command substitution.",
-                ),
-                example_arguments='{"command":"pytest -q"}',
-                example_reason="Verify the edited code with the repository test suite.",
-            ),
-            self._run_tests,
-        )
-        self.registry.register(
-            "git_diff",
-            _tool_description(
-                name="git_diff",
-                arguments_schema="{}",
-                purpose="Show the current repository git diff.",
-                requirements=(
-                    "arguments must be an empty JSON object.",
-                    "Use this after edits to inspect the exact patch before finishing.",
-                    "Do not include command, path, or content fields.",
-                ),
-                example_arguments="{}",
-                example_reason="Review the patch produced by the previous edit.",
-            ),
-            self._git_diff,
-        )
-        self.registry.register(
-            "finish",
-            _tool_description(
-                name="finish",
-                arguments_schema='{"summary":"final answer"}',
-                purpose="Finish the task and return the final answer.",
-                requirements=(
-                    "summary is required and should state what changed and what was verified.",
-                    "Only call this when the task is complete or when you must report a blocker.",
-                    "Mention failing or unrun tests in summary when relevant.",
-                ),
-                example_arguments='{"summary":"Fixed subtract and verified with pytest -q."}',
-                example_reason="Report the completed change and verification status.",
-            ),
-            self._finish,
-        )
+        self.registry.load_source(BuiltinToolSource(self), self.context)
+
+    def _register_dynamic_sources(self) -> None:
+        from my_agent.tools.config_source import ConfigToolSource
+        from my_agent.tools.plugin_source import PluginToolSource
+
+        for source in ConfigToolSource.sources_for(self.repo_root, self.config):
+            self.registry.load_source(source, self.context)
+        self.registry.load_source(PluginToolSource(self.repo_root, self.config), self.context)
 
     def _list_files(self, arguments: dict[str, Any]) -> ToolResult:
         base = validate_read_path(self.repo_root, arguments.get("path", "."))
@@ -237,6 +103,15 @@ class RepoTools:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError as exc:
             return ToolResult(ok=False, output=f"File could not be read: {exc}")
+
+        offset = arguments.get("offset")
+        if offset is not None:
+            if isinstance(offset, bool) or not isinstance(offset, int) or offset < 1:
+                return ToolResult(ok=False, output="read_file offset must be a positive integer.")
+            lines = text.splitlines()
+            selected = lines[offset - 1 : offset - 1 + limit]
+            suffix = "\n... file truncated" if offset - 1 + limit < len(lines) else ""
+            return ToolResult(ok=True, output="\n".join(selected) + suffix)
 
         if len(text) > limit:
             text = text[:limit] + "\n... file truncated"
@@ -368,27 +243,6 @@ class RepoTools:
 
 def _is_text_file(path: Path) -> bool:
     return path.suffix.lower() in TEXT_EXTENSIONS
-
-
-def _tool_description(
-    *,
-    name: str,
-    arguments_schema: str,
-    purpose: str,
-    requirements: tuple[str, ...],
-    example_arguments: str,
-    example_reason: str,
-) -> str:
-    requirements_text = " ".join(requirements)
-    example = f'{{"tool":"{name}","arguments":{example_arguments},"reason":"{example_reason}"}}'
-    return (
-        f"Arguments schema only: {arguments_schema}. "
-        f"Purpose: {purpose} "
-        f"Requirements: {requirements_text} "
-        "Use the outer tool-call object with top-level tool, arguments, and reason; "
-        "do not put reason inside arguments. "
-        f"Full tool-call example: {example}"
-    )
 
 
 def _unified_diff(rel_path: str, old: str, new: str) -> str:
