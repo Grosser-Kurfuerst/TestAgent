@@ -97,10 +97,23 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--test-command", help="Override test command from the task file.")
     run_parser.add_argument("--max-steps", type=_positive_max_steps, help="Maximum actor tool calls.")
     run_parser.add_argument("--trace-dir", help="Directory for JSONL traces.")
+    run_parser.add_argument(
+        "--mode",
+        choices=("react", "plan", "auto"),
+        default="react",
+        help="Execution mode. Default: react.",
+    )
 
     chat_parser = subparsers.add_parser("chat", help="Start the interactive ReAct shell.")
     chat_parser.add_argument("--repo", required=True, help="Target repository path.")
     chat_parser.add_argument("--trace-dir", help="Directory for JSONL traces.")
+    chat_parser.add_argument("--test-command", help="Default test command for /plan and task runs.")
+    chat_parser.add_argument(
+        "--mode",
+        choices=("react", "plan", "auto"),
+        default=None,
+        help="Interactive execution mode. Default: AGENTCLI_AGENT_MODE or auto.",
+    )
     chat_parser.add_argument("--no-banner", action="store_true", help="Do not print the startup banner.")
 
     stats_parser = subparsers.add_parser("stats", help="Summarize one trace file or a directory of JSONL traces.")
@@ -248,8 +261,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 config=config,
                 max_steps=args.max_steps if args.max_steps is not None else config.max_steps,
                 trace_dir=trace_dir,
+                mode=args.mode,
             )
-        except RuntimeError as exc:
+        except (RuntimeError, ValueError) as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 1
         print(_section("Plan", final_state.plan))
@@ -259,6 +273,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(_section("Final summary", final_state.final_answer))
         print()
         print(f"Trace: {final_state.trace_path}")
+        if getattr(final_state, "stop_reason", "") in {"plan_failed", "plan_validation_failed", "plan_cancelled"}:
+            return 1
         return 0
 
     if args.command == "chat":
@@ -266,7 +282,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             config = AgentConfig.from_env(env=_tool_environment_overrides(os.environ))
             repo_path = _resolve_repo_path(args.repo)
             trace_dir = _resolve_trace_dir(args.trace_dir, config.trace_dir)
-            return AgentRepl(repo_path=repo_path, config=config, trace_dir=trace_dir).run(show_banner=not args.no_banner)
+            return AgentRepl(
+                repo_path=repo_path,
+                config=config,
+                trace_dir=trace_dir,
+                mode=args.mode or config.agent_mode,
+                test_command=args.test_command,
+            ).run(show_banner=not args.no_banner)
         except (FileNotFoundError, ValueError, RuntimeError) as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 1
@@ -312,6 +334,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "token_budget": config.token_budget,
                     "context_window": config.context_window,
                     "max_tool_result_chars": config.max_tool_result_chars,
+                    "plan_task_max_steps": config.plan_task_max_steps,
+                    "plan_max_tasks": config.plan_max_tasks,
+                    "plan_max_replans": config.plan_max_replans,
+                    "agent_mode": config.agent_mode,
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -427,6 +453,14 @@ def _tool_environment_overrides(env: Mapping[str, str]) -> dict[str, str]:
         "MY_AGENT_RETAIN_RECENT_TURNS",
         "MY_AGENT_MAX_TOOL_RESULT_CHARS",
         "MY_AGENT_MAX_SUMMARY_INPUT_CHARS",
+        "AGENTCLI_PLAN_TASK_MAX_STEPS",
+        "AGENTCLI_PLAN_MAX_TASKS",
+        "AGENTCLI_PLAN_MAX_REPLANS",
+        "AGENTCLI_AGENT_MODE",
+        "MY_AGENT_PLAN_TASK_MAX_STEPS",
+        "MY_AGENT_PLAN_MAX_TASKS",
+        "MY_AGENT_PLAN_MAX_REPLANS",
+        "MY_AGENT_AGENT_MODE",
     }
     return {key: env[key] for key in keys if key in env}
 

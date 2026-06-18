@@ -9,7 +9,9 @@ from my_agent.config import AgentConfig
 from my_agent.context import ContextProfile, ConversationCompactor
 from my_agent.llm import build_llm
 from my_agent.llm.types import Message
+from my_agent.plan import AgentMode, PlanState, PlanTask, normalize_mode
 from my_agent.runtime import run_agent
+from my_agent.text_safety import repair_surrogates
 from my_agent.tools import RepoTools, ToolExecutionResult, ToolInvocation
 from my_agent.ui.renderer import PlainRenderer, Renderer, StartupInfo
 
@@ -22,6 +24,9 @@ HELP_TEXT = """Commands:
 /compact [focus]  Compact session context for the supplied focus.
 /clear            Clear session context.
 /trace            Show the latest trace path.
+/plan <task>      Run a task with Plan-and-Execute.
+/plan             Run the next task with Plan-and-Execute.
+/mode <mode>      Set mode: react, plan, or auto.
 /quit             Exit.
 """
 
@@ -35,12 +40,17 @@ class AgentRepl:
         trace_dir: str | Path,
         renderer: Renderer | None = None,
         input_stream: TextIO | None = None,
+        mode: AgentMode | str | None = AgentMode.AUTO,
+        test_command: str | None = None,
     ) -> None:
         self.repo_path = Path(repo_path).resolve()
         self.config = config
         self.trace_dir = Path(trace_dir)
         self.renderer = renderer or PlainRenderer()
         self.input_stream = input_stream or sys.stdin
+        self.mode = normalize_mode(mode, default=AgentMode.AUTO)
+        self._next_mode: AgentMode | None = None
+        self.test_command = test_command or _discover_test_command(self.repo_path)
         self._tools = RepoTools(self.repo_path, timeout=config.command_timeout, config=config)
         self._profile = ContextProfile.from_config(config)
         self._compactor = ConversationCompactor(self._profile, llm=build_llm(config))
@@ -57,28 +67,14 @@ class AgentRepl:
                 return 0
             if line is None:
                 return 0
-            text = line.strip()
+            text = repair_surrogates(line.strip())
             if not text:
                 continue
             if text.startswith("/"):
                 if self._handle_command(text):
                     return 0
                 continue
-            try:
-                self._session_messages.append(Message(role="user", content=text))
-                state = run_agent(
-                    repo_path=self.repo_path,
-                    task=text,
-                    config=self.config,
-                    trace_dir=self.trace_dir,
-                    event_sink=self._handle_event,
-                )
-            except Exception as exc:  # noqa: BLE001 - interactive shell should report and continue
-                self.renderer.error(f"Error: {exc}")
-                continue
-            self._latest_trace = state.trace_path
-            self._session_messages.append(Message(role="assistant", content=state.final_answer))
-            self.renderer.assistant_delta(state.final_answer)
+            self._run_task(text)
 
     def _readline(self) -> str | None:
         if self.input_stream is sys.stdin:
@@ -118,15 +114,68 @@ class AgentRepl:
         if command == "/trace":
             self.renderer.status(f"Latest trace: {self._latest_trace or 'none'}")
             return False
+        if command.startswith("/mode"):
+            value = command.removeprefix("/mode").strip()
+            if not value:
+                self.renderer.status(f"Current mode: {self.mode.value}")
+                return False
+            try:
+                self.mode = normalize_mode(value, default=self.mode)
+            except ValueError as exc:
+                self.renderer.error(f"Error: {exc}")
+                return False
+            self.renderer.status(f"Mode set to {self.mode.value}.")
+            return False
+        if command.startswith("/plan"):
+            task = command.removeprefix("/plan").strip()
+            if task:
+                self._run_task(task, mode=AgentMode.PLAN)
+            else:
+                self._next_mode = AgentMode.PLAN
+                self.renderer.status("Next task will use Plan-and-Execute.")
+            return False
         self.renderer.status("Unknown command. Type /help for commands.")
         return False
+
+    def _run_task(self, text: str, *, mode: AgentMode | None = None) -> None:
+        selected_mode = mode or self._next_mode or self.mode
+        self._next_mode = None
+        try:
+            self._session_messages.append(Message(role="user", content=text))
+            state = run_agent(
+                repo_path=self.repo_path,
+                task=text,
+                test_command=self.test_command,
+                config=self.config,
+                trace_dir=self.trace_dir,
+                event_sink=self._handle_event,
+                mode=selected_mode,
+            )
+        except Exception as exc:  # noqa: BLE001 - interactive shell should report and continue
+            self.renderer.error(f"Error: {exc}")
+            return
+        self._latest_trace = state.trace_path
+        self._session_messages.append(Message(role="assistant", content=state.final_answer))
+        self.renderer.assistant_delta(state.final_answer)
 
     def _handle_event(self, event: object) -> None:
         event_name = getattr(event, "event", "")
         payload = getattr(event, "payload", {})
         if not isinstance(payload, dict):
             return
-        if event_name == "tool.started":
+        if event_name == "plan.started":
+            plan = _plan_from_payload(payload)
+            if plan is not None:
+                self.renderer.plan_started(plan)
+        elif event_name.startswith("plan.task."):
+            task = _task_from_payload(payload)
+            if task is not None:
+                self.renderer.plan_task_updated(task, plan_id=str(payload.get("plan_id", "")))
+        elif event_name in {"plan.completed", "plan.failed", "plan.cancelled", "plan.validation_failed"}:
+            plan = _plan_from_payload(payload)
+            if plan is not None:
+                self.renderer.plan_completed(plan)
+        elif event_name == "tool.started":
             invocation = ToolInvocation(
                 id=str(payload.get("id", "")),
                 name=str(payload.get("name", "")),
@@ -187,10 +236,60 @@ class AgentRepl:
                 f"system/project: rebuilt per run",
                 f"conversation: {estimate} estimated tokens",
                 f"tools: {len(definitions)} definitions",
+                f"default test command: {self.test_command or 'not configured'}",
                 f"compression trigger: {self._profile.compression_trigger_tokens}",
                 f"max tool result chars: {self._profile.max_tool_result_chars}",
             ]
         )
+
+
+def _plan_from_payload(payload: dict[str, object]) -> PlanState | None:
+    raw = payload.get("plan")
+    if not isinstance(raw, dict):
+        return None
+    return PlanState.from_dict(raw)
+
+
+def _task_from_payload(payload: dict[str, object]) -> PlanTask | None:
+    raw = payload.get("task")
+    if not isinstance(raw, dict):
+        return None
+    return PlanTask.from_dict(raw)
+
+
+def _discover_test_command(repo_path: Path) -> str | None:
+    for filename in ("AGENT.md", "AGENTS.md"):
+        path = repo_path / filename
+        if not path.exists():
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        command = _first_backticked_test_command(text)
+        if command:
+            return command
+    tests_dir = repo_path / "tests"
+    if tests_dir.exists() and any(tests_dir.glob("test*.py")):
+        return "python -m unittest discover -s tests -q"
+    return None
+
+
+def _first_backticked_test_command(text: str) -> str | None:
+    parts = text.split("`")
+    for index in range(1, len(parts), 2):
+        command = parts[index].strip()
+        if _looks_like_test_command(command):
+            return command
+    return None
+
+
+def _looks_like_test_command(command: str) -> bool:
+    normalized = " ".join(command.split())
+    return (
+        normalized.startswith("pytest")
+        or normalized.startswith("python -m pytest")
+        or normalized.startswith("python -m unittest")
+        or normalized in {"npm test", "pnpm test", "yarn test"}
+        or normalized.startswith("npm run test")
+    )
 
 
 def _tool_summary(tools: RepoTools) -> str:

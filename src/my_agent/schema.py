@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any, Iterable
 from uuid import uuid4
 
+from my_agent.text_safety import repair_surrogates, sanitize_json_value
+
 
 @dataclass(frozen=True)
 class ToolCall:
@@ -106,7 +108,7 @@ class AgentState:
             raise ValueError("AgentState.task must be non-empty.")
         return cls(
             repo_path=Path(repo_path),
-            task=str(task).strip(),
+            task=repair_surrogates(str(task)).strip(),
             run_id=run_id or str(uuid4()),
             test_command=test_command,
             max_steps=max_steps,
@@ -130,12 +132,14 @@ class TraceEvent:
             raise ValueError("TraceEvent.run_id must be non-empty.")
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "time": self.time,
-            "run_id": self.run_id,
-            "event": self.event,
-            "payload": self.payload,
-        }
+        return sanitize_json_value(
+            {
+                "time": self.time,
+                "run_id": self.run_id,
+                "event": self.event,
+                "payload": self.payload,
+            }
+        )
 
     def to_json_line(self) -> str:
         return json.dumps(self.to_dict(), ensure_ascii=False)

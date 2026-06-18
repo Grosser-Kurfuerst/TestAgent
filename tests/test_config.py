@@ -40,6 +40,10 @@ class AgentConfigTests(unittest.TestCase):
         self.assertEqual(config.command_timeout, 60)
         self.assertEqual(str(config.trace_dir), "traces")
         self.assertFalse(config.use_fake_llm)
+        self.assertEqual(config.plan_task_max_steps, 6)
+        self.assertEqual(config.plan_max_tasks, 12)
+        self.assertEqual(config.plan_max_replans, 1)
+        self.assertEqual(config.agent_mode, "auto")
 
     def test_openai_provider_requires_api_key(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -142,6 +146,34 @@ class AgentConfigTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "Unsupported"):
             config.require_valid_provider()
+
+    def test_plan_config_values_are_loaded_from_env_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / ".env"
+            env_file.write_text("", encoding="utf-8")
+
+            config = AgentConfig.from_env(
+                env={
+                    "AGENTCLI_PLAN_TASK_MAX_STEPS": "3",
+                    "AGENTCLI_PLAN_MAX_TASKS": "5",
+                    "AGENTCLI_PLAN_MAX_REPLANS": "0",
+                    "AGENTCLI_AGENT_MODE": "plan",
+                },
+                env_file=env_file,
+            )
+
+        self.assertEqual(config.plan_task_max_steps, 3)
+        self.assertEqual(config.plan_max_tasks, 5)
+        self.assertEqual(config.plan_max_replans, 0)
+        self.assertEqual(config.agent_mode, "plan")
+
+    def test_invalid_agent_mode_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / ".env"
+            env_file.write_text("AGENTCLI_AGENT_MODE=invalid\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "Unsupported AGENTCLI_AGENT_MODE"):
+                AgentConfig.from_env(env_file=env_file)
 
 
 if __name__ == "__main__":

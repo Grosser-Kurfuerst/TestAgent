@@ -10,6 +10,7 @@ from dotenv import dotenv_values
 
 TRUE_VALUES = {"1", "true", "yes", "on"}
 SUPPORTED_PROVIDERS = {"openai", "fake"}
+SUPPORTED_AGENT_MODES = {"react", "plan", "auto"}
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_ENV_FILE = PROJECT_ROOT / ".env"
 
@@ -40,6 +41,10 @@ class AgentConfig:
     retain_recent_user_turns: int = 3
     max_tool_result_chars: int = 12_000
     max_summary_input_chars: int = 60_000
+    plan_task_max_steps: int = 6
+    plan_max_tasks: int = 12
+    plan_max_replans: int = 1
+    agent_mode: str = "auto"
 
     @classmethod
     def from_env(
@@ -88,6 +93,19 @@ class AgentConfig:
             retain_recent_user_turns=_as_int(values.get("MY_AGENT_RETAIN_RECENT_TURNS"), 3),
             max_tool_result_chars=_as_int(values.get("MY_AGENT_MAX_TOOL_RESULT_CHARS"), 12_000),
             max_summary_input_chars=_as_int(values.get("MY_AGENT_MAX_SUMMARY_INPUT_CHARS"), 60_000),
+            plan_task_max_steps=_as_positive_int(
+                values.get("AGENTCLI_PLAN_TASK_MAX_STEPS", values.get("MY_AGENT_PLAN_TASK_MAX_STEPS")),
+                6,
+            ),
+            plan_max_tasks=_as_positive_int(
+                values.get("AGENTCLI_PLAN_MAX_TASKS", values.get("MY_AGENT_PLAN_MAX_TASKS")),
+                12,
+            ),
+            plan_max_replans=_as_nonnegative_int(
+                values.get("AGENTCLI_PLAN_MAX_REPLANS", values.get("MY_AGENT_PLAN_MAX_REPLANS")),
+                1,
+            ),
+            agent_mode=_agent_mode(values.get("AGENTCLI_AGENT_MODE", values.get("MY_AGENT_AGENT_MODE", "auto"))),
         )
 
     def require_valid_provider(self) -> None:
@@ -120,6 +138,28 @@ def _as_optional_int(value: str | None) -> int | None:
     if value is None or not value.strip():
         return None
     return int(value)
+
+
+def _as_positive_int(value: str | None, default: int) -> int:
+    parsed = _as_int(value, default)
+    if parsed < 1:
+        raise ValueError("plan configuration values must be >= 1.")
+    return parsed
+
+
+def _as_nonnegative_int(value: str | None, default: int) -> int:
+    parsed = _as_int(value, default)
+    if parsed < 0:
+        raise ValueError("plan configuration values must be >= 0.")
+    return parsed
+
+
+def _agent_mode(value: str | None) -> str:
+    normalized = (value or "auto").strip().lower()
+    if normalized not in SUPPORTED_AGENT_MODES:
+        supported = ", ".join(sorted(SUPPORTED_AGENT_MODES))
+        raise ValueError(f"Unsupported AGENTCLI_AGENT_MODE={value!r}. Supported modes: {supported}.")
+    return normalized
 
 
 def _config_values(

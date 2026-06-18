@@ -431,6 +431,113 @@ class RuntimeTests(unittest.TestCase):
             self.assertNotIn("needle_secret", state.repo_context)
             self.assertNotIn("credentials.json", state.repo_context)
 
+    def test_run_agent_mode_react_uses_react_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+
+            state = run_agent(
+                repo_path=repo,
+                task="Inspect calculator.py.",
+                config=fake_config(base / "traces"),
+                llm=FakeLLM(chat_responses=[ChatResponse(content="done", finish_reason="stop")]),
+                trace_dir=base / "traces",
+                mode="react",
+            )
+
+            events = read_trace(state.trace_path)
+            event_names = [event["event"] for event in events]
+            self.assertIn("run.started", event_names)
+            self.assertNotIn("plan.started", event_names)
+
+    def test_run_agent_mode_plan_uses_plan_execute_agent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+
+            state = run_agent(
+                repo_path=repo,
+                task="先检查 calculator.py，再修复 subtract，并运行测试",
+                test_command="python -m unittest discover -s tests -q",
+                config=fake_config(base / "traces"),
+                llm=FakeLLM(),
+                trace_dir=base / "traces",
+                mode="plan",
+            )
+
+            events = read_trace(state.trace_path)
+            self.assertEqual(state.stop_reason, "plan_completed")
+            self.assertIn("plan.started", [event["event"] for event in events])
+
+    def test_run_agent_mode_plan_honors_max_steps_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+
+            state = run_agent(
+                repo_path=repo,
+                task="先检查 calculator.py，再修复 subtract，并运行测试",
+                test_command="python -m unittest discover -s tests -q",
+                config=fake_config(base / "traces"),
+                llm=FakeLLM(),
+                trace_dir=base / "traces",
+                max_steps=1,
+                mode="plan",
+            )
+
+            self.assertEqual(state.stop_reason, "plan_failed")
+            child_traces = [path for path in (base / "traces").rglob("*.jsonl") if path != state.trace_path]
+            self.assertTrue(child_traces)
+            child_events = read_trace(child_traces[0])
+            completed = [event for event in child_events if event["event"] == "run.completed"]
+            self.assertEqual(completed[-1]["payload"]["stop_reason"], "max_steps_reached")
+
+    def test_run_agent_mode_auto_routes_complex_task_to_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+
+            state = run_agent(
+                repo_path=repo,
+                task="先检查 calculator.py，再修复 subtract，并运行测试",
+                test_command="python -m unittest discover -s tests -q",
+                config=fake_config(base / "traces"),
+                llm=FakeLLM(),
+                trace_dir=base / "traces",
+                mode="auto",
+            )
+
+            self.assertEqual(state.stop_reason, "plan_completed")
+            self.assertIn("Plan:", state.plan)
+
+    def test_auto_route_keeps_simple_task_on_react(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+
+            state = run_agent(
+                repo_path=repo,
+                task="读取 calculator.py",
+                config=fake_config(base / "traces"),
+                llm=FakeLLM(chat_responses=[ChatResponse(content="done", finish_reason="stop")]),
+                trace_dir=base / "traces",
+                mode="auto",
+            )
+
+            events = read_trace(state.trace_path)
+            self.assertEqual(state.stop_reason, "assistant_final")
+            self.assertNotIn("plan.started", [event["event"] for event in events])
+
     def assert_tool_results_are_paired(self, messages: list[dict[str, object]]) -> None:
         for index, message in enumerate(messages):
             if message.get("role") != "tool":
