@@ -45,6 +45,16 @@ class AgentConfig:
     plan_max_tasks: int = 12
     plan_max_replans: int = 1
     agent_mode: str = "auto"
+    memory_dir: Path = Path("~/.agentcli/memory").expanduser()
+    memory_short_term_tokens: int = 24_000
+    memory_short_term_entries: int = 500
+    memory_context_tokens: int = 2_000
+    memory_retrieval_limit: int = 8
+    memory_compression_trigger_ratio: float = 0.8
+    memory_retain_recent_turns: int = 3
+    memory_map_chunk_size: int = 5
+    memory_tool_result_chars: int = 500
+    memory_auto_extract: bool = True
 
     @classmethod
     def from_env(
@@ -106,6 +116,43 @@ class AgentConfig:
                 1,
             ),
             agent_mode=_agent_mode(values.get("AGENTCLI_AGENT_MODE", values.get("MY_AGENT_AGENT_MODE", "auto"))),
+            memory_dir=_memory_dir(values),
+            memory_short_term_tokens=_as_positive_int(
+                values.get("AGENTCLI_MEMORY_SHORT_TERM_TOKENS", values.get("MY_AGENT_MEMORY_SHORT_TERM_TOKENS")),
+                24_000,
+            ),
+            memory_short_term_entries=_as_positive_int(
+                values.get("AGENTCLI_MEMORY_SHORT_TERM_ENTRIES", values.get("MY_AGENT_MEMORY_SHORT_TERM_ENTRIES")),
+                500,
+            ),
+            memory_context_tokens=_as_positive_int(
+                values.get("AGENTCLI_MEMORY_CONTEXT_TOKENS", values.get("MY_AGENT_MEMORY_CONTEXT_TOKENS")),
+                2_000,
+            ),
+            memory_retrieval_limit=_as_positive_int(
+                values.get("AGENTCLI_MEMORY_RETRIEVAL_LIMIT", values.get("MY_AGENT_MEMORY_RETRIEVAL_LIMIT")),
+                8,
+            ),
+            memory_compression_trigger_ratio=_as_ratio(
+                values.get("AGENTCLI_MEMORY_COMPRESSION_TRIGGER_RATIO", values.get("MY_AGENT_MEMORY_COMPRESSION_TRIGGER_RATIO")),
+                0.8,
+            ),
+            memory_retain_recent_turns=_as_positive_int(
+                values.get("AGENTCLI_MEMORY_RETAIN_RECENT_TURNS", values.get("MY_AGENT_MEMORY_RETAIN_RECENT_TURNS")),
+                3,
+            ),
+            memory_map_chunk_size=_as_positive_int(
+                values.get("AGENTCLI_MEMORY_MAP_CHUNK_SIZE", values.get("MY_AGENT_MEMORY_MAP_CHUNK_SIZE")),
+                5,
+            ),
+            memory_tool_result_chars=_as_positive_int(
+                values.get("AGENTCLI_MEMORY_TOOL_RESULT_CHARS", values.get("MY_AGENT_MEMORY_TOOL_RESULT_CHARS")),
+                500,
+            ),
+            memory_auto_extract=_as_bool(
+                values.get("AGENTCLI_MEMORY_AUTO_EXTRACT", values.get("MY_AGENT_MEMORY_AUTO_EXTRACT", "")),
+                default=True,
+            ),
         )
 
     def require_valid_provider(self) -> None:
@@ -124,7 +171,9 @@ class AgentConfig:
             )
 
 
-def _as_bool(value: str) -> bool:
+def _as_bool(value: str | None, *, default: bool = False) -> bool:
+    if value is None or not value.strip():
+        return default
     return value.strip().lower() in TRUE_VALUES
 
 
@@ -160,6 +209,22 @@ def _agent_mode(value: str | None) -> str:
         supported = ", ".join(sorted(SUPPORTED_AGENT_MODES))
         raise ValueError(f"Unsupported AGENTCLI_AGENT_MODE={value!r}. Supported modes: {supported}.")
     return normalized
+
+
+def _as_ratio(value: str | None, default: float) -> float:
+    if value is None or not value.strip():
+        return default
+    parsed = float(value)
+    if not (0.0 < parsed <= 1.0):
+        raise ValueError("memory_compression_trigger_ratio must be in (0, 1].")
+    return parsed
+
+
+def _memory_dir(values: Mapping[str, str]) -> Path:
+    raw = values.get("AGENTCLI_MEMORY_DIR", values.get("MY_AGENT_MEMORY_DIR", ""))
+    if raw and raw.strip():
+        return Path(raw).expanduser()
+    return Path("~/.agentcli/memory").expanduser()
 
 
 def _config_values(

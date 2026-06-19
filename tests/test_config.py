@@ -175,6 +175,118 @@ class AgentConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Unsupported AGENTCLI_AGENT_MODE"):
                 AgentConfig.from_env(env_file=env_file)
 
+    def test_memory_config_defaults_from_empty_dotenv_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / ".env"
+            env_file.write_text("", encoding="utf-8")
+
+            config = AgentConfig.from_env(env_file=env_file)
+
+        self.assertEqual(config.memory_dir, Path("~/.agentcli/memory").expanduser())
+        self.assertEqual(config.memory_short_term_tokens, 24_000)
+        self.assertEqual(config.memory_short_term_entries, 500)
+        self.assertEqual(config.memory_context_tokens, 2_000)
+        self.assertEqual(config.memory_retrieval_limit, 8)
+        self.assertEqual(config.memory_compression_trigger_ratio, 0.8)
+        self.assertEqual(config.memory_retain_recent_turns, 3)
+        self.assertEqual(config.memory_map_chunk_size, 5)
+        self.assertEqual(config.memory_tool_result_chars, 500)
+        # memory_auto_extract defaults to True per plan §13 (line 544).
+        self.assertTrue(config.memory_auto_extract)
+
+    def test_memory_config_loaded_from_env_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / ".env"
+            env_file.write_text("", encoding="utf-8")
+
+            config = AgentConfig.from_env(
+                env={
+                    "AGENTCLI_MEMORY_DIR": str(Path(tmp) / "mem"),
+                    "AGENTCLI_MEMORY_SHORT_TERM_TOKENS": "1000",
+                    "AGENTCLI_MEMORY_SHORT_TERM_ENTRIES": "50",
+                    "AGENTCLI_MEMORY_CONTEXT_TOKENS": "512",
+                    "AGENTCLI_MEMORY_RETRIEVAL_LIMIT": "4",
+                    "AGENTCLI_MEMORY_COMPRESSION_TRIGGER_RATIO": "0.6",
+                    "AGENTCLI_MEMORY_RETAIN_RECENT_TURNS": "2",
+                    "AGENTCLI_MEMORY_MAP_CHUNK_SIZE": "3",
+                    "AGENTCLI_MEMORY_TOOL_RESULT_CHARS": "250",
+                    "AGENTCLI_MEMORY_AUTO_EXTRACT": "true",
+                },
+                env_file=env_file,
+            )
+
+        self.assertEqual(config.memory_dir, Path(tmp) / "mem")
+        self.assertEqual(config.memory_short_term_tokens, 1_000)
+        self.assertEqual(config.memory_short_term_entries, 50)
+        self.assertEqual(config.memory_context_tokens, 512)
+        self.assertEqual(config.memory_retrieval_limit, 4)
+        self.assertEqual(config.memory_compression_trigger_ratio, 0.6)
+        self.assertEqual(config.memory_retain_recent_turns, 2)
+        self.assertEqual(config.memory_map_chunk_size, 3)
+        self.assertEqual(config.memory_tool_result_chars, 250)
+        self.assertTrue(config.memory_auto_extract)
+
+    def test_memory_auto_extract_can_be_disabled_explicitly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / ".env"
+            env_file.write_text("", encoding="utf-8")
+
+            config = AgentConfig.from_env(
+                env={"AGENTCLI_MEMORY_AUTO_EXTRACT": "0"},
+                env_file=env_file,
+            )
+
+        self.assertFalse(config.memory_auto_extract)
+
+    def test_my_agent_prefixed_memory_vars_are_supported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / ".env"
+            env_file.write_text("", encoding="utf-8")
+
+            config = AgentConfig.from_env(
+                env={
+                    "MY_AGENT_MEMORY_CONTEXT_TOKENS": "1024",
+                    "MY_AGENT_MEMORY_AUTO_EXTRACT": "on",
+                },
+                env_file=env_file,
+            )
+
+        self.assertEqual(config.memory_context_tokens, 1_024)
+        self.assertTrue(config.memory_auto_extract)
+
+    def test_invalid_compression_ratio_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / ".env"
+            env_file.write_text("", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "memory_compression_trigger_ratio"):
+                AgentConfig.from_env(
+                    env={"AGENTCLI_MEMORY_COMPRESSION_TRIGGER_RATIO": "1.5"},
+                    env_file=env_file,
+                )
+
+    def test_zero_compression_ratio_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / ".env"
+            env_file.write_text("", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "memory_compression_trigger_ratio"):
+                AgentConfig.from_env(
+                    env={"AGENTCLI_MEMORY_COMPRESSION_TRIGGER_RATIO": "0"},
+                    env_file=env_file,
+                )
+
+    def test_non_positive_memory_int_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / ".env"
+            env_file.write_text("", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "plan configuration values must be >= 1."):
+                AgentConfig.from_env(
+                    env={"AGENTCLI_MEMORY_CONTEXT_TOKENS": "0"},
+                    env_file=env_file,
+                )
+
 
 if __name__ == "__main__":
     unittest.main()
