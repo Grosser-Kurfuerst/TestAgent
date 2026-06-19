@@ -6,12 +6,14 @@ from uuid import uuid4
 
 from my_agent.config import AgentConfig
 from my_agent.llm import AgentLLM
-from my_agent.llm.types import ChatResponse
+from my_agent.llm.types import ChatResponse, LLMToolCall, Message, MessageLike, messages_to_openai
+from my_agent.memory.compression import MemoryCompressor
 from my_agent.memory.long_term import LongTermMemoryStore, STORAGE_FILE
 from my_agent.memory.retrieval import MemoryRetriever
 from my_agent.memory.short_term import ShortTermMemory
 from my_agent.memory.token import estimate_tokens
 from my_agent.memory.types import (
+    CompressionResult,
     MemoryContext,
     MemoryEntry,
     MemoryScope,
@@ -24,8 +26,8 @@ from my_agent.tools import ToolExecutionResult
 class MemoryManager:
     """The single memory entry point the Agent depends on (plan §10).
 
-    Phase 3.1-3.2 ships the parts that do not require map-reduce compression
-    or LLM fact extraction:
+    Phase 3.1-3.4 ships the memory facade and the storage/retrieval/
+    compression pieces behind it:
 
     * :meth:`from_config` — build a manager wired to the config's memory dir.
     * :meth:`save_fact` — persist a durable fact to long-term memory.
@@ -35,9 +37,9 @@ class MemoryManager:
       :meth:`append_tool_result` — record short-term entries.
     * :meth:`status` — snapshot for ``/memory`` and debugging.
 
-    Methods that need the compressor or fact extractor (``prepare_messages``,
-    ``extract_facts``, ``fork_for_task``, ``clear_short_term`) are declared to
-    match the plan's facade contract and land in phases 3.3-3.5.
+    Runtime and TUI call sites are wired in later phases; this class owns the
+    implementation boundary now so those call sites do not depend on individual
+    storage, retrieval or compression helpers.
     """
 
     def __init__(
@@ -49,8 +51,10 @@ class MemoryManager:
         short_term: ShortTermMemory,
         long_term: LongTermMemoryStore,
         retriever: MemoryRetriever,
+        compressor: MemoryCompressor,
         project_key: str,
         session_id: str = "",
+        trace_sink: Any | None = None,
     ) -> None:
         self.config = config
         self.llm = llm
@@ -58,8 +62,10 @@ class MemoryManager:
         self.short_term = short_term
         self.long_term = long_term
         self.retriever = retriever
+        self.compressor = compressor
         self.project_key = project_key
         self.session_id = session_id
+        self._trace_sink = trace_sink
 
     @classmethod
     def from_config(
@@ -80,6 +86,12 @@ class MemoryManager:
             max_entries=config.memory_short_term_entries,
         )
         retriever = MemoryRetriever()
+        compressor = MemoryCompressor(
+            llm=llm,
+            chunk_size=config.memory_map_chunk_size,
+            retain_recent_turns=config.memory_retain_recent_turns,
+            max_input_chars=config.max_summary_input_chars,
+        )
         project_key = _normalize_project_key(repo_path)
         return cls(
             config=config,
@@ -88,8 +100,10 @@ class MemoryManager:
             short_term=short_term,
             long_term=long_term,
             retriever=retriever,
+            compressor=compressor,
             project_key=project_key,
             session_id=session_id or "",
+            trace_sink=trace_sink,
         )
 
     # ------------------------------------------------------------------ writes
@@ -113,6 +127,7 @@ class MemoryManager:
         metadata: dict[str, Any] = {}
         if tool_names:
             metadata["tool_calls"] = tool_names
+            metadata["tool_calls_payload"] = [call.to_openai() for call in response.tool_calls]
         entry = MemoryEntry.build(
             id=_new_id("assistant"),
             content=response.content or "",
@@ -139,6 +154,12 @@ class MemoryManager:
             token_count=estimate_tokens(content),
             project_key=self.project_key,
             run_id=run_id,
+            metadata={
+                "tool_call_id": result.id,
+                "tool_name": result.name,
+                "ok": result.ok,
+                "error_code": result.error_code,
+            },
         )
         self.short_term.append(entry)
         return entry
@@ -152,6 +173,8 @@ class MemoryManager:
         metadata: dict[str, Any] | None = None,
     ) -> tuple[MemoryEntry, bool]:
         project_key = "" if scope == MemoryScope.GLOBAL else self.project_key
+        fact_metadata = {"source": source}
+        fact_metadata.update(metadata or {})
         entry = MemoryEntry.build(
             id=_new_id("fact"),
             content=content,
@@ -160,7 +183,7 @@ class MemoryManager:
             source=source,
             token_count=estimate_tokens(content),
             project_key=project_key,
-            metadata=metadata,
+            metadata=fact_metadata,
         )
         return self.long_term.add(entry)
 
@@ -230,34 +253,316 @@ class MemoryManager:
             long_term_entries_detail=tuple(long_entries) if include_entries else (),
         )
 
-    # ------------------------------------------------------------------ deferred (phases 3.3-3.5)
+    # ------------------------------------------------------------------ facade operations
 
     def prepare_messages(
         self,
         *,
-        base_messages: list,
+        base_messages: list[MessageLike],
         query: str,
         tools: list[dict[str, Any]],
         force_compact: bool = False,
         focus: str = "",
-    ) -> tuple[list, MemoryContext, Any | None]:
-        raise NotImplementedError("prepare_messages() lands in phase 3.3-3.4 with the compressor.")
+    ) -> tuple[list[MessageLike], MemoryContext, Any | None]:
+        memory_context = self.build_context_for_query(query)
+        messages = _inject_memory_context(list(base_messages), memory_context)
+        messages.extend(_render_short_term_entries(self.short_term.all()))
+        estimated_prompt_tokens = _estimate_prompt_tokens(messages, tools)
+
+        compaction = None
+        if force_compact or estimated_prompt_tokens >= self._compression_threshold_tokens():
+            compaction = self._compact_if_needed(
+                tools=tools,
+                force=True,
+                focus=focus,
+                before_tokens=estimated_prompt_tokens,
+                trace_completed=False,
+            )
+            if compaction and compaction.compacted:
+                memory_context = self.build_context_for_query(query)
+                messages = _inject_memory_context(list(base_messages), memory_context)
+                messages.extend(_render_short_term_entries(self.short_term.all()))
+                after_prompt_tokens = _estimate_prompt_tokens(messages, tools)
+                self._trace(
+                    "memory.compacted",
+                    {
+                        "before_tokens": compaction.before_tokens,
+                        "after_tokens": after_prompt_tokens,
+                        "map_count": compaction.map_count,
+                        "reduce_used": compaction.reduce_used,
+                        "extracted_facts": compaction.extracted_facts,
+                        "fallback": compaction.fallback,
+                    },
+                )
+                compaction = CompressionResult(
+                    compacted=compaction.compacted,
+                    before_tokens=compaction.before_tokens,
+                    after_tokens=after_prompt_tokens,
+                    map_count=compaction.map_count,
+                    reduce_used=compaction.reduce_used,
+                    extracted_facts=compaction.extracted_facts,
+                    fallback=compaction.fallback,
+                )
+        self._trace(
+            "memory.prepared",
+            {
+                "message_count": len(messages),
+                "memory_hits": len(memory_context.hits),
+                "memory_tokens": memory_context.estimated_tokens,
+                "estimated_prompt_tokens": _estimate_prompt_tokens(messages, tools),
+                "compacted": bool(compaction and compaction.compacted),
+            },
+        )
+        return messages, memory_context, compaction
 
     def extract_facts(self, *, reason: str, run_id: str = "") -> list[MemoryEntry]:
-        raise NotImplementedError("extract_facts() lands in phase 3.3 with the fact extractor.")
+        return self._extract_and_store_facts(self.short_term.all(), reason=reason, run_id=run_id)
 
     def fork_for_task(self, *, session_id: str, run_id: str = "") -> "MemoryManager":
-        raise NotImplementedError("fork_for_task() lands in phase 3.5 with Plan runtime wiring.")
+        return MemoryManager(
+            config=self.config,
+            llm=self.llm,
+            repo_path=self.repo_path,
+            short_term=ShortTermMemory(
+                max_tokens=self.config.memory_short_term_tokens,
+                max_entries=self.config.memory_short_term_entries,
+            ),
+            long_term=self.long_term,
+            retriever=self.retriever,
+            compressor=MemoryCompressor(
+                llm=self.llm,
+                chunk_size=self.config.memory_map_chunk_size,
+                retain_recent_turns=self.config.memory_retain_recent_turns,
+                max_input_chars=self.config.max_summary_input_chars,
+            ),
+            project_key=self.project_key,
+            session_id=session_id,
+            trace_sink=self._trace_sink,
+        )
 
     def clear_short_term(self, *, extract_first: bool = True, reason: str = "clear") -> tuple[int, list[MemoryEntry]]:
+        extracted: list[MemoryEntry] = []
         if extract_first:
-            raise NotImplementedError("clear_short_term(extract_first=True) needs the fact extractor (phase 3.3).")
+            extracted = self.extract_facts(reason=reason)
         removed = self.short_term.clear()
-        return len(removed), removed
+        self._trace("memory.clear", {"removed": len(removed), "extracted_facts": len(extracted), "reason": reason})
+        return len(removed), extracted
+
+    def _compact_if_needed(
+        self,
+        *,
+        tools: list[dict[str, Any]],
+        force: bool = False,
+        focus: str = "",
+        before_tokens: int | None = None,
+        trace_completed: bool = True,
+    ) -> CompressionResult | None:
+        tools_tokens = estimate_tokens(tools)
+        before = before_tokens if before_tokens is not None else self.short_term.token_count() + tools_tokens
+        if not force and before < self._compression_threshold_tokens():
+            return None
+
+        old_entries = self.short_term.old_entries_for_compression(self.config.memory_retain_recent_turns)
+        if not old_entries:
+            return CompressionResult(False, before, before)
+
+        self._trace(
+            "memory.compaction_started",
+            {"before_tokens": before, "old_entries": len(old_entries), "force": force},
+        )
+        summary, fallback, map_count, reduce_used = self.compressor.compact_entries(old_entries, focus=focus)
+        if not summary.strip():
+            result = CompressionResult(False, before, before, map_count=map_count, reduce_used=reduce_used, fallback=fallback)
+            self._trace("memory.compaction_failed", {"reason": "empty_summary", "before_tokens": before})
+            return result
+
+        summary_content = "[Compressed memory summary]\n" + summary.strip()
+        summary_entry = MemoryEntry.build(
+            id=_new_id("summary"),
+            content=summary_content,
+            type=MemoryType.SUMMARY,
+            scope=MemoryScope.SESSION,
+            source="compressor",
+            token_count=estimate_tokens(summary_content),
+            project_key=self.project_key,
+            metadata={"map_count": map_count, "reduce_used": reduce_used, "fallback": fallback},
+        )
+        self.short_term.replace_old_entries_with_summary({entry.id for entry in old_entries}, summary_entry)
+        extracted = self._extract_and_store_facts(old_entries, reason="compression")
+        after = self.short_term.token_count() + tools_tokens
+
+        result = CompressionResult(
+            True,
+            before,
+            after,
+            map_count=map_count,
+            reduce_used=reduce_used,
+            extracted_facts=len(extracted),
+            fallback=fallback,
+        )
+        if trace_completed:
+            self._trace(
+                "memory.compacted",
+                {
+                    "before_tokens": before,
+                    "after_tokens": after,
+                    "map_count": map_count,
+                    "reduce_used": reduce_used,
+                    "extracted_facts": len(extracted),
+                    "fallback": fallback,
+                },
+            )
+        return result
+
+    def _compression_threshold_tokens(self) -> int:
+        return int(max(1, self.config.memory_short_term_tokens) * self.config.memory_compression_trigger_ratio)
+
+    def _extract_and_store_facts(
+        self,
+        entries: list[MemoryEntry],
+        *,
+        reason: str,
+        run_id: str = "",
+    ) -> list[MemoryEntry]:
+        if not self.config.memory_auto_extract:
+            return []
+        candidates = self.compressor.extract_facts(entries, reason=reason, project_key=self.project_key, run_id=run_id)
+        stored: list[MemoryEntry] = []
+        for candidate in candidates:
+            entry, created = self.long_term.add(candidate)
+            if created:
+                stored.append(entry)
+        if stored:
+            self._trace(
+                "memory.fact_extracted",
+                {"count": len(stored), "reason": reason, "run_id": run_id},
+            )
+        return stored
+
+    def _trace(self, event: str, payload: dict[str, Any]) -> None:
+        if self._trace_sink is None:
+            return
+        try:
+            self._trace_sink(event, payload)
+        except Exception:
+            pass
 
 
 def _new_id(prefix: str) -> str:
     return f"{prefix}_{uuid4().hex[:12]}"
+
+
+def _inject_memory_context(base_messages: list[MessageLike], context: MemoryContext) -> list[MessageLike]:
+    if not context.injected_text:
+        return base_messages
+    memory_message = Message(role="system", content=context.injected_text)
+    if base_messages and _role(base_messages[0]) == "system":
+        return [base_messages[0], memory_message, *base_messages[1:]]
+    return [memory_message, *base_messages]
+
+
+def _render_short_term_entries(entries: list[MemoryEntry]) -> list[MessageLike]:
+    rendered: list[MessageLike] = []
+    idx = 0
+    while idx < len(entries):
+        entry = entries[idx]
+        if entry.type == MemoryType.SUMMARY:
+            rendered.append(Message(role="user", content=entry.content))
+            idx += 1
+        elif entry.source == "user":
+            rendered.append(Message(role="user", content=entry.content))
+            idx += 1
+        elif entry.source == "assistant":
+            tool_calls = _tool_calls_from_metadata(entry.metadata)
+            if not tool_calls:
+                rendered.append(Message(role="assistant", content=entry.content or ""))
+                idx += 1
+                continue
+
+            tool_entries, next_idx = _contiguous_tool_entries(entries, idx + 1)
+            if _tool_entries_match_calls(tool_entries, tool_calls):
+                rendered.append(
+                    Message(
+                        role="assistant",
+                        content=entry.content or "",
+                        tool_calls=tool_calls,
+                    )
+                )
+                rendered.extend(_tool_message_from_entry(tool_entry) for tool_entry in tool_entries)
+            else:
+                rendered.append(Message(role="user", content=_incomplete_tool_call_memory(entry, tool_entries)))
+            idx = next_idx
+        elif entry.source.startswith("tool:"):
+            rendered.append(Message(role="user", content=f"[Tool result memory]\n{entry.content}"))
+            idx += 1
+        else:
+            rendered.append(Message(role="user", content=entry.content))
+            idx += 1
+    return rendered
+
+
+def _contiguous_tool_entries(entries: list[MemoryEntry], start: int) -> tuple[list[MemoryEntry], int]:
+    tool_entries: list[MemoryEntry] = []
+    idx = start
+    while idx < len(entries) and entries[idx].source.startswith("tool:"):
+        tool_entries.append(entries[idx])
+        idx += 1
+    return tool_entries, idx
+
+
+def _tool_entries_match_calls(tool_entries: list[MemoryEntry], tool_calls: list[LLMToolCall]) -> bool:
+    if len(tool_entries) != len(tool_calls):
+        return False
+    entry_ids = [str(entry.metadata.get("tool_call_id") or entry.id) for entry in tool_entries]
+    call_ids = [call.id for call in tool_calls]
+    return entry_ids == call_ids
+
+
+def _tool_message_from_entry(entry: MemoryEntry) -> Message:
+    return Message(
+        role="tool",
+        content=entry.content,
+        tool_call_id=str(entry.metadata.get("tool_call_id") or entry.id),
+        name=str(entry.metadata.get("tool_name") or entry.source.removeprefix("tool:")),
+    )
+
+
+def _incomplete_tool_call_memory(assistant: MemoryEntry, tool_entries: list[MemoryEntry]) -> str:
+    parts = ["[Incomplete tool-call memory]"]
+    if assistant.content:
+        parts.append(f"assistant: {assistant.content}")
+    tool_names = assistant.metadata.get("tool_calls")
+    if tool_names:
+        parts.append(f"tool_calls: {tool_names}")
+    for tool_entry in tool_entries:
+        parts.append(f"{tool_entry.source}: {tool_entry.content}")
+    return "\n".join(parts)
+
+
+def _tool_calls_from_metadata(metadata: dict[str, Any]) -> list[LLMToolCall]:
+    raw_calls = metadata.get("tool_calls_payload")
+    if not isinstance(raw_calls, list):
+        return []
+    calls: list[LLMToolCall] = []
+    for raw in raw_calls:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            calls.append(LLMToolCall.from_openai(raw))
+        except ValueError:
+            continue
+    return calls
+
+
+def _role(message: MessageLike) -> str:
+    if isinstance(message, Message):
+        return message.role
+    value = message.get("role", "") if isinstance(message, dict) else ""
+    return value if isinstance(value, str) else ""
+
+
+def _estimate_prompt_tokens(messages: list[MessageLike], tools: list[dict[str, Any]]) -> int:
+    return estimate_tokens({"messages": messages_to_openai(messages), "tools": tools or []})
 
 
 def _normalize_project_key(repo_path: Path) -> str:

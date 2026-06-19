@@ -90,6 +90,11 @@ class LongTermMemoryStore:
         entry = _normalize_fingerprint(entry)
         existing = self._find_duplicate(entry)
         if existing is not None:
+            upgraded = _manual_upgrade(existing, entry)
+            if upgraded is not None:
+                self._replace_entry(existing, upgraded)
+                self._persist()
+                return upgraded, False
             return existing, False
         self._entries.append(entry)
         self._persist()
@@ -141,6 +146,12 @@ class LongTermMemoryStore:
             if _is_duplicate(existing, entry):
                 return existing
         return None
+
+    def _replace_entry(self, existing: MemoryEntry, replacement: MemoryEntry) -> None:
+        for idx, entry in enumerate(self._entries):
+            if entry is existing or entry.id == existing.id:
+                self._entries[idx] = replacement
+                return
 
     def _dedupe_in_place(self) -> None:
         """Collapse accidental duplicates loaded from a hand-edited file.
@@ -201,6 +212,31 @@ def _normalize_fingerprint(entry: MemoryEntry) -> MemoryEntry:
     if entry.fingerprint == expected:
         return entry
     return replace(entry, fingerprint=expected)
+
+
+def _manual_upgrade(existing: MemoryEntry, candidate: MemoryEntry) -> MemoryEntry | None:
+    """Upgrade an auto-extracted duplicate when the user manually saves it.
+
+    Manual saves are treated as explicit user confirmation. The stable identity
+    and original timestamp are preserved so dedupe/time-decay semantics remain
+    intact, but the content/source/metadata are updated to the manual entry.
+    """
+    if not _is_manual_entry(candidate) or not _is_auto_extracted_entry(existing):
+        return None
+    return replace(
+        candidate,
+        id=existing.id,
+        created_at=existing.created_at,
+        fingerprint=existing.fingerprint,
+    )
+
+
+def _is_manual_entry(entry: MemoryEntry) -> bool:
+    return entry.source == "manual" or entry.metadata.get("source") == "manual"
+
+
+def _is_auto_extracted_entry(entry: MemoryEntry) -> bool:
+    return entry.source == "fact_extractor" or entry.metadata.get("source") == "fact_extractor"
 
 
 def _is_visible(entry: MemoryEntry, project_key: str) -> bool:
