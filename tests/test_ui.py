@@ -88,6 +88,7 @@ class ReplTests(unittest.TestCase):
         self.assertIn("/save", text)
         self.assertIn("/plan", text)
         self.assertIn("/mode", text)
+        self.assertIn("team", text)
         self.assertIn("read_file", text)
         self.assertIn("compression trigger", text)
         self.assertIn("No conversation history was compacted", text)
@@ -298,6 +299,29 @@ class ReplTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(run_agent_mock.call_args.kwargs["mode"], AgentMode.PLAN)
         self.assertIn("Mode set to plan.", output.getvalue())
+        self.assertEqual(errors.getvalue(), "")
+
+    def test_mode_command_accepts_team_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            write_runtime_repo(repo)
+            output = io.StringIO()
+            errors = io.StringIO()
+            repl = AgentRepl(
+                repo_path=repo,
+                config=fake_config(repo / "traces"),
+                trace_dir=repo / "traces",
+                renderer=PlainRenderer(output=output, errors=errors),
+                input_stream=io.StringIO("/mode team\nDo task\n/quit\n"),
+            )
+            final_state = SimpleNamespace(trace_path=repo / "traces" / "trace.jsonl", final_answer="done")
+
+            with mock.patch("my_agent.ui.repl.run_agent", return_value=final_state) as run_agent_mock:
+                exit_code = repl.run(show_banner=False)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(run_agent_mock.call_args.kwargs["mode"], AgentMode.TEAM)
+        self.assertIn("Mode set to team.", output.getvalue())
         self.assertEqual(errors.getvalue(), "")
 
     def test_renderer_displays_plan_status_icons(self) -> None:

@@ -29,7 +29,7 @@ HELP_TEXT = """Commands:
 /trace            Show the latest trace path.
 /plan <task>      Run a task with Plan-and-Execute.
 /plan             Run the next task with Plan-and-Execute.
-/mode <mode>      Set mode: react, plan, or auto.
+/mode <mode>      Set mode: react, plan, team, or auto.
 /quit             Exit.
 """
 

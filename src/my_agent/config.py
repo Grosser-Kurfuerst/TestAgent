@@ -10,7 +10,7 @@ from dotenv import dotenv_values
 
 TRUE_VALUES = {"1", "true", "yes", "on"}
 SUPPORTED_PROVIDERS = {"openai", "fake"}
-SUPPORTED_AGENT_MODES = {"react", "plan", "auto"}
+SUPPORTED_AGENT_MODES = {"react", "plan", "team", "auto"}
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_ENV_FILE = PROJECT_ROOT / ".env"
 
@@ -45,6 +45,13 @@ class AgentConfig:
     plan_max_tasks: int = 12
     plan_max_replans: int = 1
     agent_mode: str = "auto"
+    team_worker_count: int = 2
+    team_max_steps: int = 12
+    team_max_retries: int = 2
+    team_step_max_steps: int = 6
+    team_dependency_context_chars: int = 4_000
+    team_parallel_enabled: bool = True
+    team_allow_unapproved_results: bool = False
     memory_dir: Path = Path("~/.agentcli/memory").expanduser()
     memory_short_term_tokens: int = 24_000
     memory_short_term_entries: int = 500
@@ -116,6 +123,39 @@ class AgentConfig:
                 1,
             ),
             agent_mode=_agent_mode(values.get("AGENTCLI_AGENT_MODE", values.get("MY_AGENT_AGENT_MODE", "auto"))),
+            team_worker_count=_as_positive_int(
+                values.get("AGENTCLI_TEAM_WORKERS", values.get("MY_AGENT_TEAM_WORKERS")),
+                2,
+            ),
+            team_max_steps=_as_positive_int(
+                values.get("AGENTCLI_TEAM_MAX_STEPS", values.get("MY_AGENT_TEAM_MAX_STEPS")),
+                12,
+            ),
+            team_max_retries=_as_nonnegative_int(
+                values.get("AGENTCLI_TEAM_MAX_RETRIES", values.get("MY_AGENT_TEAM_MAX_RETRIES")),
+                2,
+            ),
+            team_step_max_steps=_as_positive_int(
+                values.get("AGENTCLI_TEAM_STEP_MAX_STEPS", values.get("MY_AGENT_TEAM_STEP_MAX_STEPS")),
+                6,
+            ),
+            team_dependency_context_chars=_as_positive_int(
+                values.get(
+                    "AGENTCLI_TEAM_DEPENDENCY_CONTEXT_CHARS",
+                    values.get("MY_AGENT_TEAM_DEPENDENCY_CONTEXT_CHARS"),
+                ),
+                4_000,
+            ),
+            team_parallel_enabled=_as_bool(
+                values.get("AGENTCLI_TEAM_PARALLEL", values.get("MY_AGENT_TEAM_PARALLEL", "")),
+                default=True,
+            ),
+            team_allow_unapproved_results=_as_bool(
+                values.get(
+                    "AGENTCLI_TEAM_ALLOW_UNAPPROVED_RESULTS",
+                    values.get("MY_AGENT_TEAM_ALLOW_UNAPPROVED_RESULTS", ""),
+                )
+            ),
             memory_dir=_memory_dir(values),
             memory_short_term_tokens=_as_positive_int(
                 values.get("AGENTCLI_MEMORY_SHORT_TERM_TOKENS", values.get("MY_AGENT_MEMORY_SHORT_TERM_TOKENS")),

@@ -31,9 +31,11 @@ class CodingAgentRuntime:
         self.memory_manager = memory_manager
 
     def run(self, state: AgentState, *, mode: AgentMode | str | None = None) -> AgentState:
+        selected = resolve_mode(mode, state.task, default=AgentMode.REACT)
+        if selected == AgentMode.TEAM:
+            raise RuntimeError("team mode not implemented")
         if not getattr(self.llm, "supports_tools", False):
             raise RuntimeError("The ReAct runtime requires an LLM client with native tool-call support.")
-        selected = resolve_mode(mode, state.task, default=AgentMode.REACT)
         if selected == AgentMode.PLAN:
             return PlanExecuteAgent(
                 config=self.config,

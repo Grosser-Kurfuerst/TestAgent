@@ -6,6 +6,7 @@ from enum import Enum
 class AgentMode(str, Enum):
     REACT = "react"
     PLAN = "plan"
+    TEAM = "team"
     AUTO = "auto"
 
 

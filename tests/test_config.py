@@ -44,6 +44,13 @@ class AgentConfigTests(unittest.TestCase):
         self.assertEqual(config.plan_max_tasks, 12)
         self.assertEqual(config.plan_max_replans, 1)
         self.assertEqual(config.agent_mode, "auto")
+        self.assertEqual(config.team_worker_count, 2)
+        self.assertEqual(config.team_max_steps, 12)
+        self.assertEqual(config.team_max_retries, 2)
+        self.assertEqual(config.team_step_max_steps, 6)
+        self.assertEqual(config.team_dependency_context_chars, 4_000)
+        self.assertTrue(config.team_parallel_enabled)
+        self.assertFalse(config.team_allow_unapproved_results)
 
     def test_openai_provider_requires_api_key(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -157,7 +164,7 @@ class AgentConfigTests(unittest.TestCase):
                     "AGENTCLI_PLAN_TASK_MAX_STEPS": "3",
                     "AGENTCLI_PLAN_MAX_TASKS": "5",
                     "AGENTCLI_PLAN_MAX_REPLANS": "0",
-                    "AGENTCLI_AGENT_MODE": "plan",
+                    "AGENTCLI_AGENT_MODE": "team",
                 },
                 env_file=env_file,
             )
@@ -165,7 +172,33 @@ class AgentConfigTests(unittest.TestCase):
         self.assertEqual(config.plan_task_max_steps, 3)
         self.assertEqual(config.plan_max_tasks, 5)
         self.assertEqual(config.plan_max_replans, 0)
-        self.assertEqual(config.agent_mode, "plan")
+        self.assertEqual(config.agent_mode, "team")
+
+    def test_team_config_values_are_loaded_from_env_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / ".env"
+            env_file.write_text("", encoding="utf-8")
+
+            config = AgentConfig.from_env(
+                env={
+                    "AGENTCLI_TEAM_WORKERS": "3",
+                    "AGENTCLI_TEAM_MAX_STEPS": "9",
+                    "AGENTCLI_TEAM_MAX_RETRIES": "1",
+                    "AGENTCLI_TEAM_STEP_MAX_STEPS": "4",
+                    "AGENTCLI_TEAM_DEPENDENCY_CONTEXT_CHARS": "1500",
+                    "AGENTCLI_TEAM_PARALLEL": "0",
+                    "AGENTCLI_TEAM_ALLOW_UNAPPROVED_RESULTS": "yes",
+                },
+                env_file=env_file,
+            )
+
+        self.assertEqual(config.team_worker_count, 3)
+        self.assertEqual(config.team_max_steps, 9)
+        self.assertEqual(config.team_max_retries, 1)
+        self.assertEqual(config.team_step_max_steps, 4)
+        self.assertEqual(config.team_dependency_context_chars, 1_500)
+        self.assertFalse(config.team_parallel_enabled)
+        self.assertTrue(config.team_allow_unapproved_results)
 
     def test_invalid_agent_mode_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

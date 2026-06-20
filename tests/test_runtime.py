@@ -601,6 +601,29 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(state.stop_reason, "assistant_final")
             self.assertNotIn("plan.started", [event["event"] for event in events])
 
+    def test_run_agent_mode_team_returns_clear_not_implemented_error(self) -> None:
+        class NoToolLLM:
+            supports_tools = False
+
+            def chat(self, messages: list[object], tools: list[dict[str, object]] | None = None) -> object:
+                raise AssertionError("team skeleton should fail before LLM use")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+
+            with self.assertRaisesRegex(RuntimeError, "team mode not implemented"):
+                run_agent(
+                    repo_path=repo,
+                    task="Use the team orchestrator.",
+                    config=fake_config(base / "traces"),
+                    llm=NoToolLLM(),
+                    trace_dir=base / "traces",
+                    mode="team",
+                )
+
     def assert_tool_results_are_paired(self, messages: list[dict[str, object]]) -> None:
         for index, message in enumerate(messages):
             if message.get("role") != "tool":

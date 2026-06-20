@@ -71,20 +71,59 @@ class CliTests(unittest.TestCase):
 
     def test_build_parser_includes_chat_command(self) -> None:
         args = build_parser().parse_args(
-            ["chat", "--repo", ".", "--mode", "auto", "--test-command", "python -m unittest", "--no-banner"]
+            ["chat", "--repo", ".", "--mode", "team", "--test-command", "python -m unittest", "--no-banner"]
         )
 
         self.assertEqual(args.command, "chat")
         self.assertEqual(args.repo, ".")
-        self.assertEqual(args.mode, "auto")
+        self.assertEqual(args.mode, "team")
         self.assertEqual(args.test_command, "python -m unittest")
         self.assertTrue(args.no_banner)
 
     def test_build_parser_includes_run_mode(self) -> None:
-        args = build_parser().parse_args(["run", "--task-file", str(DEFAULT_TASK_FILE), "--mode", "plan"])
+        args = build_parser().parse_args(["run", "--task-file", str(DEFAULT_TASK_FILE), "--mode", "team"])
 
         self.assertEqual(args.command, "run")
-        self.assertEqual(args.mode, "plan")
+        self.assertEqual(args.mode, "team")
+
+    def test_cli_config_prints_team_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = _write_env_file(
+                Path(tmp),
+                "MY_AGENT_LLM_PROVIDER=fake\nAGENTCLI_TEAM_WORKERS=4\nAGENTCLI_AGENT_MODE=team\n",
+            )
+            stream = io.StringIO()
+
+            with mock.patch("my_agent.config.DEFAULT_ENV_FILE", env_file):
+                with contextlib.redirect_stdout(stream):
+                    exit_code = main(["config"])
+
+        self.assertEqual(exit_code, 0)
+        output = json.loads(stream.getvalue())
+        self.assertEqual(output["agent_mode"], "team")
+        self.assertEqual(output["team_worker_count"], 4)
+        self.assertEqual(output["team_max_steps"], 12)
+
+    def test_cli_config_prints_allowed_environment_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = _write_env_file(Path(tmp), "MY_AGENT_LLM_PROVIDER=fake\n")
+            stream = io.StringIO()
+            env = {
+                "AGENTCLI_AGENT_MODE": "team",
+                "AGENTCLI_TEAM_WORKERS": "5",
+                "AGENTCLI_TEAM_MAX_RETRIES": "0",
+            }
+
+            with mock.patch.dict(os.environ, env, clear=True):
+                with mock.patch("my_agent.config.DEFAULT_ENV_FILE", env_file):
+                    with contextlib.redirect_stdout(stream):
+                        exit_code = main(["config"])
+
+        self.assertEqual(exit_code, 0)
+        output = json.loads(stream.getvalue())
+        self.assertEqual(output["agent_mode"], "team")
+        self.assertEqual(output["team_worker_count"], 5)
+        self.assertEqual(output["team_max_retries"], 0)
 
     def test_cli_run_executes_fake_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

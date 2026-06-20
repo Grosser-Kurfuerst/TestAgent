@@ -99,7 +99,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--trace-dir", help="Directory for JSONL traces.")
     run_parser.add_argument(
         "--mode",
-        choices=("react", "plan", "auto"),
+        choices=("react", "plan", "team", "auto"),
         default="react",
         help="Execution mode. Default: react.",
     )
@@ -110,7 +110,7 @@ def build_parser() -> argparse.ArgumentParser:
     chat_parser.add_argument("--test-command", help="Default test command for /plan and task runs.")
     chat_parser.add_argument(
         "--mode",
-        choices=("react", "plan", "auto"),
+        choices=("react", "plan", "team", "auto"),
         default=None,
         help="Interactive execution mode. Default: AGENTCLI_AGENT_MODE or auto.",
     )
@@ -307,7 +307,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "config":
         try:
-            config = AgentConfig.from_env()
+            config = AgentConfig.from_env(env=_tool_environment_overrides(os.environ))
             if args.check_api_key:
                 config.require_api_key()
         except (FileNotFoundError, ValueError, RuntimeError) as exc:
@@ -338,6 +338,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "plan_max_tasks": config.plan_max_tasks,
                     "plan_max_replans": config.plan_max_replans,
                     "agent_mode": config.agent_mode,
+                    "team_worker_count": config.team_worker_count,
+                    "team_max_steps": config.team_max_steps,
+                    "team_max_retries": config.team_max_retries,
+                    "team_step_max_steps": config.team_step_max_steps,
+                    "team_dependency_context_chars": config.team_dependency_context_chars,
+                    "team_parallel_enabled": config.team_parallel_enabled,
+                    "team_allow_unapproved_results": config.team_allow_unapproved_results,
                     "memory_dir": str(config.memory_dir),
                     "memory_short_term_tokens": config.memory_short_term_tokens,
                     "memory_short_term_entries": config.memory_short_term_entries,
@@ -482,6 +489,20 @@ def _tool_environment_overrides(env: Mapping[str, str]) -> dict[str, str]:
         "MY_AGENT_PLAN_MAX_TASKS",
         "MY_AGENT_PLAN_MAX_REPLANS",
         "MY_AGENT_AGENT_MODE",
+        "AGENTCLI_TEAM_WORKERS",
+        "AGENTCLI_TEAM_MAX_STEPS",
+        "AGENTCLI_TEAM_MAX_RETRIES",
+        "AGENTCLI_TEAM_STEP_MAX_STEPS",
+        "AGENTCLI_TEAM_DEPENDENCY_CONTEXT_CHARS",
+        "AGENTCLI_TEAM_PARALLEL",
+        "AGENTCLI_TEAM_ALLOW_UNAPPROVED_RESULTS",
+        "MY_AGENT_TEAM_WORKERS",
+        "MY_AGENT_TEAM_MAX_STEPS",
+        "MY_AGENT_TEAM_MAX_RETRIES",
+        "MY_AGENT_TEAM_STEP_MAX_STEPS",
+        "MY_AGENT_TEAM_DEPENDENCY_CONTEXT_CHARS",
+        "MY_AGENT_TEAM_PARALLEL",
+        "MY_AGENT_TEAM_ALLOW_UNAPPROVED_RESULTS",
         "AGENTCLI_MEMORY_DIR",
         "MY_AGENT_MEMORY_DIR",
         "AGENTCLI_MEMORY_SHORT_TERM_TOKENS",
