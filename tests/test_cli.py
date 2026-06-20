@@ -158,6 +158,29 @@ class CliTests(unittest.TestCase):
             self.assertIn("return a - b", (repo / "calculator.py").read_text(encoding="utf-8"))
             self.assertGreaterEqual(len(list(trace_dir.rglob("*.jsonl"))), 2)
 
+    def test_cli_chat_accepts_inline_fake_env_without_dotenv(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            missing_env = base / ".env.missing"
+            env = {
+                "MY_AGENT_LLM_PROVIDER": "fake",
+                "AGENTCLI_MEMORY_DIR": str(base / "memory"),
+            }
+
+            with mock.patch.dict(os.environ, env, clear=True):
+                with mock.patch("my_agent.config.DEFAULT_ENV_FILE", missing_env):
+                    with mock.patch("my_agent.cli.AgentRepl") as repl_cls:
+                        repl_cls.return_value.run.return_value = 0
+                        exit_code = main(["chat", "--repo", str(repo), "--no-banner"])
+
+            self.assertEqual(exit_code, 0)
+            config = repl_cls.call_args.kwargs["config"]
+            self.assertEqual(config.provider, "fake")
+            self.assertTrue(config.use_fake_llm)
+            self.assertEqual(config.memory_dir, base / "memory")
+
     def test_cli_run_without_api_key_returns_clear_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -355,6 +378,8 @@ class CliTests(unittest.TestCase):
 
 def _write_env_file(base: Path, content: str) -> Path:
     env_file = base / ".env"
+    if "AGENTCLI_MEMORY_DIR" not in content and "MY_AGENT_MEMORY_DIR" not in content:
+        content += f"AGENTCLI_MEMORY_DIR={base / 'memory'}\n"
     env_file.write_text(content, encoding="utf-8")
     return env_file
 

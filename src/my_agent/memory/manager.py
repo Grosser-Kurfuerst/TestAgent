@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -26,8 +27,8 @@ from my_agent.tools import ToolExecutionResult
 class MemoryManager:
     """The single memory entry point the Agent depends on (plan §10).
 
-    Phase 3.1-3.4 ships the memory facade and the storage/retrieval/
-    compression pieces behind it:
+    Phase 3 ships the memory facade and the storage/retrieval/compression
+    pieces behind it:
 
     * :meth:`from_config` — build a manager wired to the config's memory dir.
     * :meth:`save_fact` — persist a durable fact to long-term memory.
@@ -37,8 +38,7 @@ class MemoryManager:
       :meth:`append_tool_result` — record short-term entries.
     * :meth:`status` — snapshot for ``/memory`` and debugging.
 
-    Runtime and TUI call sites are wired in later phases; this class owns the
-    implementation boundary now so those call sites do not depend on individual
+    Runtime and TUI call sites depend on this facade instead of individual
     storage, retrieval or compression helpers.
     """
 
@@ -66,6 +66,20 @@ class MemoryManager:
         self.project_key = project_key
         self.session_id = session_id
         self._trace_sink = trace_sink
+        self.last_fact_extraction_error = ""
+        self.last_fact_save_errors: list[str] = []
+
+    def set_trace_sink(self, trace_sink: Any | None) -> tuple[Any | None, Any | None]:
+        previous = (self._trace_sink, getattr(self.long_term, "_trace_sink", None))
+        self._trace_sink = trace_sink
+        if hasattr(self.long_term, "_trace_sink"):
+            self.long_term._trace_sink = trace_sink
+        return previous
+
+    def restore_trace_sink(self, snapshot: tuple[Any | None, Any | None]) -> None:
+        self._trace_sink = snapshot[0]
+        if hasattr(self.long_term, "_trace_sink"):
+            self.long_term._trace_sink = snapshot[1]
 
     @classmethod
     def from_config(
@@ -144,7 +158,8 @@ class MemoryManager:
 
     def append_tool_result(self, result: ToolExecutionResult, *, run_id: str = "") -> MemoryEntry:
         truncated = _truncate_tool_result(result.content, self.config.memory_tool_result_chars)
-        content = f"[{result.name}] {truncated}"
+        content = _tool_result_message_content(result, truncated)
+        was_truncated = truncated != result.content
         entry = MemoryEntry.build(
             id=_new_id("tool"),
             content=content,
@@ -159,6 +174,12 @@ class MemoryManager:
                 "tool_name": result.name,
                 "ok": result.ok,
                 "error_code": result.error_code,
+                "blocked": result.blocked,
+                "timed_out": result.timed_out,
+                "retryable": result.retryable,
+                "elapsed_ms": result.elapsed_ms,
+                "truncated": was_truncated,
+                "original_content_chars": len(result.content),
             },
         )
         self.short_term.append(entry)
@@ -185,7 +206,40 @@ class MemoryManager:
             project_key=project_key,
             metadata=fact_metadata,
         )
-        return self.long_term.add(entry)
+        stored, created = self.long_term.add(entry)
+        self._trace(
+            "memory.saved",
+            {
+                "id": stored.id,
+                "created": created,
+                "scope": stored.scope.value,
+                "source": stored.source,
+                "tokens": stored.token_count,
+            },
+        )
+        return stored, created
+
+    def append_summary(
+        self,
+        content: str,
+        *,
+        source: str = "summary",
+        run_id: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> MemoryEntry:
+        entry = MemoryEntry.build(
+            id=_new_id("summary"),
+            content=content,
+            type=MemoryType.SUMMARY,
+            scope=MemoryScope.SESSION,
+            source=source,
+            token_count=estimate_tokens(content),
+            project_key=self.project_key,
+            run_id=run_id,
+            metadata=metadata,
+        )
+        self.short_term.append(entry)
+        return entry
 
     # ------------------------------------------------------------------ retrieval
 
@@ -214,7 +268,17 @@ class MemoryManager:
             limit=resolved_limit,
             include_short_term=include_short_term,
         )
-        return self.retriever.build_context(hits, max_tokens=resolved_tokens)
+        context = self.retriever.build_context(hits, max_tokens=resolved_tokens)
+        self._trace(
+            "memory.retrieved",
+            {
+                "query_chars": len(query),
+                "hits": len(context.hits),
+                "tokens": context.estimated_tokens,
+                "include_short_term": include_short_term,
+            },
+        )
+        return context
 
     def retrieve_hits(
         self,
@@ -316,7 +380,10 @@ class MemoryManager:
         return messages, memory_context, compaction
 
     def extract_facts(self, *, reason: str, run_id: str = "") -> list[MemoryEntry]:
-        return self._extract_and_store_facts(self.short_term.all(), reason=reason, run_id=run_id)
+        entries = self.short_term.all()
+        if run_id:
+            entries = [entry for entry in entries if entry.run_id == run_id]
+        return self._extract_and_store_facts(entries, reason=reason, run_id=run_id)
 
     def fork_for_task(self, *, session_id: str, run_id: str = "") -> "MemoryManager":
         return MemoryManager(
@@ -424,12 +491,35 @@ class MemoryManager:
         reason: str,
         run_id: str = "",
     ) -> list[MemoryEntry]:
+        self.last_fact_extraction_error = ""
+        self.last_fact_save_errors = []
         if not self.config.memory_auto_extract:
             return []
         candidates = self.compressor.extract_facts(entries, reason=reason, project_key=self.project_key, run_id=run_id)
+        if self.compressor.last_fact_error:
+            self.last_fact_extraction_error = self.compressor.last_fact_error
+            self._trace(
+                "memory.fact_extraction_failed",
+                {"reason": reason, "run_id": run_id, "error": self.last_fact_extraction_error},
+            )
+            return []
         stored: list[MemoryEntry] = []
         for candidate in candidates:
-            entry, created = self.long_term.add(candidate)
+            try:
+                entry, created = self.long_term.add(candidate)
+            except Exception as exc:  # noqa: BLE001 - automatic extraction must not break the agent loop
+                error = f"{type(exc).__name__}: {exc}"
+                self.last_fact_save_errors.append(error)
+                self._trace(
+                    "memory.save_failed",
+                    {
+                        "reason": reason,
+                        "run_id": run_id,
+                        "candidate_id": candidate.id,
+                        "error": error,
+                    },
+                )
+                continue
             if created:
                 stored.append(entry)
         if stored:
@@ -577,6 +667,23 @@ def _truncate_tool_result(content: str, limit: int) -> str:
     if limit < 1 or len(content) <= limit:
         return content
     return content[:limit] + "...(truncated)"
+
+
+def _tool_result_message_content(result: ToolExecutionResult, truncated_content: str) -> str:
+    payload: dict[str, Any] = {
+        "tool": result.name,
+        "ok": result.ok,
+        "blocked": result.blocked,
+        "timed_out": result.timed_out,
+        "retryable": result.retryable,
+        "error_code": result.error_code,
+        "elapsed_ms": result.elapsed_ms,
+        "content": truncated_content,
+    }
+    if truncated_content != result.content:
+        payload["truncated"] = True
+        payload["original_content_chars"] = len(result.content)
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
 
 __all__ = ["MemoryManager"]

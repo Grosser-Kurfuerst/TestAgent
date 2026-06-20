@@ -8,6 +8,7 @@ from typing import Callable
 from my_agent.config import AgentConfig
 from my_agent.indexer import RepoIndexer
 from my_agent.llm import AgentLLM
+from my_agent.memory import MemoryManager
 from my_agent.plan.executor import JsonPlanStore, PlanEvent, PlanExecutor, PlanStore, ReActTaskRunner
 from my_agent.plan.graph import PlanValidationError
 from my_agent.plan.planner import Planner
@@ -61,6 +62,7 @@ class PlanExecuteAgent:
         test_command: str | None = None,
         max_steps: int | None = None,
         require_approval: bool = False,
+        memory_manager: MemoryManager | None = None,
     ) -> AgentState:
         repo = Path(repo_path).resolve()
         effective_max_steps = max_steps if max_steps is not None else self.config.max_steps
@@ -72,83 +74,150 @@ class PlanExecuteAgent:
         )
         writer = TraceWriter.create(self.trace_dir, state.run_id)
         state.trace_path = writer.path
-        self._emit_trace(
-            writer,
-            state,
-            "plan.requested",
-            {"repo_path": str(repo), "goal": goal, "require_approval": require_approval},
-        )
-
+        memory, memory_trace_snapshot = self._memory_for_run(repo, state, writer, memory_manager)
         try:
-            repo_context = self._repo_context(repo, goal, writer, state)
-            plan = Planner(self.llm, max_tasks=self.config.plan_max_tasks).create_plan(goal, repo_context=repo_context)
-            plan.trace_path = str(writer.path)
-            plan.status = PlanStatus.AWAITING_APPROVAL
-            self.state_store.save(plan)
-            self._emit_plan_state(writer, state, "plan.created", plan)
-            self._emit_plan_state(writer, state, "plan.approval_requested", plan)
-
-            decision = self.review_handler(plan) if require_approval else PlanReviewDecision(PlanReviewAction.EXECUTE)
-            if decision.action == PlanReviewAction.CANCEL:
-                plan.status = PlanStatus.CANCELLED
-                plan.error = decision.feedback or "Plan execution was cancelled before running tasks."
-                self.state_store.save(plan)
-                self._emit_plan_state(writer, state, "plan.cancelled", plan)
-                return self._final_state(state, plan)
-            if decision.action == PlanReviewAction.SUPPLEMENT:
-                supplement = decision.feedback.strip()
-                if supplement:
-                    plan = Planner(self.llm, max_tasks=self.config.plan_max_tasks).create_plan(
-                        f"{goal}\n\nAdditional requirements:\n{supplement}",
-                        repo_context=repo_context,
-                    )
-                    plan.trace_path = str(writer.path)
-                    plan.status = PlanStatus.AWAITING_APPROVAL
-                    self.state_store.save(plan)
-                    self._emit_plan_state(writer, state, "plan.created", plan)
-
-            runner = ReActTaskRunner(
-                repo_path=repo,
-                config=self.config,
-                llm=self.llm,
-                trace_dir=self.trace_dir / plan.id,
-                command_timeout=self.command_timeout,
-                test_command=test_command,
-                default_max_steps=effective_max_steps,
-                plan_task_max_steps=self.config.plan_task_max_steps,
-                event_sink=self.event_sink,
-            )
-            executor = PlanExecutor(
-                runner,
-                store=self.state_store,
-                event_sink=lambda event: self._handle_executor_event(writer, state, event),
-                max_tasks=self.config.plan_max_tasks,
-            )
-            completed = executor.execute(plan)
-            return self._final_state(state, completed)
-        except PlanValidationError as exc:
-            plan = PlanState.create(goal=goal, summary="Plan validation failed.")
-            plan.status = PlanStatus.FAILED
-            plan.error = str(exc)
-            plan.trace_path = str(writer.path)
-            self.state_store.save(plan)
             self._emit_trace(
                 writer,
                 state,
-                "plan.validation_failed",
-                {"code": exc.code, "message": exc.message, "details": exc.details, "plan": plan.to_dict()},
+                "plan.requested",
+                {"repo_path": str(repo), "goal": goal, "require_approval": require_approval},
             )
-            self._emit_event("plan.validation_failed", plan)
-            return self._final_state(state, plan, stop_reason="plan_validation_failed")
-        except RuntimeError as exc:
-            plan = PlanState.create(goal=goal, summary="Plan failed before execution.")
-            plan.status = PlanStatus.FAILED
-            plan.error = str(exc)
-            plan.trace_path = str(writer.path)
-            self.state_store.save(plan)
-            self._emit_trace(writer, state, "plan.failed", {"error": str(exc), "plan": plan.to_dict()})
-            self._emit_event("plan.failed", plan)
-            return self._final_state(state, plan, stop_reason="plan_failed")
+            self._emit_memory_loaded(writer, state, memory)
+            memory.append_user_message(goal, run_id=state.run_id)
+
+            try:
+                repo_context = self._repo_context(repo, goal, writer, state)
+                planner_context = _append_memory_context(repo_context, memory.build_context_for_query(goal).injected_text)
+                plan = Planner(self.llm, max_tasks=self.config.plan_max_tasks).create_plan(
+                    goal,
+                    repo_context=planner_context,
+                )
+                plan.trace_path = str(writer.path)
+                plan.status = PlanStatus.AWAITING_APPROVAL
+                self.state_store.save(plan)
+                self._emit_plan_state(writer, state, "plan.created", plan)
+                self._emit_plan_state(writer, state, "plan.approval_requested", plan)
+
+                decision = self.review_handler(plan) if require_approval else PlanReviewDecision(PlanReviewAction.EXECUTE)
+                if decision.action == PlanReviewAction.CANCEL:
+                    plan.status = PlanStatus.CANCELLED
+                    plan.error = decision.feedback or "Plan execution was cancelled before running tasks."
+                    self.state_store.save(plan)
+                    self._emit_plan_state(writer, state, "plan.cancelled", plan)
+                    return self._final_state(state, plan)
+                if decision.action == PlanReviewAction.SUPPLEMENT:
+                    supplement = decision.feedback.strip()
+                    if supplement:
+                        plan = Planner(self.llm, max_tasks=self.config.plan_max_tasks).create_plan(
+                            f"{goal}\n\nAdditional requirements:\n{supplement}",
+                            repo_context=planner_context,
+                        )
+                        plan.trace_path = str(writer.path)
+                        plan.status = PlanStatus.AWAITING_APPROVAL
+                        self.state_store.save(plan)
+                        self._emit_plan_state(writer, state, "plan.created", plan)
+
+                runner = ReActTaskRunner(
+                    repo_path=repo,
+                    config=self.config,
+                    llm=self.llm,
+                    trace_dir=self.trace_dir / plan.id,
+                    command_timeout=self.command_timeout,
+                    test_command=test_command,
+                    default_max_steps=effective_max_steps,
+                    plan_task_max_steps=self.config.plan_task_max_steps,
+                    event_sink=self.event_sink,
+                    memory_manager=memory,
+                )
+                executor = PlanExecutor(
+                    runner,
+                    store=self.state_store,
+                    event_sink=lambda event: self._handle_executor_event(writer, state, event),
+                    max_tasks=self.config.plan_max_tasks,
+                )
+                completed = executor.execute(plan)
+                self._record_plan_task_summaries(memory, completed, run_id=state.run_id)
+                memory.extract_facts(reason="plan_completed", run_id=state.run_id)
+                return self._final_state(state, completed)
+            except PlanValidationError as exc:
+                plan = PlanState.create(goal=goal, summary="Plan validation failed.")
+                plan.status = PlanStatus.FAILED
+                plan.error = str(exc)
+                plan.trace_path = str(writer.path)
+                self.state_store.save(plan)
+                self._emit_trace(
+                    writer,
+                    state,
+                    "plan.validation_failed",
+                    {"code": exc.code, "message": exc.message, "details": exc.details, "plan": plan.to_dict()},
+                )
+                self._emit_event("plan.validation_failed", plan)
+                return self._final_state(state, plan, stop_reason="plan_validation_failed")
+            except RuntimeError as exc:
+                plan = PlanState.create(goal=goal, summary="Plan failed before execution.")
+                plan.status = PlanStatus.FAILED
+                plan.error = str(exc)
+                plan.trace_path = str(writer.path)
+                self.state_store.save(plan)
+                self._emit_trace(writer, state, "plan.failed", {"error": str(exc), "plan": plan.to_dict()})
+                self._emit_event("plan.failed", plan)
+                return self._final_state(state, plan, stop_reason="plan_failed")
+        finally:
+            if memory_trace_snapshot is not None:
+                memory.restore_trace_sink(memory_trace_snapshot)
+
+    def _memory_for_run(
+        self,
+        repo: Path,
+        state: AgentState,
+        writer: TraceWriter,
+        memory_manager: MemoryManager | None,
+    ) -> tuple[MemoryManager, tuple[object | None, object | None] | None]:
+        trace_sink = lambda event, payload: self._emit_trace(writer, state, event, payload)
+        if memory_manager is not None:
+            snapshot = memory_manager.set_trace_sink(trace_sink)
+            return memory_manager, snapshot
+        return (
+            MemoryManager.from_config(
+                config=self.config,
+                llm=self.llm,
+                repo_path=repo,
+                session_id=state.run_id,
+                trace_sink=trace_sink,
+            ),
+            None,
+        )
+
+    def _emit_memory_loaded(self, writer: TraceWriter, state: AgentState, memory: MemoryManager) -> None:
+        status = memory.status(include_entries=False)
+        self._emit_trace(
+            writer,
+            state,
+            "memory.loaded",
+            {
+                "storage_path": status.storage_path,
+                "short_term_entries": status.short_term_entries,
+                "long_term_entries": status.long_term_entries,
+                "long_term_tokens": status.long_term_tokens,
+            },
+        )
+
+    def _record_plan_task_summaries(self, memory: MemoryManager, plan: PlanState, *, run_id: str) -> None:
+        for task in plan.tasks:
+            if task.status not in {TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.SKIPPED, TaskStatus.CANCELLED}:
+                continue
+            details = task.result.strip() or task.error.strip() or "No result recorded."
+            memory.append_summary(
+                f"[plan task {task.id} {task.status.value}] {task.title}\n{details}",
+                source="plan",
+                run_id=run_id,
+                metadata={
+                    "plan_id": plan.id,
+                    "task_id": task.id,
+                    "task_status": task.status.value,
+                    "task_type": task.type.value,
+                },
+            )
 
     def _repo_context(self, repo: Path, goal: str, writer: TraceWriter, state: AgentState) -> str:
         snapshot = RepoIndexer(repo, skip_predicate=lambda path: should_skip_path(repo, path)).snapshot(query=goal)
@@ -241,6 +310,12 @@ def _task_counts(tasks: list[PlanTask]) -> dict[str, int]:
     for task in tasks:
         counts[task.status.value] = counts.get(task.status.value, 0) + 1
     return counts
+
+
+def _append_memory_context(repo_context: str, memory_context: str) -> str:
+    if not memory_context.strip():
+        return repo_context
+    return f"{repo_context.rstrip()}\n\nMemory context:\n{memory_context.strip()}"
 
 
 def _stop_reason_for_plan(plan: PlanState) -> str:

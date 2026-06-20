@@ -246,7 +246,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "run":
         task_payload = load_task(args.task_file)
         try:
-            config = AgentConfig.from_env(env=_tool_environment_overrides(os.environ))
+            config = AgentConfig.from_env(env=_tool_environment_overrides(os.environ), require_env_file=False)
         except (FileNotFoundError, ValueError, RuntimeError) as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 1
@@ -279,7 +279,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "chat":
         try:
-            config = AgentConfig.from_env(env=_tool_environment_overrides(os.environ))
+            config = AgentConfig.from_env(env=_tool_environment_overrides(os.environ), require_env_file=False)
             repo_path = _resolve_repo_path(args.repo)
             trace_dir = _resolve_trace_dir(args.trace_dir, config.trace_dir)
             return AgentRepl(
@@ -445,6 +445,17 @@ def _handle_tools_command(args: argparse.Namespace) -> int:
 
 def _tool_environment_overrides(env: Mapping[str, str]) -> dict[str, str]:
     keys = {
+        "MY_AGENT_LLM_PROVIDER",
+        "MY_AGENT_USE_FAKE_LLM",
+        "MY_AGENT_API_KEY",
+        "OPENAI_API_KEY",
+        "MY_AGENT_BASE_URL",
+        "OPENAI_BASE_URL",
+        "MY_AGENT_MODEL",
+        "MY_AGENT_TEMPERATURE",
+        "MY_AGENT_MAX_STEPS",
+        "MY_AGENT_COMMAND_TIMEOUT",
+        "MY_AGENT_TRACE_DIR",
         "AGENTCLI_ENABLE_PROJECT_TOOLS",
         "AGENTCLI_ENABLE_PROJECT_PLUGINS",
         "AGENTCLI_TOOL_CONFIGS",

@@ -327,6 +327,38 @@ class LongTermMemoryStoreTests(unittest.TestCase):
             self.assertIs(stored, built)
             self.assertEqual(stored.fingerprint, built.fingerprint)
 
+    def test_manual_upgrade_rolls_back_when_persist_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(Path(tmp))
+            store.load()
+            auto = _fact(
+                "用户偏好：回答中文",
+                id="auto",
+                source="fact_extractor",
+                created_at=NOW - timedelta(days=1),
+            )
+            store.add(auto)
+            original_persist = store._persist
+
+            def fail_persist() -> None:
+                raise OSError("disk full")
+
+            store._persist = fail_persist  # type: ignore[method-assign]
+            with self.assertRaises(OSError):
+                store.add(_fact("用户偏好：回答中文", id="manual", source="manual", created_at=NOW))
+
+            restored = store.all()[0]
+            self.assertEqual(restored.id, "auto")
+            self.assertEqual(restored.source, "fact_extractor")
+            self.assertEqual(restored.created_at, NOW - timedelta(days=1))
+
+            store._persist = original_persist  # type: ignore[method-assign]
+            upgraded, created = store.add(_fact("用户偏好：回答中文", id="manual", source="manual", created_at=NOW))
+            self.assertFalse(created)
+            self.assertEqual(upgraded.id, "auto")
+            self.assertEqual(upgraded.source, "manual")
+            self.assertEqual(upgraded.created_at, NOW - timedelta(days=1))
+
     def test_reload_preserves_count_and_created_at(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = self._store(Path(tmp))

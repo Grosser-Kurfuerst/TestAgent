@@ -69,6 +69,13 @@ class RecordingMemoryLLM:
         return ChatResponse(content="noop")
 
 
+class FailingFactLLM:
+    supports_tools = True
+
+    def chat(self, messages: list[MessageLike], tools: list[dict[str, object]] | None = None) -> ChatResponse:
+        raise RuntimeError("fact llm failed")
+
+
 def _messages_text(messages: list[MessageLike]) -> str:
     lines: list[str] = []
     for message in messages:
@@ -235,11 +242,30 @@ class MemoryManagerAppendTests(unittest.TestCase):
             )
             long_output = "x" * 500
             manager.append_tool_result(
-                ToolExecutionResult(id="c1", name="run_tests", ok=True, content=long_output)
+                ToolExecutionResult(
+                    id="c1",
+                    name="run_tests",
+                    ok=False,
+                    content=long_output,
+                    elapsed_ms=123,
+                    error_code="tool_failed",
+                    retryable=True,
+                    blocked=True,
+                    timed_out=True,
+                )
             )
             entry = manager.short_term.all()[0]
-            self.assertLessEqual(len(entry.content), 50)
-            self.assertIn("truncated", entry.content)
+            payload = json.loads(entry.content)
+            self.assertEqual(payload["tool"], "run_tests")
+            self.assertFalse(payload["ok"])
+            self.assertTrue(payload["blocked"])
+            self.assertTrue(payload["timed_out"])
+            self.assertTrue(payload["retryable"])
+            self.assertEqual(payload["error_code"], "tool_failed")
+            self.assertEqual(payload["elapsed_ms"], 123)
+            self.assertEqual(payload["content"], "x" * 10 + "...(truncated)")
+            self.assertTrue(payload["truncated"])
+            self.assertEqual(payload["original_content_chars"], 500)
 
 
 class MemoryManagerStatusTests(unittest.TestCase):
@@ -312,7 +338,8 @@ class MemoryManagerCompressionTests(unittest.TestCase):
             self.assertIn("user turn 10", contents)
             self.assertIn("user turn 11", contents)
             self.assertIn("assistant turn 0", llm.map_prompts[0])
-            self.assertIn("[read_file] result 0", llm.map_prompts[0])
+            self.assertIn('"tool": "read_file"', llm.map_prompts[0])
+            self.assertIn('"content": "result 0"', llm.map_prompts[0])
 
     def test_prepare_messages_auto_compacts_above_configured_threshold(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -531,6 +558,10 @@ class MemoryManagerFacadeTests(unittest.TestCase):
             tool_messages = [message for message in messages if isinstance(message, Message) and message.role == "tool"]
             self.assertEqual(assistant_messages[-1].tool_calls[0].name, "read_file")
             self.assertEqual(tool_messages[-1].tool_call_id, "call_read")
+            tool_payload = json.loads(tool_messages[-1].content or "{}")
+            self.assertTrue(tool_payload["ok"])
+            self.assertEqual(tool_payload["error_code"], "")
+            self.assertEqual(tool_payload["content"], "def subtract(a, b): return a - b")
 
     def test_manual_save_upgrades_existing_auto_extracted_fact(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -678,6 +709,117 @@ class MemoryManagerFacadeTests(unittest.TestCase):
             self.assertEqual(len(extracted), 1)
             self.assertEqual(len(manager.short_term), 0)
             self.assertIn("用户偏好：回答中文", manager.long_term.all(project_key=str(repo.resolve()))[0].content)
+
+    def test_extract_facts_does_not_raise_when_auto_save_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            traces: list[tuple[str, dict[str, object]]] = []
+            fact_response = json.dumps(
+                [{"content": "用户偏好：回答中文", "scope": "project", "confidence": 0.9}],
+                ensure_ascii=False,
+            )
+            manager = MemoryManager.from_config(
+                config=_config(Path(tmp) / "memory"),
+                llm=RecordingMemoryLLM(fact_response=fact_response),
+                repo_path=repo,
+                trace_sink=lambda event, payload: traces.append((event, payload)),
+            )
+            manager.append_user_message("用户偏好：回答中文", run_id="run_1")
+
+            def fail_add(entry: object) -> tuple[object, bool]:
+                raise OSError("disk full")
+
+            manager.long_term.add = fail_add  # type: ignore[method-assign]
+
+            extracted = manager.extract_facts(reason="run_completed", run_id="run_1")
+
+            self.assertEqual(extracted, [])
+            self.assertTrue(manager.last_fact_save_errors)
+            self.assertIn("memory.save_failed", [event for event, _ in traces])
+
+    def test_extract_facts_rolls_back_memory_when_persist_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            traces: list[tuple[str, dict[str, object]]] = []
+            fact_response = json.dumps(
+                [{"content": "用户偏好：回答中文", "scope": "project", "confidence": 0.9}],
+                ensure_ascii=False,
+            )
+            manager = MemoryManager.from_config(
+                config=_config(Path(tmp) / "memory"),
+                llm=RecordingMemoryLLM(fact_response=fact_response),
+                repo_path=repo,
+                trace_sink=lambda event, payload: traces.append((event, payload)),
+            )
+            manager.append_user_message("用户偏好：回答中文", run_id="run_1")
+            original_persist = manager.long_term._persist
+
+            def fail_persist() -> None:
+                raise OSError("disk full")
+
+            manager.long_term._persist = fail_persist  # type: ignore[method-assign]
+
+            extracted = manager.extract_facts(reason="run_completed", run_id="run_1")
+
+            self.assertEqual(extracted, [])
+            self.assertFalse(any("用户偏好：回答中文" in entry.content for entry in manager.long_term.all()))
+            self.assertIn("memory.save_failed", [event for event, _ in traces])
+            self.assertNotIn("memory.fact_extracted", [event for event, _ in traces])
+
+            manager.long_term._persist = original_persist  # type: ignore[method-assign]
+            entry, created = manager.save_fact("用户偏好：回答中文")
+            self.assertTrue(created)
+            self.assertIn("用户偏好：回答中文", entry.content)
+
+    def test_extract_facts_records_llm_failure_without_raising(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            traces: list[tuple[str, dict[str, object]]] = []
+            manager = MemoryManager.from_config(
+                config=_config(Path(tmp) / "memory"),
+                llm=FailingFactLLM(),
+                repo_path=repo,
+                trace_sink=lambda event, payload: traces.append((event, payload)),
+            )
+            manager.append_user_message("用户偏好：回答中文")
+
+            count, extracted = manager.clear_short_term(extract_first=True)
+
+            self.assertEqual(count, 1)
+            self.assertEqual(extracted, [])
+            self.assertIn("RuntimeError: fact llm failed", manager.last_fact_extraction_error)
+            self.assertIn("memory.fact_extraction_failed", [event for event, _ in traces])
+            self.assertEqual(len(manager.short_term), 0)
+
+    def test_run_completed_fact_extraction_only_uses_matching_run_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            fact_response = json.dumps(
+                [
+                    {"content": "用户偏好：回答中文", "scope": "project", "confidence": 0.95},
+                    {"content": "项目 AgentCli 使用 Python src 布局", "scope": "project", "confidence": 0.9},
+                ],
+                ensure_ascii=False,
+            )
+            manager = MemoryManager.from_config(
+                config=_config(Path(tmp) / "memory"),
+                llm=RecordingMemoryLLM(fact_response=fact_response),
+                repo_path=repo,
+            )
+            manager.append_user_message("用户偏好：回答中文", run_id="old")
+            manager.append_user_message("项目 AgentCli 使用 Python src 布局", run_id="new")
+
+            extracted = manager.extract_facts(reason="run_completed", run_id="new")
+
+            contents = [entry.content for entry in extracted]
+            self.assertIn("项目 AgentCli 使用 Python src 布局", contents)
+            prompts = manager.compressor.llm.fact_prompts  # type: ignore[union-attr]
+            self.assertEqual(len(prompts), 1)
+            self.assertNotIn("用户偏好：回答中文", prompts[0])
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ add_src_to_path()
 
 from my_agent.llm import FakeLLM
 from my_agent.llm.types import ChatResponse, LLMToolCall
+from my_agent.memory import MemoryManager, MemoryScope
 from my_agent.plan import (
     AgentMode,
     InMemoryPlanStore,
@@ -85,6 +86,7 @@ def read_trace(path: Path) -> list[dict[str, object]]:
 
 
 def fake_config(trace_dir: Path | None = None, **overrides: object) -> AgentConfig:
+    resolved_trace_dir = trace_dir or Path("traces")
     values = {
         "provider": "fake",
         "api_key": "",
@@ -93,7 +95,8 @@ def fake_config(trace_dir: Path | None = None, **overrides: object) -> AgentConf
         "temperature": 0.0,
         "max_steps": 8,
         "command_timeout": 60,
-        "trace_dir": trace_dir or Path("traces"),
+        "trace_dir": resolved_trace_dir,
+        "memory_dir": resolved_trace_dir.parent / "memory",
         "use_fake_llm": True,
     }
     values.update(overrides)
@@ -537,6 +540,31 @@ class ReActTaskRunnerTests(unittest.TestCase):
         )
         self.assertEqual(capped.max_steps_for_task(PlanTask("task_1", "Inspect", "Inspect", type=TaskType.INSPECT)), 1)
 
+    def test_react_task_runner_uses_forked_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+            config = fake_config(base / "traces", memory_dir=base / "memory")
+            memory = MemoryManager.from_config(config=config, llm=FakeLLM(), repo_path=repo)
+            plan = plan_with([PlanTask("task_1", "Inspect", "Inspect calculator", type=TaskType.INSPECT)])
+            runner = ReActTaskRunner(
+                repo_path=repo,
+                config=config,
+                llm=FakeLLM(),
+                trace_dir=base / "traces",
+                command_timeout=60,
+                memory_manager=memory,
+            )
+
+            result = PlanExecutor(runner).execute(plan)
+
+            self.assertEqual(result.status, PlanStatus.SUCCEEDED)
+            parent_contents = "\n".join(entry.content for entry in memory.short_term.all())
+            self.assertNotIn("[read_file]", parent_contents)
+            self.assertEqual(len(memory.short_term.all()), 0)
+
     def test_executor_records_task_trace_path_and_child_trace_events(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -617,6 +645,71 @@ class PlanExecuteAgentTests(unittest.TestCase):
             self.assertIn("status=succeeded", state.review)
             self.assertIn("Plan succeeded", state.final_answer)
             self.assertIn("return a - b", (repo / "calculator.py").read_text(encoding="utf-8"))
+
+    def test_plan_agent_injects_memory_and_records_parent_task_summaries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+            config = fake_config(base / "traces", memory_dir=base / "memory")
+            llm = FakeLLM()
+            memory = MemoryManager.from_config(config=config, llm=llm, repo_path=repo)
+            memory.save_fact(
+                "Project calculator.py uses subtract tests.",
+                scope=MemoryScope.PROJECT,
+            )
+            agent = PlanExecuteAgent(
+                config=config,
+                llm=llm,
+                trace_dir=base / "traces",
+                command_timeout=60,
+            )
+
+            state = agent.run(
+                repo_path=repo,
+                goal="先检查 calculator.py，再修复 subtract，并运行测试",
+                test_command="python -m unittest discover -s tests -q",
+                memory_manager=memory,
+            )
+
+            self.assertEqual(state.stop_reason, "plan_completed")
+            parent_contents = "\n".join(entry.content for entry in memory.short_term.all())
+            self.assertIn("[plan task task_1 succeeded]", parent_contents)
+            self.assertIn("[plan task task_2 succeeded]", parent_contents)
+            self.assertNotIn("[read_file]", parent_contents)
+            event_names = [event["event"] for event in read_trace(state.trace_path)]
+            self.assertIn("memory.loaded", event_names)
+            self.assertIn("memory.retrieved", event_names)
+
+    def test_external_memory_trace_sink_is_restored_after_plan_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+            config = fake_config(base / "traces", memory_dir=base / "memory")
+            memory = MemoryManager.from_config(config=config, llm=FakeLLM(), repo_path=repo)
+            agent = PlanExecuteAgent(
+                config=config,
+                llm=FakeLLM(),
+                trace_dir=base / "traces",
+                command_timeout=60,
+            )
+
+            state = agent.run(
+                repo_path=repo,
+                goal="先检查 calculator.py，再修复 subtract，并运行测试",
+                test_command="python -m unittest discover -s tests -q",
+                memory_manager=memory,
+            )
+            before = read_trace(state.trace_path)
+
+            memory.save_fact("用户偏好：回答中文", scope=MemoryScope.PROJECT)
+
+            after = read_trace(state.trace_path)
+            self.assertEqual(after, before)
+            self.assertNotIn("memory.saved", [event["event"] for event in after])
 
     def test_plan_agent_uses_configured_max_tasks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

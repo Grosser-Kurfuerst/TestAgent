@@ -92,12 +92,22 @@ class LongTermMemoryStore:
         if existing is not None:
             upgraded = _manual_upgrade(existing, entry)
             if upgraded is not None:
+                snapshot = list(self._entries)
                 self._replace_entry(existing, upgraded)
-                self._persist()
+                try:
+                    self._persist()
+                except Exception:
+                    self._entries = snapshot
+                    raise
                 return upgraded, False
             return existing, False
+        snapshot = list(self._entries)
         self._entries.append(entry)
-        self._persist()
+        try:
+            self._persist()
+        except Exception:
+            self._entries = snapshot
+            raise
         return entry, True
 
     def all(self, *, project_key: str | None = None) -> list[MemoryEntry]:

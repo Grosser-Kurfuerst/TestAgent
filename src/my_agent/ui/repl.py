@@ -6,9 +6,10 @@ from pathlib import Path
 from typing import TextIO
 
 from my_agent.config import AgentConfig
-from my_agent.context import ContextProfile, ConversationCompactor
+from my_agent.context import ContextProfile
 from my_agent.llm import build_llm
 from my_agent.llm.types import Message
+from my_agent.memory import MemoryManager, MemoryScope
 from my_agent.plan import AgentMode, PlanState, PlanTask, normalize_mode
 from my_agent.runtime import run_agent
 from my_agent.text_safety import repair_surrogates
@@ -20,9 +21,11 @@ HELP_TEXT = """Commands:
 /help             Show this help.
 /tools            List enabled tools with source and risk.
 /tools reload     Reload tools from configuration and plugins.
-/context          Show context budget estimates.
+/context          Show memory and context budget estimates.
+/memory           Show memory system status and long-term entries.
+/save <fact>      Save a durable fact to long-term memory.
 /compact [focus]  Compact session context for the supplied focus.
-/clear            Clear session context.
+/clear            Extract facts, then clear short-term memory.
 /trace            Show the latest trace path.
 /plan <task>      Run a task with Plan-and-Execute.
 /plan             Run the next task with Plan-and-Execute.
@@ -53,28 +56,31 @@ class AgentRepl:
         self.test_command = test_command or _discover_test_command(self.repo_path)
         self._tools = RepoTools(self.repo_path, timeout=config.command_timeout, config=config)
         self._profile = ContextProfile.from_config(config)
-        self._compactor = ConversationCompactor(self._profile, llm=build_llm(config))
-        self._session_messages: list[object] = []
+        self._memory = MemoryManager.from_config(config=config, llm=build_llm(config), repo_path=self.repo_path)
         self._latest_trace: Path | None = None
+        self._shutdown_complete = False
 
     def run(self, *, show_banner: bool = True) -> int:
-        if show_banner:
-            self.renderer.banner(self._startup_info())
-        while True:
-            try:
-                line = self._readline()
-            except EOFError:
-                return 0
-            if line is None:
-                return 0
-            text = repair_surrogates(line.strip())
-            if not text:
-                continue
-            if text.startswith("/"):
-                if self._handle_command(text):
+        try:
+            if show_banner:
+                self.renderer.banner(self._startup_info())
+            while True:
+                try:
+                    line = self._readline()
+                except EOFError:
                     return 0
-                continue
-            self._run_task(text)
+                if line is None:
+                    return 0
+                text = repair_surrogates(line.strip())
+                if not text:
+                    continue
+                if text.startswith("/"):
+                    if self._handle_command(text):
+                        return 0
+                    continue
+                self._run_task(text)
+        finally:
+            self._shutdown()
 
     def _readline(self) -> str | None:
         if self.input_stream is sys.stdin:
@@ -97,10 +103,22 @@ class AgentRepl:
         if command == "/context":
             self.renderer.status(self._context_text())
             return False
+        if command == "/memory":
+            self.renderer.status(self._memory_text())
+            return False
+        if command.startswith("/save"):
+            self._handle_save(command)
+            return False
         if command.startswith("/compact"):
             focus = command.removeprefix("/compact").strip()
-            result = self._compactor.compact_now(self._session_messages, self._tools.tool_definitions(), focus=focus)
-            if result.compacted:
+            _, _, result = self._memory.prepare_messages(
+                base_messages=[Message(role="system", content="Memory maintenance request.")],
+                query=focus or "session context",
+                tools=self._tools.tool_definitions(),
+                force_compact=True,
+                focus=focus,
+            )
+            if result and result.compacted:
                 self.renderer.status(
                     f"Compacted context: {result.before_tokens} -> {result.after_tokens} estimated tokens."
                 )
@@ -108,8 +126,11 @@ class AgentRepl:
                 self.renderer.status("No conversation history was compacted.")
             return False
         if command == "/clear":
-            self._session_messages.clear()
-            self.renderer.status("Conversation context cleared.")
+            removed, extracted = self._memory.clear_short_term(extract_first=True, reason="clear_command")
+            if self._memory.last_fact_extraction_error:
+                self.renderer.status(f"Fact extraction failed; cleared {removed} short-term entries.")
+            else:
+                self.renderer.status(f"Extracted {len(extracted)} facts, cleared {removed} short-term entries.")
             return False
         if command == "/trace":
             self.renderer.status(f"Latest trace: {self._latest_trace or 'none'}")
@@ -137,11 +158,16 @@ class AgentRepl:
         self.renderer.status("Unknown command. Type /help for commands.")
         return False
 
+    def _shutdown(self) -> None:
+        if self._shutdown_complete:
+            return
+        self._shutdown_complete = True
+        self._memory.extract_facts(reason="session_end")
+
     def _run_task(self, text: str, *, mode: AgentMode | None = None) -> None:
         selected_mode = mode or self._next_mode or self.mode
         self._next_mode = None
         try:
-            self._session_messages.append(Message(role="user", content=text))
             state = run_agent(
                 repo_path=self.repo_path,
                 task=text,
@@ -150,12 +176,12 @@ class AgentRepl:
                 trace_dir=self.trace_dir,
                 event_sink=self._handle_event,
                 mode=selected_mode,
+                memory_manager=self._memory,
             )
         except Exception as exc:  # noqa: BLE001 - interactive shell should report and continue
             self.renderer.error(f"Error: {exc}")
             return
         self._latest_trace = state.trace_path
-        self._session_messages.append(Message(role="assistant", content=state.final_answer))
         self.renderer.assistant_delta(state.final_answer)
 
     def _handle_event(self, event: object) -> None:
@@ -195,7 +221,6 @@ class AgentRepl:
                 timed_out=bool(payload.get("timed_out")),
             )
             self.renderer.tool_call_completed(result)
-            self._session_messages.append(Message(role="tool", tool_call_id=result.id, content=result.content))
 
     def _startup_info(self) -> StartupInfo:
         return StartupInfo(
@@ -229,18 +254,67 @@ class AgentRepl:
         return "\n".join(lines)
 
     def _context_text(self) -> str:
-        definitions = self._tools.tool_definitions()
-        estimate = self._compactor.estimate_tokens(self._session_messages, definitions)
+        status = self._memory.status(include_entries=False)
         return "\n".join(
             [
                 f"system/project: rebuilt per run",
-                f"conversation: {estimate} estimated tokens",
-                f"tools: {len(definitions)} definitions",
+                f"short-term: {status.short_term_entries} entries, {status.short_term_tokens} tokens",
+                f"short-term limit: {status.short_term_token_limit}",
+                f"long-term: {status.long_term_entries} entries, {status.long_term_tokens} tokens",
+                f"tools: {len(self._tools.tool_definitions())} definitions",
                 f"default test command: {self.test_command or 'not configured'}",
-                f"compression trigger: {self._profile.compression_trigger_tokens}",
-                f"max tool result chars: {self._profile.max_tool_result_chars}",
+                f"compression trigger: {int(status.short_term_token_limit * status.compression_trigger_ratio)}",
+                f"retain recent turns: {status.retain_recent_turns}",
+                f"max tool result chars: {self.config.memory_tool_result_chars}",
             ]
         )
+
+    def _memory_text(self) -> str:
+        status = self._memory.status(include_entries=True)
+        lines = [
+            "Memory",
+            f"project: {status.project_key}",
+            f"storage: {status.storage_path}",
+            (
+                f"short-term: {status.short_term_entries} entries, {status.short_term_tokens} tokens, "
+                f"limit {status.short_term_token_limit}"
+            ),
+            f"long-term: {status.long_term_entries} entries, {status.long_term_tokens} tokens",
+            (
+                f"compression: trigger {int(status.compression_trigger_ratio * 100)}%, "
+                f"retain {status.retain_recent_turns} turns, map chunk {status.map_chunk_size}"
+            ),
+            "",
+            "Long-term entries:",
+        ]
+        if not status.long_term_entries_detail:
+            lines.append("- none")
+            return "\n".join(lines)
+        for entry in status.long_term_entries_detail:
+            timestamp = entry.created_at.isoformat()
+            lines.append(
+                f"- {entry.id} [{entry.type.value} {entry.scope.value} {entry.source} {timestamp}] {entry.content}"
+            )
+        return "\n".join(lines)
+
+    def _handle_save(self, command: str) -> None:
+        content = command.removeprefix("/save").strip()
+        scope = MemoryScope.PROJECT
+        if content.startswith("--global"):
+            scope = MemoryScope.GLOBAL
+            content = content.removeprefix("--global").strip()
+        if not content:
+            self.renderer.status("Usage: /save <fact>")
+            return
+        try:
+            entry, created = self._memory.save_fact(content, scope=scope)
+        except Exception as exc:  # noqa: BLE001 - interactive shell should report and continue
+            self.renderer.error(f"Error: {exc}")
+            return
+        if created:
+            self.renderer.status(f"Saved memory: {entry.id}")
+        else:
+            self.renderer.status(f"Memory already exists: {entry.id}")
 
 
 def _plan_from_payload(payload: dict[str, object]) -> PlanState | None:

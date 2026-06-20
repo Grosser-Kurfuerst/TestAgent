@@ -15,6 +15,7 @@ add_src_to_path()
 from my_agent.config import AgentConfig
 from my_agent.llm import FakeLLM
 from my_agent.llm.types import ChatResponse, LLMToolCall, MessageLike, messages_to_openai
+from my_agent.memory import MemoryManager, MemoryScope
 from my_agent.runtime import run_agent
 
 
@@ -46,6 +47,7 @@ def read_trace(path: Path) -> list[dict[str, object]]:
 
 
 def fake_config(trace_dir: Path | None = None, **overrides: object) -> AgentConfig:
+    resolved_trace_dir = trace_dir or Path("traces")
     values = {
         "provider": "fake",
         "api_key": "",
@@ -54,7 +56,8 @@ def fake_config(trace_dir: Path | None = None, **overrides: object) -> AgentConf
         "temperature": 0.0,
         "max_steps": 8,
         "command_timeout": 60,
-        "trace_dir": trace_dir or Path("traces"),
+        "trace_dir": resolved_trace_dir,
+        "memory_dir": resolved_trace_dir.parent / "memory",
         "use_fake_llm": True,
     }
     values.update(overrides)
@@ -372,7 +375,66 @@ class RuntimeTests(unittest.TestCase):
 
             self.assertEqual(state.stop_reason, "repeated_tool_failure")
 
-    def test_automatic_compaction_handles_single_user_react_history(self) -> None:
+    def test_runtime_uses_memory_manager_for_messages_and_trace_events(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+            config = fake_config(base / "traces", memory_dir=base / "memory")
+            llm = RecordingFakeLLM([ChatResponse(content="done", finish_reason="stop")])
+            memory = MemoryManager.from_config(config=config, llm=llm, repo_path=repo)
+            memory.save_fact(
+                "Project calculator.py contains calculator functions.",
+                scope=MemoryScope.PROJECT,
+            )
+
+            state = run_agent(
+                repo_path=repo,
+                task="Inspect calculator memory.",
+                config=config,
+                llm=llm,
+                trace_dir=base / "traces",
+                memory_manager=memory,
+            )
+
+            self.assertEqual(state.stop_reason, "assistant_final")
+            self.assertGreaterEqual(memory.status(include_entries=False).short_term_entries, 2)
+            first_request = json.dumps(llm.requests[0], ensure_ascii=False)
+            self.assertIn("Relevant long-term memory:", first_request)
+            self.assertIn("calculator.py contains calculator functions", first_request)
+            event_names = [event["event"] for event in read_trace(state.trace_path)]
+            self.assertIn("memory.loaded", event_names)
+            self.assertIn("memory.retrieved", event_names)
+            self.assertIn("memory.prepared", event_names)
+
+    def test_external_memory_trace_sink_is_restored_after_react_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+            config = fake_config(base / "traces", memory_dir=base / "memory")
+            llm = RecordingFakeLLM([ChatResponse(content="done", finish_reason="stop")])
+            memory = MemoryManager.from_config(config=config, llm=llm, repo_path=repo)
+
+            state = run_agent(
+                repo_path=repo,
+                task="Inspect calculator memory.",
+                config=config,
+                llm=llm,
+                trace_dir=base / "traces",
+                memory_manager=memory,
+            )
+            before = read_trace(state.trace_path)
+
+            memory.save_fact("用户偏好：回答中文", scope=MemoryScope.PROJECT)
+
+            after = read_trace(state.trace_path)
+            self.assertEqual(after, before)
+            self.assertNotIn("memory.saved", [event["event"] for event in after])
+
+    def test_memory_preparation_handles_single_user_react_history(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             repo = base / "repo"
@@ -392,11 +454,11 @@ class RuntimeTests(unittest.TestCase):
                 task="Read a large file twice.",
                 config=fake_config(
                     base / "traces",
-                    context_window=5000,
-                    response_reserve_tokens=100,
-                    compression_buffer_tokens=100,
-                    retain_recent_user_turns=1,
-                    max_tool_result_chars=10000,
+                    memory_dir=base / "memory",
+                    memory_short_term_tokens=50,
+                    memory_compression_trigger_ratio=0.8,
+                    memory_retain_recent_turns=3,
+                    memory_tool_result_chars=10000,
                 ),
                 llm=llm,
                 max_steps=8,
@@ -405,9 +467,10 @@ class RuntimeTests(unittest.TestCase):
 
             self.assertEqual(state.stop_reason, "assistant_final")
             events = read_trace(state.trace_path)
-            self.assertIn("context.compacted", [event["event"] for event in events])
+            prepared = [event["payload"] for event in events if event["event"] == "memory.prepared"]
+            self.assertTrue(prepared)
+            self.assertFalse(prepared[-1]["compacted"])
             final_request = llm.requests[-1]
-            self.assertTrue(any("Compressed conversation summary" in str(message.get("content", "")) for message in final_request))
             self.assert_tool_results_are_paired(final_request)
 
     def test_runtime_index_skips_protected_files(self) -> None:

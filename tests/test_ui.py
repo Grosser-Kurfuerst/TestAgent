@@ -19,18 +19,22 @@ from my_agent.plan import AgentMode, PlanState, PlanStatus, PlanTask, TaskStatus
 from my_agent.ui import AgentRepl, PlainRenderer
 
 
-def fake_config(trace_dir: Path | None = None) -> AgentConfig:
-    return AgentConfig(
-        provider="fake",
-        api_key="",
-        base_url=None,
-        model="fake",
-        temperature=0.0,
-        max_steps=8,
-        command_timeout=60,
-        trace_dir=trace_dir or Path("traces"),
-        use_fake_llm=True,
-    )
+def fake_config(trace_dir: Path | None = None, **overrides: object) -> AgentConfig:
+    resolved_trace_dir = trace_dir or Path("traces")
+    values = {
+        "provider": "fake",
+        "api_key": "",
+        "base_url": None,
+        "model": "fake",
+        "temperature": 0.0,
+        "max_steps": 8,
+        "command_timeout": 60,
+        "trace_dir": resolved_trace_dir,
+        "memory_dir": resolved_trace_dir.parent / "memory",
+        "use_fake_llm": True,
+    }
+    values.update(overrides)
+    return AgentConfig(**values)
 
 
 def write_runtime_repo(repo: Path) -> None:
@@ -80,12 +84,14 @@ class ReplTests(unittest.TestCase):
         self.assertIn("TuraCLI", text)
         self.assertIn("version: 0.1.0", text)
         self.assertIn("/tools", text)
+        self.assertIn("/memory", text)
+        self.assertIn("/save", text)
         self.assertIn("/plan", text)
         self.assertIn("/mode", text)
         self.assertIn("read_file", text)
         self.assertIn("compression trigger", text)
         self.assertIn("No conversation history was compacted", text)
-        self.assertIn("Conversation context cleared", text)
+        self.assertIn("Extracted 0 facts, cleared 0 short-term entries", text)
         self.assertIn("Latest trace: none", text)
         self.assertEqual(errors.getvalue(), "")
 
@@ -110,9 +116,115 @@ class ReplTests(unittest.TestCase):
         self.assertIn("tool started: retrieve_context", text)
         self.assertIn("tool completed: run_tests", text)
         self.assertIn("Updated subtract", text)
-        self.assertIn("conversation:", text)
-        self.assertNotIn("conversation: 1 estimated tokens", text)
+        self.assertIn("short-term:", text)
         self.assertEqual(errors.getvalue(), "")
+
+    def test_memory_save_memory_clear_commands_share_persistent_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+            output = io.StringIO()
+            errors = io.StringIO()
+            config = fake_config(base / "traces", memory_dir=base / "memory")
+            repl = AgentRepl(
+                repo_path=repo,
+                config=config,
+                trace_dir=base / "traces",
+                renderer=PlainRenderer(output=output, errors=errors),
+                input_stream=io.StringIO(
+                    "/save 用户偏好：回答中文，先给结论\n"
+                    "/memory\n"
+                    "读取 calculator.py\n"
+                    "/clear\n"
+                    "/memory\n"
+                    "/quit\n"
+                ),
+            )
+
+            exit_code = repl.run(show_banner=False)
+
+            self.assertEqual(exit_code, 0)
+            text = output.getvalue()
+            self.assertIn("Saved memory:", text)
+            self.assertIn("Memory", text)
+            self.assertIn("用户偏好：回答中文，先给结论", text)
+            self.assertIn("Extracted", text)
+            self.assertIn("cleared", text)
+            self.assertIn("short-term: 0 entries", text)
+            self.assertEqual(errors.getvalue(), "")
+
+            reopened_output = io.StringIO()
+            reopened = AgentRepl(
+                repo_path=repo,
+                config=config,
+                trace_dir=base / "traces",
+                renderer=PlainRenderer(output=reopened_output, errors=io.StringIO()),
+                input_stream=io.StringIO("/memory\n/quit\n"),
+            )
+            reopened.run(show_banner=False)
+            self.assertIn("用户偏好：回答中文，先给结论", reopened_output.getvalue())
+
+    def test_clear_reports_fact_extraction_failure_but_still_clears(self) -> None:
+        class FailingFactLLM:
+            supports_tools = True
+
+            def chat(self, messages: list[object], tools: list[dict[str, object]] | None = None) -> object:
+                raise RuntimeError("fact extraction unavailable")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            (repo / "sample.py").write_text("x = 1\n", encoding="utf-8")
+            output = io.StringIO()
+            errors = io.StringIO()
+            repl = AgentRepl(
+                repo_path=repo,
+                config=fake_config(base / "traces", memory_dir=base / "memory"),
+                trace_dir=base / "traces",
+                renderer=PlainRenderer(output=output, errors=errors),
+                input_stream=io.StringIO("/clear\n/memory\n/quit\n"),
+            )
+            repl._memory.compressor.llm = FailingFactLLM()  # type: ignore[assignment]
+            repl._memory.append_user_message("用户偏好：回答中文")
+
+            exit_code = repl.run(show_banner=False)
+
+            self.assertEqual(exit_code, 0)
+            text = output.getvalue()
+            self.assertIn("Fact extraction failed; cleared 1 short-term entries.", text)
+            self.assertIn("short-term: 0 entries", text)
+            self.assertEqual(errors.getvalue(), "")
+
+    def test_repl_extracts_session_facts_when_input_stream_ends(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            output = io.StringIO()
+            errors = io.StringIO()
+            repl = AgentRepl(
+                repo_path=repo,
+                config=fake_config(base / "traces", memory_dir=base / "memory"),
+                trace_dir=base / "traces",
+                renderer=PlainRenderer(output=output, errors=errors),
+                input_stream=io.StringIO(""),
+            )
+            reasons: list[str] = []
+
+            def record_extract(*, reason: str, run_id: str = "") -> list[object]:
+                reasons.append(reason)
+                return []
+
+            repl._memory.extract_facts = record_extract  # type: ignore[method-assign]
+
+            exit_code = repl.run(show_banner=False)
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(reasons, ["session_end"])
+            self.assertEqual(errors.getvalue(), "")
 
     def test_plan_command_runs_plan_agent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

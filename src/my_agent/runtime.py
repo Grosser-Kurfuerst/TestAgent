@@ -5,6 +5,7 @@ from typing import Any, Callable
 
 from my_agent.config import AgentConfig
 from my_agent.llm import AgentLLM, build_llm
+from my_agent.memory import MemoryManager
 from my_agent.plan import AgentMode, PlanExecuteAgent, resolve_mode
 from my_agent.react_runtime import ReActRuntime
 from my_agent.schema import AgentState
@@ -20,12 +21,14 @@ class CodingAgentRuntime:
         trace_dir: str | Path | None = None,
         command_timeout: int | None = None,
         event_sink: Callable[[Any], None] | None = None,
+        memory_manager: MemoryManager | None = None,
     ):
         self.config = config or AgentConfig.from_env()
         self.llm = llm or build_llm(self.config)
         self.trace_dir = Path(trace_dir) if trace_dir is not None else self.config.trace_dir
         self.command_timeout = command_timeout or self.config.command_timeout
         self.event_sink = event_sink
+        self.memory_manager = memory_manager
 
     def run(self, state: AgentState, *, mode: AgentMode | str | None = None) -> AgentState:
         if not getattr(self.llm, "supports_tools", False):
@@ -43,6 +46,7 @@ class CodingAgentRuntime:
                 goal=state.task,
                 test_command=state.test_command,
                 max_steps=state.max_steps,
+                memory_manager=self.memory_manager,
             )
         return ReActRuntime(
             config=self.config,
@@ -50,6 +54,7 @@ class CodingAgentRuntime:
             trace_dir=self.trace_dir,
             command_timeout=self.command_timeout,
             event_sink=self.event_sink,
+            memory_manager=self.memory_manager,
         ).run(state)
 
 
@@ -63,6 +68,7 @@ def run_agent(
     trace_dir: str | Path | None = None,
     event_sink: Callable[[Any], None] | None = None,
     mode: AgentMode | str | None = None,
+    memory_manager: MemoryManager | None = None,
 ) -> AgentState:
     resolved_config = config or AgentConfig.from_env()
     state = AgentState.initial(
@@ -71,5 +77,11 @@ def run_agent(
         test_command=test_command,
         max_steps=resolved_config.max_steps if max_steps is None else max_steps,
     )
-    runtime = CodingAgentRuntime(config=resolved_config, llm=llm, trace_dir=trace_dir, event_sink=event_sink)
+    runtime = CodingAgentRuntime(
+        config=resolved_config,
+        llm=llm,
+        trace_dir=trace_dir,
+        event_sink=event_sink,
+        memory_manager=memory_manager,
+    )
     return runtime.run(state, mode=mode)

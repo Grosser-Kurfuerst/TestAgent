@@ -1,16 +1,16 @@
 from __future__ import annotations
 
-import json
 from datetime import date
 from pathlib import Path
 from typing import Any, Callable
 
 from my_agent.budget import AgentBudget
 from my_agent.config import AgentConfig
-from my_agent.context import ContextProfile, ConversationCompactor, truncate_tool_content
 from my_agent.indexer import RepoIndexer
 from my_agent.llm import AgentLLM
-from my_agent.llm.types import ChatResponse, LLMToolCall, Message
+from my_agent.llm.types import ChatResponse, LLMToolCall, Message, MessageLike, messages_to_openai
+from my_agent.memory import MemoryManager
+from my_agent.memory.token import estimate_tokens
 from my_agent.schema import AgentState, ToolCall, ToolRecord, ToolResult
 from my_agent.tools import RepoTools, ToolExecutionResult, ToolInvocation, should_skip_path
 from my_agent.tracing import TraceWriter
@@ -27,12 +27,14 @@ class ReActRuntime:
         trace_dir: str | Path,
         command_timeout: int,
         event_sink: EventSink | None = None,
+        memory_manager: MemoryManager | None = None,
     ) -> None:
         self.config = config
         self.llm = llm
         self.trace_dir = Path(trace_dir)
         self.command_timeout = command_timeout
         self.event_sink = event_sink
+        self.memory_manager = memory_manager
 
     def run(self, state: AgentState) -> AgentState:
         state.repo_path = Path(state.repo_path).resolve()
@@ -41,123 +43,156 @@ class ReActRuntime:
 
         writer = TraceWriter.create(self.trace_dir, state.run_id)
         state.trace_path = writer.path
-        tools = RepoTools(state.repo_path, timeout=self.command_timeout, config=self.config)
-        tool_definitions = tools.tool_definitions()
-        profile = ContextProfile.from_config(self.config)
-        compactor = ConversationCompactor(profile, llm=self.llm)
-        budget = AgentBudget.from_config(self.config, max_steps=state.max_steps)
+        memory, memory_trace_snapshot = self._memory_for_run(state, writer)
+        try:
+            tools = RepoTools(state.repo_path, timeout=self.command_timeout, config=self.config)
+            tool_definitions = tools.tool_definitions()
+            budget = AgentBudget.from_config(self.config, max_steps=state.max_steps)
 
-        self._emit(
-            writer,
-            state.trace_event(
-                "run.started",
-                {"repo_path": str(state.repo_path), "task": state.task, "mode": "native_tool_calls"},
+            self._emit(
+                writer,
+                state.trace_event(
+                    "run.started",
+                    {"repo_path": str(state.repo_path), "task": state.task, "mode": "native_tool_calls"},
+                )
             )
-        )
-        self._emit(
-            writer,
-            state.trace_event(
-                "tools.loaded",
-                {
-                    "count": len(tools.registry.tools),
-                    "tools": [
-                        {
-                            "name": tool.spec.name,
-                            "source": tool.spec.source,
-                            "risk": tool.spec.risk.value,
-                            "enabled": tool.spec.enabled,
-                        }
-                        for tool in tools.registry.tools
-                    ],
-                },
+            self._emit(
+                writer,
+                state.trace_event(
+                    "tools.loaded",
+                    {
+                        "count": len(tools.registry.tools),
+                        "tools": [
+                            {
+                                "name": tool.spec.name,
+                                "source": tool.spec.source,
+                                "risk": tool.spec.risk.value,
+                                "enabled": tool.spec.enabled,
+                            }
+                            for tool in tools.registry.tools
+                        ],
+                    },
+                )
             )
-        )
-        self._index_repo(state, writer)
-        state.plan = "Use native ReAct tool calls to inspect, edit, verify, and finish the task."
+            self._emit_memory_loaded(state, writer, memory)
+            self._index_repo(state, writer)
+            state.plan = "Use native ReAct tool calls to inspect, edit, verify, and finish the task."
 
-        messages = self._initial_messages(state)
-        while not state.done:
-            stop_reason = budget.check_before_llm()
-            if stop_reason:
-                self._stop_by_budget(state, writer, budget, stop_reason)
-                break
+            base_messages = self._initial_messages(state)
+            memory.append_user_message(state.task, run_id=state.run_id)
+            while not state.done:
+                stop_reason = budget.check_before_llm()
+                if stop_reason:
+                    self._stop_by_budget(state, writer, budget, stop_reason)
+                    break
 
-            compacted = compactor.compact_if_needed(messages, tool_definitions)
-            if compacted.compacted:
+                messages, _, _ = memory.prepare_messages(
+                    base_messages=base_messages,
+                    query=state.task,
+                    tools=tool_definitions,
+                )
+
+                budget.begin_iteration()
                 self._emit(
                     writer,
                     state.trace_event(
-                        "context.compacted",
+                        "llm.requested",
                         {
-                            "before_tokens": compacted.before_tokens,
-                            "after_tokens": compacted.after_tokens,
-                            "summary_chars": compacted.summary_chars,
-                            "fallback": compacted.fallback,
+                            "iteration": budget.iterations,
+                            "message_count": len(messages),
+                            "tool_count": len(tool_definitions),
+                            "estimated_tokens": _estimate_prompt_tokens(messages, tool_definitions),
+                        },
+                    )
+                )
+                response = self._chat(
+                    messages,
+                    tool_definitions,
+                    writer,
+                    state,
+                    memory=memory,
+                    base_messages=base_messages,
+                )
+                if response is None:
+                    break
+                memory.append_assistant_response(response, run_id=state.run_id)
+
+                budget.record_usage(response.usage)
+                self._emit(
+                    writer,
+                    state.trace_event(
+                        "llm.completed",
+                        {
+                            "iteration": budget.iterations,
+                            "finish_reason": response.finish_reason,
+                            "content_chars": len(response.content),
+                            "tool_calls": [
+                                {"id": call.id, "name": call.name, "arguments": call.arguments_json}
+                                for call in response.tool_calls
+                            ],
+                            "usage": response.usage.to_dict(),
                         },
                     )
                 )
 
-            budget.begin_iteration()
-            self._emit(
-                writer,
-                state.trace_event(
-                    "llm.requested",
-                    {
-                        "iteration": budget.iterations,
-                        "message_count": len(messages),
-                        "tool_count": len(tool_definitions),
-                        "estimated_tokens": compactor.estimate_tokens(messages, tool_definitions),
-                    },
-                )
+                if not response.tool_calls:
+                    state.done = True
+                    state.stop_reason = "assistant_final"
+                    state.final_answer = response.content.strip() or "No final response returned."
+                    break
+
+                budget.record_tool_calls(response.tool_calls)
+                results = self._execute_tool_calls(state, writer, tools, response.tool_calls, budget)
+                budget.record_tool_results(results, response.tool_calls)
+                for result in results:
+                    memory.append_tool_result(result, run_id=state.run_id)
+
+                self._verify_after_tools(state, writer)
+                stop_reason = budget.check_after_tools()
+                if stop_reason and not state.done:
+                    self._stop_by_budget(state, writer, budget, stop_reason)
+
+            memory.extract_facts(reason="run_completed", run_id=state.run_id)
+            self._finalize(state, writer, budget)
+            return state
+        finally:
+            if memory_trace_snapshot is not None:
+                memory.restore_trace_sink(memory_trace_snapshot)
+
+    def _memory_for_run(
+        self,
+        state: AgentState,
+        writer: TraceWriter,
+    ) -> tuple[MemoryManager, tuple[Any | None, Any | None] | None]:
+        trace_sink = lambda event, payload: self._emit(writer, state.trace_event(event, payload))
+        if self.memory_manager is not None:
+            snapshot = self.memory_manager.set_trace_sink(trace_sink)
+            return self.memory_manager, snapshot
+        return (
+            MemoryManager.from_config(
+                config=self.config,
+                llm=self.llm,
+                repo_path=state.repo_path,
+                session_id=state.run_id,
+                trace_sink=trace_sink,
+            ),
+            None,
+        )
+
+    def _emit_memory_loaded(self, state: AgentState, writer: TraceWriter, memory: MemoryManager) -> None:
+        status = memory.status(include_entries=False)
+        self._emit(
+            writer,
+            state.trace_event(
+                "memory.loaded",
+                {
+                    "storage_path": status.storage_path,
+                    "short_term_entries": status.short_term_entries,
+                    "long_term_entries": status.long_term_entries,
+                    "long_term_tokens": status.long_term_tokens,
+                },
             )
-            response = self._chat(messages, tool_definitions, compactor, writer, state)
-            if response is None:
-                break
-
-            budget.record_usage(response.usage)
-            self._emit(
-                writer,
-                state.trace_event(
-                    "llm.completed",
-                    {
-                        "iteration": budget.iterations,
-                        "finish_reason": response.finish_reason,
-                        "content_chars": len(response.content),
-                        "tool_calls": [
-                            {"id": call.id, "name": call.name, "arguments": call.arguments_json}
-                            for call in response.tool_calls
-                        ],
-                        "usage": response.usage.to_dict(),
-                    },
-                )
-            )
-
-            if not response.tool_calls:
-                state.done = True
-                state.stop_reason = "assistant_final"
-                state.final_answer = response.content.strip() or "No final response returned."
-                break
-
-            budget.record_tool_calls(response.tool_calls)
-            messages.append(Message(role="assistant", content=response.content or "", tool_calls=response.tool_calls))
-            results = self._execute_tool_calls(state, writer, tools, response.tool_calls, profile, budget)
-            budget.record_tool_results(results, response.tool_calls)
-            for result in results:
-                messages.append(
-                    Message(
-                        role="tool",
-                        tool_call_id=result.id,
-                        content=_tool_message_content(result, profile.max_tool_result_chars),
-                    )
-                )
-
-            self._verify_after_tools(state, writer)
-            stop_reason = budget.check_after_tools()
-            if stop_reason and not state.done:
-                self._stop_by_budget(state, writer, budget, stop_reason)
-
-        self._finalize(state, writer, budget)
-        return state
+        )
 
     def _index_repo(self, state: AgentState, writer: TraceWriter) -> None:
         snapshot = RepoIndexer(
@@ -197,32 +232,34 @@ class ReActRuntime:
 
     def _chat(
         self,
-        messages: list[Message],
+        messages: list[MessageLike],
         tool_definitions: list[dict[str, Any]],
-        compactor: ConversationCompactor,
         writer: TraceWriter,
         state: AgentState,
+        *,
+        memory: MemoryManager,
+        base_messages: list[MessageLike],
     ) -> ChatResponse | None:
         try:
             return self.llm.chat(messages, tools=tool_definitions)
         except RuntimeError as exc:
             if _looks_like_context_error(str(exc)):
-                compacted = compactor.compact_now(messages, tool_definitions, focus="Retry after context length error.")
+                retry_messages, _, _ = memory.prepare_messages(
+                    base_messages=base_messages,
+                    query=state.task,
+                    tools=tool_definitions,
+                    force_compact=True,
+                    focus="Retry after context length error.",
+                )
                 self._emit(
                     writer,
                     state.trace_event(
-                        "context.compacted",
-                        {
-                            "before_tokens": compacted.before_tokens,
-                            "after_tokens": compacted.after_tokens,
-                            "summary_chars": compacted.summary_chars,
-                            "fallback": compacted.fallback,
-                            "forced": True,
-                        },
+                        "memory.compaction_retry",
+                        {"reason": "context_length_error", "message_count": len(retry_messages)},
                     )
                 )
                 try:
-                    return self.llm.chat(messages, tools=tool_definitions)
+                    return self.llm.chat(retry_messages, tools=tool_definitions)
                 except RuntimeError as retry_exc:
                     self._stop_by_llm_failure(state, writer, retry_exc)
                     return None
@@ -235,7 +272,6 @@ class ReActRuntime:
         writer: TraceWriter,
         tools: RepoTools,
         tool_calls: list[LLMToolCall],
-        profile: ContextProfile,
         budget: AgentBudget,
     ) -> list[ToolExecutionResult]:
         results: list[ToolExecutionResult] = []
@@ -275,7 +311,7 @@ class ReActRuntime:
                 count_step = True
 
             results.append(result)
-            self._record_tool_result(state, writer, call, result, profile, count_step=count_step)
+            self._record_tool_result(state, writer, call, result, count_step=count_step)
             self._emit(writer, state.trace_event("tool.completed", result.to_dict()))
         return results
 
@@ -285,7 +321,6 @@ class ReActRuntime:
         writer: TraceWriter,
         call: LLMToolCall,
         result: ToolExecutionResult,
-        profile: ContextProfile,
         *,
         count_step: bool = True,
     ) -> None:
@@ -381,14 +416,6 @@ def _invocation_from_tool_call(call: LLMToolCall, *, default_test_command: str |
     )
 
 
-def _tool_message_content(result: ToolExecutionResult, limit: int) -> str:
-    payload = result.to_dict()
-    payload["content"] = truncate_tool_content(result.content, limit)
-    if len(result.content) > limit:
-        payload["original_content_chars"] = len(result.content)
-    return json.dumps(payload, ensure_ascii=False)
-
-
 def _arguments_for_history(call: LLMToolCall) -> dict[str, Any]:
     if call.arguments_error:
         return {"raw": call.arguments_json, "error": call.arguments_error}
@@ -421,3 +448,7 @@ def _deterministic_final_answer(state: AgentState) -> str:
 def _looks_like_context_error(message: str) -> bool:
     lowered = message.lower()
     return "context" in lowered and ("length" in lowered or "window" in lowered or "maximum" in lowered)
+
+
+def _estimate_prompt_tokens(messages: list[MessageLike], tools: list[dict[str, Any]]) -> int:
+    return estimate_tokens({"messages": messages_to_openai(messages), "tools": tools or []})

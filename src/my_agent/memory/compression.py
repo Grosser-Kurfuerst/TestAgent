@@ -136,6 +136,7 @@ class MemoryCompressor:
         self.chunk_size = max(1, chunk_size)
         self.retain_recent_turns = max(1, retain_recent_turns)
         self.max_input_chars = max(1, max_input_chars)
+        self.last_fact_error = ""
 
     def compact_entries(self, entries: list[MemoryEntry], *, focus: str = "") -> tuple[str, bool, int, bool]:
         """Compress entries with map-reduce.
@@ -190,6 +191,7 @@ class MemoryCompressor:
         responses return an empty list so memory maintenance cannot interrupt
         the agent loop.
         """
+        self.last_fact_error = ""
         if not entries or self.llm is None:
             return []
 
@@ -202,7 +204,8 @@ class MemoryCompressor:
                 ],
                 tools=None,
             )
-        except Exception:
+        except Exception as exc:
+            self.last_fact_error = f"{type(exc).__name__}: {exc}"
             return []
 
         facts = _parse_fact_response(response.content)

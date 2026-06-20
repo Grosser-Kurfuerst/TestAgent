@@ -5,9 +5,9 @@ remaining modules (types, token, short/long-term storage, retrieval and
 compression) are implementation details that can be swapped without changing
 the call sites.
 
-Phase 3.1-3.4 ships the data model, short/long-term storage, config wiring,
-retrieval/context injection, map-reduce compression, fact extraction and the
-:class:`MemoryManager` facade. Runtime/TUI wiring lands in phases 3.5-3.6.
+Phase 3 ships the data model, short/long-term storage, config wiring,
+retrieval/context injection, map-reduce compression, fact extraction, the
+:class:`MemoryManager` facade, and the runtime/TUI call-site wiring.
 """
 
 from __future__ import annotations

@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Callable, Protocol
 
 from my_agent.config import AgentConfig
+from my_agent.memory import MemoryManager
 from my_agent.plan.graph import TaskGraph
 from my_agent.plan.types import PlanState, PlanStatus, PlanTask, TaskResult, TaskStatus, TaskType
 from my_agent.react_runtime import ReActRuntime
@@ -277,6 +278,7 @@ class ReActTaskRunner:
         default_max_steps: int | None = None,
         plan_task_max_steps: int | None = None,
         event_sink: Callable[[object], None] | None = None,
+        memory_manager: MemoryManager | None = None,
     ) -> None:
         self.repo_path = Path(repo_path).resolve()
         self.config = config
@@ -287,6 +289,7 @@ class ReActTaskRunner:
         self.default_max_steps = _positive_or_default(default_max_steps, config.max_steps)
         self.plan_task_max_steps = _positive_or_default(plan_task_max_steps, getattr(config, "plan_task_max_steps", 6))
         self.event_sink = event_sink
+        self.memory_manager = memory_manager
 
     def run_task(self, plan: PlanState, task: PlanTask) -> TaskResult:
         state = AgentState.initial(
@@ -296,6 +299,11 @@ class ReActTaskRunner:
             max_steps=self.max_steps_for_task(task),
             run_id=f"{task.id}_{plan.id}",
         )
+        task_memory = (
+            self.memory_manager.fork_for_task(session_id=f"{plan.id}:{task.id}", run_id=state.run_id)
+            if self.memory_manager is not None
+            else None
+        )
         try:
             final_state = ReActRuntime(
                 config=self.config,
@@ -303,6 +311,7 @@ class ReActTaskRunner:
                 trace_dir=self.trace_dir,
                 command_timeout=self.command_timeout,
                 event_sink=self.event_sink,
+                memory_manager=task_memory,
             ).run(state)
         except KeyboardInterrupt as exc:
             raise PlanCancelled("Task execution was interrupted.") from exc
