@@ -28,6 +28,8 @@ class ReActRuntime:
         command_timeout: int,
         event_sink: EventSink | None = None,
         memory_manager: MemoryManager | None = None,
+        role_prompt: str | None = None,
+        run_label: str = "native_tool_calls",
     ) -> None:
         self.config = config
         self.llm = llm
@@ -35,6 +37,8 @@ class ReActRuntime:
         self.command_timeout = command_timeout
         self.event_sink = event_sink
         self.memory_manager = memory_manager
+        self.role_prompt = role_prompt
+        self.run_label = run_label
 
     def run(self, state: AgentState) -> AgentState:
         state.repo_path = Path(state.repo_path).resolve()
@@ -53,7 +57,7 @@ class ReActRuntime:
                 writer,
                 state.trace_event(
                     "run.started",
-                    {"repo_path": str(state.repo_path), "task": state.task, "mode": "native_tool_calls"},
+                    {"repo_path": str(state.repo_path), "task": state.task, "mode": self.run_label},
                 )
             )
             self._emit(
@@ -215,7 +219,7 @@ class ReActRuntime:
         )
 
     def _initial_messages(self, state: AgentState) -> list[Message]:
-        system = (
+        system = self.role_prompt or (
             "You are a careful coding agent. Use the provided function tools when repository inspection, edits, "
             "or verification are needed. Keep tool arguments as valid JSON objects. Inspect files before editing, "
             "run relevant tests after edits, and return a final assistant answer when the task is complete."

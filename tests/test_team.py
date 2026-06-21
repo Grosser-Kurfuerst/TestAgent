@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import tempfile
 import unittest
+from pathlib import Path
 
 try:
     from ._path import add_src_to_path
@@ -11,17 +13,26 @@ except ImportError:
 add_src_to_path()
 
 from my_agent.llm import FakeLLM
-from my_agent.plan import AgentMode, PlanValidationError, TaskType, normalize_mode, resolve_mode
+from my_agent.llm.types import ChatResponse, MessageLike, messages_to_openai
+from my_agent.config import AgentConfig
+from my_agent.plan import AgentMode, PlanValidationError, TaskResult, TaskType, normalize_mode, resolve_mode
+from my_agent.memory import MemoryManager, MemoryScope
 from my_agent.team import (
     ExecutionStep,
+    JsonTeamStore,
+    ReviewDecision,
     StepStatus,
+    SubAgent,
+    TeamOrchestrator,
     TeamPlanner,
     TeamState,
     execution_batches,
     get_executable_steps,
+    parse_review_decision,
     topological_order,
     validate_team_graph,
 )
+from my_agent.team.types import AgentRole, TeamStatus
 
 
 def step(
@@ -38,6 +49,136 @@ def step(
         dependencies=list(dependencies or []),
         status=status,
     )
+
+
+def write_runtime_repo(repo: Path) -> None:
+    (repo / "calculator.py").write_text(
+        "def subtract(a: int, b: int) -> int:\n"
+        "    \"\"\"Return a minus b.\"\"\"\n"
+        "    return a + b\n",
+        encoding="utf-8",
+    )
+    tests = repo / "tests"
+    tests.mkdir()
+    (tests / "test_calculator.py").write_text(
+        "import unittest\n"
+        "from calculator import subtract\n\n"
+        "class CalculatorTests(unittest.TestCase):\n"
+        "    def test_subtract(self):\n"
+        "        self.assertEqual(subtract(5, 3), 2)\n",
+        encoding="utf-8",
+    )
+
+
+def fake_config(trace_dir: Path | None = None, **overrides: object) -> AgentConfig:
+    resolved_trace_dir = trace_dir or Path("traces")
+    values = {
+        "provider": "fake",
+        "api_key": "",
+        "base_url": None,
+        "model": "fake",
+        "temperature": 0.0,
+        "max_steps": 8,
+        "command_timeout": 60,
+        "trace_dir": resolved_trace_dir,
+        "memory_dir": resolved_trace_dir.parent / "memory",
+        "use_fake_llm": True,
+        "memory_auto_extract": False,
+    }
+    values.update(overrides)
+    return AgentConfig(**values)
+
+
+class RecordingLLM(FakeLLM):
+    def __init__(self, responses: list[ChatResponse | str]):
+        super().__init__(chat_responses=responses)
+        self.requests: list[list[dict[str, object]]] = []
+        self.tools_seen: list[list[dict[str, object]] | None] = []
+
+    def chat(self, messages: list[MessageLike], tools: list[dict[str, object]] | None = None) -> ChatResponse:
+        self.requests.append(messages_to_openai(messages))
+        self.tools_seen.append(tools)
+        return super().chat(messages, tools=tools)  # type: ignore[arg-type]
+
+
+class ReviewerCrashLLM(FakeLLM):
+    def chat(self, messages: list[MessageLike], tools: list[dict[str, object]] | None = None) -> ChatResponse:
+        if tools is None:
+            raise RuntimeError("review llm unavailable")
+        return super().chat(messages, tools=tools)  # type: ignore[arg-type]
+
+
+class StaticPlanner:
+    def __init__(self, team: TeamState):
+        self.team = team
+
+    def create_team_plan(self, goal: str, **_: object) -> TeamState:
+        return TeamState.from_dict(self.team.to_dict())
+
+
+class RecordingPlanner(StaticPlanner):
+    def __init__(self, team: TeamState):
+        super().__init__(team)
+        self.repo_context = ""
+        self.memory_context = ""
+
+    def create_team_plan(self, goal: str, **kwargs: object) -> TeamState:
+        self.repo_context = str(kwargs.get("repo_context", ""))
+        self.memory_context = str(kwargs.get("memory_context", ""))
+        return super().create_team_plan(goal, **kwargs)
+
+
+class ScriptedWorker:
+    name = "worker-test"
+
+    def __init__(self, results: dict[str, list[TaskResult]]):
+        self.results = results
+        self.calls: list[tuple[str, str, str]] = []
+        self.clear_count = 0
+
+    def execute_step(self, state: TeamState, item: ExecutionStep, context: str, feedback: str = "") -> TaskResult:
+        self.calls.append((item.id, context, feedback))
+        queue = self.results.setdefault(item.id, [])
+        if not queue:
+            return TaskResult.failure(item.id, "No scripted worker result.")
+        return queue.pop(0)
+
+    def clear_history(self) -> None:
+        self.clear_count += 1
+
+
+class ScriptedReviewer:
+    def __init__(self, decisions: list[ReviewDecision]):
+        self.decisions = decisions
+        self.calls: list[tuple[str, str, str]] = []
+        self.clear_count = 0
+
+    def review_step(self, goal: str, item: ExecutionStep, context: str, result: str) -> ReviewDecision:
+        self.calls.append((item.id, context, result))
+        if not self.decisions:
+            return ReviewDecision(approved=True, summary="default approval")
+        return self.decisions.pop(0)
+
+    def clear_history(self) -> None:
+        self.clear_count += 1
+
+
+class CrashingWorker:
+    name = "crashing-worker"
+
+    def execute_step(self, state: TeamState, item: ExecutionStep, context: str, feedback: str = "") -> TaskResult:
+        raise RuntimeError("worker crashed")
+
+    def clear_history(self) -> None:
+        return None
+
+
+class CrashingReviewer:
+    def review_step(self, goal: str, item: ExecutionStep, context: str, result: str) -> ReviewDecision:
+        raise RuntimeError("reviewer crashed")
+
+    def clear_history(self) -> None:
+        return None
 
 
 class TeamTypeTests(unittest.TestCase):
@@ -240,6 +381,426 @@ class TeamPlannerTests(unittest.TestCase):
         self.assertEqual(team.summary, "Team plan generated by FakeLLM.")
         self.assertEqual([item.id for item in team.steps], ["step_1", "step_2", "step_3"])
         self.assertEqual(team.steps[1].dependencies, ["step_1"])
+
+
+class TeamReviewerTests(unittest.TestCase):
+    def test_review_decision_parses_valid_json(self) -> None:
+        decision = parse_review_decision(
+            json.dumps(
+                {
+                    "approved": False,
+                    "summary": "not enough",
+                    "issues": ["missing tests"],
+                    "suggestions": ["run tests"],
+                }
+            )
+        )
+
+        self.assertFalse(decision.approved)
+        self.assertEqual(decision.summary, "not enough")
+        self.assertEqual(decision.issues, ("missing tests",))
+        self.assertIn("missing tests", decision.feedback_text)
+
+    def test_review_decision_rejects_invalid_empty_and_missing_approved(self) -> None:
+        self.assertFalse(parse_review_decision("").approved)
+        self.assertEqual(parse_review_decision("").parse_error, "empty_review")
+        self.assertFalse(parse_review_decision("{not json").approved)
+        self.assertIn("invalid_json", parse_review_decision("{not json").parse_error)
+        missing = parse_review_decision(json.dumps({"summary": "looks ok"}))
+        self.assertFalse(missing.approved)
+        self.assertEqual(missing.parse_error, "missing_approved")
+
+    def test_reviewer_uses_chat_without_tools(self) -> None:
+        llm = RecordingLLM([ChatResponse(content=json.dumps({"approved": True, "summary": "ok"}), finish_reason="stop")])
+        agent = SubAgent(
+            name="reviewer-step_1",
+            role=AgentRole.REVIEWER,
+            config=fake_config(),
+            llm=llm,
+            repo_path=Path.cwd(),
+            trace_dir=Path("traces"),
+            command_timeout=60,
+        )
+
+        decision = agent.review_step("goal", step("step_1"), "dependency context", "worker result")
+
+        self.assertTrue(decision.approved)
+        self.assertEqual(llm.tools_seen, [None])
+        request_text = "\n".join(str(message.get("content", "")) for message in llm.requests[0])
+        self.assertIn("dependency context", request_text)
+        self.assertIn("worker result", request_text)
+
+
+class TeamSubAgentTests(unittest.TestCase):
+    def test_worker_prompt_contains_step_context_and_feedback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+            llm = RecordingLLM([ChatResponse(content="worker completed", finish_reason="stop")])
+            agent = SubAgent(
+                name="worker-1",
+                role=AgentRole.WORKER,
+                config=fake_config(base / "traces"),
+                llm=llm,
+                repo_path=repo,
+                trace_dir=base / "traces",
+                command_timeout=60,
+                test_command="python -m unittest discover -s tests -q",
+            )
+            team = TeamState.create(goal="Fix calculator", steps=[step("step_1")])
+            item = team.steps[0]
+            item.acceptance = "calculator behavior is verified"
+            item.attempts = 2
+
+            result = agent.execute_step(team, item, "dependency context", feedback="fix missing verification")
+
+            self.assertTrue(result.ok)
+            self.assertIn("worker completed", result.output)
+            self.assertTrue(llm.tools_seen[0])
+            request_text = "\n".join(str(message.get("content", "")) for message in llm.requests[0])
+            self.assertIn("You are a worker sub-agent", request_text)
+            self.assertIn("- id: step_1", request_text)
+            self.assertIn("- type: analysis", request_text)
+            self.assertIn("calculator behavior is verified", request_text)
+            self.assertIn("dependency context", request_text)
+            self.assertIn("fix missing verification", request_text)
+
+
+class TeamOrchestratorTests(unittest.TestCase):
+    def test_single_step_success_marks_team_succeeded_and_persists_store(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+            team = TeamState.create(goal="Inspect", summary="single", steps=[step("step_1")])
+            store = JsonTeamStore(base / "teams")
+            worker = ScriptedWorker({"step_1": [TaskResult.success("step_1", "inspected")]})
+            reviewer = ScriptedReviewer([ReviewDecision(approved=True, summary="ok")])
+            events: list[object] = []
+
+            state = TeamOrchestrator(
+                config=fake_config(base / "traces"),
+                llm=FakeLLM(),
+                trace_dir=base / "traces",
+                command_timeout=60,
+                planner=StaticPlanner(team),  # type: ignore[arg-type]
+                state_store=store,
+                worker_factory=lambda _: worker,
+                reviewer_factory=lambda _: reviewer,
+                event_sink=events.append,
+            ).run(repo_path=repo, goal="Inspect")
+
+            self.assertEqual(state.stop_reason, "team_completed")
+            self.assertIn("Team succeeded", state.final_answer)
+            stored_files = list((base / "teams").glob("team_*.json"))
+            self.assertEqual(len(stored_files), 1)
+            stored = TeamState.from_dict(json.loads(stored_files[0].read_text(encoding="utf-8")))
+            self.assertEqual(stored.status, TeamStatus.SUCCEEDED)
+            self.assertEqual(stored.steps[0].status, StepStatus.COMPLETED)
+            event_names = [getattr(event, "event", "") for event in events]
+            self.assertIn("team.step.worker_completed", event_names)
+            self.assertIn("team.step.review_completed", event_names)
+            self.assertIn("team.completed", event_names)
+
+    def test_default_fake_llm_supports_serial_team_smoke(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+
+            state = TeamOrchestrator(
+                config=fake_config(base / "traces"),
+                llm=FakeLLM(),
+                trace_dir=base / "traces",
+                command_timeout=60,
+            ).run(
+                repo_path=repo,
+                goal="修复 subtract 并运行测试",
+                test_command="python -m unittest discover -s tests -q",
+            )
+
+            self.assertEqual(state.stop_reason, "team_completed")
+            self.assertIn("return a - b", (repo / "calculator.py").read_text(encoding="utf-8"))
+            stored = TeamState.from_dict(json.loads(next((base / "traces" / "teams").glob("team_*.json")).read_text(encoding="utf-8")))
+            self.assertEqual(stored.status, TeamStatus.SUCCEEDED)
+            self.assertEqual([item.status for item in stored.steps], [StepStatus.COMPLETED] * 3)
+
+    def test_reviewer_rejection_retries_and_second_attempt_can_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+            team = TeamState.create(goal="Fix", steps=[step("step_1")])
+            worker = ScriptedWorker(
+                {
+                    "step_1": [
+                        TaskResult.success("step_1", "first result"),
+                        TaskResult.success("step_1", "second result"),
+                    ]
+                }
+            )
+            reviewer = ScriptedReviewer(
+                [
+                    ReviewDecision(approved=False, summary="needs work", issues=("missing verification",)),
+                    ReviewDecision(approved=True, summary="ok"),
+                ]
+            )
+            events: list[object] = []
+
+            state = TeamOrchestrator(
+                config=fake_config(base / "traces", team_max_retries=1),
+                llm=FakeLLM(),
+                trace_dir=base / "traces",
+                command_timeout=60,
+                planner=StaticPlanner(team),  # type: ignore[arg-type]
+                worker_factory=lambda _: worker,
+                reviewer_factory=lambda _: reviewer,
+                event_sink=events.append,
+            ).run(repo_path=repo, goal="Fix")
+
+            stored = TeamState.from_dict(json.loads(next((base / "traces" / "teams").glob("team_*.json")).read_text(encoding="utf-8")))
+            self.assertEqual(state.stop_reason, "team_completed")
+            self.assertEqual(stored.steps[0].status, StepStatus.COMPLETED)
+            self.assertEqual(stored.steps[0].attempts, 2)
+            self.assertEqual(worker.calls[1][2], "Review summary: needs work\n\nIssues:\n- missing verification")
+            self.assertIn("team.step.retry_started", [getattr(event, "event", "") for event in events])
+
+    def test_allow_unapproved_results_preserves_last_worker_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+            team = TeamState.create(goal="Fix", steps=[step("step_1")])
+            worker = ScriptedWorker({"step_1": [TaskResult.success("step_1", "unapproved worker output")]})
+            reviewer = ScriptedReviewer([ReviewDecision(approved=False, summary="not good")])
+
+            state = TeamOrchestrator(
+                config=fake_config(base / "traces", team_max_retries=0, team_allow_unapproved_results=True),
+                llm=FakeLLM(),
+                trace_dir=base / "traces",
+                command_timeout=60,
+                planner=StaticPlanner(team),  # type: ignore[arg-type]
+                worker_factory=lambda _: worker,
+                reviewer_factory=lambda _: reviewer,
+            ).run(repo_path=repo, goal="Fix")
+
+            stored = TeamState.from_dict(json.loads(next((base / "traces" / "teams").glob("team_*.json")).read_text(encoding="utf-8")))
+            self.assertEqual(state.stop_reason, "team_completed")
+            self.assertEqual(stored.steps[0].status, StepStatus.COMPLETED)
+            self.assertEqual(stored.steps[0].result, "unapproved worker output")
+
+    def test_planner_receives_memory_context_separately_from_repo_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+            config = fake_config(base / "traces")
+            memory = MemoryManager.from_config(config=config, llm=FakeLLM(), repo_path=repo)
+            memory.save_fact("AgentCli team memory fact", scope=MemoryScope.PROJECT)
+            team = TeamState.create(goal="AgentCli task", steps=[step("step_1")])
+            planner = RecordingPlanner(team)
+
+            TeamOrchestrator(
+                config=config,
+                llm=FakeLLM(),
+                trace_dir=base / "traces",
+                command_timeout=60,
+                planner=planner,  # type: ignore[arg-type]
+                worker_factory=lambda _: ScriptedWorker({"step_1": [TaskResult.success("step_1", "done")]}),
+                reviewer_factory=lambda _: ScriptedReviewer([ReviewDecision(approved=True)]),
+            ).run(repo_path=repo, goal="AgentCli task", memory_manager=memory)
+
+            self.assertNotIn("AgentCli team memory fact", planner.repo_context)
+            self.assertIn("AgentCli team memory fact", planner.memory_context)
+
+    def test_reviewer_rejects_until_failed_and_dependency_is_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+            team = TeamState.create(
+                goal="Fix",
+                steps=[step("step_1"), step("step_2", dependencies=["step_1"])],
+            )
+            worker = ScriptedWorker(
+                {
+                    "step_1": [
+                        TaskResult.success("step_1", "first result"),
+                        TaskResult.success("step_1", "second result"),
+                    ]
+                }
+            )
+            reviewer = ScriptedReviewer(
+                [
+                    ReviewDecision(approved=False, summary="bad"),
+                    ReviewDecision(approved=False, summary="still bad"),
+                ]
+            )
+
+            state = TeamOrchestrator(
+                config=fake_config(base / "traces", team_max_retries=1),
+                llm=FakeLLM(),
+                trace_dir=base / "traces",
+                command_timeout=60,
+                planner=StaticPlanner(team),  # type: ignore[arg-type]
+                worker_factory=lambda _: worker,
+                reviewer_factory=lambda _: reviewer,
+            ).run(repo_path=repo, goal="Fix")
+
+            stored = TeamState.from_dict(json.loads(next((base / "traces" / "teams").glob("team_*.json")).read_text(encoding="utf-8")))
+            self.assertEqual(state.stop_reason, "team_failed")
+            self.assertEqual(stored.status, TeamStatus.FAILED)
+            self.assertEqual(stored.steps[0].status, StepStatus.FAILED)
+            self.assertEqual(stored.steps[1].status, StepStatus.SKIPPED)
+            self.assertIn("failed", state.final_answer)
+            self.assertIn("skipped", state.final_answer)
+
+    def test_worker_failure_fails_step_and_skips_dependency(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+            team = TeamState.create(
+                goal="Fix",
+                steps=[step("step_1"), step("step_2", dependencies=["step_1"])],
+            )
+            worker = ScriptedWorker({"step_1": [TaskResult.failure("step_1", "worker exploded")]})
+
+            state = TeamOrchestrator(
+                config=fake_config(base / "traces"),
+                llm=FakeLLM(),
+                trace_dir=base / "traces",
+                command_timeout=60,
+                planner=StaticPlanner(team),  # type: ignore[arg-type]
+                worker_factory=lambda _: worker,
+                reviewer_factory=lambda _: ScriptedReviewer([ReviewDecision(approved=True)]),
+            ).run(repo_path=repo, goal="Fix")
+
+            stored = TeamState.from_dict(json.loads(next((base / "traces" / "teams").glob("team_*.json")).read_text(encoding="utf-8")))
+            self.assertEqual(state.stop_reason, "team_failed")
+            self.assertEqual(stored.steps[0].status, StepStatus.FAILED)
+            self.assertEqual(stored.steps[0].error, "worker exploded")
+            self.assertEqual(stored.steps[1].status, StepStatus.SKIPPED)
+
+    def test_worker_exception_fails_current_step_and_persists_original_team(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+            team = TeamState.create(
+                goal="Fix",
+                steps=[step("step_1"), step("step_2", dependencies=["step_1"])],
+            )
+
+            state = TeamOrchestrator(
+                config=fake_config(base / "traces"),
+                llm=FakeLLM(),
+                trace_dir=base / "traces",
+                command_timeout=60,
+                planner=StaticPlanner(team),  # type: ignore[arg-type]
+                worker_factory=lambda _: CrashingWorker(),
+                reviewer_factory=lambda _: ScriptedReviewer([ReviewDecision(approved=True)]),
+            ).run(repo_path=repo, goal="Fix")
+
+            stored_files = list((base / "traces" / "teams").glob("team_*.json"))
+            self.assertEqual(len(stored_files), 1)
+            stored = TeamState.from_dict(json.loads(stored_files[0].read_text(encoding="utf-8")))
+            self.assertEqual(state.stop_reason, "team_failed")
+            self.assertEqual(stored.status, TeamStatus.FAILED)
+            self.assertEqual(stored.steps[0].status, StepStatus.FAILED)
+            self.assertIn("Worker crashed: RuntimeError: worker crashed", stored.steps[0].error)
+            self.assertEqual(stored.steps[1].status, StepStatus.SKIPPED)
+
+    def test_reviewer_exception_fails_current_step_and_persists_original_team(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+            team = TeamState.create(
+                goal="Fix",
+                steps=[step("step_1"), step("step_2", dependencies=["step_1"])],
+            )
+
+            state = TeamOrchestrator(
+                config=fake_config(base / "traces"),
+                llm=FakeLLM(),
+                trace_dir=base / "traces",
+                command_timeout=60,
+                planner=StaticPlanner(team),  # type: ignore[arg-type]
+                worker_factory=lambda _: ScriptedWorker({"step_1": [TaskResult.success("step_1", "worker result")]}),
+                reviewer_factory=lambda _: CrashingReviewer(),
+            ).run(repo_path=repo, goal="Fix")
+
+            stored_files = list((base / "traces" / "teams").glob("team_*.json"))
+            self.assertEqual(len(stored_files), 1)
+            stored = TeamState.from_dict(json.loads(stored_files[0].read_text(encoding="utf-8")))
+            self.assertEqual(state.stop_reason, "team_failed")
+            self.assertEqual(stored.status, TeamStatus.FAILED)
+            self.assertEqual(stored.steps[0].status, StepStatus.FAILED)
+            self.assertEqual(stored.steps[0].result, "worker result")
+            self.assertIn("Reviewer crashed: RuntimeError: reviewer crashed", stored.steps[0].error)
+            self.assertEqual(stored.steps[1].status, StepStatus.SKIPPED)
+
+    def test_real_reviewer_llm_failure_fails_without_rerunning_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+            team = TeamState.create(
+                goal="Fix",
+                steps=[step("step_1"), step("step_2", dependencies=["step_1"])],
+            )
+            worker = ScriptedWorker(
+                {
+                    "step_1": [
+                        TaskResult.success("step_1", "worker result"),
+                        TaskResult.success("step_1", "should not rerun"),
+                    ]
+                }
+            )
+
+            def reviewer_factory(_: str) -> SubAgent:
+                return SubAgent(
+                    name="reviewer-step_1",
+                    role=AgentRole.REVIEWER,
+                    config=fake_config(base / "traces"),
+                    llm=ReviewerCrashLLM(),
+                    repo_path=repo,
+                    trace_dir=base / "traces",
+                    command_timeout=60,
+                )
+
+            state = TeamOrchestrator(
+                config=fake_config(base / "traces", team_max_retries=1),
+                llm=FakeLLM(),
+                trace_dir=base / "traces",
+                command_timeout=60,
+                planner=StaticPlanner(team),  # type: ignore[arg-type]
+                worker_factory=lambda _: worker,
+                reviewer_factory=reviewer_factory,
+            ).run(repo_path=repo, goal="Fix")
+
+            stored_files = list((base / "traces" / "teams").glob("team_*.json"))
+            self.assertEqual(len(stored_files), 1)
+            stored = TeamState.from_dict(json.loads(stored_files[0].read_text(encoding="utf-8")))
+            self.assertEqual(state.stop_reason, "team_failed")
+            self.assertEqual(len(worker.calls), 1)
+            self.assertEqual(stored.steps[0].status, StepStatus.FAILED)
+            self.assertEqual(stored.steps[0].result, "worker result")
+            self.assertIn("Reviewer crashed: RuntimeError: review llm unavailable", stored.steps[0].error)
+            self.assertEqual(stored.steps[1].status, StepStatus.SKIPPED)
 
 
 class TeamRoutingTests(unittest.TestCase):

@@ -17,6 +17,7 @@ DEFAULT_ENV_FILE = PROJECT_ROOT / ".env"
 
 @dataclass(frozen=True)
 class AgentConfig:
+    # LLM provider and process-level runtime settings.
     provider: str
     api_key: str
     base_url: str | None
@@ -26,25 +27,35 @@ class AgentConfig:
     command_timeout: int
     trace_dir: Path
     use_fake_llm: bool
+
+    # Dynamic tool loading is opt-in for project-controlled sources.
     tool_config_paths: tuple[Path, ...] = ()
     enable_project_tools: bool = False
     enable_project_plugins: bool = False
+
+    # ReAct loop safety budgets and stop-condition tuning.
     max_iterations: int = 50
     max_tool_calls: int = 200
     max_elapsed_seconds: int = 1800
     token_budget: int | None = None
     stagnation_window: int = 3
     repeated_failure_window: int = 3
+
+    # Context construction and compaction budgets.
     context_window: int = 128_000
     response_reserve_tokens: int = 8_000
     compression_buffer_tokens: int = 8_000
     retain_recent_user_turns: int = 3
     max_tool_result_chars: int = 12_000
     max_summary_input_chars: int = 60_000
+
+    # Plan-and-execute defaults.
     plan_task_max_steps: int = 6
     plan_max_tasks: int = 12
     plan_max_replans: int = 1
     agent_mode: str = "auto"
+
+    # Team orchestration settings; execution is wired in later stages.
     team_worker_count: int = 2
     team_max_steps: int = 12
     team_max_retries: int = 2
@@ -52,6 +63,8 @@ class AgentConfig:
     team_dependency_context_chars: int = 4_000
     team_parallel_enabled: bool = True
     team_allow_unapproved_results: bool = False
+
+    # Memory storage, retrieval, and compression defaults.
     memory_dir: Path = Path("~/.agentcli/memory").expanduser()
     memory_short_term_tokens: int = 24_000
     memory_short_term_entries: int = 500
