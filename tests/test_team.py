@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 import tempfile
 import unittest
 from pathlib import Path
@@ -108,6 +110,13 @@ class ReviewerCrashLLM(FakeLLM):
         return super().chat(messages, tools=tools)  # type: ignore[arg-type]
 
 
+class PlannerCrashLLM(FakeLLM):
+    def chat(self, messages: list[MessageLike], tools: list[dict[str, object]] | None = None) -> ChatResponse:
+        if tools is None:
+            raise RuntimeError("planner llm unavailable")
+        return super().chat(messages, tools=tools)  # type: ignore[arg-type]
+
+
 class StaticPlanner:
     def __init__(self, team: TeamState):
         self.team = team
@@ -179,6 +188,46 @@ class CrashingReviewer:
 
     def clear_history(self) -> None:
         return None
+
+
+class ParallelWorker:
+    def __init__(
+        self,
+        name: str,
+        calls: list[tuple[str, str]],
+        *,
+        crash_steps: set[str] | None = None,
+        active_counter: dict[str, int] | None = None,
+        lock: threading.Lock | None = None,
+    ):
+        self.name = name
+        self.calls = calls
+        self.crash_steps = set(crash_steps or set())
+        self.active_counter = active_counter
+        self.lock = lock or threading.Lock()
+        self.clear_count = 0
+
+    def execute_step(self, state: TeamState, item: ExecutionStep, context: str, feedback: str = "") -> TaskResult:
+        with self.lock:
+            self.calls.append((self.name, item.id))
+            if self.active_counter is not None:
+                self.active_counter["current"] = self.active_counter.get("current", 0) + 1
+                self.active_counter["max"] = max(
+                    self.active_counter.get("max", 0),
+                    self.active_counter["current"],
+                )
+        try:
+            time.sleep(0.01)
+            if item.id in self.crash_steps:
+                raise RuntimeError(f"{item.id} crashed")
+            return TaskResult.success(item.id, f"{self.name} completed {item.id}")
+        finally:
+            with self.lock:
+                if self.active_counter is not None:
+                    self.active_counter["current"] -= 1
+
+    def clear_history(self) -> None:
+        self.clear_count += 1
 
 
 class TeamTypeTests(unittest.TestCase):
@@ -528,6 +577,177 @@ class TeamOrchestratorTests(unittest.TestCase):
             stored = TeamState.from_dict(json.loads(next((base / "traces" / "teams").glob("team_*.json")).read_text(encoding="utf-8")))
             self.assertEqual(stored.status, TeamStatus.SUCCEEDED)
             self.assertEqual([item.status for item in stored.steps], [StepStatus.COMPLETED] * 3)
+            trace_paths = [Path(item.trace_path) for item in stored.steps]
+            self.assertEqual(len(set(trace_paths)), 3)
+            for trace_path in trace_paths:
+                events = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
+                run_ids = {event["run_id"] for event in events if event["event"] == "run.started"}
+                self.assertEqual(len(run_ids), 1)
+
+    def test_parallel_batch_runs_independent_steps_before_dependencies(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+            team = TeamState.create(
+                goal="Inspect independently",
+                steps=[
+                    step("step_1"),
+                    step("step_2"),
+                    step("step_3", dependencies=["step_1", "step_2"]),
+                ],
+            )
+            calls: list[tuple[str, str]] = []
+            events: list[object] = []
+
+            state = TeamOrchestrator(
+                config=fake_config(base / "traces", team_worker_count=2),
+                llm=FakeLLM(),
+                trace_dir=base / "traces",
+                command_timeout=60,
+                planner=StaticPlanner(team),  # type: ignore[arg-type]
+                worker_factory=lambda index: ParallelWorker(f"worker-{index}", calls),
+                reviewer_factory=lambda _: ScriptedReviewer([ReviewDecision(approved=True, summary="ok")]),
+                event_sink=events.append,
+            ).run(repo_path=repo, goal="Inspect independently")
+
+            self.assertEqual(state.stop_reason, "team_completed")
+            batch_events = [event for event in events if getattr(event, "event", "") == "team.batch.started"]
+            self.assertGreaterEqual(len(batch_events), 2)
+            self.assertEqual(batch_events[0].payload["batch"], ["step_1", "step_2"])
+            self.assertEqual(batch_events[1].payload["batch"], ["step_3"])
+            stored = TeamState.from_dict(json.loads(next((base / "traces" / "teams").glob("team_*.json")).read_text(encoding="utf-8")))
+            self.assertEqual([item.status for item in stored.steps], [StepStatus.COMPLETED] * 3)
+            self.assertEqual({item_id for _, item_id in calls}, {"step_1", "step_2", "step_3"})
+
+    def test_parallel_step_events_have_complete_step_snapshots(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+            team = TeamState.create(goal="Parallel snapshots", steps=[step("step_1"), step("step_2")])
+            events: list[object] = []
+
+            TeamOrchestrator(
+                config=fake_config(base / "traces", team_worker_count=2),
+                llm=FakeLLM(),
+                trace_dir=base / "traces",
+                command_timeout=60,
+                planner=StaticPlanner(team),  # type: ignore[arg-type]
+                worker_factory=lambda index: ParallelWorker(f"worker-{index}", []),
+                reviewer_factory=lambda _: ScriptedReviewer([ReviewDecision(approved=True)]),
+                event_sink=events.append,
+            ).run(repo_path=repo, goal="Parallel snapshots")
+
+            for event in events:
+                if getattr(event, "event", "") != "team.step.completed":
+                    continue
+                step_payload = event.payload["step"]
+                self.assertEqual(step_payload["status"], "completed")
+                self.assertTrue(step_payload["result"])
+                self.assertFalse(step_payload["error"])
+
+    def test_worker_pool_size_one_reuses_worker_without_concurrent_use(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+            team = TeamState.create(goal="Two independent steps", steps=[step("step_1"), step("step_2")])
+            calls: list[tuple[str, str]] = []
+            counter = {"current": 0, "max": 0}
+            lock = threading.Lock()
+            worker = ParallelWorker("worker-1", calls, active_counter=counter, lock=lock)
+
+            state = TeamOrchestrator(
+                config=fake_config(base / "traces", team_worker_count=1),
+                llm=FakeLLM(),
+                trace_dir=base / "traces",
+                command_timeout=60,
+                planner=StaticPlanner(team),  # type: ignore[arg-type]
+                worker_factory=lambda _: worker,
+                reviewer_factory=lambda _: ScriptedReviewer([ReviewDecision(approved=True)]),
+            ).run(repo_path=repo, goal="Two independent steps")
+
+            self.assertEqual(state.stop_reason, "team_completed")
+            self.assertEqual(counter["max"], 1)
+            self.assertEqual(worker.clear_count, 2)
+            self.assertEqual([item_id for _, item_id in calls], ["step_1", "step_2"])
+
+    def test_parallel_step_crash_does_not_block_same_batch_success(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+            team = TeamState.create(
+                goal="Parallel failure",
+                steps=[
+                    step("step_1"),
+                    step("step_2"),
+                    step("step_3", dependencies=["step_1", "step_2"]),
+                ],
+            )
+            calls: list[tuple[str, str]] = []
+
+            state = TeamOrchestrator(
+                config=fake_config(base / "traces", team_worker_count=2),
+                llm=FakeLLM(),
+                trace_dir=base / "traces",
+                command_timeout=60,
+                planner=StaticPlanner(team),  # type: ignore[arg-type]
+                worker_factory=lambda index: ParallelWorker(f"worker-{index}", calls, crash_steps={"step_1"}),
+                reviewer_factory=lambda _: ScriptedReviewer([ReviewDecision(approved=True)]),
+            ).run(repo_path=repo, goal="Parallel failure")
+
+            stored = TeamState.from_dict(json.loads(next((base / "traces" / "teams").glob("team_*.json")).read_text(encoding="utf-8")))
+            self.assertEqual(state.stop_reason, "team_failed")
+            self.assertEqual(stored.steps[0].status, StepStatus.FAILED)
+            self.assertEqual(stored.steps[1].status, StepStatus.COMPLETED)
+            self.assertEqual(stored.steps[2].status, StepStatus.SKIPPED)
+            self.assertIn("Worker crashed: RuntimeError: step_1 crashed", stored.steps[0].error)
+
+    def test_parallel_worker_events_are_serialized_through_orchestrator_sink(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+            team = TeamState.create(goal="Inspect in parallel", steps=[step("step_1"), step("step_2")])
+            sink_lock = threading.Lock()
+            overlaps: list[str] = []
+            seen_events: list[str] = []
+
+            def serialized_sink(event: object) -> None:
+                acquired = sink_lock.acquire(blocking=False)
+                if not acquired:
+                    overlaps.append(getattr(event, "event", "unknown"))
+                    return
+                try:
+                    seen_events.append(getattr(event, "event", ""))
+                    time.sleep(0.002)
+                finally:
+                    sink_lock.release()
+
+            state = TeamOrchestrator(
+                config=fake_config(base / "traces", team_worker_count=2),
+                llm=FakeLLM(),
+                trace_dir=base / "traces",
+                command_timeout=60,
+                planner=StaticPlanner(team),  # type: ignore[arg-type]
+                event_sink=serialized_sink,
+            ).run(
+                repo_path=repo,
+                goal="Inspect in parallel",
+                test_command="python -m unittest discover -s tests -q",
+            )
+
+            self.assertEqual(state.stop_reason, "team_completed")
+            self.assertEqual(overlaps, [])
+            self.assertIn("tool.started", seen_events)
+            self.assertIn("team.step.completed", seen_events)
 
     def test_reviewer_rejection_retries_and_second_attempt_can_pass(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -619,6 +839,30 @@ class TeamOrchestratorTests(unittest.TestCase):
 
             self.assertNotIn("AgentCli team memory fact", planner.repo_context)
             self.assertIn("AgentCli team memory fact", planner.memory_context)
+
+    def test_planner_llm_failure_uses_team_planner_failed_stop_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+
+            state = TeamOrchestrator(
+                config=fake_config(base / "traces"),
+                llm=PlannerCrashLLM(),
+                trace_dir=base / "traces",
+                command_timeout=60,
+            ).run(repo_path=repo, goal="Plan with unavailable LLM")
+
+            self.assertEqual(state.stop_reason, "team_planner_failed")
+            self.assertIn("Team failed", state.final_answer)
+            events = [
+                json.loads(line)
+                for line in state.trace_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            validation = [event for event in events if event["event"] == "team.validation_failed"]
+            self.assertEqual(validation[-1]["payload"]["code"], "team_planner_llm_failed")
 
     def test_reviewer_rejects_until_failed_and_dependency_is_skipped(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -807,6 +1051,10 @@ class TeamRoutingTests(unittest.TestCase):
     def test_team_mode_is_normalized_and_resolved(self) -> None:
         self.assertEqual(normalize_mode("team"), AgentMode.TEAM)
         self.assertEqual(resolve_mode("team", "anything"), AgentMode.TEAM)
+
+    def test_auto_mode_uses_team_only_for_explicit_multi_agent_cues(self) -> None:
+        self.assertEqual(resolve_mode("auto", "请让 worker 和 reviewer 分工审查这个实现"), AgentMode.TEAM)
+        self.assertEqual(resolve_mode("auto", "先检查 calculator.py 再运行测试"), AgentMode.PLAN)
 
 
 if __name__ == "__main__":

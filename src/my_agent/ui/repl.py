@@ -12,6 +12,7 @@ from my_agent.llm.types import Message
 from my_agent.memory import MemoryManager, MemoryScope
 from my_agent.plan import AgentMode, PlanState, PlanTask, normalize_mode
 from my_agent.runtime import run_agent
+from my_agent.team import ExecutionStep, TeamState
 from my_agent.text_safety import repair_surrogates
 from my_agent.tools import RepoTools, ToolExecutionResult, ToolInvocation
 from my_agent.ui.renderer import PlainRenderer, Renderer, StartupInfo
@@ -29,6 +30,8 @@ HELP_TEXT = """Commands:
 /trace            Show the latest trace path.
 /plan <task>      Run a task with Plan-and-Execute.
 /plan             Run the next task with Plan-and-Execute.
+/team <task>      Run a task with Multi-Agent team orchestration.
+/team             Run the next task with Multi-Agent team orchestration.
 /mode <mode>      Set mode: react, plan, team, or auto.
 /quit             Exit.
 """
@@ -155,6 +158,14 @@ class AgentRepl:
                 self._next_mode = AgentMode.PLAN
                 self.renderer.status("Next task will use Plan-and-Execute.")
             return False
+        if command.startswith("/team"):
+            task = command.removeprefix("/team").strip()
+            if task:
+                self._run_task(task, mode=AgentMode.TEAM)
+            else:
+                self._next_mode = AgentMode.TEAM
+                self.renderer.status("Next task will use Multi-Agent team orchestration.")
+            return False
         self.renderer.status("Unknown command. Type /help for commands.")
         return False
 
@@ -201,6 +212,18 @@ class AgentRepl:
             plan = _plan_from_payload(payload)
             if plan is not None:
                 self.renderer.plan_completed(plan)
+        elif event_name == "team.started":
+            team = _team_from_payload(payload)
+            if team is not None:
+                self.renderer.team_started(team)
+        elif event_name.startswith("team.step."):
+            step = _team_step_from_payload(payload)
+            if step is not None:
+                self.renderer.team_step_updated(step, team_id=str(payload.get("team_id", "")))
+        elif event_name in {"team.completed", "team.failed", "team.cancelled", "team.validation_failed"}:
+            team = _team_from_payload(payload)
+            if team is not None:
+                self.renderer.team_completed(team)
         elif event_name == "tool.started":
             invocation = ToolInvocation(
                 id=str(payload.get("id", "")),
@@ -329,6 +352,20 @@ def _task_from_payload(payload: dict[str, object]) -> PlanTask | None:
     if not isinstance(raw, dict):
         return None
     return PlanTask.from_dict(raw)
+
+
+def _team_from_payload(payload: dict[str, object]) -> TeamState | None:
+    raw = payload.get("team")
+    if not isinstance(raw, dict):
+        return None
+    return TeamState.from_dict(raw)
+
+
+def _team_step_from_payload(payload: dict[str, object]) -> ExecutionStep | None:
+    raw = payload.get("step")
+    if not isinstance(raw, dict):
+        return None
+    return ExecutionStep.from_dict(raw)
 
 
 def _discover_test_command(repo_path: Path) -> str | None:

@@ -16,6 +16,7 @@ add_src_to_path()
 
 from my_agent.config import AgentConfig
 from my_agent.plan import AgentMode, PlanState, PlanStatus, PlanTask, TaskStatus
+from my_agent.team import ExecutionStep, StepStatus, TeamState, TeamStatus
 from my_agent.ui import AgentRepl, PlainRenderer
 
 
@@ -87,6 +88,7 @@ class ReplTests(unittest.TestCase):
         self.assertIn("/memory", text)
         self.assertIn("/save", text)
         self.assertIn("/plan", text)
+        self.assertIn("/team", text)
         self.assertIn("/mode", text)
         self.assertIn("team", text)
         self.assertIn("read_file", text)
@@ -254,6 +256,32 @@ class ReplTests(unittest.TestCase):
         self.assertIn("Latest trace:", text)
         self.assertEqual(errors.getvalue(), "")
 
+    def test_team_command_runs_team_agent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            write_runtime_repo(repo)
+            output = io.StringIO()
+            errors = io.StringIO()
+            repl = AgentRepl(
+                repo_path=repo,
+                config=fake_config(repo / "traces"),
+                trace_dir=repo / "traces",
+                renderer=PlainRenderer(output=output, errors=errors),
+                input_stream=io.StringIO("/team 先检查 calculator.py，再修复 subtract，并运行测试\n/trace\n/quit\n"),
+            )
+
+            exit_code = repl.run(show_banner=False)
+
+        self.assertEqual(exit_code, 0)
+        text = output.getvalue()
+        self.assertIn("team started:", text)
+        self.assertIn("reviewing", text)
+        self.assertIn("completed", text)
+        self.assertIn("team succeeded:", text)
+        self.assertIn("Team succeeded", text)
+        self.assertIn("Latest trace:", text)
+        self.assertEqual(errors.getvalue(), "")
+
     def test_plan_command_repairs_surrogateescape_input(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
@@ -324,6 +352,29 @@ class ReplTests(unittest.TestCase):
         self.assertIn("Mode set to team.", output.getvalue())
         self.assertEqual(errors.getvalue(), "")
 
+    def test_team_command_without_task_sets_next_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            write_runtime_repo(repo)
+            output = io.StringIO()
+            errors = io.StringIO()
+            repl = AgentRepl(
+                repo_path=repo,
+                config=fake_config(repo / "traces"),
+                trace_dir=repo / "traces",
+                renderer=PlainRenderer(output=output, errors=errors),
+                input_stream=io.StringIO("/team\nDo task\n/quit\n"),
+            )
+            final_state = SimpleNamespace(trace_path=repo / "traces" / "trace.jsonl", final_answer="done")
+
+            with mock.patch("my_agent.ui.repl.run_agent", return_value=final_state) as run_agent_mock:
+                exit_code = repl.run(show_banner=False)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(run_agent_mock.call_args.kwargs["mode"], AgentMode.TEAM)
+        self.assertIn("Next task will use Multi-Agent team orchestration.", output.getvalue())
+        self.assertEqual(errors.getvalue(), "")
+
     def test_renderer_displays_plan_status_icons(self) -> None:
         output = io.StringIO()
         renderer = PlainRenderer(output=output)
@@ -340,6 +391,25 @@ class ReplTests(unittest.TestCase):
         self.assertIn("○ task_1", text)
         self.assertIn("▶ task_1 running", text)
         self.assertIn("plan succeeded:", text)
+
+    def test_renderer_displays_team_status_icons(self) -> None:
+        output = io.StringIO()
+        renderer = PlainRenderer(output=output)
+        team = TeamState.create(goal="goal", summary="summary", steps=[ExecutionStep("step_1", "Inspect", "Inspect")])
+        team.status = TeamStatus.RUNNING
+
+        renderer.team_started(team)
+        team.steps[0].status = StepStatus.REVIEWING
+        renderer.team_step_updated(team.steps[0], team_id=team.id)
+        team.steps[0].status = StepStatus.COMPLETED
+        team.status = TeamStatus.SUCCEEDED
+        renderer.team_completed(team)
+
+        text = output.getvalue()
+        self.assertIn("team started:", text)
+        self.assertIn("○ step_1", text)
+        self.assertIn("? step_1 reviewing", text)
+        self.assertIn("team succeeded:", text)
 
     def test_renderer_has_ascii_status_fallback(self) -> None:
         output = io.StringIO()

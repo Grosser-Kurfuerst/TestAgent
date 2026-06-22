@@ -27,7 +27,27 @@ def resolve_mode(value: AgentMode | str | None, task: str, *, default: AgentMode
     mode = normalize_mode(value, default=default)
     if mode != AgentMode.AUTO:
         return mode
+    if should_use_team(task):
+        return AgentMode.TEAM
     return AgentMode.PLAN if should_use_plan(task) else AgentMode.REACT
+
+
+def should_use_team(task: str) -> bool:
+    text = task.strip().lower()
+    team_cues = [
+        "multi-agent",
+        "reviewer",
+        "worker",
+        "orchestrator",
+        "团队",
+        "分工",
+        "多智能体",
+        "主从",
+        "编排",
+        "审查",
+        "review",
+    ]
+    return any(cue in text for cue in team_cues)
 
 
 def should_use_plan(task: str) -> bool:

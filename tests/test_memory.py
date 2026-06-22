@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -258,7 +259,31 @@ class LongTermMemoryStoreTests(unittest.TestCase):
             store.add(_fact("shared fact", id="p1", project_key="/a"))
             _, created = store.add(_fact("shared fact", id="p2", project_key="/b"))
             self.assertTrue(created)
-            self.assertEqual(len(store), 2)
+
+    def test_concurrent_adds_persist_without_tmp_file_race(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            store = self._store(base)
+            store.load()
+            errors: list[BaseException] = []
+
+            def add_fact(index: int) -> None:
+                try:
+                    store.add(_fact(f"parallel fact {index}", id=f"f{index}"))
+                except BaseException as exc:  # noqa: BLE001 - test records thread failures.
+                    errors.append(exc)
+
+            threads = [threading.Thread(target=add_fact, args=(index,)) for index in range(12)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+            self.assertEqual(errors, [])
+            self.assertEqual(len(store), 12)
+            reloaded = self._store(base)
+            reloaded.load()
+            self.assertEqual(len(reloaded), 12)
 
     def test_add_computes_fingerprint_for_blank_entry(self) -> None:
         # add() is a public store boundary (plan §6: "add() 先计算

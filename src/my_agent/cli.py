@@ -100,8 +100,8 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument(
         "--mode",
         choices=("react", "plan", "team", "auto"),
-        default="react",
-        help="Execution mode. Default: react.",
+        default=None,
+        help="Execution mode. Default: AGENTCLI_AGENT_MODE or auto.",
     )
 
     chat_parser = subparsers.add_parser("chat", help="Start the interactive ReAct shell.")
@@ -259,7 +259,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 task=args.task or task_payload["task"],
                 test_command=test_command,
                 config=config,
-                max_steps=args.max_steps if args.max_steps is not None else config.max_steps,
+                max_steps=args.max_steps,
                 trace_dir=trace_dir,
                 mode=args.mode,
             )
@@ -273,7 +273,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(_section("Final summary", final_state.final_answer))
         print()
         print(f"Trace: {final_state.trace_path}")
-        if getattr(final_state, "stop_reason", "") in {"plan_failed", "plan_validation_failed", "plan_cancelled"}:
+        if getattr(final_state, "stop_reason", "") in {
+            "plan_failed",
+            "plan_validation_failed",
+            "plan_cancelled",
+            "team_failed",
+            "team_validation_failed",
+            "team_cancelled",
+            "team_planner_failed",
+        }:
             return 1
         return 0
 

@@ -16,12 +16,17 @@ class TraceWriter:
         directory = Path(trace_dir)
         directory.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        suffix = run_id.replace("/", "_")[:8]
+        suffix = _safe_trace_suffix(run_id)
         return cls(directory / f"agent_trace_{timestamp}_{suffix}.jsonl")
 
     def append(self, event: TraceEvent) -> None:
         with self.path.open("a", encoding="utf-8") as file:
             file.write(event.to_json_line() + "\n")
+
+
+def _safe_trace_suffix(run_id: str) -> str:
+    safe = "".join(char if char.isalnum() or char in {"_", "-"} else "_" for char in run_id)
+    return (safe or "run")[:64]
 
 
 def append_benchmark_result(

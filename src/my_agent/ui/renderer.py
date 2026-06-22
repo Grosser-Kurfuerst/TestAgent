@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Protocol, TextIO
 
 from my_agent.plan import PlanState, PlanStatus, PlanTask, TaskStatus
+from my_agent.team import ExecutionStep, StepStatus, TeamState, TeamStatus
 from my_agent.tools import ToolExecutionResult, ToolInvocation
 
 
@@ -58,6 +59,15 @@ class Renderer(Protocol):
     def plan_completed(self, plan: PlanState) -> None:
         ...
 
+    def team_started(self, team: TeamState) -> None:
+        ...
+
+    def team_step_updated(self, step: ExecutionStep, *, team_id: str) -> None:
+        ...
+
+    def team_completed(self, team: TeamState) -> None:
+        ...
+
     def status(self, status: str) -> None:
         ...
 
@@ -83,6 +93,28 @@ TASK_STATUS_ASCII = {
     TaskStatus.FAILED: "[failed]",
     TaskStatus.SKIPPED: "[skipped]",
     TaskStatus.CANCELLED: "[cancelled]",
+}
+
+STEP_STATUS_ICON = {
+    StepStatus.PENDING: "○",
+    StepStatus.READY: "◌",
+    StepStatus.RUNNING: "▶",
+    StepStatus.REVIEWING: "?",
+    StepStatus.COMPLETED: "✓",
+    StepStatus.FAILED: "✗",
+    StepStatus.SKIPPED: "-",
+    StepStatus.CANCELLED: "!",
+}
+
+STEP_STATUS_ASCII = {
+    StepStatus.PENDING: "[pending]",
+    StepStatus.READY: "[ready]",
+    StepStatus.RUNNING: "[running]",
+    StepStatus.REVIEWING: "[reviewing]",
+    StepStatus.COMPLETED: "[ok]",
+    StepStatus.FAILED: "[failed]",
+    StepStatus.SKIPPED: "[skipped]",
+    StepStatus.CANCELLED: "[cancelled]",
 }
 
 
@@ -146,6 +178,22 @@ class PlainRenderer:
         label = _plan_label(plan.status)
         self.output.write(f"plan {label}: {suffix or 'no tasks'}\n")
 
+    def team_started(self, team: TeamState) -> None:
+        self.output.write(f"team started: {team.id} {len(team.steps)} steps\n")
+        if team.summary:
+            self.output.write(f"summary: {team.summary}\n")
+        for step in team.steps:
+            self.output.write(f"{self._step_icon(step.status)} {step.id} {step.type.value} {step.title}\n")
+
+    def team_step_updated(self, step: ExecutionStep, *, team_id: str) -> None:
+        worker = f" {step.worker_name}" if step.worker_name and step.status == StepStatus.RUNNING else ""
+        self.output.write(f"{self._step_icon(step.status)} {step.id} {step.status.value}{worker} {step.title}\n")
+
+    def team_completed(self, team: TeamState) -> None:
+        counts = _team_status_counts(team)
+        suffix = ", ".join(f"{status}={count}" for status, count in sorted(counts.items()))
+        self.output.write(f"team {_team_label(team.status)}: {suffix or 'no steps'}\n")
+
     def status(self, status: str) -> None:
         self.output.write(status.rstrip() + "\n")
 
@@ -154,6 +202,9 @@ class PlainRenderer:
 
     def _task_icon(self, status: TaskStatus) -> str:
         return (TASK_STATUS_ICON if self.unicode_icons else TASK_STATUS_ASCII)[status]
+
+    def _step_icon(self, status: StepStatus) -> str:
+        return (STEP_STATUS_ICON if self.unicode_icons else STEP_STATUS_ASCII)[status]
 
 
 class AnsiRenderer(PlainRenderer):
@@ -170,11 +221,28 @@ def _status_counts(plan: PlanState) -> dict[str, int]:
     return counts
 
 
+def _team_status_counts(team: TeamState) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for step in team.steps:
+        counts[step.status.value] = counts.get(step.status.value, 0) + 1
+    return counts
+
+
 def _plan_label(status: PlanStatus) -> str:
     if status == PlanStatus.SUCCEEDED:
         return "succeeded"
     if status == PlanStatus.FAILED:
         return "failed"
     if status == PlanStatus.CANCELLED:
+        return "cancelled"
+    return status.value
+
+
+def _team_label(status: TeamStatus) -> str:
+    if status == TeamStatus.SUCCEEDED:
+        return "succeeded"
+    if status == TeamStatus.FAILED:
+        return "failed"
+    if status == TeamStatus.CANCELLED:
         return "cancelled"
     return status.value

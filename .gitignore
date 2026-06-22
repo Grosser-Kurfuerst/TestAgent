@@ -17,5 +17,5 @@ traces/
 evaluationResults/
 data/
 models/
-docs/
+docs/*
 AGENTS.md

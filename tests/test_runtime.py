@@ -143,6 +143,53 @@ class RuntimeTests(unittest.TestCase):
             self.assertNotIn("final_summary", event_names)
             self.assertEqual({event["run_id"] for event in events}, {state.run_id})
 
+    def test_run_agent_team_mode_executes_team_orchestrator(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+
+            state = run_agent(
+                repo_path=repo,
+                task="先检查 calculator.py 和测试，再修复 subtract，并运行测试",
+                test_command="python -m unittest discover -s tests -q",
+                config=fake_config(base / "traces"),
+                llm=FakeLLM(),
+                trace_dir=base / "traces",
+                mode="team",
+            )
+
+            self.assertEqual(state.stop_reason, "team_completed")
+            self.assertIn("Team succeeded", state.final_answer)
+            self.assertIn("return a - b", (repo / "calculator.py").read_text(encoding="utf-8"))
+            events = read_trace(state.trace_path)
+            event_names = [event["event"] for event in events]
+            self.assertIn("team.started", event_names)
+            self.assertIn("team.step.review_completed", event_names)
+            self.assertIn("team.completed", event_names)
+
+    def test_run_agent_default_mode_uses_config_agent_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+
+            state = run_agent(
+                repo_path=repo,
+                task="先检查 calculator.py 和测试，再修复 subtract，并运行测试",
+                test_command="python -m unittest discover -s tests -q",
+                config=fake_config(base / "traces", agent_mode="team"),
+                llm=FakeLLM(),
+                trace_dir=base / "traces",
+            )
+
+            self.assertEqual(state.stop_reason, "team_completed")
+            event_names = [event["event"] for event in read_trace(state.trace_path)]
+            self.assertIn("team.started", event_names)
+            self.assertNotIn("run.started", event_names)
+
     def test_multi_tool_calls_execute_in_response_order(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -601,12 +648,12 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(state.stop_reason, "assistant_final")
             self.assertNotIn("plan.started", [event["event"] for event in events])
 
-    def test_run_agent_mode_team_returns_clear_not_implemented_error(self) -> None:
+    def test_run_agent_mode_team_requires_native_tool_support(self) -> None:
         class NoToolLLM:
             supports_tools = False
 
             def chat(self, messages: list[object], tools: list[dict[str, object]] | None = None) -> object:
-                raise AssertionError("team skeleton should fail before LLM use")
+                raise AssertionError("team runtime should fail before LLM use")
 
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -614,7 +661,7 @@ class RuntimeTests(unittest.TestCase):
             repo.mkdir()
             write_runtime_repo(repo)
 
-            with self.assertRaisesRegex(RuntimeError, "team mode not implemented"):
+            with self.assertRaisesRegex(RuntimeError, "native tool-call support"):
                 run_agent(
                     repo_path=repo,
                     task="Use the team orchestrator.",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
@@ -35,6 +36,7 @@ class LongTermMemoryStore:
         self._trace_sink = trace_sink
         self._entries: list[MemoryEntry] = []
         self._loaded = False
+        self._lock = threading.RLock()
 
     @classmethod
     def from_dir(cls, directory: str | Path, *, trace_sink: TraceSink | None = None) -> "LongTermMemoryStore":
@@ -42,36 +44,37 @@ class LongTermMemoryStore:
 
     def load(self) -> None:
         """Load entries from disk. Safe to call once at startup."""
-        self._entries = []
-        skipped = 0
-        if self.path.exists():
-            with self.path.open("r", encoding="utf-8") as file:
-                for line_no, raw in enumerate(file, start=1):
-                    line = raw.strip()
-                    if not line:
-                        continue
-                    try:
-                        payload = json.loads(line)
-                        if not isinstance(payload, dict):
-                            raise ValueError("not an object")
-                        entry = _entry_from_payload(payload)
-                    except (ValueError, json.JSONDecodeError, KeyError, TypeError) as exc:
-                        skipped += 1
-                        self._trace("memory.load_skipped", {
-                            "file": str(self.path),
-                            "line": line_no,
-                            "error": f"{type(exc).__name__}: {exc}",
-                        })
-                        continue
-                    self._entries.append(entry)
-        self._dedupe_in_place()
-        self._loaded = True
-        if skipped:
-            self._trace("memory.load_skipped_summary", {
-                "file": str(self.path),
-                "skipped": skipped,
-                "loaded": len(self._entries),
-            })
+        with self._lock:
+            self._entries = []
+            skipped = 0
+            if self.path.exists():
+                with self.path.open("r", encoding="utf-8") as file:
+                    for line_no, raw in enumerate(file, start=1):
+                        line = raw.strip()
+                        if not line:
+                            continue
+                        try:
+                            payload = json.loads(line)
+                            if not isinstance(payload, dict):
+                                raise ValueError("not an object")
+                            entry = _entry_from_payload(payload)
+                        except (ValueError, json.JSONDecodeError, KeyError, TypeError) as exc:
+                            skipped += 1
+                            self._trace("memory.load_skipped", {
+                                "file": str(self.path),
+                                "line": line_no,
+                                "error": f"{type(exc).__name__}: {exc}",
+                            })
+                            continue
+                        self._entries.append(entry)
+            self._dedupe_in_place()
+            self._loaded = True
+            if skipped:
+                self._trace("memory.load_skipped_summary", {
+                    "file": str(self.path),
+                    "skipped": skipped,
+                    "loaded": len(self._entries),
+                })
 
     def add(self, entry: MemoryEntry) -> tuple[MemoryEntry, bool]:
         """Add an entry, deduplicating by scope/project/fingerprint.
@@ -86,58 +89,62 @@ class LongTermMemoryStore:
         cannot collide. ``MemoryEntry.build()`` already fills a matching
         fingerprint, so well-formed entries pass through unchanged.
         """
-        self._ensure_loaded()
-        entry = _normalize_fingerprint(entry)
-        existing = self._find_duplicate(entry)
-        if existing is not None:
-            upgraded = _manual_upgrade(existing, entry)
-            if upgraded is not None:
-                snapshot = list(self._entries)
-                self._replace_entry(existing, upgraded)
-                try:
-                    self._persist()
-                except Exception:
-                    self._entries = snapshot
-                    raise
-                return upgraded, False
-            return existing, False
-        snapshot = list(self._entries)
-        self._entries.append(entry)
-        try:
-            self._persist()
-        except Exception:
-            self._entries = snapshot
-            raise
-        return entry, True
+        with self._lock:
+            self._ensure_loaded()
+            entry = _normalize_fingerprint(entry)
+            existing = self._find_duplicate(entry)
+            if existing is not None:
+                upgraded = _manual_upgrade(existing, entry)
+                if upgraded is not None:
+                    snapshot = list(self._entries)
+                    self._replace_entry(existing, upgraded)
+                    try:
+                        self._persist()
+                    except Exception:
+                        self._entries = snapshot
+                        raise
+                    return upgraded, False
+                return existing, False
+            snapshot = list(self._entries)
+            self._entries.append(entry)
+            try:
+                self._persist()
+            except Exception:
+                self._entries = snapshot
+                raise
+            return entry, True
 
     def all(self, *, project_key: str | None = None) -> list[MemoryEntry]:
-        self._ensure_loaded()
-        if project_key is None:
-            return list(self._entries)
-        return [entry for entry in self._entries if _is_visible(entry, project_key)]
+        with self._lock:
+            self._ensure_loaded()
+            if project_key is None:
+                return list(self._entries)
+            return [entry for entry in self._entries if _is_visible(entry, project_key)]
 
     def search_candidates(self, *, project_key: str | None = None) -> list[MemoryEntry]:
         """Entries visible to ``project_key`` for retrieval scoring."""
         return self.all(project_key=project_key)
 
     def clear(self, *, scope: MemoryScope | None = None, project_key: str | None = None) -> int:
-        self._ensure_loaded()
-        before = len(self._entries)
-        if scope is None and project_key is None:
-            self._entries = []
-        else:
-            self._entries = [
-                entry for entry in self._entries
-                if not _matches_filter(entry, scope=scope, project_key=project_key)
-            ]
-        removed = before - len(self._entries)
-        if removed:
-            self._persist()
-        return removed
+        with self._lock:
+            self._ensure_loaded()
+            before = len(self._entries)
+            if scope is None and project_key is None:
+                self._entries = []
+            else:
+                self._entries = [
+                    entry for entry in self._entries
+                    if not _matches_filter(entry, scope=scope, project_key=project_key)
+                ]
+            removed = before - len(self._entries)
+            if removed:
+                self._persist()
+            return removed
 
     def __len__(self) -> int:
-        self._ensure_loaded()
-        return len(self._entries)
+        with self._lock:
+            self._ensure_loaded()
+            return len(self._entries)
 
     def _ensure_loaded(self) -> None:
         """Lazily load disk state before the first read or mutation.

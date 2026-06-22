@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -39,8 +40,13 @@ class FakeLLM:
         self._chat_responses = list(chat_responses or [])
         self._chat_turn = 0
         self._plan_task_turns: dict[str, int] = {}
+        self._lock = threading.Lock()
 
     def chat(self, messages: list[MessageLike], tools: list[dict[str, Any]] | None = None) -> ChatResponse:
+        with self._lock:
+            return self._chat_unlocked(messages, tools)
+
+    def _chat_unlocked(self, messages: list[MessageLike], tools: list[dict[str, Any]] | None = None) -> ChatResponse:
         if self._chat_responses:
             response = self._chat_responses.pop(0)
             if isinstance(response, ChatResponse):

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from queue import Queue
 from typing import Any, Callable, Protocol
 
 from my_agent.config import AgentConfig
@@ -111,6 +114,7 @@ class TeamOrchestrator:
         self._test_command: str | None = None
         self._memory: MemoryManager | None = None
         self._step_max_steps = config.team_step_max_steps
+        self._state_lock = threading.RLock()
 
     def run(
         self,
@@ -124,7 +128,7 @@ class TeamOrchestrator:
         repo = Path(repo_path).resolve()
         self._repo_path = repo
         self._test_command = test_command
-        self._step_max_steps = _positive_or_default(max_steps, self.config.team_step_max_steps)
+        self._step_max_steps = self.config.team_step_max_steps
         state = AgentState.initial(
             repo_path=repo,
             task=goal,
@@ -144,11 +148,25 @@ class TeamOrchestrator:
             try:
                 repo_context = self._repo_context(repo, goal, writer, state)
                 memory_context = memory.build_context_for_query(goal).injected_text
-                team = self.planner.create_team_plan(
-                    goal,
-                    repo_context=repo_context,
-                    memory_context=memory_context,
-                )
+                try:
+                    team = self.planner.create_team_plan(
+                        goal,
+                        repo_context=repo_context,
+                        memory_context=memory_context,
+                    )
+                except RuntimeError as exc:
+                    team = TeamState.create(goal=goal, summary="Team planning failed.")
+                    team.status = TeamStatus.FAILED
+                    team.error = str(exc)
+                    team.trace_path = str(writer.path)
+                    self._save_and_emit(
+                        writer,
+                        state,
+                        team,
+                        "team.validation_failed",
+                        extra={"code": "team_planner_failed", "message": str(exc)},
+                    )
+                    return self._final_state(state, team, stop_reason="team_planner_failed")
                 team.trace_path = str(writer.path)
                 team.status = TeamStatus.RUNNING
                 team.started_at = team.started_at or _now()
@@ -164,7 +182,17 @@ class TeamOrchestrator:
                         "batches": execution_batches(team.steps, max_steps=state.max_steps),
                     },
                 )
-                completed = self._execute_serial(team, writer, state)
+                self._save_and_emit(
+                    writer,
+                    state,
+                    team,
+                    "team.started",
+                    extra={
+                        "worker_count": self.config.team_worker_count,
+                        "parallel_enabled": self.config.team_parallel_enabled,
+                    },
+                )
+                completed = self._execute_team(team, writer, state)
                 self._record_team_step_summaries(memory, completed, run_id=state.run_id)
                 memory.extract_facts(reason="team_completed", run_id=state.run_id)
                 return self._final_state(state, completed)
@@ -180,7 +208,8 @@ class TeamOrchestrator:
                     "team.validation_failed",
                     extra={"code": exc.code, "message": exc.message, "details": exc.details},
                 )
-                return self._final_state(state, team, stop_reason="team_validation_failed")
+                stop_reason = "team_planner_failed" if exc.code == "team_planner_llm_failed" else "team_validation_failed"
+                return self._final_state(state, team, stop_reason=stop_reason)
             except RuntimeError as exc:
                 team = TeamState.create(goal=goal, summary="Team execution failed before completion.")
                 team.status = TeamStatus.FAILED
@@ -211,11 +240,12 @@ class TeamOrchestrator:
         last_output = ""
 
         for attempt in range(1, max_attempts + 1):
-            step.attempts = attempt
-            step.status = StepStatus.RUNNING
-            step.started_at = step.started_at or _now()
-            step.worker_name = getattr(active_worker, "name", "")
-            self._save_and_emit(writer, state, team, "team.step.started", step)
+            with self._state_lock:
+                step.attempts = attempt
+                step.status = StepStatus.RUNNING
+                step.started_at = step.started_at or _now()
+                step.worker_name = getattr(active_worker, "name", "")
+                self._save_and_emit(writer, state, team, "team.step.started", step)
 
             try:
                 result: TaskResult = active_worker.execute_step(team, step, dependency_context, feedback=feedback)
@@ -228,22 +258,25 @@ class TeamOrchestrator:
                     state,
                 )
                 return
-            step.trace_path = result.trace_path
+            with self._state_lock:
+                step.trace_path = result.trace_path
             if not result.ok:
                 self._mark_failed(team, step, result.error or "Worker failed.", writer, state, output=result.output)
                 return
             last_output = result.output
-            self._save_and_emit(
-                writer,
-                state,
-                team,
-                "team.step.worker_completed",
-                step,
-                extra={"attempt": attempt, "worker_result": result.to_dict()},
-            )
+            with self._state_lock:
+                self._save_and_emit(
+                    writer,
+                    state,
+                    team,
+                    "team.step.worker_completed",
+                    step,
+                    extra={"attempt": attempt, "worker_result": result.to_dict()},
+                )
 
-            step.status = StepStatus.REVIEWING
-            self._save_and_emit(writer, state, team, "team.step.review_started", step)
+            with self._state_lock:
+                step.status = StepStatus.REVIEWING
+                self._save_and_emit(writer, state, team, "team.step.review_started", step)
             try:
                 decision: ReviewDecision = active_reviewer.review_step(team.goal, step, dependency_context, result.output)
             except Exception as exc:  # noqa: BLE001 - reviewer failures must not corrupt team state.
@@ -256,19 +289,20 @@ class TeamOrchestrator:
                     output=result.output,
                 )
                 return
-            step.review_summary = decision.summary
-            step.review_issues = list(decision.issues)
-            step.review_suggestions = list(decision.suggestions)
+            with self._state_lock:
+                step.review_summary = decision.summary
+                step.review_issues = list(decision.issues)
+                step.review_suggestions = list(decision.suggestions)
+                self._save_and_emit(
+                    writer,
+                    state,
+                    team,
+                    "team.step.review_completed",
+                    step,
+                    extra={"attempt": attempt, "review": _review_payload(decision)},
+                )
             if hasattr(active_reviewer, "clear_history"):
                 active_reviewer.clear_history()
-            self._save_and_emit(
-                writer,
-                state,
-                team,
-                "team.step.review_completed",
-                step,
-                extra={"attempt": attempt, "review": _review_payload(decision)},
-            )
 
             if decision.approved:
                 self._mark_completed(team, step, result, writer, state)
@@ -325,23 +359,101 @@ class TeamOrchestrator:
             )
         return "\n".join(chunks) if chunks else "No completed dependencies."
 
-    def _execute_serial(self, team: TeamState, writer: TraceWriter, state: AgentState) -> TeamState:
-        worker = self._make_worker(1)
+    def _execute_team(
+        self,
+        team: TeamState,
+        writer: TraceWriter,
+        state: AgentState,
+        *,
+        parallel_enabled: bool | None = None,
+    ) -> TeamState:
+        use_parallel = self.config.team_parallel_enabled if parallel_enabled is None else parallel_enabled
+        worker_pool = self._make_worker_pool()
         while True:
             executable = get_executable_steps(team.steps)
             if not executable:
                 break
-            step = executable[0]
-            step.status = StepStatus.READY
-            self._save_and_emit(writer, state, team, "team.step.ready", step)
-            reviewer = self._make_reviewer(step.id)
-            self.run_step(team, step, worker=worker, reviewer=reviewer, writer=writer, state=state)
-            if hasattr(worker, "clear_history"):
-                worker.clear_history()
+            for step in executable:
+                with self._state_lock:
+                    step.status = StepStatus.READY
+                    self._save_and_emit(writer, state, team, "team.step.ready", step)
+
+            self._save_and_emit(
+                writer,
+                state,
+                team,
+                "team.batch.started",
+                extra={
+                    "batch": [step.id for step in executable],
+                    "worker_count": min(len(executable), max(1, self.config.team_worker_count)),
+                    "parallel": use_parallel and len(executable) > 1,
+                },
+            )
+
+            if use_parallel and len(executable) > 1:
+                self.run_batch_parallel(team, executable, worker_pool=worker_pool, writer=writer, state=state)
+            else:
+                for step in executable:
+                    self._run_with_worker_from_pool(team, step, worker_pool, writer, state)
 
         self._skip_residual_steps(team, writer, state)
         self._finish_team(team, writer, state)
         return team
+
+    def _execute_serial(self, team: TeamState, writer: TraceWriter, state: AgentState) -> TeamState:
+        return self._execute_team(team, writer, state, parallel_enabled=False)
+
+    def run_batch_parallel(
+        self,
+        team: TeamState,
+        batch: list[ExecutionStep],
+        *,
+        worker_pool: Queue[Any],
+        writer: TraceWriter,
+        state: AgentState,
+    ) -> None:
+        max_workers = min(len(batch), max(1, self.config.team_worker_count))
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="agentcli-team") as executor:
+            futures = {
+                executor.submit(self._run_with_worker_from_pool, team, step, worker_pool, writer, state): step
+                for step in batch
+            }
+            for future in as_completed(futures):
+                step = futures[future]
+                try:
+                    future.result()
+                except Exception as exc:  # noqa: BLE001 - one crashed future must not stop the batch.
+                    self._mark_failed(
+                        team,
+                        step,
+                        f"Parallel step crashed: {type(exc).__name__}: {exc}",
+                        writer,
+                        state,
+                    )
+
+    def _make_worker_pool(self) -> Queue[Any]:
+        pool: Queue[Any] = Queue()
+        for index in range(1, max(1, self.config.team_worker_count) + 1):
+            pool.put(self._make_worker(index))
+        return pool
+
+    def _run_with_worker_from_pool(
+        self,
+        team: TeamState,
+        step: ExecutionStep,
+        worker_pool: Queue[Any],
+        writer: TraceWriter,
+        state: AgentState,
+    ) -> None:
+        worker = worker_pool.get()
+        try:
+            reviewer = self._make_reviewer(step.id)
+            context = self.build_dependency_context(team, step)
+            self.run_step(team, step, worker=worker, reviewer=reviewer, context=context, writer=writer, state=state)
+        finally:
+            if hasattr(worker, "clear_history"):
+                worker.clear_history()
+            worker_pool.put(worker)
 
     def _skip_residual_steps(self, team: TeamState, writer: TraceWriter, state: AgentState) -> None:
         step_map = team.step_by_id()
@@ -356,29 +468,31 @@ class TeamOrchestrator:
             reason = "Skipped because dependencies did not complete"
             if blockers:
                 reason += f": {', '.join(blockers)}"
-            step.status = StepStatus.SKIPPED
-            step.error = reason
-            step.ended_at = _now()
-            self._save_and_emit(writer, state, team, "team.step.skipped", step)
+            with self._state_lock:
+                step.status = StepStatus.SKIPPED
+                step.error = reason
+                step.ended_at = _now()
+                self._save_and_emit(writer, state, team, "team.step.skipped", step)
 
     def _finish_team(self, team: TeamState, writer: TraceWriter, state: AgentState) -> None:
         failed = [step for step in team.steps if step.status == StepStatus.FAILED]
         skipped = [step for step in team.steps if step.status == StepStatus.SKIPPED]
         cancelled = [step for step in team.steps if step.status == StepStatus.CANCELLED]
-        if cancelled:
-            team.status = TeamStatus.CANCELLED
-            team.error = _summarize_step_errors(cancelled)
-            event = "team.cancelled"
-        elif failed or skipped:
-            team.status = TeamStatus.FAILED
-            team.error = _summarize_step_errors(failed + skipped)
-            event = "team.failed"
-        else:
-            team.status = TeamStatus.SUCCEEDED
-            team.result = _summarize_step_results(team.steps)
-            event = "team.completed"
-        team.ended_at = _now()
-        self._save_and_emit(writer, state, team, event)
+        with self._state_lock:
+            if cancelled:
+                team.status = TeamStatus.CANCELLED
+                team.error = _summarize_step_errors(cancelled)
+                event = "team.cancelled"
+            elif failed or skipped:
+                team.status = TeamStatus.FAILED
+                team.error = _summarize_step_errors(failed + skipped)
+                event = "team.failed"
+            else:
+                team.status = TeamStatus.SUCCEEDED
+                team.result = _summarize_step_results(team.steps)
+                event = "team.completed"
+            team.ended_at = _now()
+            self._save_and_emit(writer, state, team, event)
 
     def _mark_completed(
         self,
@@ -388,12 +502,13 @@ class TeamOrchestrator:
         writer: TraceWriter | None,
         state: AgentState | None,
     ) -> None:
-        step.status = StepStatus.COMPLETED
-        step.result = result.output
-        step.error = ""
-        step.trace_path = result.trace_path
-        step.ended_at = _now()
-        self._save_and_emit(writer, state, team, "team.step.completed", step)
+        with self._state_lock:
+            step.status = StepStatus.COMPLETED
+            step.result = result.output
+            step.error = ""
+            step.trace_path = result.trace_path
+            step.ended_at = _now()
+            self._save_and_emit(writer, state, team, "team.step.completed", step)
 
     def _mark_failed(
         self,
@@ -405,11 +520,12 @@ class TeamOrchestrator:
         *,
         output: str = "",
     ) -> None:
-        step.status = StepStatus.FAILED
-        step.result = output
-        step.error = error or "Step failed."
-        step.ended_at = _now()
-        self._save_and_emit(writer, state, team, "team.step.failed", step)
+        with self._state_lock:
+            step.status = StepStatus.FAILED
+            step.result = output
+            step.error = error or "Step failed."
+            step.ended_at = _now()
+            self._save_and_emit(writer, state, team, "team.step.failed", step)
 
     def _make_worker(self, index: int) -> Any:
         if self.worker_factory is not None:
@@ -423,7 +539,7 @@ class TeamOrchestrator:
             trace_dir=self.trace_dir,
             command_timeout=self.command_timeout,
             memory_manager=self._memory,
-            event_sink=self.event_sink,
+            event_sink=self._forward_worker_event,
             test_command=self._test_command,
             step_max_steps=self._step_max_steps,
         )
@@ -440,7 +556,7 @@ class TeamOrchestrator:
             trace_dir=self.trace_dir,
             command_timeout=self.command_timeout,
             memory_manager=self._memory,
-            event_sink=self.event_sink,
+            event_sink=self._forward_worker_event,
             test_command=self._test_command,
         )
 
@@ -517,25 +633,32 @@ class TeamOrchestrator:
         *,
         extra: dict[str, object] | None = None,
     ) -> None:
-        self.state_store.save(team)
-        payload = _event_payload(team, step)
-        if extra:
-            payload.update(extra)
-        if writer is not None and state is not None:
-            self._emit_trace(writer, state, event, payload)
-        if self.event_sink is not None:
-            self.event_sink(
-                TeamEvent(
-                    event=event,
-                    team_id=team.id,
-                    status=step.status.value if step is not None else team.status.value,
-                    step_id=step.id if step is not None else "",
-                    payload=payload,
+        with self._state_lock:
+            self.state_store.save(team)
+            payload = _event_payload(team, step)
+            if extra:
+                payload.update(extra)
+            if writer is not None and state is not None:
+                self._emit_trace(writer, state, event, payload)
+            if self.event_sink is not None:
+                self.event_sink(
+                    TeamEvent(
+                        event=event,
+                        team_id=team.id,
+                        status=step.status.value if step is not None else team.status.value,
+                        step_id=step.id if step is not None else "",
+                        payload=payload,
+                    )
                 )
-            )
 
     def _emit_trace(self, writer: TraceWriter, state: AgentState, event: str, payload: dict[str, object]) -> None:
         writer.append(TraceEvent(event=event, payload=payload, run_id=state.run_id))
+
+    def _forward_worker_event(self, event: object) -> None:
+        if self.event_sink is None:
+            return
+        with self._state_lock:
+            self.event_sink(event)
 
     def _final_state(
         self,

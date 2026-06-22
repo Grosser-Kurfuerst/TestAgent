@@ -9,6 +9,7 @@ from my_agent.memory import MemoryManager
 from my_agent.plan import AgentMode, PlanExecuteAgent, resolve_mode
 from my_agent.react_runtime import ReActRuntime
 from my_agent.schema import AgentState
+from my_agent.team import TeamOrchestrator
 
 
 class CodingAgentRuntime:
@@ -31,11 +32,23 @@ class CodingAgentRuntime:
         self.memory_manager = memory_manager
 
     def run(self, state: AgentState, *, mode: AgentMode | str | None = None) -> AgentState:
-        selected = resolve_mode(mode, state.task, default=AgentMode.REACT)
-        if selected == AgentMode.TEAM:
-            raise RuntimeError("team mode not implemented")
+        selected = resolve_mode(mode if mode is not None else self.config.agent_mode, state.task, default=AgentMode.AUTO)
         if not getattr(self.llm, "supports_tools", False):
             raise RuntimeError("The ReAct runtime requires an LLM client with native tool-call support.")
+        if selected == AgentMode.TEAM:
+            return TeamOrchestrator(
+                config=self.config,
+                llm=self.llm,
+                trace_dir=self.trace_dir,
+                command_timeout=self.command_timeout,
+                event_sink=self.event_sink,
+            ).run(
+                repo_path=state.repo_path,
+                goal=state.task,
+                test_command=state.test_command,
+                max_steps=state.max_steps,
+                memory_manager=self.memory_manager,
+            )
         if selected == AgentMode.PLAN:
             return PlanExecuteAgent(
                 config=self.config,
@@ -73,11 +86,13 @@ def run_agent(
     memory_manager: MemoryManager | None = None,
 ) -> AgentState:
     resolved_config = config or AgentConfig.from_env()
+    selected_mode = resolve_mode(mode if mode is not None else resolved_config.agent_mode, task, default=AgentMode.AUTO)
+    default_max_steps = resolved_config.team_max_steps if selected_mode == AgentMode.TEAM else resolved_config.max_steps
     state = AgentState.initial(
         repo_path=Path(repo_path).resolve(),
         task=task,
         test_command=test_command,
-        max_steps=resolved_config.max_steps if max_steps is None else max_steps,
+        max_steps=default_max_steps if max_steps is None else max_steps,
     )
     runtime = CodingAgentRuntime(
         config=resolved_config,
@@ -86,4 +101,4 @@ def run_agent(
         event_sink=event_sink,
         memory_manager=memory_manager,
     )
-    return runtime.run(state, mode=mode)
+    return runtime.run(state, mode=selected_mode)
