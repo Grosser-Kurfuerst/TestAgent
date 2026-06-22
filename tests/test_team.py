@@ -19,6 +19,7 @@ from my_agent.llm.types import ChatResponse, MessageLike, messages_to_openai
 from my_agent.config import AgentConfig
 from my_agent.plan import AgentMode, PlanValidationError, TaskResult, TaskType, normalize_mode, resolve_mode
 from my_agent.memory import MemoryManager, MemoryScope
+from my_agent.schema import AgentState
 from my_agent.team import (
     ExecutionStep,
     JsonTeamStore,
@@ -70,6 +71,10 @@ def write_runtime_repo(repo: Path) -> None:
         "        self.assertEqual(subtract(5, 3), 2)\n",
         encoding="utf-8",
     )
+
+
+def agent_state(repo: Path, goal: str, *, test_command: str | None = None) -> AgentState:
+    return AgentState.initial(repo_path=repo, task=goal, test_command=test_command)
 
 
 def fake_config(trace_dir: Path | None = None, **overrides: object) -> AgentConfig:
@@ -540,7 +545,7 @@ class TeamOrchestratorTests(unittest.TestCase):
                 worker_factory=lambda _: worker,
                 reviewer_factory=lambda _: reviewer,
                 event_sink=events.append,
-            ).run(repo_path=repo, goal="Inspect")
+            ).run(agent_state(repo, "Inspect"))
 
             self.assertEqual(state.stop_reason, "team_completed")
             self.assertIn("Team succeeded", state.final_answer)
@@ -566,11 +571,7 @@ class TeamOrchestratorTests(unittest.TestCase):
                 llm=FakeLLM(),
                 trace_dir=base / "traces",
                 command_timeout=60,
-            ).run(
-                repo_path=repo,
-                goal="修复 subtract 并运行测试",
-                test_command="python -m unittest discover -s tests -q",
-            )
+            ).run(agent_state(repo, "修复 subtract 并运行测试", test_command="python -m unittest discover -s tests -q"))
 
             self.assertEqual(state.stop_reason, "team_completed")
             self.assertIn("return a - b", (repo / "calculator.py").read_text(encoding="utf-8"))
@@ -610,7 +611,7 @@ class TeamOrchestratorTests(unittest.TestCase):
                 worker_factory=lambda index: ParallelWorker(f"worker-{index}", calls),
                 reviewer_factory=lambda _: ScriptedReviewer([ReviewDecision(approved=True, summary="ok")]),
                 event_sink=events.append,
-            ).run(repo_path=repo, goal="Inspect independently")
+            ).run(agent_state(repo, "Inspect independently"))
 
             self.assertEqual(state.stop_reason, "team_completed")
             batch_events = [event for event in events if getattr(event, "event", "") == "team.batch.started"]
@@ -639,7 +640,7 @@ class TeamOrchestratorTests(unittest.TestCase):
                 worker_factory=lambda index: ParallelWorker(f"worker-{index}", []),
                 reviewer_factory=lambda _: ScriptedReviewer([ReviewDecision(approved=True)]),
                 event_sink=events.append,
-            ).run(repo_path=repo, goal="Parallel snapshots")
+            ).run(agent_state(repo, "Parallel snapshots"))
 
             for event in events:
                 if getattr(event, "event", "") != "team.step.completed":
@@ -669,7 +670,7 @@ class TeamOrchestratorTests(unittest.TestCase):
                 planner=StaticPlanner(team),  # type: ignore[arg-type]
                 worker_factory=lambda _: worker,
                 reviewer_factory=lambda _: ScriptedReviewer([ReviewDecision(approved=True)]),
-            ).run(repo_path=repo, goal="Two independent steps")
+            ).run(agent_state(repo, "Two independent steps"))
 
             self.assertEqual(state.stop_reason, "team_completed")
             self.assertEqual(counter["max"], 1)
@@ -700,7 +701,7 @@ class TeamOrchestratorTests(unittest.TestCase):
                 planner=StaticPlanner(team),  # type: ignore[arg-type]
                 worker_factory=lambda index: ParallelWorker(f"worker-{index}", calls, crash_steps={"step_1"}),
                 reviewer_factory=lambda _: ScriptedReviewer([ReviewDecision(approved=True)]),
-            ).run(repo_path=repo, goal="Parallel failure")
+            ).run(agent_state(repo, "Parallel failure"))
 
             stored = TeamState.from_dict(json.loads(next((base / "traces" / "teams").glob("team_*.json")).read_text(encoding="utf-8")))
             self.assertEqual(state.stop_reason, "team_failed")
@@ -738,11 +739,7 @@ class TeamOrchestratorTests(unittest.TestCase):
                 command_timeout=60,
                 planner=StaticPlanner(team),  # type: ignore[arg-type]
                 event_sink=serialized_sink,
-            ).run(
-                repo_path=repo,
-                goal="Inspect in parallel",
-                test_command="python -m unittest discover -s tests -q",
-            )
+            ).run(agent_state(repo, "Inspect in parallel", test_command="python -m unittest discover -s tests -q"))
 
             self.assertEqual(state.stop_reason, "team_completed")
             self.assertEqual(overlaps, [])
@@ -781,7 +778,7 @@ class TeamOrchestratorTests(unittest.TestCase):
                 worker_factory=lambda _: worker,
                 reviewer_factory=lambda _: reviewer,
                 event_sink=events.append,
-            ).run(repo_path=repo, goal="Fix")
+            ).run(agent_state(repo, "Fix"))
 
             stored = TeamState.from_dict(json.loads(next((base / "traces" / "teams").glob("team_*.json")).read_text(encoding="utf-8")))
             self.assertEqual(state.stop_reason, "team_completed")
@@ -808,7 +805,7 @@ class TeamOrchestratorTests(unittest.TestCase):
                 planner=StaticPlanner(team),  # type: ignore[arg-type]
                 worker_factory=lambda _: worker,
                 reviewer_factory=lambda _: reviewer,
-            ).run(repo_path=repo, goal="Fix")
+            ).run(agent_state(repo, "Fix"))
 
             stored = TeamState.from_dict(json.loads(next((base / "traces" / "teams").glob("team_*.json")).read_text(encoding="utf-8")))
             self.assertEqual(state.stop_reason, "team_completed")
@@ -835,7 +832,8 @@ class TeamOrchestratorTests(unittest.TestCase):
                 planner=planner,  # type: ignore[arg-type]
                 worker_factory=lambda _: ScriptedWorker({"step_1": [TaskResult.success("step_1", "done")]}),
                 reviewer_factory=lambda _: ScriptedReviewer([ReviewDecision(approved=True)]),
-            ).run(repo_path=repo, goal="AgentCli task", memory_manager=memory)
+                memory_manager=memory,
+            ).run(agent_state(repo, "AgentCli task"))
 
             self.assertNotIn("AgentCli team memory fact", planner.repo_context)
             self.assertIn("AgentCli team memory fact", planner.memory_context)
@@ -852,7 +850,7 @@ class TeamOrchestratorTests(unittest.TestCase):
                 llm=PlannerCrashLLM(),
                 trace_dir=base / "traces",
                 command_timeout=60,
-            ).run(repo_path=repo, goal="Plan with unavailable LLM")
+            ).run(agent_state(repo, "Plan with unavailable LLM"))
 
             self.assertEqual(state.stop_reason, "team_planner_failed")
             self.assertIn("Team failed", state.final_answer)
@@ -897,7 +895,7 @@ class TeamOrchestratorTests(unittest.TestCase):
                 planner=StaticPlanner(team),  # type: ignore[arg-type]
                 worker_factory=lambda _: worker,
                 reviewer_factory=lambda _: reviewer,
-            ).run(repo_path=repo, goal="Fix")
+            ).run(agent_state(repo, "Fix"))
 
             stored = TeamState.from_dict(json.loads(next((base / "traces" / "teams").glob("team_*.json")).read_text(encoding="utf-8")))
             self.assertEqual(state.stop_reason, "team_failed")
@@ -927,7 +925,7 @@ class TeamOrchestratorTests(unittest.TestCase):
                 planner=StaticPlanner(team),  # type: ignore[arg-type]
                 worker_factory=lambda _: worker,
                 reviewer_factory=lambda _: ScriptedReviewer([ReviewDecision(approved=True)]),
-            ).run(repo_path=repo, goal="Fix")
+            ).run(agent_state(repo, "Fix"))
 
             stored = TeamState.from_dict(json.loads(next((base / "traces" / "teams").glob("team_*.json")).read_text(encoding="utf-8")))
             self.assertEqual(state.stop_reason, "team_failed")
@@ -954,7 +952,7 @@ class TeamOrchestratorTests(unittest.TestCase):
                 planner=StaticPlanner(team),  # type: ignore[arg-type]
                 worker_factory=lambda _: CrashingWorker(),
                 reviewer_factory=lambda _: ScriptedReviewer([ReviewDecision(approved=True)]),
-            ).run(repo_path=repo, goal="Fix")
+            ).run(agent_state(repo, "Fix"))
 
             stored_files = list((base / "traces" / "teams").glob("team_*.json"))
             self.assertEqual(len(stored_files), 1)
@@ -984,7 +982,7 @@ class TeamOrchestratorTests(unittest.TestCase):
                 planner=StaticPlanner(team),  # type: ignore[arg-type]
                 worker_factory=lambda _: ScriptedWorker({"step_1": [TaskResult.success("step_1", "worker result")]}),
                 reviewer_factory=lambda _: CrashingReviewer(),
-            ).run(repo_path=repo, goal="Fix")
+            ).run(agent_state(repo, "Fix"))
 
             stored_files = list((base / "traces" / "teams").glob("team_*.json"))
             self.assertEqual(len(stored_files), 1)
@@ -1034,7 +1032,7 @@ class TeamOrchestratorTests(unittest.TestCase):
                 planner=StaticPlanner(team),  # type: ignore[arg-type]
                 worker_factory=lambda _: worker,
                 reviewer_factory=reviewer_factory,
-            ).run(repo_path=repo, goal="Fix")
+            ).run(agent_state(repo, "Fix"))
 
             stored_files = list((base / "traces" / "teams").glob("team_*.json"))
             self.assertEqual(len(stored_files), 1)

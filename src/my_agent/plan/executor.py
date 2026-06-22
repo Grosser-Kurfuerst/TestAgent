@@ -1,26 +1,18 @@
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Protocol
 
+from my_agent.react.child_runner import ChildReActRequest, ChildReActRunner
 from my_agent.config import AgentConfig
 from my_agent.memory import MemoryManager
 from my_agent.plan.graph import TaskGraph
+from my_agent.plan.store import InMemoryPlanStore, PlanStore
 from my_agent.plan.types import PlanState, PlanStatus, PlanTask, TaskResult, TaskStatus, TaskType
-from my_agent.react_runtime import ReActRuntime
-from my_agent.schema import AgentState
-from my_agent.text_safety import sanitize_json_value
-
-
-class PlanStore(Protocol):
-    def save(self, plan: PlanState) -> None:
-        ...
-
-    def get(self, plan_id: str) -> PlanState | None:
-        ...
+from my_agent.utils.numbers import positive_or_default
+from my_agent.utils.text import single_line
 
 
 class TaskRunner(Protocol):
@@ -48,41 +40,6 @@ class PlanEvent:
             "task_id": self.task_id,
             "payload": dict(self.payload),
         }
-
-
-class InMemoryPlanStore:
-    def __init__(self) -> None:
-        self._plans: dict[str, PlanState] = {}
-
-    def save(self, plan: PlanState) -> None:
-        self._plans[plan.id] = PlanState.from_dict(plan.to_dict())
-
-    def get(self, plan_id: str) -> PlanState | None:
-        plan = self._plans.get(plan_id)
-        return PlanState.from_dict(plan.to_dict()) if plan is not None else None
-
-
-class JsonPlanStore:
-    def __init__(self, directory: str | Path):
-        self.directory = Path(directory)
-        self.directory.mkdir(parents=True, exist_ok=True)
-
-    def save(self, plan: PlanState) -> None:
-        path = self._path_for(plan.id)
-        path.write_text(json.dumps(sanitize_json_value(plan.to_dict()), ensure_ascii=False, indent=2), encoding="utf-8")
-
-    def get(self, plan_id: str) -> PlanState | None:
-        path = self._path_for(plan_id)
-        if not path.exists():
-            return None
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(payload, dict):
-            return None
-        return PlanState.from_dict(payload)
-
-    def _path_for(self, plan_id: str) -> Path:
-        safe_id = "".join(char if char.isalnum() or char in {"_", "-"} else "_" for char in plan_id)
-        return self.directory / f"{safe_id}.json"
 
 
 class PlanExecutor:
@@ -286,52 +243,35 @@ class ReActTaskRunner:
         self.trace_dir = Path(trace_dir)
         self.command_timeout = command_timeout
         self.test_command = test_command
-        self.default_max_steps = _positive_or_default(default_max_steps, config.max_steps)
-        self.plan_task_max_steps = _positive_or_default(plan_task_max_steps, getattr(config, "plan_task_max_steps", 6))
+        self.default_max_steps = positive_or_default(default_max_steps, config.max_steps)
+        self.plan_task_max_steps = positive_or_default(plan_task_max_steps, getattr(config, "plan_task_max_steps", 6))
         self.event_sink = event_sink
         self.memory_manager = memory_manager
+        self.child_runner = ChildReActRunner(
+            config=config,
+            llm=llm,
+            command_timeout=command_timeout,
+            event_sink=event_sink,
+            memory_manager=memory_manager,
+        )
 
     def run_task(self, plan: PlanState, task: PlanTask) -> TaskResult:
-        state = AgentState.initial(
-            repo_path=self.repo_path,
-            task=self.build_task_prompt(plan, task),
-            test_command=self.test_command,
-            max_steps=self.max_steps_for_task(task),
-            run_id=f"{task.id}_{plan.id}",
-        )
-        task_memory = (
-            self.memory_manager.fork_for_task(session_id=f"{plan.id}:{task.id}", run_id=state.run_id)
-            if self.memory_manager is not None
-            else None
-        )
+        run_id = f"{task.id}_{plan.id}"
         try:
-            final_state = ReActRuntime(
-                config=self.config,
-                llm=self.llm,  # type: ignore[arg-type]
-                trace_dir=self.trace_dir,
-                command_timeout=self.command_timeout,
-                event_sink=self.event_sink,
-                memory_manager=task_memory,
-            ).run(state)
+            return self.child_runner.run(
+                ChildReActRequest(
+                    task_id=task.id,
+                    repo_path=self.repo_path,
+                    task=self.build_task_prompt(plan, task),
+                    test_command=self.test_command,
+                    run_id=run_id,
+                    trace_dir=self.trace_dir,
+                    max_steps=self.max_steps_for_task(task),
+                    memory_session_id=f"{plan.id}:{task.id}",
+                )
+            )
         except KeyboardInterrupt as exc:
             raise PlanCancelled("Task execution was interrupted.") from exc
-
-        output = final_state.final_answer or final_state.review
-        trace_path = str(final_state.trace_path or "")
-        if _react_state_succeeded(final_state):
-            return TaskResult.success(
-                task.id,
-                output,
-                trace_path=trace_path,
-                stop_reason=final_state.stop_reason,
-            )
-        return TaskResult.failure(
-            task.id,
-            _react_failure_message(final_state),
-            output=output,
-            trace_path=trace_path,
-            stop_reason=final_state.stop_reason,
-        )
 
     def build_task_prompt(self, plan: PlanState, task: PlanTask) -> str:
         dependency_results = []
@@ -341,7 +281,7 @@ class ReActTaskRunner:
             if dependency is None:
                 continue
             summary = dependency.result.strip() or dependency.error.strip() or "No result recorded."
-            dependency_results.append(f"- {dependency.id} ({dependency.status.value}): {_single_line(summary, 500)}")
+            dependency_results.append(f"- {dependency.id} ({dependency.status.value}): {single_line(summary, 500)}")
 
         lines = [
             f"Overall goal:\n{plan.goal}",
@@ -366,23 +306,6 @@ class ReActTaskRunner:
         return max(1, min(value for value in candidates if value >= 1))
 
 
-def _react_state_succeeded(state: AgentState) -> bool:
-    return state.stop_reason in {"finish_called", "assistant_final"}
-
-
-def _react_failure_message(state: AgentState) -> str:
-    if state.review:
-        return state.review
-    return f"ReAct task failed with stop_reason={state.stop_reason or 'unknown'}."
-
-
-def _single_line(text: str, limit: int) -> str:
-    normalized = " ".join(text.replace("\r", " ").replace("\n", " ").split())
-    if len(normalized) <= limit:
-        return normalized
-    return normalized[: limit - 3].rstrip() + "..."
-
-
 _DEFAULT_TASK_MAX_STEPS = {
     TaskType.INSPECT: 4,
     TaskType.EDIT: 6,
@@ -391,9 +314,3 @@ _DEFAULT_TASK_MAX_STEPS = {
     TaskType.ANALYSIS: 3,
     TaskType.DOCUMENTATION: 5,
 }
-
-
-def _positive_or_default(value: int | None, default: int) -> int:
-    if value is None or isinstance(value, bool) or value < 1:
-        return max(1, default)
-    return value

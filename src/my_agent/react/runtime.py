@@ -6,19 +6,20 @@ from typing import Any, Callable
 
 from my_agent.budget import AgentBudget
 from my_agent.config import AgentConfig
-from my_agent.indexer import RepoIndexer
 from my_agent.llm import AgentLLM
 from my_agent.llm.types import ChatResponse, LLMToolCall, Message, MessageLike, messages_to_openai
 from my_agent.memory import MemoryManager
 from my_agent.memory.token import estimate_tokens
+from my_agent.runtime_base import AgentRunBase
 from my_agent.schema import AgentState, ToolCall, ToolRecord, ToolResult
-from my_agent.tools import RepoTools, ToolExecutionResult, ToolInvocation, should_skip_path
+from my_agent.tools import RepoTools, ToolExecutionResult, ToolInvocation
 from my_agent.tracing import TraceWriter
+from my_agent.utils.answers import append_trace_to_answer
 
 EventSink = Callable[[Any], None]
 
 
-class ReActRuntime:
+class ReActRuntime(AgentRunBase):
     def __init__(
         self,
         *,
@@ -31,12 +32,14 @@ class ReActRuntime:
         role_prompt: str | None = None,
         run_label: str = "native_tool_calls",
     ) -> None:
-        self.config = config
-        self.llm = llm
-        self.trace_dir = Path(trace_dir)
-        self.command_timeout = command_timeout
-        self.event_sink = event_sink
-        self.memory_manager = memory_manager
+        super().__init__(
+            config=config,
+            llm=llm,
+            trace_dir=trace_dir,
+            command_timeout=command_timeout,
+            event_sink=event_sink,
+            memory_manager=memory_manager,
+        )
         self.role_prompt = role_prompt
         self.run_label = run_label
 
@@ -45,10 +48,9 @@ class ReActRuntime:
         if state.max_steps < 1:
             raise ValueError("max_steps must be >= 1.")
 
-        writer = TraceWriter.create(self.trace_dir, state.run_id)
-        state.trace_path = writer.path
-        memory, memory_trace_snapshot = self._memory_for_run(state, writer)
-        try:
+        with self.open_run_context(state) as ctx:
+            writer = ctx.writer
+            memory = ctx.memory
             tools = RepoTools(state.repo_path, timeout=self.command_timeout, config=self.config)
             tool_definitions = tools.tool_definitions()
             budget = AgentBudget.from_config(self.config, max_steps=state.max_steps)
@@ -78,8 +80,11 @@ class ReActRuntime:
                     },
                 )
             )
-            self._emit_memory_loaded(state, writer, memory)
-            self._index_repo(state, writer)
+            snapshot = ctx.repo_snapshot
+            if snapshot is None:
+                raise RuntimeError("ReAct runtime requires repository context.")
+            state.repo_context = snapshot.as_context()
+            state.project_rules = snapshot.project_rules
             state.plan = "Use native ReAct tool calls to inspect, edit, verify, and finish the task."
 
             base_messages = self._initial_messages(state)
@@ -159,64 +164,6 @@ class ReActRuntime:
             memory.extract_facts(reason="run_completed", run_id=state.run_id)
             self._finalize(state, writer, budget)
             return state
-        finally:
-            if memory_trace_snapshot is not None:
-                memory.restore_trace_sink(memory_trace_snapshot)
-
-    def _memory_for_run(
-        self,
-        state: AgentState,
-        writer: TraceWriter,
-    ) -> tuple[MemoryManager, tuple[Any | None, Any | None] | None]:
-        trace_sink = lambda event, payload: self._emit(writer, state.trace_event(event, payload))
-        if self.memory_manager is not None:
-            snapshot = self.memory_manager.set_trace_sink(trace_sink)
-            return self.memory_manager, snapshot
-        return (
-            MemoryManager.from_config(
-                config=self.config,
-                llm=self.llm,
-                repo_path=state.repo_path,
-                session_id=state.run_id,
-                trace_sink=trace_sink,
-            ),
-            None,
-        )
-
-    def _emit_memory_loaded(self, state: AgentState, writer: TraceWriter, memory: MemoryManager) -> None:
-        status = memory.status(include_entries=False)
-        self._emit(
-            writer,
-            state.trace_event(
-                "memory.loaded",
-                {
-                    "storage_path": status.storage_path,
-                    "short_term_entries": status.short_term_entries,
-                    "long_term_entries": status.long_term_entries,
-                    "long_term_tokens": status.long_term_tokens,
-                },
-            )
-        )
-
-    def _index_repo(self, state: AgentState, writer: TraceWriter) -> None:
-        snapshot = RepoIndexer(
-            state.repo_path,
-            skip_predicate=lambda path: should_skip_path(state.repo_path, path),
-        ).snapshot(query=state.task)
-        state.repo_context = snapshot.as_context()
-        state.project_rules = snapshot.project_rules
-        self._emit(
-            writer,
-            state.trace_event(
-                "repo.indexed",
-                {
-                    "repo_path": str(state.repo_path),
-                    "task": state.task,
-                    "tree": snapshot.tree,
-                    "symbols": snapshot.symbols,
-                },
-            )
-        )
 
     def _initial_messages(self, state: AgentState) -> list[Message]:
         system = self.role_prompt or (
@@ -382,8 +329,7 @@ class ReActRuntime:
     def _finalize(self, state: AgentState, writer: TraceWriter, budget: AgentBudget) -> None:
         if not state.final_answer:
             state.final_answer = _deterministic_final_answer(state)
-        if state.trace_path and "Trace:" not in state.final_answer:
-            state.final_answer += f"\nTrace: {state.trace_path}"
+        state.final_answer = append_trace_to_answer(state.final_answer, state.trace_path)
         if not state.review:
             state.review = _deterministic_review(state)
         self._emit(
@@ -403,8 +349,7 @@ class ReActRuntime:
 
     def _emit(self, writer: TraceWriter, event: Any) -> None:
         writer.append(event)
-        if self.event_sink is not None:
-            self.event_sink(event)
+        self._emit_event(event)
 
 
 def _invocation_from_tool_call(call: LLMToolCall, *, default_test_command: str | None) -> ToolInvocation:

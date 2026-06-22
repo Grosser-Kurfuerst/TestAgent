@@ -16,7 +16,9 @@ from my_agent.config import AgentConfig
 from my_agent.llm import FakeLLM
 from my_agent.llm.types import ChatResponse, LLMToolCall, MessageLike, messages_to_openai
 from my_agent.memory import MemoryManager, MemoryScope
-from my_agent.runtime import run_agent
+from my_agent.plan import AgentMode
+from my_agent.runtime import CodingAgentRuntime, run_agent
+from my_agent.runtime_base import AgentRunBase
 
 
 def write_runtime_repo(repo: Path) -> None:
@@ -541,7 +543,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertNotIn("needle_secret", state.repo_context)
             self.assertNotIn("credentials.json", state.repo_context)
 
-    def test_run_agent_mode_react_uses_react_runtime(self) -> None:
+    def test_run_agent_mode_react_uses_react_runner(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             repo = base / "repo"
@@ -561,6 +563,21 @@ class RuntimeTests(unittest.TestCase):
             event_names = [event["event"] for event in events]
             self.assertIn("run.started", event_names)
             self.assertNotIn("plan.started", event_names)
+
+    def test_runtime_mode_dispatch_returns_agent_run_base(self) -> None:
+        runtime = CodingAgentRuntime(config=fake_config(), llm=FakeLLM(), trace_dir=Path("traces"))
+
+        self.assertIsInstance(runtime._runner_for_mode(AgentMode.REACT), AgentRunBase)
+        self.assertIsInstance(runtime._runner_for_mode(AgentMode.PLAN), AgentRunBase)
+        self.assertIsInstance(runtime._runner_for_mode(AgentMode.TEAM), AgentRunBase)
+
+    def test_react_runner_imports_from_react_package(self) -> None:
+        from my_agent.react import ReActRuntime as NewReActRuntime
+        from my_agent.react.child_runner import ChildReActRunner as PackageChildReActRunner
+        from my_agent.react.runtime import ReActRuntime as PackageReActRuntime
+
+        self.assertIs(NewReActRuntime, PackageReActRuntime)
+        self.assertEqual(PackageChildReActRunner.__name__, "ChildReActRunner")
 
     def test_run_agent_mode_plan_uses_plan_execute_agent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

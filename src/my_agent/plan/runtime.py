@@ -6,16 +6,18 @@ from pathlib import Path
 from typing import Callable
 
 from my_agent.config import AgentConfig
-from my_agent.indexer import RepoIndexer
 from my_agent.llm import AgentLLM
 from my_agent.memory import MemoryManager
-from my_agent.plan.executor import JsonPlanStore, PlanEvent, PlanExecutor, PlanStore, ReActTaskRunner
+from my_agent.plan.executor import PlanEvent, PlanExecutor, ReActTaskRunner
 from my_agent.plan.graph import PlanValidationError
 from my_agent.plan.planner import Planner
-from my_agent.plan.types import PlanState, PlanStatus, PlanTask, TaskStatus
-from my_agent.schema import AgentState, TraceEvent
-from my_agent.tools import should_skip_path
+from my_agent.plan.rendering import render_plan, render_plan_final_answer, render_plan_review
+from my_agent.plan.store import JsonPlanStore, PlanStore
+from my_agent.plan.types import PlanState, PlanStatus, TaskStatus
+from my_agent.runtime_base import AgentRunBase
+from my_agent.schema import AgentState
 from my_agent.tracing import TraceWriter
+from my_agent.utils.text import terminal_summary_text
 
 
 class PlanReviewAction(str, Enum):
@@ -34,7 +36,7 @@ PlanReviewHandler = Callable[[PlanState], PlanReviewDecision]
 EventSink = Callable[[object], None]
 
 
-class PlanExecuteAgent:
+class PlanExecuteAgent(AgentRunBase):
     def __init__(
         self,
         *,
@@ -45,48 +47,42 @@ class PlanExecuteAgent:
         event_sink: EventSink | None = None,
         review_handler: PlanReviewHandler | None = None,
         state_store: PlanStore | None = None,
-    ) -> None:
-        self.config = config
-        self.llm = llm
-        self.trace_dir = Path(trace_dir)
-        self.command_timeout = command_timeout
-        self.event_sink = event_sink
-        self.review_handler = review_handler or _default_review_handler
-        self.state_store = state_store or JsonPlanStore(self.trace_dir / "plans")
-
-    def run(
-        self,
-        *,
-        repo_path: str | Path,
-        goal: str,
-        test_command: str | None = None,
-        max_steps: int | None = None,
         require_approval: bool = False,
         memory_manager: MemoryManager | None = None,
-    ) -> AgentState:
-        repo = Path(repo_path).resolve()
-        effective_max_steps = max_steps if max_steps is not None else self.config.max_steps
-        state = AgentState.initial(
-            repo_path=repo,
-            task=goal,
-            test_command=test_command,
-            max_steps=effective_max_steps,
+    ) -> None:
+        super().__init__(
+            config=config,
+            llm=llm,
+            trace_dir=trace_dir,
+            command_timeout=command_timeout,
+            event_sink=event_sink,
+            memory_manager=memory_manager,
         )
-        writer = TraceWriter.create(self.trace_dir, state.run_id)
-        state.trace_path = writer.path
-        memory, memory_trace_snapshot = self._memory_for_run(repo, state, writer, memory_manager)
-        try:
+        self.review_handler = review_handler or _default_review_handler
+        self.state_store = state_store or JsonPlanStore(self.trace_dir / "plans")
+        self.require_approval = require_approval
+
+    def run(self, state: AgentState) -> AgentState:
+        state.repo_path = Path(state.repo_path).resolve()
+        repo = state.repo_path
+        goal = state.task
+        test_command = state.test_command
+        effective_max_steps = state.max_steps
+        with self.open_run_context(state) as ctx:
+            writer = ctx.writer
+            memory = ctx.memory
             self._emit_trace(
                 writer,
                 state,
                 "plan.requested",
-                {"repo_path": str(repo), "goal": goal, "require_approval": require_approval},
+                {"repo_path": str(repo), "goal": goal, "require_approval": self.require_approval},
             )
-            self._emit_memory_loaded(writer, state, memory)
             memory.append_user_message(goal, run_id=state.run_id)
 
             try:
-                repo_context = self._repo_context(repo, goal, writer, state)
+                if ctx.repo_snapshot is None:
+                    raise RuntimeError("Plan execution requires repository context.")
+                repo_context = ctx.repo_snapshot.as_context()
                 planner_context = _append_memory_context(repo_context, memory.build_context_for_query(goal).injected_text)
                 plan = Planner(self.llm, max_tasks=self.config.plan_max_tasks).create_plan(
                     goal,
@@ -98,7 +94,7 @@ class PlanExecuteAgent:
                 self._emit_plan_state(writer, state, "plan.created", plan)
                 self._emit_plan_state(writer, state, "plan.approval_requested", plan)
 
-                decision = self.review_handler(plan) if require_approval else PlanReviewDecision(PlanReviewAction.EXECUTE)
+                decision = self.review_handler(plan) if self.require_approval else PlanReviewDecision(PlanReviewAction.EXECUTE)
                 if decision.action == PlanReviewAction.CANCEL:
                     plan.status = PlanStatus.CANCELLED
                     plan.error = decision.feedback or "Plan execution was cancelled before running tasks."
@@ -151,7 +147,7 @@ class PlanExecuteAgent:
                     "plan.validation_failed",
                     {"code": exc.code, "message": exc.message, "details": exc.details, "plan": plan.to_dict()},
                 )
-                self._emit_event("plan.validation_failed", plan)
+                self._emit_plan_event("plan.validation_failed", plan)
                 return self._final_state(state, plan, stop_reason="plan_validation_failed")
             except RuntimeError as exc:
                 plan = PlanState.create(goal=goal, summary="Plan failed before execution.")
@@ -160,53 +156,14 @@ class PlanExecuteAgent:
                 plan.trace_path = str(writer.path)
                 self.state_store.save(plan)
                 self._emit_trace(writer, state, "plan.failed", {"error": str(exc), "plan": plan.to_dict()})
-                self._emit_event("plan.failed", plan)
+                self._emit_plan_event("plan.failed", plan)
                 return self._final_state(state, plan, stop_reason="plan_failed")
-        finally:
-            if memory_trace_snapshot is not None:
-                memory.restore_trace_sink(memory_trace_snapshot)
-
-    def _memory_for_run(
-        self,
-        repo: Path,
-        state: AgentState,
-        writer: TraceWriter,
-        memory_manager: MemoryManager | None,
-    ) -> tuple[MemoryManager, tuple[object | None, object | None] | None]:
-        trace_sink = lambda event, payload: self._emit_trace(writer, state, event, payload)
-        if memory_manager is not None:
-            snapshot = memory_manager.set_trace_sink(trace_sink)
-            return memory_manager, snapshot
-        return (
-            MemoryManager.from_config(
-                config=self.config,
-                llm=self.llm,
-                repo_path=repo,
-                session_id=state.run_id,
-                trace_sink=trace_sink,
-            ),
-            None,
-        )
-
-    def _emit_memory_loaded(self, writer: TraceWriter, state: AgentState, memory: MemoryManager) -> None:
-        status = memory.status(include_entries=False)
-        self._emit_trace(
-            writer,
-            state,
-            "memory.loaded",
-            {
-                "storage_path": status.storage_path,
-                "short_term_entries": status.short_term_entries,
-                "long_term_entries": status.long_term_entries,
-                "long_term_tokens": status.long_term_tokens,
-            },
-        )
 
     def _record_plan_task_summaries(self, memory: MemoryManager, plan: PlanState, *, run_id: str) -> None:
         for task in plan.tasks:
             if task.status not in {TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.SKIPPED, TaskStatus.CANCELLED}:
                 continue
-            details = task.result.strip() or task.error.strip() or "No result recorded."
+            details = terminal_summary_text(task.result, task.error, "No result recorded.")
             memory.append_summary(
                 f"[plan task {task.id} {task.status.value}] {task.title}\n{details}",
                 source="plan",
@@ -219,17 +176,6 @@ class PlanExecuteAgent:
                 },
             )
 
-    def _repo_context(self, repo: Path, goal: str, writer: TraceWriter, state: AgentState) -> str:
-        snapshot = RepoIndexer(repo, skip_predicate=lambda path: should_skip_path(repo, path)).snapshot(query=goal)
-        context = snapshot.as_context()
-        self._emit_trace(
-            writer,
-            state,
-            "repo.indexed",
-            {"repo_path": str(repo), "task": goal, "tree": snapshot.tree, "symbols": snapshot.symbols},
-        )
-        return context
-
     def _handle_executor_event(self, writer: TraceWriter, state: AgentState, event: PlanEvent) -> None:
         self._emit_trace(writer, state, event.event, event.payload)
         if self.event_sink is not None:
@@ -237,12 +183,9 @@ class PlanExecuteAgent:
 
     def _emit_plan_state(self, writer: TraceWriter, state: AgentState, event: str, plan: PlanState) -> None:
         self._emit_trace(writer, state, event, {"plan_id": plan.id, "status": plan.status.value, "plan": plan.to_dict()})
-        self._emit_event(event, plan)
+        self._emit_plan_event(event, plan)
 
-    def _emit_trace(self, writer: TraceWriter, state: AgentState, event: str, payload: dict[str, object]) -> None:
-        writer.append(TraceEvent(event=event, payload=payload, run_id=state.run_id))
-
-    def _emit_event(self, event: str, plan: PlanState) -> None:
+    def _emit_plan_event(self, event: str, plan: PlanState) -> None:
         if self.event_sink is not None:
             self.event_sink(PlanEvent(event=event, plan_id=plan.id, status=plan.status.value, payload={"plan": plan.to_dict()}))
 
@@ -262,54 +205,8 @@ class PlanExecuteAgent:
         return state
 
 
-def render_plan(plan: PlanState) -> str:
-    lines = [
-        f"Plan: {plan.id}",
-        f"Status: {plan.status.value}",
-        f"Summary: {plan.summary or 'No summary provided.'}",
-        "Tasks:",
-    ]
-    for task in plan.tasks:
-        lines.append(f"- {task.id} [{task.status.value}] {task.title}")
-    return "\n".join(lines)
-
-
-def render_plan_review(plan: PlanState) -> str:
-    counts = _task_counts(plan.tasks)
-    parts = [f"{status}={count}" for status, count in sorted(counts.items())]
-    details = ", ".join(parts) if parts else "no tasks"
-    return f"Plan review: status={plan.status.value}, {details}, trace={plan.trace_path or 'none'}."
-
-
-def render_plan_final_answer(plan: PlanState) -> str:
-    lines = [
-        f"Plan {plan.status.value}: {plan.summary or plan.goal}",
-        "",
-        "Tasks:",
-    ]
-    for task in plan.tasks:
-        line = f"- {task.id} {task.status.value}: {task.title}"
-        if task.error:
-            line += f" ({task.error})"
-        lines.append(line)
-    if plan.result:
-        lines.extend(["", "Result:", plan.result])
-    if plan.error:
-        lines.extend(["", "Error:", plan.error])
-    if plan.trace_path:
-        lines.extend(["", f"Trace: {plan.trace_path}"])
-    return "\n".join(lines)
-
-
 def _default_review_handler(plan: PlanState) -> PlanReviewDecision:
     return PlanReviewDecision(PlanReviewAction.EXECUTE)
-
-
-def _task_counts(tasks: list[PlanTask]) -> dict[str, int]:
-    counts: dict[str, int] = {}
-    for task in tasks:
-        counts[task.status.value] = counts.get(task.status.value, 0) + 1
-    return counts
 
 
 def _append_memory_context(repo_context: str, memory_context: str) -> str:

@@ -15,6 +15,7 @@ add_src_to_path()
 from my_agent.llm import FakeLLM
 from my_agent.llm.types import ChatResponse, LLMToolCall
 from my_agent.memory import MemoryManager, MemoryScope
+from my_agent.schema import AgentState
 from my_agent.plan import (
     AgentMode,
     InMemoryPlanStore,
@@ -634,11 +635,11 @@ class PlanExecuteAgentTests(unittest.TestCase):
                 command_timeout=60,
             )
 
-            state = agent.run(
+            state = agent.run(AgentState.initial(
                 repo_path=repo,
-                goal="先检查 calculator.py，再修复 subtract，并运行测试",
+                task="先检查 calculator.py，再修复 subtract，并运行测试",
                 test_command="python -m unittest discover -s tests -q",
-            )
+            ))
 
             self.assertEqual(state.stop_reason, "plan_completed")
             self.assertIn("Plan:", state.plan)
@@ -664,14 +665,14 @@ class PlanExecuteAgentTests(unittest.TestCase):
                 llm=llm,
                 trace_dir=base / "traces",
                 command_timeout=60,
-            )
-
-            state = agent.run(
-                repo_path=repo,
-                goal="先检查 calculator.py，再修复 subtract，并运行测试",
-                test_command="python -m unittest discover -s tests -q",
                 memory_manager=memory,
             )
+
+            state = agent.run(AgentState.initial(
+                repo_path=repo,
+                task="先检查 calculator.py，再修复 subtract，并运行测试",
+                test_command="python -m unittest discover -s tests -q",
+            ))
 
             self.assertEqual(state.stop_reason, "plan_completed")
             parent_contents = "\n".join(entry.content for entry in memory.short_term.all())
@@ -695,14 +696,14 @@ class PlanExecuteAgentTests(unittest.TestCase):
                 llm=FakeLLM(),
                 trace_dir=base / "traces",
                 command_timeout=60,
-            )
-
-            state = agent.run(
-                repo_path=repo,
-                goal="先检查 calculator.py，再修复 subtract，并运行测试",
-                test_command="python -m unittest discover -s tests -q",
                 memory_manager=memory,
             )
+
+            state = agent.run(AgentState.initial(
+                repo_path=repo,
+                task="先检查 calculator.py，再修复 subtract，并运行测试",
+                test_command="python -m unittest discover -s tests -q",
+            ))
             before = read_trace(state.trace_path)
 
             memory.save_fact("用户偏好：回答中文", scope=MemoryScope.PROJECT)
@@ -724,7 +725,7 @@ class PlanExecuteAgentTests(unittest.TestCase):
                 command_timeout=60,
             )
 
-            state = agent.run(repo_path=repo, goal="先检查 calculator.py，再修复 subtract，并运行测试")
+            state = agent.run(AgentState.initial(repo_path=repo, task="先检查 calculator.py，再修复 subtract，并运行测试"))
 
             self.assertEqual(state.stop_reason, "plan_validation_failed")
             self.assertIn("too_many_tasks", state.final_answer)
@@ -750,7 +751,7 @@ class PlanExecuteAgentTests(unittest.TestCase):
                 command_timeout=60,
             )
 
-            state = agent.run(repo_path=repo, goal="bad plan")
+            state = agent.run(AgentState.initial(repo_path=repo, task="bad plan"))
 
             self.assertEqual(state.stop_reason, "plan_validation_failed")
             event_names = [event["event"] for event in read_trace(state.trace_path)]
@@ -770,7 +771,7 @@ class PlanExecuteAgentTests(unittest.TestCase):
                 command_timeout=60,
             )
 
-            state = agent.run(repo_path=repo, goal="bad plan")
+            state = agent.run(AgentState.initial(repo_path=repo, task="bad plan"))
 
             self.assertEqual(state.stop_reason, "plan_validation_failed")
             self.assertEqual(llm.tool_calls, 0)
@@ -796,7 +797,7 @@ class PlanExecuteAgentTests(unittest.TestCase):
                 command_timeout=60,
             )
 
-            state = agent.run(repo_path=repo, goal="fail task")
+            state = agent.run(AgentState.initial(repo_path=repo, task="fail task"))
 
             self.assertEqual(state.stop_reason, "plan_failed")
             event_names = [event["event"] for event in read_trace(state.trace_path)]

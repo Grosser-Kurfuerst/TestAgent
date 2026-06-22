@@ -7,7 +7,8 @@ from my_agent.config import AgentConfig
 from my_agent.llm import AgentLLM, build_llm
 from my_agent.memory import MemoryManager
 from my_agent.plan import AgentMode, PlanExecuteAgent, resolve_mode
-from my_agent.react_runtime import ReActRuntime
+from my_agent.react import ReActRuntime
+from my_agent.runtime_base import AgentRunBase
 from my_agent.schema import AgentState
 from my_agent.team import TeamOrchestrator
 
@@ -35,6 +36,10 @@ class CodingAgentRuntime:
         selected = resolve_mode(mode if mode is not None else self.config.agent_mode, state.task, default=AgentMode.AUTO)
         if not getattr(self.llm, "supports_tools", False):
             raise RuntimeError("The ReAct runtime requires an LLM client with native tool-call support.")
+        runner = self._runner_for_mode(selected)
+        return runner.run(state)
+
+    def _runner_for_mode(self, selected: AgentMode) -> AgentRunBase:
         if selected == AgentMode.TEAM:
             return TeamOrchestrator(
                 config=self.config,
@@ -42,11 +47,6 @@ class CodingAgentRuntime:
                 trace_dir=self.trace_dir,
                 command_timeout=self.command_timeout,
                 event_sink=self.event_sink,
-            ).run(
-                repo_path=state.repo_path,
-                goal=state.task,
-                test_command=state.test_command,
-                max_steps=state.max_steps,
                 memory_manager=self.memory_manager,
             )
         if selected == AgentMode.PLAN:
@@ -56,11 +56,6 @@ class CodingAgentRuntime:
                 trace_dir=self.trace_dir,
                 command_timeout=self.command_timeout,
                 event_sink=self.event_sink,
-            ).run(
-                repo_path=state.repo_path,
-                goal=state.task,
-                test_command=state.test_command,
-                max_steps=state.max_steps,
                 memory_manager=self.memory_manager,
             )
         return ReActRuntime(
@@ -70,7 +65,7 @@ class CodingAgentRuntime:
             command_timeout=self.command_timeout,
             event_sink=self.event_sink,
             memory_manager=self.memory_manager,
-        ).run(state)
+        )
 
 
 def run_agent(

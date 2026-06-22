@@ -3,13 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Callable
 
+from my_agent.react.child_runner import ChildReActRequest, ChildReActRunner
 from my_agent.config import AgentConfig
 from my_agent.llm import AgentLLM
 from my_agent.llm.types import Message, MessageLike
 from my_agent.memory import MemoryManager
 from my_agent.plan import TaskResult
-from my_agent.react_runtime import ReActRuntime
-from my_agent.schema import AgentState
 from my_agent.team.prompts import (
     TEAM_REVIEWER_SYSTEM_PROMPT,
     TEAM_WORKER_SYSTEM_PROMPT,
@@ -18,6 +17,7 @@ from my_agent.team.prompts import (
 )
 from my_agent.team.reviewer import parse_review_decision
 from my_agent.team.types import AgentRole, ExecutionStep, ReviewDecision, TeamState
+from my_agent.utils.numbers import positive_or_default
 
 EventSink = Callable[[Any], None]
 
@@ -48,7 +48,14 @@ class SubAgent:
         self.memory_manager = memory_manager
         self.event_sink = event_sink
         self.test_command = test_command
-        self.step_max_steps = _positive_or_default(step_max_steps, config.team_step_max_steps)
+        self.step_max_steps = positive_or_default(step_max_steps, config.team_step_max_steps)
+        self.child_runner = ChildReActRunner(
+            config=config,
+            llm=llm,
+            command_timeout=command_timeout,
+            event_sink=event_sink,
+            memory_manager=memory_manager,
+        )
         self.history: list[MessageLike] = [Message(role="system", content=self._system_prompt())]
 
     def execute_step(
@@ -74,44 +81,20 @@ class SubAgent:
         )
         attempt = max(1, step.attempts)
         run_id = f"{state.id}_{step.id}_{attempt}"
-        task_memory = (
-            self.memory_manager.fork_for_task(session_id=f"{state.id}:{step.id}:{attempt}", run_id=run_id)
-            if self.memory_manager is not None
-            else None
-        )
-        agent_state = AgentState.initial(
-            repo_path=self.repo_path,
-            task=prompt,
-            test_command=self.test_command,
-            max_steps=self.step_max_steps,
-            run_id=run_id,
-        )
-        final_state = ReActRuntime(
-            config=self.config,
-            llm=self.llm,
-            trace_dir=self.trace_dir / state.id,
-            command_timeout=self.command_timeout,
-            event_sink=self.event_sink,
-            memory_manager=task_memory,
-            role_prompt=TEAM_WORKER_SYSTEM_PROMPT,
-            run_label="team_worker",
-        ).run(agent_state)
-
-        output = final_state.final_answer or final_state.review
-        trace_path = str(final_state.trace_path or "")
-        if _react_state_succeeded(final_state):
-            return TaskResult.success(
-                step.id,
-                output,
-                trace_path=trace_path,
-                stop_reason=final_state.stop_reason,
+        return self.child_runner.run(
+            ChildReActRequest(
+                task_id=step.id,
+                repo_path=self.repo_path,
+                task=prompt,
+                test_command=self.test_command,
+                run_id=run_id,
+                trace_dir=self.trace_dir / state.id,
+                max_steps=self.step_max_steps,
+                memory_session_id=f"{state.id}:{step.id}:{attempt}",
+                failure_prefix="Team worker failed",
+                role_prompt=TEAM_WORKER_SYSTEM_PROMPT,
+                run_label="team_worker",
             )
-        return TaskResult.failure(
-            step.id,
-            _react_failure_message(final_state),
-            output=output,
-            trace_path=trace_path,
-            stop_reason=final_state.stop_reason,
         )
 
     def review_step(self, goal: str, step: ExecutionStep, context: str, result: str) -> ReviewDecision:
@@ -142,19 +125,3 @@ class SubAgent:
         if self.role == AgentRole.REVIEWER:
             return TEAM_REVIEWER_SYSTEM_PROMPT
         return "You are a planner sub-agent in a Multi-Agent coding team."
-
-
-def _react_state_succeeded(state: AgentState) -> bool:
-    return state.stop_reason in {"finish_called", "assistant_final"}
-
-
-def _react_failure_message(state: AgentState) -> str:
-    if state.review:
-        return state.review
-    return f"Team worker failed with stop_reason={state.stop_reason or 'unknown'}."
-
-
-def _positive_or_default(value: int | None, default: int) -> int:
-    if isinstance(value, int) and not isinstance(value, bool) and value >= 1:
-        return value
-    return max(1, default)
