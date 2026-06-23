@@ -7,7 +7,7 @@ from typing import Any, Callable
 
 from my_agent.schema import ToolResult
 from my_agent.tools.execution import ToolExecutionResult, ToolInvocation
-from my_agent.tools.hooks import HookViolation
+from my_agent.tools.hooks import HookViolation, validate_tool_call_preflight
 from my_agent.tools.spec import ToolContext, ToolRegistration, ToolSpec
 from my_agent.tools.validation import validate_arguments_schema
 
@@ -16,6 +16,7 @@ from my_agent.tools.validation import validate_arguments_schema
 class RegisteredTool:
     spec: ToolSpec
     handler: Callable[[dict[str, Any], ToolContext], ToolResult]
+    preflight: Callable[[dict[str, Any], ToolContext], None] | None = None
 
     @property
     def name(self) -> str:
@@ -51,7 +52,11 @@ class ToolRegistry:
                 f"Tool already registered: {registration.spec.name} "
                 f"(existing source={existing.spec.source}, new source={registration.spec.source})."
             )
-        self._tools[registration.spec.name] = RegisteredTool(spec=registration.spec, handler=registration.handler)
+        self._tools[registration.spec.name] = RegisteredTool(
+            spec=registration.spec,
+            handler=registration.handler,
+            preflight=registration.preflight,
+        )
 
     def load_source(self, source: Any, context: ToolContext | None = None) -> None:
         load_context = context or self.context
@@ -65,6 +70,27 @@ class ToolRegistry:
         return [self._execute_one(invocation) for invocation in invocations]
 
     def _execute_one(self, invocation: ToolInvocation) -> ToolExecutionResult:
+        resolved = self._resolve_tool(invocation)
+        if isinstance(resolved, ToolExecutionResult):
+            return resolved
+        tool = resolved
+
+        parsed = self._parse_arguments(invocation)
+        if isinstance(parsed, ToolExecutionResult):
+            return parsed
+        arguments = parsed
+
+        schema_result = self._validate_schema(invocation, tool, arguments)
+        if schema_result is not None:
+            return schema_result
+
+        policy_result = self._preflight_policy(invocation, tool, arguments)
+        if policy_result is not None:
+            return policy_result
+
+        return self._execute_registered(invocation, tool, arguments)
+
+    def _resolve_tool(self, invocation: ToolInvocation) -> RegisteredTool | ToolExecutionResult:
         tool = self._tools.get(invocation.name)
         if tool is None or not tool.spec.enabled:
             return ToolExecutionResult(
@@ -74,9 +100,11 @@ class ToolRegistry:
                 content=f"Unknown tool: {invocation.name}",
                 error_code="unknown_tool",
             )
+        return tool
 
+    def _parse_arguments(self, invocation: ToolInvocation) -> dict[str, Any] | ToolExecutionResult:
         try:
-            arguments = invocation.arguments()
+            return invocation.arguments()
         except ValueError as exc:
             return ToolExecutionResult(
                 id=invocation.id,
@@ -87,17 +115,57 @@ class ToolRegistry:
                 retryable=True,
             )
 
+    def _validate_schema(
+        self,
+        invocation: ToolInvocation,
+        tool: RegisteredTool,
+        arguments: dict[str, Any],
+    ) -> ToolExecutionResult | None:
         schema_errors = validate_arguments_schema(tool.spec.parameters, arguments)
-        if schema_errors:
+        if not schema_errors:
+            return None
+        return ToolExecutionResult(
+            id=invocation.id,
+            name=invocation.name,
+            ok=False,
+            content="Tool arguments failed schema validation: " + "; ".join(schema_errors),
+            error_code="invalid_arguments_schema",
+            retryable=True,
+        )
+
+    def _preflight_policy(
+        self,
+        invocation: ToolInvocation,
+        tool: RegisteredTool,
+        arguments: dict[str, Any],
+    ) -> ToolExecutionResult | None:
+        try:
+            if tool.preflight is not None:
+                tool.preflight(dict(arguments), self.context)
+            else:
+                validate_tool_call_preflight(
+                    tool_name=tool.spec.name,
+                    arguments=arguments,
+                    repo_root=self.context.repo_root,
+                )
+        except (HookViolation, ValueError) as exc:
             return ToolExecutionResult(
                 id=invocation.id,
                 name=invocation.name,
                 ok=False,
-                content="Tool arguments failed schema validation: " + "; ".join(schema_errors),
-                error_code="invalid_arguments_schema",
-                retryable=True,
+                content=f"[POLICY] Operation denied before approval: {exc}",
+                error_code="policy_denied",
+                retryable=False,
+                blocked=True,
             )
+        return None
 
+    def _execute_registered(
+        self,
+        invocation: ToolInvocation,
+        tool: RegisteredTool,
+        arguments: dict[str, Any],
+    ) -> ToolExecutionResult:
         started = time.monotonic()
         try:
             result = tool.handler(dict(arguments), self.context)

@@ -120,6 +120,10 @@ def validate_tool_call(repo_root: Path, tool_name: str, arguments: dict[str, Any
         validate_test_command(str(arguments.get("command") or "pytest -q"), repo_root=repo_root)
 
 
+def validate_tool_call_preflight(*, tool_name: str, arguments: dict[str, Any], repo_root: Path) -> None:
+    validate_tool_call(repo_root, tool_name, arguments)
+
+
 def validate_test_command(command: str, repo_root: Path | None = None) -> list[str]:
     normalized = command.strip() or "pytest -q"
     lowered = normalized.lower()

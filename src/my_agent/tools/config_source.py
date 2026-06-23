@@ -129,7 +129,18 @@ class ConfigToolSource(ToolSource):
                 arguments=arguments,
             )
 
-        return ToolRegistration(spec=spec, handler=handler)
+        def preflight(arguments: dict[str, Any], tool_context: ToolContext) -> None:
+            _prepare_configured_command(
+                tool_name=name,
+                repo_root=tool_context.repo_root,
+                argv_template=argv,
+                cwd_template=cwd,
+                path_args=path_args,
+                declared_properties=set(declared_properties),
+                arguments=arguments,
+            )
+
+        return ToolRegistration(spec=spec, handler=handler, preflight=preflight)
 
 
 def _required_string(payload: dict[str, Any], key: str, path: Path) -> str:
@@ -152,15 +163,15 @@ def _run_configured_command(
     arguments: dict[str, Any],
 ) -> ToolResult:
     try:
-        sanitized_arguments = _sanitize_arguments(
+        sanitized_arguments, argv, cwd = _prepare_configured_command(
             tool_name=tool_name,
             repo_root=repo_root,
-            arguments=arguments,
-            declared_properties=declared_properties,
+            argv_template=argv_template,
+            cwd_template=cwd_template,
             path_args=path_args,
+            declared_properties=declared_properties,
+            arguments=arguments,
         )
-        argv = [_render_template(part, sanitized_arguments, tool_name) for part in argv_template]
-        cwd = ensure_inside_repo(repo_root, _render_template(cwd_template, sanitized_arguments, tool_name))
     except HookViolation as exc:
         return ToolResult(ok=False, output=str(exc), blocked=True, reason=str(exc))
     except ValueError as exc:
@@ -198,6 +209,28 @@ def _run_configured_command(
         ok=completed.returncode == 0,
         output=_format_command_output(completed.returncode, completed.stdout, completed.stderr),
     )
+
+
+def _prepare_configured_command(
+    *,
+    tool_name: str,
+    repo_root: Path,
+    argv_template: list[str],
+    cwd_template: str,
+    path_args: set[str],
+    declared_properties: set[str],
+    arguments: dict[str, Any],
+) -> tuple[dict[str, Any], list[str], Path]:
+    sanitized_arguments = _sanitize_arguments(
+        tool_name=tool_name,
+        repo_root=repo_root,
+        arguments=arguments,
+        declared_properties=declared_properties,
+        path_args=path_args,
+    )
+    argv = [_render_template(part, sanitized_arguments, tool_name) for part in argv_template]
+    cwd = ensure_inside_repo(repo_root, _render_template(cwd_template, sanitized_arguments, tool_name))
+    return sanitized_arguments, argv, cwd
 
 
 def _render_template(template: str, arguments: dict[str, Any], tool_name: str) -> str:

@@ -6,7 +6,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from my_agent.indexer import RepoIndexer, TEXT_EXTENSIONS
 from my_agent.schema import ToolResult
@@ -22,16 +22,46 @@ from my_agent.tools.builtin import BuiltinToolSource
 from my_agent.tools.registry import ToolRegistry
 from my_agent.tools.spec import ToolContext
 
+if TYPE_CHECKING:
+    from my_agent.hitl.handler import HitlHandler
+    from my_agent.hitl.types import ApprovalEvent
+
 
 class RepoTools:
-    def __init__(self, repo_path: str | Path, timeout: int = 60, config: Any | None = None, include_dynamic: bool = True):
+    def __init__(
+        self,
+        repo_path: str | Path,
+        timeout: int = 60,
+        config: Any | None = None,
+        include_dynamic: bool = True,
+        *,
+        run_id: str = "",
+        hitl_handler: HitlHandler | None = None,
+        approval_observer: Callable[[ApprovalEvent], None] | None = None,
+    ):
         self.repo_root = Path(repo_path).resolve()
         if not self.repo_root.exists() or not self.repo_root.is_dir():
             raise ValueError(f"Repository path does not exist or is not a directory: {self.repo_root}")
         self.timeout = timeout
         self.config = config
-        self.context = ToolContext(repo_root=self.repo_root, timeout_seconds=timeout, config=config)
-        self.registry = ToolRegistry(context=self.context)
+        self.context = ToolContext(repo_root=self.repo_root, timeout_seconds=timeout, config=config, run_id=run_id)
+        if hitl_handler is None:
+            self.registry = ToolRegistry(context=self.context)
+        else:
+            from my_agent.hitl.audit import AuditLog
+            from my_agent.hitl.policy import StaticApprovalPolicy
+            from my_agent.hitl.registry import HitlToolRegistry
+
+            self.registry = HitlToolRegistry(
+                context=self.context,
+                handler=hitl_handler,
+                policy=StaticApprovalPolicy(
+                    medium_risk_mode=str(getattr(config, "hitl_medium_risk_mode", "ask") or "ask")
+                ),
+                audit_log=AuditLog.from_config(config),
+                observer=approval_observer,
+                run_id=run_id,
+            )
         self._register_defaults()
         if include_dynamic:
             self._register_dynamic_sources()

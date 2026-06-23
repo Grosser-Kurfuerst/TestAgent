@@ -21,6 +21,7 @@ class ToolContext:
     repo_root: Path
     timeout_seconds: int = 60
     config: Any | None = None
+    run_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -57,10 +58,16 @@ class ToolHandler(Protocol):
         ...
 
 
+class ToolPreflight(Protocol):
+    def __call__(self, arguments: dict[str, Any], context: ToolContext) -> None:
+        ...
+
+
 @dataclass(frozen=True)
 class ToolRegistration:
     spec: ToolSpec
     handler: ToolHandler
+    preflight: ToolPreflight | None = None
 
 
 class ToolSource(Protocol):
