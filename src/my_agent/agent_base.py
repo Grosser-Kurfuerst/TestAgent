@@ -26,7 +26,7 @@ class RunContext:
     repo_snapshot: Any | None = None
 
 
-class AgentRunBase(ABC):
+class AgentBase(ABC):
     """Shared runtime plumbing for ReAct, plan, and team modes."""
 
     def __init__(

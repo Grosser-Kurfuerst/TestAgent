@@ -3,14 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Callable
 
+from my_agent.agent_factory import AgentFactory
 from my_agent.config import AgentConfig
 from my_agent.llm import AgentLLM, build_llm
 from my_agent.memory import MemoryManager
-from my_agent.plan import AgentMode, PlanExecuteAgent, resolve_mode
-from my_agent.react import ReActRuntime
-from my_agent.runtime_base import AgentRunBase
+from my_agent.plan import AgentMode, resolve_mode
 from my_agent.schema import AgentState
-from my_agent.team import TeamOrchestrator
 
 
 class CodingAgentRuntime:
@@ -36,36 +34,15 @@ class CodingAgentRuntime:
         selected = resolve_mode(mode if mode is not None else self.config.agent_mode, state.task, default=AgentMode.AUTO)
         if not getattr(self.llm, "supports_tools", False):
             raise RuntimeError("The ReAct runtime requires an LLM client with native tool-call support.")
-        runner = self._runner_for_mode(selected)
-        return runner.run(state)
-
-    def _runner_for_mode(self, selected: AgentMode) -> AgentRunBase:
-        if selected == AgentMode.TEAM:
-            return TeamOrchestrator(
-                config=self.config,
-                llm=self.llm,
-                trace_dir=self.trace_dir,
-                command_timeout=self.command_timeout,
-                event_sink=self.event_sink,
-                memory_manager=self.memory_manager,
-            )
-        if selected == AgentMode.PLAN:
-            return PlanExecuteAgent(
-                config=self.config,
-                llm=self.llm,
-                trace_dir=self.trace_dir,
-                command_timeout=self.command_timeout,
-                event_sink=self.event_sink,
-                memory_manager=self.memory_manager,
-            )
-        return ReActRuntime(
+        agent = AgentFactory(
             config=self.config,
             llm=self.llm,
             trace_dir=self.trace_dir,
             command_timeout=self.command_timeout,
             event_sink=self.event_sink,
             memory_manager=self.memory_manager,
-        )
+        ).create(selected)
+        return agent.run(state)
 
 
 def run_agent(

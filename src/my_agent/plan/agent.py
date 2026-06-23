@@ -14,7 +14,7 @@ from my_agent.plan.planner import Planner
 from my_agent.plan.rendering import render_plan, render_plan_final_answer, render_plan_review
 from my_agent.plan.store import JsonPlanStore, PlanStore
 from my_agent.plan.types import PlanState, PlanStatus, TaskStatus
-from my_agent.runtime_base import AgentRunBase
+from my_agent.agent_base import AgentBase
 from my_agent.schema import AgentState
 from my_agent.tracing import TraceWriter
 from my_agent.utils.text import terminal_summary_text
@@ -36,7 +36,7 @@ PlanReviewHandler = Callable[[PlanState], PlanReviewDecision]
 EventSink = Callable[[object], None]
 
 
-class PlanExecuteAgent(AgentRunBase):
+class PlanExecuteAgent(AgentBase):
     def __init__(
         self,
         *,

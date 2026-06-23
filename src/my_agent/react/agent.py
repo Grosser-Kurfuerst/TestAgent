@@ -10,7 +10,7 @@ from my_agent.llm import AgentLLM
 from my_agent.llm.types import ChatResponse, LLMToolCall, Message, MessageLike, messages_to_openai
 from my_agent.memory import MemoryManager
 from my_agent.memory.token import estimate_tokens
-from my_agent.runtime_base import AgentRunBase
+from my_agent.agent_base import AgentBase
 from my_agent.schema import AgentState, ToolCall, ToolRecord, ToolResult
 from my_agent.tools import RepoTools, ToolExecutionResult, ToolInvocation
 from my_agent.tracing import TraceWriter
@@ -19,7 +19,7 @@ from my_agent.utils.answers import append_trace_to_answer
 EventSink = Callable[[Any], None]
 
 
-class ReActRuntime(AgentRunBase):
+class ReActAgent(AgentBase):
     def __init__(
         self,
         *,

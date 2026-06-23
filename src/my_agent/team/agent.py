@@ -12,7 +12,7 @@ from my_agent.config import AgentConfig
 from my_agent.llm import AgentLLM
 from my_agent.memory import MemoryManager
 from my_agent.plan import PlanValidationError, TaskResult
-from my_agent.runtime_base import AgentRunBase
+from my_agent.agent_base import AgentBase
 from my_agent.schema import AgentState
 from my_agent.team.graph import execution_batches, get_executable_steps, validate_team_graph
 from my_agent.team.planner import TeamPlanner
@@ -45,7 +45,7 @@ class TeamEvent:
         }
 
 
-class TeamOrchestrator(AgentRunBase):
+class TeamAgent(AgentBase):
     def __init__(
         self,
         *,

@@ -26,7 +26,7 @@ from my_agent.team import (
     ReviewDecision,
     StepStatus,
     SubAgent,
-    TeamOrchestrator,
+    TeamAgent,
     TeamPlanner,
     TeamState,
     execution_batches,
@@ -522,7 +522,7 @@ class TeamSubAgentTests(unittest.TestCase):
             self.assertIn("fix missing verification", request_text)
 
 
-class TeamOrchestratorTests(unittest.TestCase):
+class TeamAgentTests(unittest.TestCase):
     def test_single_step_success_marks_team_succeeded_and_persists_store(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -535,7 +535,7 @@ class TeamOrchestratorTests(unittest.TestCase):
             reviewer = ScriptedReviewer([ReviewDecision(approved=True, summary="ok")])
             events: list[object] = []
 
-            state = TeamOrchestrator(
+            state = TeamAgent(
                 config=fake_config(base / "traces"),
                 llm=FakeLLM(),
                 trace_dir=base / "traces",
@@ -566,7 +566,7 @@ class TeamOrchestratorTests(unittest.TestCase):
             repo.mkdir()
             write_runtime_repo(repo)
 
-            state = TeamOrchestrator(
+            state = TeamAgent(
                 config=fake_config(base / "traces"),
                 llm=FakeLLM(),
                 trace_dir=base / "traces",
@@ -602,7 +602,7 @@ class TeamOrchestratorTests(unittest.TestCase):
             calls: list[tuple[str, str]] = []
             events: list[object] = []
 
-            state = TeamOrchestrator(
+            state = TeamAgent(
                 config=fake_config(base / "traces", team_worker_count=2),
                 llm=FakeLLM(),
                 trace_dir=base / "traces",
@@ -631,7 +631,7 @@ class TeamOrchestratorTests(unittest.TestCase):
             team = TeamState.create(goal="Parallel snapshots", steps=[step("step_1"), step("step_2")])
             events: list[object] = []
 
-            TeamOrchestrator(
+            TeamAgent(
                 config=fake_config(base / "traces", team_worker_count=2),
                 llm=FakeLLM(),
                 trace_dir=base / "traces",
@@ -662,7 +662,7 @@ class TeamOrchestratorTests(unittest.TestCase):
             lock = threading.Lock()
             worker = ParallelWorker("worker-1", calls, active_counter=counter, lock=lock)
 
-            state = TeamOrchestrator(
+            state = TeamAgent(
                 config=fake_config(base / "traces", team_worker_count=1),
                 llm=FakeLLM(),
                 trace_dir=base / "traces",
@@ -693,7 +693,7 @@ class TeamOrchestratorTests(unittest.TestCase):
             )
             calls: list[tuple[str, str]] = []
 
-            state = TeamOrchestrator(
+            state = TeamAgent(
                 config=fake_config(base / "traces", team_worker_count=2),
                 llm=FakeLLM(),
                 trace_dir=base / "traces",
@@ -732,7 +732,7 @@ class TeamOrchestratorTests(unittest.TestCase):
                 finally:
                     sink_lock.release()
 
-            state = TeamOrchestrator(
+            state = TeamAgent(
                 config=fake_config(base / "traces", team_worker_count=2),
                 llm=FakeLLM(),
                 trace_dir=base / "traces",
@@ -769,7 +769,7 @@ class TeamOrchestratorTests(unittest.TestCase):
             )
             events: list[object] = []
 
-            state = TeamOrchestrator(
+            state = TeamAgent(
                 config=fake_config(base / "traces", team_max_retries=1),
                 llm=FakeLLM(),
                 trace_dir=base / "traces",
@@ -797,7 +797,7 @@ class TeamOrchestratorTests(unittest.TestCase):
             worker = ScriptedWorker({"step_1": [TaskResult.success("step_1", "unapproved worker output")]})
             reviewer = ScriptedReviewer([ReviewDecision(approved=False, summary="not good")])
 
-            state = TeamOrchestrator(
+            state = TeamAgent(
                 config=fake_config(base / "traces", team_max_retries=0, team_allow_unapproved_results=True),
                 llm=FakeLLM(),
                 trace_dir=base / "traces",
@@ -824,7 +824,7 @@ class TeamOrchestratorTests(unittest.TestCase):
             team = TeamState.create(goal="AgentCli task", steps=[step("step_1")])
             planner = RecordingPlanner(team)
 
-            TeamOrchestrator(
+            TeamAgent(
                 config=config,
                 llm=FakeLLM(),
                 trace_dir=base / "traces",
@@ -845,7 +845,7 @@ class TeamOrchestratorTests(unittest.TestCase):
             repo.mkdir()
             write_runtime_repo(repo)
 
-            state = TeamOrchestrator(
+            state = TeamAgent(
                 config=fake_config(base / "traces"),
                 llm=PlannerCrashLLM(),
                 trace_dir=base / "traces",
@@ -887,7 +887,7 @@ class TeamOrchestratorTests(unittest.TestCase):
                 ]
             )
 
-            state = TeamOrchestrator(
+            state = TeamAgent(
                 config=fake_config(base / "traces", team_max_retries=1),
                 llm=FakeLLM(),
                 trace_dir=base / "traces",
@@ -917,7 +917,7 @@ class TeamOrchestratorTests(unittest.TestCase):
             )
             worker = ScriptedWorker({"step_1": [TaskResult.failure("step_1", "worker exploded")]})
 
-            state = TeamOrchestrator(
+            state = TeamAgent(
                 config=fake_config(base / "traces"),
                 llm=FakeLLM(),
                 trace_dir=base / "traces",
@@ -944,7 +944,7 @@ class TeamOrchestratorTests(unittest.TestCase):
                 steps=[step("step_1"), step("step_2", dependencies=["step_1"])],
             )
 
-            state = TeamOrchestrator(
+            state = TeamAgent(
                 config=fake_config(base / "traces"),
                 llm=FakeLLM(),
                 trace_dir=base / "traces",
@@ -974,7 +974,7 @@ class TeamOrchestratorTests(unittest.TestCase):
                 steps=[step("step_1"), step("step_2", dependencies=["step_1"])],
             )
 
-            state = TeamOrchestrator(
+            state = TeamAgent(
                 config=fake_config(base / "traces"),
                 llm=FakeLLM(),
                 trace_dir=base / "traces",
@@ -1024,7 +1024,7 @@ class TeamOrchestratorTests(unittest.TestCase):
                     command_timeout=60,
                 )
 
-            state = TeamOrchestrator(
+            state = TeamAgent(
                 config=fake_config(base / "traces", team_max_retries=1),
                 llm=FakeLLM(),
                 trace_dir=base / "traces",

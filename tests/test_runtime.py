@@ -12,13 +12,14 @@ except ImportError:
 
 add_src_to_path()
 
+from my_agent.agent_base import AgentBase
+from my_agent.agent_factory import AgentFactory
 from my_agent.config import AgentConfig
 from my_agent.llm import FakeLLM
 from my_agent.llm.types import ChatResponse, LLMToolCall, MessageLike, messages_to_openai
 from my_agent.memory import MemoryManager, MemoryScope
 from my_agent.plan import AgentMode
 from my_agent.runtime import CodingAgentRuntime, run_agent
-from my_agent.runtime_base import AgentRunBase
 
 
 def write_runtime_repo(repo: Path) -> None:
@@ -564,19 +565,24 @@ class RuntimeTests(unittest.TestCase):
             self.assertIn("run.started", event_names)
             self.assertNotIn("plan.started", event_names)
 
-    def test_runtime_mode_dispatch_returns_agent_run_base(self) -> None:
-        runtime = CodingAgentRuntime(config=fake_config(), llm=FakeLLM(), trace_dir=Path("traces"))
+    def test_agent_factory_creates_agent_base_for_each_mode(self) -> None:
+        factory = AgentFactory(
+            config=fake_config(),
+            llm=FakeLLM(),
+            trace_dir=Path("traces"),
+            command_timeout=60,
+        )
 
-        self.assertIsInstance(runtime._runner_for_mode(AgentMode.REACT), AgentRunBase)
-        self.assertIsInstance(runtime._runner_for_mode(AgentMode.PLAN), AgentRunBase)
-        self.assertIsInstance(runtime._runner_for_mode(AgentMode.TEAM), AgentRunBase)
+        self.assertIsInstance(factory.create(AgentMode.REACT), AgentBase)
+        self.assertIsInstance(factory.create(AgentMode.PLAN), AgentBase)
+        self.assertIsInstance(factory.create(AgentMode.TEAM), AgentBase)
 
     def test_react_runner_imports_from_react_package(self) -> None:
-        from my_agent.react import ReActRuntime as NewReActRuntime
+        from my_agent.react import ReActAgent as NewReActAgent
         from my_agent.react.child_runner import ChildReActRunner as PackageChildReActRunner
-        from my_agent.react.runtime import ReActRuntime as PackageReActRuntime
+        from my_agent.react.agent import ReActAgent as PackageReActAgent
 
-        self.assertIs(NewReActRuntime, PackageReActRuntime)
+        self.assertIs(NewReActAgent, PackageReActAgent)
         self.assertEqual(PackageChildReActRunner.__name__, "ChildReActRunner")
 
     def test_run_agent_mode_plan_uses_plan_execute_agent(self) -> None:

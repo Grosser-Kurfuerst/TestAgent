@@ -7,7 +7,7 @@ from typing import Any, Callable
 from my_agent.config import AgentConfig
 from my_agent.memory import MemoryManager
 from my_agent.plan.types import TaskResult
-from my_agent.react.runtime import ReActRuntime
+from my_agent.react.agent import ReActAgent
 from my_agent.schema import AgentState
 
 
@@ -58,7 +58,7 @@ class ChildReActRunner:
             max_steps=request.max_steps,
             run_id=request.run_id,
         )
-        final_state = ReActRuntime(
+        final_state = ReActAgent(
             config=self.config,
             llm=self.llm,
             trace_dir=request.trace_dir,
