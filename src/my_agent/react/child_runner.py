@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from my_agent.config import AgentConfig
+from my_agent.hitl.handler import HitlHandler
 from my_agent.memory import MemoryManager
 from my_agent.plan.types import TaskResult
 from my_agent.react.agent import ReActAgent
@@ -35,12 +36,14 @@ class ChildReActRunner:
         command_timeout: int,
         event_sink: Callable[[object], None] | None = None,
         memory_manager: MemoryManager | None = None,
+        hitl_handler: HitlHandler | None = None,
     ) -> None:
         self.config = config
         self.llm = llm
         self.command_timeout = command_timeout
         self.event_sink = event_sink
         self.memory_manager = memory_manager
+        self.hitl_handler = hitl_handler
 
     def run(self, request: ChildReActRequest) -> TaskResult:
         task_memory = (
@@ -65,6 +68,7 @@ class ChildReActRunner:
             command_timeout=self.command_timeout,
             event_sink=self.event_sink,
             memory_manager=task_memory,
+            hitl_handler=self.hitl_handler,
             role_prompt=request.role_prompt,
             run_label=request.run_label,
         ).run(state)

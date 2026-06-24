@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Callable
 
 from my_agent.config import AgentConfig
+from my_agent.hitl.handler import HitlHandler
 from my_agent.llm import AgentLLM
 from my_agent.memory import MemoryManager
 from my_agent.plan.executor import PlanEvent, PlanExecutor, ReActTaskRunner
@@ -49,6 +50,7 @@ class PlanExecuteAgent(AgentBase):
         state_store: PlanStore | None = None,
         require_approval: bool = False,
         memory_manager: MemoryManager | None = None,
+        hitl_handler: HitlHandler | None = None,
     ) -> None:
         super().__init__(
             config=config,
@@ -57,6 +59,7 @@ class PlanExecuteAgent(AgentBase):
             command_timeout=command_timeout,
             event_sink=event_sink,
             memory_manager=memory_manager,
+            hitl_handler=hitl_handler,
         )
         self.review_handler = review_handler or _default_review_handler
         self.state_store = state_store or JsonPlanStore(self.trace_dir / "plans")
@@ -124,6 +127,7 @@ class PlanExecuteAgent(AgentBase):
                     plan_task_max_steps=self.config.plan_task_max_steps,
                     event_sink=self.event_sink,
                     memory_manager=memory,
+                    hitl_handler=self.hitl_handler,
                 )
                 executor = PlanExecutor(
                     runner,

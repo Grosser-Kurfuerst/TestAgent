@@ -68,6 +68,9 @@ class Renderer(Protocol):
     def team_completed(self, team: TeamState) -> None:
         ...
 
+    def reset_between_iterations(self) -> None:
+        ...
+
     def status(self, status: str) -> None:
         ...
 
@@ -193,6 +196,10 @@ class PlainRenderer:
         counts = _team_status_counts(team)
         suffix = ", ".join(f"{status}={count}" for status, count in sorted(counts.items()))
         self.output.write(f"team {_team_label(team.status)}: {suffix or 'no steps'}\n")
+
+    def reset_between_iterations(self) -> None:
+        self.output.flush()
+        self.errors.flush()
 
     def status(self, status: str) -> None:
         self.output.write(status.rstrip() + "\n")

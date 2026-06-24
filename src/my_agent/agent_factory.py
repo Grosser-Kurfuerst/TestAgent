@@ -5,6 +5,7 @@ from typing import Any, Callable
 
 from my_agent.agent_base import AgentBase
 from my_agent.config import AgentConfig
+from my_agent.hitl.handler import HitlHandler
 from my_agent.llm import AgentLLM
 from my_agent.memory import MemoryManager
 from my_agent.plan import AgentMode, PlanExecuteAgent
@@ -24,6 +25,7 @@ class AgentFactory:
         command_timeout: int,
         event_sink: EventSink | None = None,
         memory_manager: MemoryManager | None = None,
+        hitl_handler: HitlHandler | None = None,
     ) -> None:
         self.config = config
         self.llm = llm
@@ -31,6 +33,7 @@ class AgentFactory:
         self.command_timeout = command_timeout
         self.event_sink = event_sink
         self.memory_manager = memory_manager
+        self.hitl_handler = hitl_handler
 
     def create(self, mode: AgentMode) -> AgentBase:
         if mode == AgentMode.TEAM:
@@ -41,6 +44,7 @@ class AgentFactory:
                 command_timeout=self.command_timeout,
                 event_sink=self.event_sink,
                 memory_manager=self.memory_manager,
+                hitl_handler=self.hitl_handler,
             )
         if mode == AgentMode.PLAN:
             return PlanExecuteAgent(
@@ -50,6 +54,7 @@ class AgentFactory:
                 command_timeout=self.command_timeout,
                 event_sink=self.event_sink,
                 memory_manager=self.memory_manager,
+                hitl_handler=self.hitl_handler,
             )
         return ReActAgent(
             config=self.config,
@@ -58,5 +63,5 @@ class AgentFactory:
             command_timeout=self.command_timeout,
             event_sink=self.event_sink,
             memory_manager=self.memory_manager,
+            hitl_handler=self.hitl_handler,
         )
-

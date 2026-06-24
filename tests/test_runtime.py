@@ -15,6 +15,7 @@ add_src_to_path()
 from my_agent.agent_base import AgentBase
 from my_agent.agent_factory import AgentFactory
 from my_agent.config import AgentConfig
+from my_agent.hitl import ApprovalDecision, ApprovalRequest, ApprovalResult, ApprovalScope
 from my_agent.llm import FakeLLM
 from my_agent.llm.types import ChatResponse, LLMToolCall, MessageLike, messages_to_openai
 from my_agent.memory import MemoryManager, MemoryScope
@@ -87,6 +88,33 @@ class RecordingFakeLLM(FakeLLM):
         return super().chat(messages, tools=tools)  # type: ignore[arg-type]
 
 
+class RecordingHitlHandler:
+    def __init__(self, *results: ApprovalResult, enabled: bool = True) -> None:
+        self.results = list(results)
+        self.enabled = enabled
+        self.requests: list[ApprovalRequest] = []
+        self.approved_all: set[tuple[ApprovalScope, str]] = set()
+
+    def request_approval(self, request: ApprovalRequest) -> ApprovalResult:
+        self.requests.append(request)
+        result = self.results.pop(0) if self.results else ApprovalResult(ApprovalDecision.APPROVED)
+        if result.decision == ApprovalDecision.APPROVED_ALL:
+            self.approved_all.add((ApprovalScope.TOOL, request.tool_name))
+        return result
+
+    def is_enabled(self) -> bool:
+        return self.enabled
+
+    def set_enabled(self, enabled: bool) -> None:
+        self.enabled = enabled
+
+    def clear_approved_all(self) -> None:
+        self.approved_all.clear()
+
+    def is_approved_all(self, *, scope: ApprovalScope, key: str) -> bool:
+        return (scope, key) in self.approved_all
+
+
 class RuntimeTests(unittest.TestCase):
     def test_run_agent_rejects_zero_max_steps(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -145,6 +173,74 @@ class RuntimeTests(unittest.TestCase):
             self.assertNotIn("tool_call", event_names)
             self.assertNotIn("final_summary", event_names)
             self.assertEqual({event["run_id"] for event in events}, {state.run_id})
+
+    def test_hitl_approval_events_are_traced_and_forwarded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+            llm = FakeLLM(
+                chat_responses=[
+                    tool_response("write_file", {"path": "approved.txt", "content": "ok"}, "call_write"),
+                    ChatResponse(content="done", finish_reason="stop"),
+                ]
+            )
+            handler = RecordingHitlHandler(ApprovalResult(ApprovalDecision.APPROVED))
+            events: list[object] = []
+
+            state = run_agent(
+                repo_path=repo,
+                task="Create approved file.",
+                config=fake_config(base / "traces", hitl_audit_dir=base / "audit"),
+                llm=llm,
+                trace_dir=base / "traces",
+                event_sink=events.append,
+                hitl_handler=handler,
+            )
+
+            self.assertEqual(state.stop_reason, "assistant_final")
+            self.assertEqual((repo / "approved.txt").read_text(encoding="utf-8"), "ok")
+            self.assertEqual(len(handler.requests), 1)
+            trace_events = read_trace(state.trace_path)
+            requested = [event for event in trace_events if event["event"] == "approval.requested"]
+            completed = [event for event in trace_events if event["event"] == "approval.completed"]
+            self.assertEqual(len(requested), 1)
+            self.assertEqual(len(completed), 1)
+            self.assertEqual(requested[0]["payload"]["id"], completed[0]["payload"]["id"])
+            self.assertEqual(requested[0]["payload"]["run_id"], state.run_id)
+            event_names = [getattr(event, "event", "") for event in events]
+            self.assertIn("render.flush_requested", event_names)
+            self.assertIn("approval.requested", event_names)
+            self.assertIn("approval.completed", event_names)
+
+    def test_hitl_rejection_is_returned_to_model_as_tool_result(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+            llm = RecordingFakeLLM(
+                [
+                    tool_response("write_file", {"path": "blocked.txt", "content": "x"}, "call_write"),
+                    ChatResponse(content="blocked by user", finish_reason="stop"),
+                ]
+            )
+            handler = RecordingHitlHandler(ApprovalResult(ApprovalDecision.REJECTED, reason="do not write"))
+
+            state = run_agent(
+                repo_path=repo,
+                task="Create blocked file.",
+                config=fake_config(base / "traces", hitl_audit_dir=base / "audit"),
+                llm=llm,
+                trace_dir=base / "traces",
+                hitl_handler=handler,
+            )
+
+            self.assertEqual(state.stop_reason, "assistant_final")
+            self.assertFalse((repo / "blocked.txt").exists())
+            self.assertEqual(state.tool_history[0].result.reason, "approval_rejected")
+            self.assertIn("[HITL] Operation rejected", json.dumps(llm.requests[-1], ensure_ascii=False))
 
     def test_run_agent_team_mode_executes_team_orchestrator(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

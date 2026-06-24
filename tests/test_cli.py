@@ -71,20 +71,22 @@ class CliTests(unittest.TestCase):
 
     def test_build_parser_includes_chat_command(self) -> None:
         args = build_parser().parse_args(
-            ["chat", "--repo", ".", "--mode", "team", "--test-command", "python -m unittest", "--no-banner"]
+            ["chat", "--repo", ".", "--mode", "team", "--test-command", "python -m unittest", "--hitl", "--no-banner"]
         )
 
         self.assertEqual(args.command, "chat")
         self.assertEqual(args.repo, ".")
         self.assertEqual(args.mode, "team")
         self.assertEqual(args.test_command, "python -m unittest")
+        self.assertTrue(args.hitl)
         self.assertTrue(args.no_banner)
 
     def test_build_parser_includes_run_mode(self) -> None:
-        args = build_parser().parse_args(["run", "--task-file", str(DEFAULT_TASK_FILE), "--mode", "team"])
+        args = build_parser().parse_args(["run", "--task-file", str(DEFAULT_TASK_FILE), "--mode", "team", "--no-hitl"])
 
         self.assertEqual(args.command, "run")
         self.assertEqual(args.mode, "team")
+        self.assertFalse(args.hitl)
 
     def test_build_parser_run_mode_defaults_to_config_mode(self) -> None:
         args = build_parser().parse_args(["run", "--task-file", str(DEFAULT_TASK_FILE)])
@@ -109,6 +111,8 @@ class CliTests(unittest.TestCase):
         self.assertEqual(output["agent_mode"], "team")
         self.assertEqual(output["team_worker_count"], 4)
         self.assertEqual(output["team_max_steps"], 12)
+        self.assertFalse(output["hitl_enabled"])
+        self.assertEqual(output["hitl_medium_risk_mode"], "ask")
 
     def test_cli_config_prints_allowed_environment_overrides(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -118,6 +122,8 @@ class CliTests(unittest.TestCase):
                 "AGENTCLI_AGENT_MODE": "team",
                 "AGENTCLI_TEAM_WORKERS": "5",
                 "AGENTCLI_TEAM_MAX_RETRIES": "0",
+                "AGENTCLI_HITL": "1",
+                "AGENTCLI_HITL_MEDIUM_RISK_MODE": "allow",
             }
 
             with mock.patch.dict(os.environ, env, clear=True):
@@ -130,6 +136,8 @@ class CliTests(unittest.TestCase):
         self.assertEqual(output["agent_mode"], "team")
         self.assertEqual(output["team_worker_count"], 5)
         self.assertEqual(output["team_max_retries"], 0)
+        self.assertTrue(output["hitl_enabled"])
+        self.assertEqual(output["hitl_medium_risk_mode"], "allow")
 
     def test_cli_run_executes_fake_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -297,13 +305,14 @@ class CliTests(unittest.TestCase):
                 with mock.patch("my_agent.config.DEFAULT_ENV_FILE", missing_env):
                     with mock.patch("my_agent.cli.AgentRepl") as repl_cls:
                         repl_cls.return_value.run.return_value = 0
-                        exit_code = main(["chat", "--repo", str(repo), "--no-banner"])
+                        exit_code = main(["chat", "--repo", str(repo), "--hitl", "--no-banner"])
 
             self.assertEqual(exit_code, 0)
             config = repl_cls.call_args.kwargs["config"]
             self.assertEqual(config.provider, "fake")
             self.assertTrue(config.use_fake_llm)
             self.assertEqual(config.memory_dir, base / "memory")
+            self.assertTrue(config.hitl_enabled)
 
     def test_cli_run_without_api_key_returns_clear_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

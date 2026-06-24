@@ -76,6 +76,14 @@ class AgentConfig:
     memory_tool_result_chars: int = 500
     memory_auto_extract: bool = True
 
+    # Human-in-the-loop approval; disabled by default.
+    hitl_enabled: bool = False
+    hitl_audit_dir: Path = Path("~/.agentcli/audit").expanduser()
+    hitl_non_interactive: str = "reject"
+    # Medium-risk handling: ask for approval, allow, or deny.
+    hitl_medium_risk_mode: str = "ask"
+    hitl_llm_judge_enabled: bool = False
+
     @classmethod
     def from_env(
         cls,
@@ -206,6 +214,17 @@ class AgentConfig:
                 values.get("AGENTCLI_MEMORY_AUTO_EXTRACT", values.get("MY_AGENT_MEMORY_AUTO_EXTRACT", "")),
                 default=True,
             ),
+            hitl_enabled=_as_bool(values.get("AGENTCLI_HITL", values.get("MY_AGENT_HITL", ""))),
+            hitl_audit_dir=_hitl_audit_dir(values),
+            hitl_non_interactive=_hitl_non_interactive(
+                values.get("AGENTCLI_HITL_NON_INTERACTIVE", values.get("MY_AGENT_HITL_NON_INTERACTIVE", "reject"))
+            ),
+            hitl_medium_risk_mode=_hitl_medium_risk_mode(
+                values.get("AGENTCLI_HITL_MEDIUM_RISK_MODE", values.get("MY_AGENT_HITL_MEDIUM_RISK_MODE", "ask"))
+            ),
+            hitl_llm_judge_enabled=_as_bool(
+                values.get("AGENTCLI_HITL_LLM_JUDGE", values.get("MY_AGENT_HITL_LLM_JUDGE", ""))
+            ),
         )
 
     def require_valid_provider(self) -> None:
@@ -278,6 +297,27 @@ def _memory_dir(values: Mapping[str, str]) -> Path:
     if raw and raw.strip():
         return Path(raw).expanduser()
     return Path("~/.agentcli/memory").expanduser()
+
+
+def _hitl_audit_dir(values: Mapping[str, str]) -> Path:
+    raw = values.get("AGENTCLI_HITL_AUDIT_DIR", values.get("MY_AGENT_HITL_AUDIT_DIR", ""))
+    if raw and raw.strip():
+        return Path(raw).expanduser()
+    return Path("~/.agentcli/audit").expanduser()
+
+
+def _hitl_medium_risk_mode(value: str | None) -> str:
+    normalized = (value or "ask").strip().lower()
+    if normalized not in {"ask", "allow", "deny"}:
+        raise ValueError("AGENTCLI_HITL_MEDIUM_RISK_MODE must be one of: ask, allow, deny.")
+    return normalized
+
+
+def _hitl_non_interactive(value: str | None) -> str:
+    normalized = (value or "reject").strip().lower()
+    if normalized != "reject":
+        raise ValueError("AGENTCLI_HITL_NON_INTERACTIVE currently supports only 'reject'.")
+    return normalized
 
 
 def _config_values(

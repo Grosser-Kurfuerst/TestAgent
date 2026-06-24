@@ -15,6 +15,7 @@ except ImportError:
 add_src_to_path()
 
 from my_agent.config import AgentConfig
+from my_agent.hitl import HitlToolRegistry
 from my_agent.plan import AgentMode, PlanState, PlanStatus, PlanTask, TaskStatus
 from my_agent.team import ExecutionStep, StepStatus, TeamState, TeamStatus
 from my_agent.ui import AgentRepl, PlainRenderer
@@ -89,6 +90,7 @@ class ReplTests(unittest.TestCase):
         self.assertIn("/save", text)
         self.assertIn("/plan", text)
         self.assertIn("/team", text)
+        self.assertIn("/hitl", text)
         self.assertIn("/mode", text)
         self.assertIn("team", text)
         self.assertIn("read_file", text)
@@ -96,6 +98,34 @@ class ReplTests(unittest.TestCase):
         self.assertIn("No conversation history was compacted", text)
         self.assertIn("Extracted 0 facts, cleared 0 short-term entries", text)
         self.assertIn("Latest trace: none", text)
+        self.assertEqual(errors.getvalue(), "")
+
+    def test_hitl_command_toggles_session_approval_and_tools_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / "sample.py").write_text("x = 1\n", encoding="utf-8")
+            output = io.StringIO()
+            errors = io.StringIO()
+            repl = AgentRepl(
+                repo_path=repo,
+                config=fake_config(repo / "traces", hitl_enabled=False),
+                trace_dir=repo / "traces",
+                renderer=PlainRenderer(output=output, errors=errors),
+                input_stream=io.StringIO("/hitl\n/hitl on\n/tools\n/hitl off\n/quit\n"),
+            )
+            self.assertIsInstance(repl._tools.registry, HitlToolRegistry)
+            repl._load_tools = mock.Mock(side_effect=AssertionError("hitl toggle must not reload tools"))  # type: ignore[method-assign]
+
+            exit_code = repl.run(show_banner=False)
+
+        self.assertEqual(exit_code, 0)
+        text = output.getvalue()
+        self.assertIn("HITL approval is off", text)
+        self.assertIn("HITL approval enabled.", text)
+        self.assertIn("approval", text)
+        self.assertIn("write_file", text)
+        self.assertIn("ask", text)
+        self.assertIn("HITL approval disabled. Cleared HITL approve-all grants.", text)
         self.assertEqual(errors.getvalue(), "")
 
     def test_repl_task_renders_tools_and_updates_context(self) -> None:

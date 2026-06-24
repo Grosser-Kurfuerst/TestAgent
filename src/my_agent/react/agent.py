@@ -6,6 +6,8 @@ from typing import Any, Callable
 
 from my_agent.budget import AgentBudget
 from my_agent.config import AgentConfig
+from my_agent.hitl.handler import HitlHandler
+from my_agent.hitl.types import ApprovalEvent
 from my_agent.llm import AgentLLM
 from my_agent.llm.types import ChatResponse, LLMToolCall, Message, MessageLike, messages_to_openai
 from my_agent.memory import MemoryManager
@@ -29,6 +31,7 @@ class ReActAgent(AgentBase):
         command_timeout: int,
         event_sink: EventSink | None = None,
         memory_manager: MemoryManager | None = None,
+        hitl_handler: HitlHandler | None = None,
         role_prompt: str | None = None,
         run_label: str = "native_tool_calls",
     ) -> None:
@@ -39,6 +42,7 @@ class ReActAgent(AgentBase):
             command_timeout=command_timeout,
             event_sink=event_sink,
             memory_manager=memory_manager,
+            hitl_handler=hitl_handler,
         )
         self.role_prompt = role_prompt
         self.run_label = run_label
@@ -51,7 +55,14 @@ class ReActAgent(AgentBase):
         with self.open_run_context(state) as ctx:
             writer = ctx.writer
             memory = ctx.memory
-            tools = RepoTools(state.repo_path, timeout=self.command_timeout, config=self.config)
+            tools = RepoTools(
+                state.repo_path,
+                timeout=self.command_timeout,
+                config=self.config,
+                run_id=state.run_id,
+                hitl_handler=self.hitl_handler,
+                approval_observer=lambda event: self._handle_approval_event(writer, state, event),
+            )
             tool_definitions = tools.tool_definitions()
             budget = AgentBudget.from_config(self.config, max_steps=state.max_steps)
 
@@ -225,6 +236,7 @@ class ReActAgent(AgentBase):
         tool_calls: list[LLMToolCall],
         budget: AgentBudget,
     ) -> list[ToolExecutionResult]:
+        self._emit_event(ApprovalEvent(event="render.flush_requested", payload={"reason": "before_tool_calls"}))
         results: list[ToolExecutionResult] = []
         for call in tool_calls:
             if state.steps >= state.max_steps or budget.tool_calls + len(results) >= budget.max_tool_calls:
@@ -349,6 +361,10 @@ class ReActAgent(AgentBase):
 
     def _emit(self, writer: TraceWriter, event: Any) -> None:
         writer.append(event)
+        self._emit_event(event)
+
+    def _handle_approval_event(self, writer: TraceWriter, state: AgentState, event: ApprovalEvent) -> None:
+        self._emit_trace(writer, state, event.event, dict(event.payload))
         self._emit_event(event)
 
 

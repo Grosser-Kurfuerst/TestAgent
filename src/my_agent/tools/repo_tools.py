@@ -56,7 +56,8 @@ class RepoTools:
                 context=self.context,
                 handler=hitl_handler,
                 policy=StaticApprovalPolicy(
-                    medium_risk_mode=str(getattr(config, "hitl_medium_risk_mode", "ask") or "ask")
+                    medium_risk_mode=str(getattr(config, "hitl_medium_risk_mode", "ask") or "ask"),
+                    judge_enabled=bool(getattr(config, "hitl_llm_judge_enabled", False)),
                 ),
                 audit_log=AuditLog.from_config(config),
                 observer=approval_observer,

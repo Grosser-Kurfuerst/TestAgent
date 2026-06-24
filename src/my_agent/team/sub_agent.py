@@ -5,6 +5,7 @@ from typing import Any, Callable
 
 from my_agent.react.child_runner import ChildReActRequest, ChildReActRunner
 from my_agent.config import AgentConfig
+from my_agent.hitl.handler import HitlHandler
 from my_agent.llm import AgentLLM
 from my_agent.llm.types import Message, MessageLike
 from my_agent.memory import MemoryManager
@@ -35,6 +36,7 @@ class SubAgent:
         command_timeout: int,
         memory_manager: MemoryManager | None = None,
         event_sink: EventSink | None = None,
+        hitl_handler: HitlHandler | None = None,
         test_command: str | None = None,
         step_max_steps: int | None = None,
     ) -> None:
@@ -47,6 +49,7 @@ class SubAgent:
         self.command_timeout = command_timeout
         self.memory_manager = memory_manager
         self.event_sink = event_sink
+        self.hitl_handler = hitl_handler
         self.test_command = test_command
         self.step_max_steps = positive_or_default(step_max_steps, config.team_step_max_steps)
         self.child_runner = ChildReActRunner(
@@ -55,6 +58,7 @@ class SubAgent:
             command_timeout=command_timeout,
             event_sink=event_sink,
             memory_manager=memory_manager,
+            hitl_handler=hitl_handler,
         )
         self.history: list[MessageLike] = [Message(role="system", content=self._system_prompt())]
 

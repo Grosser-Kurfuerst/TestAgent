@@ -24,6 +24,7 @@ from my_agent.hitl import (
     AuditLog,
     HitlToolRegistry,
     NonInteractiveHitlHandler,
+    PolicyDecision,
     RiskLevel,
     StaticApprovalPolicy,
     TerminalHitlHandler,
@@ -130,6 +131,70 @@ class HitlPolicyTests(unittest.TestCase):
             self.assertTrue(result.blocked)
             self.assertEqual(result.error_code, "policy_denied")
             self.assertFalse(called)
+
+    def test_static_policy_does_not_run_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            context = ToolContext(repo_root=Path(tmp))
+            registry = ToolRegistry(context=context)
+            called = False
+
+            def preflight(_: dict[str, object], __: ToolContext) -> None:
+                nonlocal called
+                called = True
+                raise HookViolation("registry owns hard preflight")
+
+            registry.register(
+                ToolRegistration(
+                    spec=ToolSpec(
+                        name="custom_write",
+                        description="custom write",
+                        parameters=object_schema({"path": {"type": "string"}}, required=["path"]),
+                        risk=ToolRisk.WRITE,
+                        source="test",
+                    ),
+                    handler=lambda _args, _context: ToolResult(ok=True, output="ok"),
+                    preflight=preflight,
+                )
+            )
+            decision = StaticApprovalPolicy().evaluate(registry.tools[0], {"path": "../outside.txt"}, context)
+
+            self.assertFalse(called)
+            self.assertTrue(decision.allowed)
+            self.assertEqual(decision.risk_level, RiskLevel.MEDIUM)
+            self.assertTrue(decision.requires_approval)
+
+    def test_risk_judge_can_refine_medium_risk_but_not_high(self) -> None:
+        class FakeJudge:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def judge(self, registered_tool, arguments, static):  # type: ignore[no-untyped-def]
+                self.calls += 1
+                return PolicyDecision(
+                    allowed=True,
+                    requires_approval=False,
+                    risk_level=static.risk_level,
+                    reason="judge allow",
+                    description="fake judge allowed medium risk",
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            context = ToolContext(repo_root=Path(tmp))
+            registry = ToolRegistry(context=context)
+            registry.register(_registration("custom_write", risk=ToolRisk.WRITE))
+            registry.register(_registration("custom_exec", risk=ToolRisk.EXECUTE))
+            judge = FakeJudge()
+            policy = StaticApprovalPolicy(judge=judge, judge_enabled=True)
+
+            medium = policy.evaluate(registry.tools[0], {"path": "a.txt", "content": "x"}, context)
+            high = policy.evaluate(registry.tools[1], {"path": "a.txt", "content": "x"}, context)
+
+        self.assertTrue(medium.allowed)
+        self.assertFalse(medium.requires_approval)
+        self.assertEqual(medium.reason, "judge allow")
+        self.assertTrue(high.allowed)
+        self.assertTrue(high.requires_approval)
+        self.assertEqual(judge.calls, 1)
 
 
 class HitlHandlerTests(unittest.TestCase):
@@ -283,6 +348,43 @@ class HitlRegistryTests(unittest.TestCase):
             self.assertEqual(regular_result.error_code, "policy_denied")
             self.assertFalse(called)
 
+    def test_hitl_registry_runs_preflight_once_before_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            preflight_calls = 0
+
+            def handler(_: dict[str, object], __: ToolContext) -> ToolResult:
+                return ToolResult(ok=True, output="ran")
+
+            def preflight(_: dict[str, object], __: ToolContext) -> None:
+                nonlocal preflight_calls
+                preflight_calls += 1
+
+            hitl = HitlToolRegistry(
+                context=ToolContext(repo_root=repo),
+                handler=RecordingHitlHandler(ApprovalResult(ApprovalDecision.APPROVED)),
+                audit_log=AuditLog(repo / "audit"),
+                run_id="run-preflight-once",
+            )
+            hitl.register(
+                ToolRegistration(
+                    spec=ToolSpec(
+                        name="custom_write",
+                        description="custom write",
+                        parameters=object_schema({"path": {"type": "string"}}, required=["path"]),
+                        risk=ToolRisk.WRITE,
+                        source="test",
+                    ),
+                    handler=handler,
+                    preflight=preflight,
+                )
+            )
+
+            result = _execute(hitl, "custom_write", {"path": "a.txt"})
+
+            self.assertTrue(result.ok, result.content)
+            self.assertEqual(preflight_calls, 1)
+
     def test_read_file_does_not_trigger_approval(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
@@ -356,7 +458,7 @@ class HitlRegistryTests(unittest.TestCase):
             self.assertIn("tool_ok", outcomes)
             self.assertTrue(all(line["run_id"] == "run-1" for line in audit_lines))
 
-    def test_modified_arguments_are_revalidated_by_policy(self) -> None:
+    def test_modified_arguments_are_revalidated_by_preflight(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             handler = RecordingHitlHandler(

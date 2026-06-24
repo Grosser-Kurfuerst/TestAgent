@@ -118,8 +118,17 @@ class HitlToolRegistry(ToolRegistry):
             started=time.monotonic(),
         )
 
-    def _deny_if_preflight_failed(self, ctx: _HitlCallContext) -> ToolExecutionResult | None:
-        preflight_result = self._preflight_policy(ctx.invocation, ctx.tool, ctx.arguments)
+    def _deny_if_preflight_failed(
+        self,
+        ctx: _HitlCallContext,
+        *,
+        invocation: ToolInvocation | None = None,
+        arguments: dict[str, object] | None = None,
+        approval_decision: str = "none",
+    ) -> ToolExecutionResult | None:
+        effective_invocation = ctx.invocation if invocation is None else invocation
+        effective_arguments = ctx.arguments if arguments is None else arguments
+        preflight_result = self._preflight_policy(effective_invocation, ctx.tool, effective_arguments)
         if preflight_result is not None:
             reason = _policy_reason_from_result(preflight_result)
             return self._audit_and_return(
@@ -131,10 +140,12 @@ class HitlToolRegistry(ToolRegistry):
                     reason=reason,
                     description="Static policy denied the tool call before approval.",
                 ),
-                approval_decision="none",
+                approval_decision=approval_decision,
                 outcome="policy_denied",
                 reason=reason,
                 result=preflight_result,
+                invocation=effective_invocation,
+                arguments=effective_arguments,
             )
         return None
 
@@ -295,6 +306,14 @@ class HitlToolRegistry(ToolRegistry):
                 invocation=modified,
                 arguments=modified_parsed,
             )
+        modified_preflight_denied = self._deny_if_preflight_failed(
+            ctx,
+            invocation=modified,
+            arguments=modified_parsed,
+            approval_decision=approval.decision.value,
+        )
+        if modified_preflight_denied is not None:
+            return modified_preflight_denied
         modified_policy = self.policy.evaluate(ctx.tool, modified_parsed, self.context)
         if not modified_policy.allowed:
             result = _policy_denied_result(modified, modified_policy)

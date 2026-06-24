@@ -226,6 +226,11 @@ class AgentConfigTests(unittest.TestCase):
         self.assertEqual(config.memory_tool_result_chars, 500)
         # memory_auto_extract defaults to True per plan §13 (line 544).
         self.assertTrue(config.memory_auto_extract)
+        self.assertFalse(config.hitl_enabled)
+        self.assertEqual(config.hitl_audit_dir, Path("~/.agentcli/audit").expanduser())
+        self.assertEqual(config.hitl_non_interactive, "reject")
+        self.assertEqual(config.hitl_medium_risk_mode, "ask")
+        self.assertFalse(config.hitl_llm_judge_enabled)
 
     def test_memory_config_loaded_from_env_mapping(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -258,6 +263,36 @@ class AgentConfigTests(unittest.TestCase):
         self.assertEqual(config.memory_map_chunk_size, 3)
         self.assertEqual(config.memory_tool_result_chars, 250)
         self.assertTrue(config.memory_auto_extract)
+
+    def test_hitl_config_loaded_from_env_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / ".env"
+            env_file.write_text("", encoding="utf-8")
+
+            config = AgentConfig.from_env(
+                env={
+                    "AGENTCLI_HITL": "1",
+                    "AGENTCLI_HITL_AUDIT_DIR": str(Path(tmp) / "audit"),
+                    "AGENTCLI_HITL_NON_INTERACTIVE": "reject",
+                    "AGENTCLI_HITL_MEDIUM_RISK_MODE": "allow",
+                    "AGENTCLI_HITL_LLM_JUDGE": "true",
+                },
+                env_file=env_file,
+            )
+
+        self.assertTrue(config.hitl_enabled)
+        self.assertEqual(config.hitl_audit_dir, Path(tmp) / "audit")
+        self.assertEqual(config.hitl_non_interactive, "reject")
+        self.assertEqual(config.hitl_medium_risk_mode, "allow")
+        self.assertTrue(config.hitl_llm_judge_enabled)
+
+    def test_invalid_hitl_config_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / ".env"
+            env_file.write_text("AGENTCLI_HITL_MEDIUM_RISK_MODE=judge\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "AGENTCLI_HITL_MEDIUM_RISK_MODE"):
+                AgentConfig.from_env(env_file=env_file)
 
     def test_memory_auto_extract_can_be_disabled_explicitly(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

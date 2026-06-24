@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -97,6 +98,9 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--test-command", help="Override test command from the task file.")
     run_parser.add_argument("--max-steps", type=_positive_max_steps, help="Maximum actor tool calls.")
     run_parser.add_argument("--trace-dir", help="Directory for JSONL traces.")
+    run_hitl = run_parser.add_mutually_exclusive_group()
+    run_hitl.add_argument("--hitl", dest="hitl", action="store_true", default=None, help="Enable HITL approvals.")
+    run_hitl.add_argument("--no-hitl", dest="hitl", action="store_false", help="Disable HITL approvals.")
     run_parser.add_argument(
         "--mode",
         choices=("react", "plan", "team", "auto"),
@@ -108,6 +112,9 @@ def build_parser() -> argparse.ArgumentParser:
     chat_parser.add_argument("--repo", required=True, help="Target repository path.")
     chat_parser.add_argument("--trace-dir", help="Directory for JSONL traces.")
     chat_parser.add_argument("--test-command", help="Default test command for /plan and task runs.")
+    chat_hitl = chat_parser.add_mutually_exclusive_group()
+    chat_hitl.add_argument("--hitl", dest="hitl", action="store_true", default=None, help="Enable HITL approvals.")
+    chat_hitl.add_argument("--no-hitl", dest="hitl", action="store_false", help="Disable HITL approvals.")
     chat_parser.add_argument(
         "--mode",
         choices=("react", "plan", "team", "auto"),
@@ -247,6 +254,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         task_payload = load_task(args.task_file)
         try:
             config = AgentConfig.from_env(env=_tool_environment_overrides(os.environ), require_env_file=False)
+            config = _with_hitl_flag(config, args.hitl)
         except (FileNotFoundError, ValueError, RuntimeError) as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 1
@@ -288,6 +296,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "chat":
         try:
             config = AgentConfig.from_env(env=_tool_environment_overrides(os.environ), require_env_file=False)
+            config = _with_hitl_flag(config, args.hitl)
             repo_path = _resolve_repo_path(args.repo)
             trace_dir = _resolve_trace_dir(args.trace_dir, config.trace_dir)
             return AgentRepl(
@@ -363,6 +372,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "memory_map_chunk_size": config.memory_map_chunk_size,
                     "memory_tool_result_chars": config.memory_tool_result_chars,
                     "memory_auto_extract": config.memory_auto_extract,
+                    "hitl_enabled": config.hitl_enabled,
+                    "hitl_audit_dir": str(config.hitl_audit_dir),
+                    "hitl_non_interactive": config.hitl_non_interactive,
+                    "hitl_medium_risk_mode": config.hitl_medium_risk_mode,
+                    "hitl_llm_judge_enabled": config.hitl_llm_judge_enabled,
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -531,8 +545,24 @@ def _tool_environment_overrides(env: Mapping[str, str]) -> dict[str, str]:
         "MY_AGENT_MEMORY_TOOL_RESULT_CHARS",
         "AGENTCLI_MEMORY_AUTO_EXTRACT",
         "MY_AGENT_MEMORY_AUTO_EXTRACT",
+        "AGENTCLI_HITL",
+        "MY_AGENT_HITL",
+        "AGENTCLI_HITL_AUDIT_DIR",
+        "MY_AGENT_HITL_AUDIT_DIR",
+        "AGENTCLI_HITL_NON_INTERACTIVE",
+        "MY_AGENT_HITL_NON_INTERACTIVE",
+        "AGENTCLI_HITL_MEDIUM_RISK_MODE",
+        "MY_AGENT_HITL_MEDIUM_RISK_MODE",
+        "AGENTCLI_HITL_LLM_JUDGE",
+        "MY_AGENT_HITL_LLM_JUDGE",
     }
     return {key: env[key] for key in keys if key in env}
+
+
+def _with_hitl_flag(config: AgentConfig, enabled: bool | None) -> AgentConfig:
+    if enabled is None:
+        return config
+    return replace(config, hitl_enabled=enabled)
 
 
 def _resolve_repo_path(value: str | Path) -> Path:

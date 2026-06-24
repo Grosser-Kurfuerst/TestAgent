@@ -7,6 +7,7 @@ from typing import Callable, Protocol
 
 from my_agent.react.child_runner import ChildReActRequest, ChildReActRunner
 from my_agent.config import AgentConfig
+from my_agent.hitl.handler import HitlHandler
 from my_agent.memory import MemoryManager
 from my_agent.plan.graph import TaskGraph
 from my_agent.plan.store import InMemoryPlanStore, PlanStore
@@ -236,6 +237,7 @@ class ReActTaskRunner:
         plan_task_max_steps: int | None = None,
         event_sink: Callable[[object], None] | None = None,
         memory_manager: MemoryManager | None = None,
+        hitl_handler: HitlHandler | None = None,
     ) -> None:
         self.repo_path = Path(repo_path).resolve()
         self.config = config
@@ -247,12 +249,14 @@ class ReActTaskRunner:
         self.plan_task_max_steps = positive_or_default(plan_task_max_steps, getattr(config, "plan_task_max_steps", 6))
         self.event_sink = event_sink
         self.memory_manager = memory_manager
+        self.hitl_handler = hitl_handler
         self.child_runner = ChildReActRunner(
             config=config,
             llm=llm,
             command_timeout=command_timeout,
             event_sink=event_sink,
             memory_manager=memory_manager,
+            hitl_handler=hitl_handler,
         )
 
     def run_task(self, plan: PlanState, task: PlanTask) -> TaskResult:

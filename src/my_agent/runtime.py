@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sys
 from typing import Any, Callable
 
 from my_agent.agent_factory import AgentFactory
 from my_agent.config import AgentConfig
+from my_agent.hitl.handler import HitlHandler, NonInteractiveHitlHandler, TerminalHitlHandler
 from my_agent.llm import AgentLLM, build_llm
 from my_agent.memory import MemoryManager
 from my_agent.plan import AgentMode, resolve_mode
@@ -22,6 +24,7 @@ class CodingAgentRuntime:
         command_timeout: int | None = None,
         event_sink: Callable[[Any], None] | None = None,
         memory_manager: MemoryManager | None = None,
+        hitl_handler: HitlHandler | None = None,
     ):
         self.config = config or AgentConfig.from_env()
         self.llm = llm or build_llm(self.config)
@@ -29,6 +32,7 @@ class CodingAgentRuntime:
         self.command_timeout = command_timeout or self.config.command_timeout
         self.event_sink = event_sink
         self.memory_manager = memory_manager
+        self.hitl_handler = hitl_handler if hitl_handler is not None else _default_hitl_handler(self.config)
 
     def run(self, state: AgentState, *, mode: AgentMode | str | None = None) -> AgentState:
         selected = resolve_mode(mode if mode is not None else self.config.agent_mode, state.task, default=AgentMode.AUTO)
@@ -41,6 +45,7 @@ class CodingAgentRuntime:
             command_timeout=self.command_timeout,
             event_sink=self.event_sink,
             memory_manager=self.memory_manager,
+            hitl_handler=self.hitl_handler,
         ).create(selected)
         return agent.run(state)
 
@@ -56,6 +61,7 @@ def run_agent(
     event_sink: Callable[[Any], None] | None = None,
     mode: AgentMode | str | None = None,
     memory_manager: MemoryManager | None = None,
+    hitl_handler: HitlHandler | None = None,
 ) -> AgentState:
     resolved_config = config or AgentConfig.from_env()
     selected_mode = resolve_mode(mode if mode is not None else resolved_config.agent_mode, task, default=AgentMode.AUTO)
@@ -72,5 +78,19 @@ def run_agent(
         trace_dir=trace_dir,
         event_sink=event_sink,
         memory_manager=memory_manager,
+        hitl_handler=hitl_handler,
     )
     return runtime.run(state, mode=selected_mode)
+
+
+def _default_hitl_handler(config: AgentConfig) -> HitlHandler | None:
+    if not config.hitl_enabled:
+        return None
+    if _stdin_is_interactive():
+        return TerminalHitlHandler(enabled=True)
+    return NonInteractiveHitlHandler(enabled=True)
+
+
+def _stdin_is_interactive() -> bool:
+    isatty = getattr(sys.stdin, "isatty", None)
+    return bool(isatty is not None and isatty())

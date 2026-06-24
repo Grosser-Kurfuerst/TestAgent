@@ -9,6 +9,7 @@ from queue import Queue
 from typing import Any, Callable
 
 from my_agent.config import AgentConfig
+from my_agent.hitl.handler import HitlHandler
 from my_agent.llm import AgentLLM
 from my_agent.memory import MemoryManager
 from my_agent.plan import PlanValidationError, TaskResult
@@ -59,6 +60,7 @@ class TeamAgent(AgentBase):
         worker_factory: Callable[[int], Any] | None = None,
         reviewer_factory: Callable[[str], Any] | None = None,
         memory_manager: MemoryManager | None = None,
+        hitl_handler: HitlHandler | None = None,
     ) -> None:
         super().__init__(
             config=config,
@@ -67,6 +69,7 @@ class TeamAgent(AgentBase):
             command_timeout=command_timeout,
             event_sink=event_sink,
             memory_manager=memory_manager,
+            hitl_handler=hitl_handler,
         )
         self.planner = planner or TeamPlanner(llm, max_steps=config.team_max_steps)
         self.state_store = state_store or JsonTeamStore(self.trace_dir / "teams")
@@ -488,6 +491,7 @@ class TeamAgent(AgentBase):
             command_timeout=self.command_timeout,
             memory_manager=self._memory,
             event_sink=self._forward_worker_event,
+            hitl_handler=self.hitl_handler,
             test_command=self._test_command,
             step_max_steps=self._step_max_steps,
         )
@@ -505,6 +509,7 @@ class TeamAgent(AgentBase):
             command_timeout=self.command_timeout,
             memory_manager=self._memory,
             event_sink=self._forward_worker_event,
+            hitl_handler=self.hitl_handler,
             test_command=self._test_command,
         )
 

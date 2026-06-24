@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from my_agent.config import AgentConfig
+from my_agent.hitl.handler import HitlHandler
 from my_agent.indexer import RepoIndexer
 from my_agent.llm import AgentLLM
 from my_agent.memory import MemoryManager
@@ -38,6 +39,7 @@ class AgentBase(ABC):
         command_timeout: int,
         event_sink: EventSink | None = None,
         memory_manager: MemoryManager | None = None,
+        hitl_handler: HitlHandler | None = None,
     ) -> None:
         self.config = config
         self.llm = llm
@@ -45,6 +47,7 @@ class AgentBase(ABC):
         self.command_timeout = command_timeout
         self.event_sink = event_sink
         self.memory_manager = memory_manager
+        self.hitl_handler = hitl_handler
 
     @abstractmethod
     def run(self, state: AgentState) -> AgentState:

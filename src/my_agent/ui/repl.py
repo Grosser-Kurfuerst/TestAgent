@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import sys
 from collections import Counter
+from dataclasses import replace
 from pathlib import Path
 from typing import TextIO
 
 from my_agent.config import AgentConfig
 from my_agent.context import ContextProfile
+from my_agent.hitl import SwitchableHitlHandler, TerminalHitlHandler
 from my_agent.llm import build_llm
 from my_agent.llm.types import Message
 from my_agent.memory import MemoryManager, MemoryScope
@@ -32,6 +34,9 @@ HELP_TEXT = """Commands:
 /plan             Run the next task with Plan-and-Execute.
 /team <task>      Run a task with Multi-Agent team orchestration.
 /team             Run the next task with Multi-Agent team orchestration.
+/hitl             Show HITL approval status.
+/hitl on          Enable HITL approvals for this session.
+/hitl off         Disable HITL approvals and clear approve-all grants.
 /mode <mode>      Set mode: react, plan, team, or auto.
 /quit             Exit.
 """
@@ -57,7 +62,16 @@ class AgentRepl:
         self.mode = normalize_mode(mode, default=AgentMode.AUTO)
         self._next_mode: AgentMode | None = None
         self.test_command = test_command or _discover_test_command(self.repo_path)
-        self._tools = RepoTools(self.repo_path, timeout=config.command_timeout, config=config)
+        self._hitl_handler = SwitchableHitlHandler(
+            TerminalHitlHandler(
+                enabled=config.hitl_enabled,
+                stdin=self.input_stream,
+                stdout=_renderer_output(self.renderer),
+                before_prompt=self.renderer.reset_between_iterations,
+                require_tty=self.input_stream is sys.stdin,
+            )
+        )
+        self._tools = self._load_tools()
         self._profile = ContextProfile.from_config(config)
         self._memory = MemoryManager.from_config(config=config, llm=build_llm(config), repo_path=self.repo_path)
         self._latest_trace: Path | None = None
@@ -100,7 +114,7 @@ class AgentRepl:
             self.renderer.status(self._tools_text())
             return False
         if command == "/tools reload":
-            self._tools = RepoTools(self.repo_path, timeout=self.config.command_timeout, config=self.config)
+            self._tools = self._load_tools()
             self.renderer.status(f"Reloaded {len(self._tools.registry.tools)} tools.")
             return False
         if command == "/context":
@@ -130,10 +144,17 @@ class AgentRepl:
             return False
         if command == "/clear":
             removed, extracted = self._memory.clear_short_term(extract_first=True, reason="clear_command")
+            self._hitl_handler.clear_approved_all()
             if self._memory.last_fact_extraction_error:
-                self.renderer.status(f"Fact extraction failed; cleared {removed} short-term entries.")
+                self.renderer.status(
+                    f"Fact extraction failed; cleared {removed} short-term entries.\n"
+                    "Cleared HITL approve-all grants."
+                )
             else:
-                self.renderer.status(f"Extracted {len(extracted)} facts, cleared {removed} short-term entries.")
+                self.renderer.status(
+                    f"Extracted {len(extracted)} facts, cleared {removed} short-term entries.\n"
+                    "Cleared HITL approve-all grants."
+                )
             return False
         if command == "/trace":
             self.renderer.status(f"Latest trace: {self._latest_trace or 'none'}")
@@ -149,6 +170,9 @@ class AgentRepl:
                 self.renderer.error(f"Error: {exc}")
                 return False
             self.renderer.status(f"Mode set to {self.mode.value}.")
+            return False
+        if command.startswith("/hitl"):
+            self._handle_hitl(command)
             return False
         if command.startswith("/plan"):
             task = command.removeprefix("/plan").strip()
@@ -188,6 +212,7 @@ class AgentRepl:
                 event_sink=self._handle_event,
                 mode=selected_mode,
                 memory_manager=self._memory,
+                hitl_handler=self._hitl_handler if self._hitl_handler.is_enabled() else None,
             )
         except Exception as exc:  # noqa: BLE001 - interactive shell should report and continue
             self.renderer.error(f"Error: {exc}")
@@ -244,6 +269,20 @@ class AgentRepl:
                 timed_out=bool(payload.get("timed_out")),
             )
             self.renderer.tool_call_completed(result)
+        elif event_name == "render.flush_requested":
+            self.renderer.reset_between_iterations()
+        elif event_name == "approval.requested":
+            tool_name = str(payload.get("tool_name", ""))
+            risk_level = str(payload.get("risk_level", ""))
+            self.renderer.status(f"approval requested: {tool_name} {risk_level}")
+        elif event_name == "approval.completed":
+            tool_name = str(payload.get("tool_name", ""))
+            decision = str(payload.get("decision", ""))
+            self.renderer.status(f"approval completed: {tool_name} {decision}")
+        elif event_name == "approval.audit_failed":
+            tool_name = str(payload.get("tool_name", ""))
+            error = str(payload.get("error", ""))
+            self.renderer.status(f"approval audit failed: {tool_name} {error}")
 
     def _startup_info(self) -> StartupInfo:
         return StartupInfo(
@@ -260,7 +299,7 @@ class AgentRepl:
         )
 
     def _tools_text(self) -> str:
-        lines = ["name\tsource\trisk\tdescription"]
+        lines = ["name\tsource\trisk\tapproval\tdescription"]
         for tool in self._tools.registry.tools:
             if not tool.spec.enabled:
                 continue
@@ -270,6 +309,7 @@ class AgentRepl:
                         tool.spec.name,
                         tool.spec.source,
                         tool.spec.risk.value,
+                        self._approval_label(tool.spec.risk.value),
                         tool.spec.description,
                     ]
                 )
@@ -339,6 +379,45 @@ class AgentRepl:
         else:
             self.renderer.status(f"Memory already exists: {entry.id}")
 
+    def _handle_hitl(self, command: str) -> None:
+        value = command.removeprefix("/hitl").strip().lower()
+        if not value:
+            self.renderer.status(
+                "HITL approval is "
+                f"{'on' if self._hitl_handler.is_enabled() else 'off'} "
+                f"(medium={self.config.hitl_medium_risk_mode}, audit={self.config.hitl_audit_dir})."
+            )
+            return
+        if value == "on":
+            self.config = replace(self.config, hitl_enabled=True)
+            self._hitl_handler.set_enabled(True)
+            self.renderer.status("HITL approval enabled.")
+            return
+        if value == "off":
+            self.config = replace(self.config, hitl_enabled=False)
+            self._hitl_handler.set_enabled(False)
+            self._hitl_handler.clear_approved_all()
+            self.renderer.status("HITL approval disabled. Cleared HITL approve-all grants.")
+            return
+        self.renderer.status("Usage: /hitl [on|off]")
+
+    def _load_tools(self) -> RepoTools:
+        return RepoTools(
+            self.repo_path,
+            timeout=self.config.command_timeout,
+            config=self.config,
+            hitl_handler=self._hitl_handler,
+        )
+
+    def _approval_label(self, risk: str) -> str:
+        if risk == "read":
+            return "none"
+        if not self._hitl_handler.is_enabled():
+            return "off"
+        if risk == "execute":
+            return "ask"
+        return self.config.hitl_medium_risk_mode
+
 
 def _plan_from_payload(payload: dict[str, object]) -> PlanState | None:
     raw = payload.get("plan")
@@ -366,6 +445,13 @@ def _team_step_from_payload(payload: dict[str, object]) -> ExecutionStep | None:
     if not isinstance(raw, dict):
         return None
     return ExecutionStep.from_dict(raw)
+
+
+def _renderer_output(renderer: Renderer) -> TextIO:
+    output = getattr(renderer, "output", None)
+    if output is not None:
+        return output
+    return sys.stdout
 
 
 def _discover_test_command(repo_path: Path) -> str | None:
