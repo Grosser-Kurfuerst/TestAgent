@@ -6,11 +6,13 @@ from typing import Any, Callable
 
 from my_agent.agent_factory import AgentFactory
 from my_agent.config import AgentConfig
+from my_agent.cancellation import CancelledError, CancellationToken
 from my_agent.hitl.handler import HitlHandler, NonInteractiveHitlHandler, TerminalHitlHandler
 from my_agent.llm import AgentLLM, build_llm
 from my_agent.memory import MemoryManager
 from my_agent.plan import AgentMode, resolve_mode
-from my_agent.schema import AgentState
+from my_agent.schema import AgentState, TraceEvent
+from my_agent.tracing import TraceWriter
 
 
 class CodingAgentRuntime:
@@ -47,7 +49,10 @@ class CodingAgentRuntime:
             memory_manager=self.memory_manager,
             hitl_handler=self.hitl_handler,
         ).create(selected)
-        return agent.run(state)
+        try:
+            return agent.run(state)
+        except CancelledError as exc:
+            return _cancelled_state(state, self.trace_dir, reason=str(exc) or "cancelled")
 
 
 def run_agent(
@@ -62,6 +67,7 @@ def run_agent(
     mode: AgentMode | str | None = None,
     memory_manager: MemoryManager | None = None,
     hitl_handler: HitlHandler | None = None,
+    cancellation_token: CancellationToken | None = None,
 ) -> AgentState:
     resolved_config = config or AgentConfig.from_env()
     selected_mode = resolve_mode(mode if mode is not None else resolved_config.agent_mode, task, default=AgentMode.AUTO)
@@ -71,6 +77,7 @@ def run_agent(
         task=task,
         test_command=test_command,
         max_steps=default_max_steps if max_steps is None else max_steps,
+        cancellation_token=cancellation_token,
     )
     runtime = CodingAgentRuntime(
         config=resolved_config,
@@ -94,3 +101,27 @@ def _default_hitl_handler(config: AgentConfig) -> HitlHandler | None:
 def _stdin_is_interactive() -> bool:
     isatty = getattr(sys.stdin, "isatty", None)
     return bool(isatty is not None and isatty())
+
+
+def _cancelled_state(state: AgentState, trace_dir: Path, *, reason: str) -> AgentState:
+    state.done = True
+    state.stop_reason = "cancelled"
+    state.final_answer = "Cancelled."
+    state.review = f"Run cancelled: {reason or 'cancelled'}."
+    writer = TraceWriter(state.trace_path) if state.trace_path is not None else TraceWriter.create(trace_dir, state.run_id)
+    state.trace_path = writer.path
+    payload = {"reason": reason or "cancelled"}
+    writer.append(TraceEvent(event="run.cancelled", payload=payload, run_id=state.run_id))
+    writer.append(
+        TraceEvent(
+            event="run.completed",
+            payload={
+                "stop_reason": state.stop_reason,
+                "done": state.done,
+                "review": state.review,
+                "final_answer": state.final_answer,
+            },
+            run_id=state.run_id,
+        )
+    )
+    return state

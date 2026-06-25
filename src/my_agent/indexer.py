@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from my_agent.cancellation import CancellationToken
+
 
 IGNORED_DIRS = {
     ".git",
@@ -81,11 +83,13 @@ class RepoIndexer:
         max_files: int = 80,
         preview_chars: int = 1200,
         skip_predicate: Callable[[Path], bool] | None = None,
+        cancellation_token: CancellationToken | None = None,
     ):
         self.repo_path = Path(repo_path).resolve()
         self.max_files = max_files
         self.preview_chars = preview_chars
         self.skip_predicate = skip_predicate
+        self.cancellation_token = cancellation_token
         if not self.repo_path.exists() or not self.repo_path.is_dir():
             raise ValueError(f"Repository path does not exist or is not a directory: {self.repo_path}")
 
@@ -108,6 +112,7 @@ class RepoIndexer:
 
         scored: list[tuple[float, Path, str]] = []
         for path in self._collect_files():
+            self._raise_if_cancelled()
             if not _is_text_file(path):
                 continue
             try:
@@ -132,6 +137,7 @@ class RepoIndexer:
     def _collect_files(self) -> list[Path]:
         files: list[Path] = []
         for root, dirnames, filenames in os.walk(self.repo_path):
+            self._raise_if_cancelled()
             root_path = Path(root)
             dirnames[:] = sorted(
                 name
@@ -139,6 +145,7 @@ class RepoIndexer:
                 if name not in IGNORED_DIRS and not (root_path / name).is_symlink()
             )
             for filename in sorted(filenames):
+                self._raise_if_cancelled()
                 path = root_path / filename
                 rel = path.relative_to(self.repo_path)
                 if any(part in IGNORED_DIRS for part in rel.parts):
@@ -146,6 +153,10 @@ class RepoIndexer:
                 if self._is_safe_repo_file(path) and not self._should_skip(path):
                     files.append(path)
         return sorted(files, key=lambda item: item.relative_to(self.repo_path).as_posix())
+
+    def _raise_if_cancelled(self) -> None:
+        if self.cancellation_token is not None:
+            self.cancellation_token.raise_if_cancelled()
 
     def _is_safe_repo_file(self, path: Path) -> bool:
         if path.is_symlink():

@@ -2,18 +2,21 @@ from __future__ import annotations
 
 import sys
 from collections import Counter
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from typing import TextIO
 
 from my_agent.config import AgentConfig
 from my_agent.context import ContextProfile
+from my_agent.cancellation import CancellationToken
 from my_agent.hitl import SwitchableHitlHandler, TerminalHitlHandler
 from my_agent.llm import build_llm
 from my_agent.llm.types import Message
 from my_agent.memory import MemoryManager, MemoryScope
 from my_agent.plan import AgentMode, PlanState, PlanTask, normalize_mode
 from my_agent.runtime import run_agent
+from my_agent.schema import AgentState
 from my_agent.team import ExecutionStep, TeamState
 from my_agent.text_safety import repair_surrogates
 from my_agent.tools import RepoTools, ToolExecutionResult, ToolInvocation
@@ -34,6 +37,7 @@ HELP_TEXT = """Commands:
 /plan             Run the next task with Plan-and-Execute.
 /team <task>      Run a task with Multi-Agent team orchestration.
 /team             Run the next task with Multi-Agent team orchestration.
+/cancel           Request cancellation of the current task.
 /hitl             Show HITL approval status.
 /hitl on          Enable HITL approvals for this session.
 /hitl off         Disable HITL approvals and clear approve-all grants.
@@ -76,6 +80,9 @@ class AgentRepl:
         self._memory = MemoryManager.from_config(config=config, llm=build_llm(config), repo_path=self.repo_path)
         self._latest_trace: Path | None = None
         self._shutdown_complete = False
+        self._run_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="agentcli-repl")
+        self._current_future: Future[AgentState] | None = None
+        self._current_token: CancellationToken | None = None
 
     def run(self, *, show_banner: bool = True) -> int:
         try:
@@ -91,6 +98,7 @@ class AgentRepl:
                 text = repair_surrogates(line.strip())
                 if not text:
                     continue
+                self._collect_current_task(wait=False)
                 if text.startswith("/"):
                     if self._handle_command(text):
                         return 0
@@ -105,7 +113,10 @@ class AgentRepl:
         return self.input_stream.readline() or None
 
     def _handle_command(self, command: str) -> bool:
+        if command != "/cancel" and self.input_stream is not sys.stdin:
+            self._collect_current_task(wait=True)
         if command in {"/quit", "/exit"}:
+            self._cancel_current_task(shutting_down=True)
             return True
         if command == "/help":
             self.renderer.status(HELP_TEXT)
@@ -159,6 +170,9 @@ class AgentRepl:
         if command == "/trace":
             self.renderer.status(f"Latest trace: {self._latest_trace or 'none'}")
             return False
+        if command == "/cancel":
+            self._cancel_current_task()
+            return False
         if command.startswith("/mode"):
             value = command.removeprefix("/mode").strip()
             if not value:
@@ -197,28 +211,66 @@ class AgentRepl:
         if self._shutdown_complete:
             return
         self._shutdown_complete = True
+        self._cancel_current_task(shutting_down=True)
+        self._run_executor.shutdown(wait=False, cancel_futures=True)
         self._memory.extract_facts(reason="session_end")
 
     def _run_task(self, text: str, *, mode: AgentMode | None = None) -> None:
+        self._collect_current_task(wait=False)
+        if self._current_future is not None and not self._current_future.done():
+            self.renderer.status("Current task is still running; use /cancel or wait.")
+            return
         selected_mode = mode or self._next_mode or self.mode
         self._next_mode = None
+        token = CancellationToken()
+        self._current_token = token
+        self._current_future = self._run_executor.submit(self._run_task_worker, text, selected_mode, token)
+
+    def _run_task_worker(self, text: str, selected_mode: AgentMode, token: CancellationToken) -> AgentState:
+        return run_agent(
+            repo_path=self.repo_path,
+            task=text,
+            test_command=self.test_command,
+            config=self.config,
+            trace_dir=self.trace_dir,
+            event_sink=self._handle_event,
+            mode=selected_mode,
+            memory_manager=self._memory,
+            hitl_handler=self._hitl_handler,
+            cancellation_token=token,
+        )
+
+    def _collect_current_task(self, *, wait: bool) -> None:
+        future = self._current_future
+        if future is None:
+            return
+        if not wait and not future.done():
+            return
         try:
-            state = run_agent(
-                repo_path=self.repo_path,
-                task=text,
-                test_command=self.test_command,
-                config=self.config,
-                trace_dir=self.trace_dir,
-                event_sink=self._handle_event,
-                mode=selected_mode,
-                memory_manager=self._memory,
-                hitl_handler=self._hitl_handler if self._hitl_handler.is_enabled() else None,
-            )
+            state = future.result()
         except Exception as exc:  # noqa: BLE001 - interactive shell should report and continue
             self.renderer.error(f"Error: {exc}")
+            self._current_future = None
+            self._current_token = None
             return
         self._latest_trace = state.trace_path
         self.renderer.assistant_delta(state.final_answer)
+        self._current_future = None
+        self._current_token = None
+
+    def _cancel_current_task(self, *, shutting_down: bool = False) -> None:
+        future = self._current_future
+        token = self._current_token
+        if future is None or future.done():
+            self._collect_current_task(wait=False)
+            if not shutting_down:
+                self.renderer.status("No running task.")
+            return
+        if token is not None:
+            token.cancel("user_cancelled")
+        future.cancel()
+        if not shutting_down:
+            self.renderer.status("Cancellation requested.")
 
     def _handle_event(self, event: object) -> None:
         event_name = getattr(event, "event", "")

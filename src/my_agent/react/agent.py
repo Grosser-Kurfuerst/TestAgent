@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date
 from pathlib import Path
+import threading
 from typing import Any, Callable
 
 from my_agent.budget import AgentBudget
@@ -46,6 +47,8 @@ class ReActAgent(AgentBase):
         )
         self.role_prompt = role_prompt
         self.run_label = run_label
+        self._approval_event_lock = threading.Lock()
+        self._approval_event_buffer: list[ApprovalEvent] | None = None
 
     def run(self, state: AgentState) -> AgentState:
         state.repo_path = Path(state.repo_path).resolve()
@@ -60,8 +63,9 @@ class ReActAgent(AgentBase):
                 timeout=self.command_timeout,
                 config=self.config,
                 run_id=state.run_id,
+                cancellation_token=state.cancellation_token,
                 hitl_handler=self.hitl_handler,
-                approval_observer=lambda event: self._handle_approval_event(writer, state, event),
+                approval_observer=lambda event: self._observe_approval_event(writer, state, event),
             )
             tool_definitions = tools.tool_definitions()
             budget = AgentBudget.from_config(self.config, max_steps=state.max_steps)
@@ -101,6 +105,9 @@ class ReActAgent(AgentBase):
             base_messages = self._initial_messages(state)
             memory.append_user_message(state.task, run_id=state.run_id)
             while not state.done:
+                if _is_cancelled(state):
+                    self._stop_cancelled(state, writer)
+                    break
                 stop_reason = budget.check_before_llm()
                 if stop_reason:
                     self._stop_by_budget(state, writer, budget, stop_reason)
@@ -134,6 +141,9 @@ class ReActAgent(AgentBase):
                     base_messages=base_messages,
                 )
                 if response is None:
+                    break
+                if _is_cancelled(state):
+                    self._stop_cancelled(state, writer)
                     break
                 memory.append_assistant_response(response, run_id=state.run_id)
 
@@ -237,9 +247,22 @@ class ReActAgent(AgentBase):
         budget: AgentBudget,
     ) -> list[ToolExecutionResult]:
         self._emit_event(ApprovalEvent(event="render.flush_requested", payload={"reason": "before_tool_calls"}))
-        results: list[ToolExecutionResult] = []
+        prepared: list[tuple[LLMToolCall, ToolInvocation | ToolExecutionResult, bool]] = []
+        invocations: list[ToolInvocation] = []
+        slots_used = 0
+        allowed = min(max(0, state.max_steps - state.steps), max(0, budget.max_tool_calls - budget.tool_calls))
         for call in tool_calls:
-            if state.steps >= state.max_steps or budget.tool_calls + len(results) >= budget.max_tool_calls:
+            if _is_cancelled(state):
+                result = ToolExecutionResult(
+                    id=call.id,
+                    name=call.name,
+                    ok=False,
+                    content=f"Tool call cancelled: {state.cancellation_token.reason if state.cancellation_token else 'cancelled'}",
+                    error_code="cancelled",
+                    retryable=False,
+                )
+                prepared.append((call, result, False))
+            elif slots_used >= allowed:
                 result = ToolExecutionResult(
                     id=call.id,
                     name=call.name,
@@ -250,7 +273,7 @@ class ReActAgent(AgentBase):
                 )
                 state.done = True
                 state.stop_reason = "max_steps_reached"
-                count_step = False
+                prepared.append((call, result, False))
             elif call.arguments_error:
                 result = ToolExecutionResult(
                     id=call.id,
@@ -260,7 +283,8 @@ class ReActAgent(AgentBase):
                     error_code="invalid_arguments_json",
                     retryable=True,
                 )
-                count_step = True
+                prepared.append((call, result, True))
+                slots_used += 1
             else:
                 invocation = _invocation_from_tool_call(call, default_test_command=state.test_command)
                 self._emit(
@@ -270,9 +294,51 @@ class ReActAgent(AgentBase):
                         {"id": call.id, "name": call.name, "arguments": invocation.arguments_json},
                     )
                 )
-                result = tools.execute([invocation])[0]
-                count_step = True
+                invocations.append(invocation)
+                prepared.append((call, invocation, True))
+                slots_used += 1
 
+        executed: dict[str, ToolExecutionResult] = {}
+        if invocations:
+            buffered_approval_events: list[ApprovalEvent] = []
+            self._emit(
+                writer,
+                state.trace_event(
+                    "tool.batch.started",
+                    {
+                        "count": len(invocations),
+                        "parallel": False,
+                        "ids": [invocation.id for invocation in invocations],
+                        "requested": True,
+                    },
+                ),
+            )
+            previous_buffer = self._set_approval_event_buffer(buffered_approval_events)
+            try:
+                batch_results = tools.execute_tools(invocations)
+            finally:
+                self._set_approval_event_buffer(previous_buffer)
+            executed = {result.id: result for result in batch_results}
+            self._flush_approval_events(writer, state, buffered_approval_events, tool_calls)
+            batch_summary = dict(getattr(tools.registry, "last_execution_summary", {"groups": []}))
+            groups = list(batch_summary.get("groups", []))
+            self._emit(
+                writer,
+                state.trace_event(
+                    "tool.batch.completed",
+                    {
+                        "count": len(batch_results),
+                        "parallel": any(bool(group.get("parallel")) for group in groups if isinstance(group, dict)),
+                        "groups": groups,
+                        "timed_out": any(result.timed_out for result in batch_results),
+                        "cancelled": any(result.error_code == "cancelled" for result in batch_results),
+                    },
+                ),
+            )
+
+        results: list[ToolExecutionResult] = []
+        for call, item, count_step in prepared:
+            result = executed[item.id] if isinstance(item, ToolInvocation) else item
             results.append(result)
             self._record_tool_result(state, writer, call, result, count_step=count_step)
             self._emit(writer, state.trace_event("tool.completed", result.to_dict()))
@@ -338,6 +404,18 @@ class ReActAgent(AgentBase):
         state.stop_reason = "llm_failed"
         self._emit(writer, state.trace_event("llm.failed", {"error": f"{type(exc).__name__}: {exc}"}))
 
+    def _stop_cancelled(self, state: AgentState, writer: TraceWriter) -> None:
+        state.done = True
+        state.stop_reason = "cancelled"
+        state.final_answer = "Cancelled."
+        self._emit(
+            writer,
+            state.trace_event(
+                "run.cancelled",
+                {"reason": state.cancellation_token.reason if state.cancellation_token else "cancelled"},
+            ),
+        )
+
     def _finalize(self, state: AgentState, writer: TraceWriter, budget: AgentBudget) -> None:
         if not state.final_answer:
             state.final_answer = _deterministic_final_answer(state)
@@ -367,6 +445,32 @@ class ReActAgent(AgentBase):
         self._emit_trace(writer, state, event.event, dict(event.payload))
         self._emit_event(event)
 
+    def _observe_approval_event(self, writer: TraceWriter, state: AgentState, event: ApprovalEvent) -> None:
+        with self._approval_event_lock:
+            if self._approval_event_buffer is not None:
+                self._approval_event_buffer.append(event)
+                return
+        self._handle_approval_event(writer, state, event)
+
+    def _set_approval_event_buffer(self, buffer: list[ApprovalEvent] | None) -> list[ApprovalEvent] | None:
+        with self._approval_event_lock:
+            previous = self._approval_event_buffer
+            self._approval_event_buffer = buffer
+            return previous
+
+    def _flush_approval_events(
+        self,
+        writer: TraceWriter,
+        state: AgentState,
+        events: list[ApprovalEvent],
+        tool_calls: list[LLMToolCall],
+    ) -> None:
+        order = {call.id: index for index, call in enumerate(tool_calls)}
+        indexed = list(enumerate(events))
+        indexed.sort(key=lambda item: (order.get(str(item[1].payload.get("tool_call_id", "")), len(order)), item[0]))
+        for _, event in indexed:
+            self._handle_approval_event(writer, state, event)
+
 
 def _invocation_from_tool_call(call: LLMToolCall, *, default_test_command: str | None) -> ToolInvocation:
     arguments = dict(call.arguments)
@@ -392,6 +496,10 @@ def _latest_test_failed(state: AgentState) -> bool:
         if record.call.tool == "run_tests":
             return not record.result.ok
     return False
+
+
+def _is_cancelled(state: AgentState) -> bool:
+    return bool(state.cancellation_token is not None and state.cancellation_token.is_cancelled())
 
 
 def _deterministic_review(state: AgentState) -> str:

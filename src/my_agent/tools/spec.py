@@ -5,6 +5,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Protocol
 
+from my_agent.cancellation import CancellationToken
 from my_agent.schema import ToolResult
 
 
@@ -22,6 +23,11 @@ class ToolContext:
     timeout_seconds: int = 60
     config: Any | None = None
     run_id: str = ""
+    cancellation_token: CancellationToken | None = None
+    max_parallel_tools: int = 4
+    tool_batch_timeout_seconds: int = 60
+    tool_shutdown_grace_seconds: int = 2
+    max_process_output_chars: int = 8_000
 
 
 @dataclass(frozen=True)
@@ -63,11 +69,19 @@ class ToolPreflight(Protocol):
         ...
 
 
+class ToolResourceResolver(Protocol):
+    def __call__(self, arguments: dict[str, Any], context: ToolContext) -> set[str]:
+        ...
+
+
 @dataclass(frozen=True)
 class ToolRegistration:
     spec: ToolSpec
     handler: ToolHandler
     preflight: ToolPreflight | None = None
+    resource_resolver: ToolResourceResolver | None = None
+    parallel_side_effect_safe: bool = False
+    cancellation_safe: bool = False
 
 
 class ToolSource(Protocol):

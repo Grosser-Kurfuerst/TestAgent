@@ -84,6 +84,16 @@ class AgentConfig:
     hitl_medium_risk_mode: str = "ask"
     hitl_llm_judge_enabled: bool = False
 
+    # Parallel execution and cancellation defaults.
+    max_parallel_tools: int = 4
+    tool_batch_timeout_seconds: int = 60
+    tool_shutdown_grace_seconds: int = 2
+    max_process_output_chars: int = 8_000
+    plan_parallel_enabled: bool = True
+    plan_max_parallel_tasks: int = 4
+    plan_task_batch_timeout_seconds: int = 1_800
+    team_step_batch_timeout_seconds: int = 1_800
+
     @classmethod
     def from_env(
         cls,
@@ -224,6 +234,53 @@ class AgentConfig:
             ),
             hitl_llm_judge_enabled=_as_bool(
                 values.get("AGENTCLI_HITL_LLM_JUDGE", values.get("MY_AGENT_HITL_LLM_JUDGE", ""))
+            ),
+            max_parallel_tools=_as_positive_int(
+                values.get("AGENTCLI_MAX_PARALLEL_TOOLS", values.get("MY_AGENT_MAX_PARALLEL_TOOLS")),
+                4,
+            ),
+            tool_batch_timeout_seconds=_as_positive_int(
+                values.get(
+                    "AGENTCLI_TOOL_BATCH_TIMEOUT_SECONDS",
+                    values.get("MY_AGENT_TOOL_BATCH_TIMEOUT_SECONDS"),
+                ),
+                60,
+            ),
+            tool_shutdown_grace_seconds=_as_nonnegative_int(
+                values.get(
+                    "AGENTCLI_TOOL_SHUTDOWN_GRACE_SECONDS",
+                    values.get("MY_AGENT_TOOL_SHUTDOWN_GRACE_SECONDS"),
+                ),
+                2,
+            ),
+            max_process_output_chars=max(
+                1_000,
+                _as_positive_int(
+                    values.get("AGENTCLI_MAX_PROCESS_OUTPUT_CHARS", values.get("MY_AGENT_MAX_PROCESS_OUTPUT_CHARS")),
+                    8_000,
+                ),
+            ),
+            plan_parallel_enabled=_as_bool(
+                values.get("AGENTCLI_PLAN_PARALLEL", values.get("MY_AGENT_PLAN_PARALLEL", "")),
+                default=True,
+            ),
+            plan_max_parallel_tasks=_as_positive_int(
+                values.get("AGENTCLI_PLAN_MAX_PARALLEL_TASKS", values.get("MY_AGENT_PLAN_MAX_PARALLEL_TASKS")),
+                4,
+            ),
+            plan_task_batch_timeout_seconds=_as_positive_int(
+                values.get(
+                    "AGENTCLI_PLAN_TASK_BATCH_TIMEOUT_SECONDS",
+                    values.get("MY_AGENT_PLAN_TASK_BATCH_TIMEOUT_SECONDS"),
+                ),
+                1_800,
+            ),
+            team_step_batch_timeout_seconds=_as_positive_int(
+                values.get(
+                    "AGENTCLI_TEAM_STEP_BATCH_TIMEOUT_SECONDS",
+                    values.get("MY_AGENT_TEAM_STEP_BATCH_TIMEOUT_SECONDS"),
+                ),
+                1_800,
             ),
         )
 

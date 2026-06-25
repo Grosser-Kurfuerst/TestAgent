@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Callable
 
+from my_agent.cancellation import CancellationToken
 from my_agent.react.child_runner import ChildReActRequest, ChildReActRunner
 from my_agent.config import AgentConfig
 from my_agent.hitl.handler import HitlHandler
@@ -68,6 +69,7 @@ class SubAgent:
         step: ExecutionStep,
         context: str,
         feedback: str = "",
+        cancellation_token: CancellationToken | None = None,
     ) -> TaskResult:
         if self.role != AgentRole.WORKER:
             raise ValueError("Only worker sub-agents can execute steps.")
@@ -98,6 +100,7 @@ class SubAgent:
                 failure_prefix="Team worker failed",
                 role_prompt=TEAM_WORKER_SYSTEM_PROMPT,
                 run_label="team_worker",
+                cancellation_token=cancellation_token,
             )
         )
 

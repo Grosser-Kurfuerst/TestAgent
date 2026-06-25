@@ -1,20 +1,24 @@
 from __future__ import annotations
 
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, wait
 from dataclasses import dataclass, field
 from datetime import datetime
+import inspect
 from pathlib import Path
 from queue import Queue
 from typing import Any, Callable
 
 from my_agent.config import AgentConfig
+from my_agent.cancellation import CancellationToken
+from my_agent.events import BufferedEventSink
 from my_agent.hitl.handler import HitlHandler
 from my_agent.llm import AgentLLM
 from my_agent.memory import MemoryManager
 from my_agent.plan import PlanValidationError, TaskResult
 from my_agent.agent_base import AgentBase
 from my_agent.schema import AgentState
+from my_agent.parallel import create_bounded_executor, shutdown_executor
 from my_agent.team.graph import execution_batches, get_executable_steps, validate_team_graph
 from my_agent.team.planner import TeamPlanner
 from my_agent.team.rendering import render_team_final_answer, render_team_plan, render_team_review
@@ -80,6 +84,7 @@ class TeamAgent(AgentBase):
         self._memory: MemoryManager | None = None
         self._step_max_steps = config.team_step_max_steps
         self._state_lock = threading.RLock()
+        self._event_local = threading.local()
 
     def run(self, state: AgentState) -> AgentState:
         state.repo_path = Path(state.repo_path).resolve()
@@ -182,6 +187,7 @@ class TeamAgent(AgentBase):
         context: str | None = None,
         writer: TraceWriter | None = None,
         state: AgentState | None = None,
+        cancellation_token: CancellationToken | None = None,
     ) -> None:
         feedback = ""
         dependency_context = context if context is not None else self.build_dependency_context(team, step)
@@ -191,6 +197,15 @@ class TeamAgent(AgentBase):
         last_output = ""
 
         for attempt in range(1, max_attempts + 1):
+            if _token_cancelled(cancellation_token):
+                self._mark_cancelled(
+                    team,
+                    step,
+                    f"Step was cancelled: {cancellation_token.reason or 'cancelled'}",
+                    writer,
+                    state,
+                )
+                return
             with self._state_lock:
                 step.attempts = attempt
                 step.status = StepStatus.RUNNING
@@ -199,7 +214,14 @@ class TeamAgent(AgentBase):
                 self._save_and_emit(writer, state, team, "team.step.started", step)
 
             try:
-                result: TaskResult = active_worker.execute_step(team, step, dependency_context, feedback=feedback)
+                result = _execute_worker_step(
+                    active_worker,
+                    team,
+                    step,
+                    dependency_context,
+                    feedback=feedback,
+                    cancellation_token=cancellation_token,
+                )
             except Exception as exc:  # noqa: BLE001 - a crashing worker must fail only this step.
                 self._mark_failed(
                     team,
@@ -211,10 +233,29 @@ class TeamAgent(AgentBase):
                 return
             with self._state_lock:
                 step.trace_path = result.trace_path
+            if result.stop_reason == "cancelled" or _token_cancelled(cancellation_token):
+                self._mark_cancelled(
+                    team,
+                    step,
+                    result.error
+                    or f"Step was cancelled: {cancellation_token.reason if cancellation_token else 'cancelled'}",
+                    writer,
+                    state,
+                )
+                return
             if not result.ok:
                 self._mark_failed(team, step, result.error or "Worker failed.", writer, state, output=result.output)
                 return
             last_output = result.output
+            if _token_cancelled(cancellation_token):
+                self._mark_cancelled(
+                    team,
+                    step,
+                    f"Step was cancelled: {cancellation_token.reason or 'cancelled'}",
+                    writer,
+                    state,
+                )
+                return
             with self._state_lock:
                 self._save_and_emit(
                     writer,
@@ -225,6 +266,15 @@ class TeamAgent(AgentBase):
                     extra={"attempt": attempt, "worker_result": result.to_dict()},
                 )
 
+            if _token_cancelled(cancellation_token):
+                self._mark_cancelled(
+                    team,
+                    step,
+                    f"Step was cancelled: {cancellation_token.reason or 'cancelled'}",
+                    writer,
+                    state,
+                )
+                return
             with self._state_lock:
                 step.status = StepStatus.REVIEWING
                 self._save_and_emit(writer, state, team, "team.step.review_started", step)
@@ -254,6 +304,16 @@ class TeamAgent(AgentBase):
                 )
             if hasattr(active_reviewer, "clear_history"):
                 active_reviewer.clear_history()
+
+            if _token_cancelled(cancellation_token):
+                self._mark_cancelled(
+                    team,
+                    step,
+                    f"Step was cancelled: {cancellation_token.reason or 'cancelled'}",
+                    writer,
+                    state,
+                )
+                return
 
             if decision.approved:
                 self._mark_completed(team, step, result, writer, state)
@@ -321,6 +381,9 @@ class TeamAgent(AgentBase):
         use_parallel = self.config.team_parallel_enabled if parallel_enabled is None else parallel_enabled
         worker_pool = self._make_worker_pool()
         while True:
+            if _state_cancelled(state):
+                self._cancel_unfinished(team, writer, state, "Cancelled because team execution was cancelled.")
+                break
             executable = get_executable_steps(team.steps)
             if not executable:
                 break
@@ -345,7 +408,13 @@ class TeamAgent(AgentBase):
                 self.run_batch_parallel(team, executable, worker_pool=worker_pool, writer=writer, state=state)
             else:
                 for step in executable:
-                    self._run_with_worker_from_pool(team, step, worker_pool, writer, state)
+                    if _state_cancelled(state):
+                        self._cancel_unfinished(team, writer, state, "Cancelled because team execution was cancelled.")
+                        break
+                    self._run_with_worker_from_pool(team, step, worker_pool, writer, state, _child_token(state))
+            if _state_cancelled(state):
+                self._cancel_unfinished(team, writer, state, "Cancelled because team execution was cancelled.")
+                break
 
         self._skip_residual_steps(team, writer, state)
         self._finish_team(team, writer, state)
@@ -364,23 +433,90 @@ class TeamAgent(AgentBase):
         state: AgentState,
     ) -> None:
         max_workers = min(len(batch), max(1, self.config.team_worker_count))
-        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="agentcli-team") as executor:
-            futures = {
-                executor.submit(self._run_with_worker_from_pool, team, step, worker_pool, writer, state): step
-                for step in batch
-            }
-            for future in as_completed(futures):
-                step = futures[future]
-                try:
-                    future.result()
-                except Exception as exc:  # noqa: BLE001 - one crashed future must not stop the batch.
+        buffers = BufferedEventSink(self.event_sink)
+        step_tokens = {step.id: _child_token(state) for step in batch}
+        executor = create_bounded_executor(max_workers=max_workers, thread_name_prefix="agentcli-team")
+        futures: dict[Future[None], ExecutionStep] = {}
+        try:
+            for step in batch:
+                if _state_cancelled(state):
+                    break
+                futures[
+                    executor.submit(
+                        self._run_with_worker_from_pool,
+                        team,
+                        step,
+                        worker_pool,
+                        writer,
+                        state,
+                        step_tokens[step.id],
+                        buffers.buffer_for(step.id).append,
+                    )
+                ] = step
+
+            done, not_done = wait(set(futures), timeout=self.config.team_step_batch_timeout_seconds)
+            timed_out = set(not_done)
+            still_running = set()
+            if not_done:
+                reason = "cancelled" if _state_cancelled(state) else "batch_timeout"
+                for future, step in futures.items():
+                    if future in not_done and step_tokens[step.id] is not None:
+                        step_tokens[step.id].cancel(reason)
+                done_after_grace, still_running = wait(not_done, timeout=self.config.tool_shutdown_grace_seconds)
+                done = done.union(done_after_grace)
+
+            for future, step in futures.items():
+                if future in timed_out and not _state_cancelled(state):
                     self._mark_failed(
                         team,
                         step,
-                        f"Parallel step crashed: {type(exc).__name__}: {exc}",
+                        f"Step batch timed out after {self.config.team_step_batch_timeout_seconds}s.",
                         writer,
                         state,
+                        force=True,
                     )
+                elif future in still_running:
+                    if _state_cancelled(state):
+                        self._mark_cancelled(
+                            team,
+                            step,
+                            "Cancelled because team execution was cancelled.",
+                            writer,
+                            state,
+                        )
+                    else:
+                        self._mark_failed(
+                            team,
+                            step,
+                            f"Step batch timed out after {self.config.team_step_batch_timeout_seconds}s.",
+                            writer,
+                            state,
+                        )
+                elif future in done and not future.cancelled():
+                    try:
+                        future.result()
+                    except Exception as exc:  # noqa: BLE001 - one crashed future must not stop the batch.
+                        self._mark_failed(
+                            team,
+                            step,
+                            f"Parallel step crashed: {type(exc).__name__}: {exc}",
+                            writer,
+                            state,
+                        )
+            buffers.flush_in_order([step.id for step in batch])
+            if timed_out and not _state_cancelled(state):
+                self._save_and_emit(
+                    writer,
+                    state,
+                    team,
+                    "team.batch.timeout",
+                    extra={
+                        "batch": [step.id for step in batch],
+                        "timeout_seconds": self.config.team_step_batch_timeout_seconds,
+                    },
+                )
+        finally:
+            shutdown_executor(executor)
 
     def _make_worker_pool(self) -> Queue[Any]:
         pool: Queue[Any] = Queue()
@@ -395,13 +531,35 @@ class TeamAgent(AgentBase):
         worker_pool: Queue[Any],
         writer: TraceWriter,
         state: AgentState,
+        cancellation_token: CancellationToken | None = None,
+        event_sink: Callable[[object], None] | None = None,
     ) -> None:
         worker = worker_pool.get()
+        previous_sink = getattr(self._event_local, "sink", None)
+        if event_sink is not None:
+            self._event_local.sink = event_sink
         try:
             reviewer = self._make_reviewer(step.id)
             context = self.build_dependency_context(team, step)
-            self.run_step(team, step, worker=worker, reviewer=reviewer, context=context, writer=writer, state=state)
+            self.run_step(
+                team,
+                step,
+                worker=worker,
+                reviewer=reviewer,
+                context=context,
+                writer=writer,
+                state=state,
+                cancellation_token=cancellation_token,
+            )
         finally:
+            if event_sink is not None:
+                if previous_sink is None:
+                    try:
+                        del self._event_local.sink
+                    except AttributeError:
+                        pass
+                else:
+                    self._event_local.sink = previous_sink
             if hasattr(worker, "clear_history"):
                 worker.clear_history()
             worker_pool.put(worker)
@@ -424,6 +582,12 @@ class TeamAgent(AgentBase):
                 step.error = reason
                 step.ended_at = _now()
                 self._save_and_emit(writer, state, team, "team.step.skipped", step)
+
+    def _cancel_unfinished(self, team: TeamState, writer: TraceWriter, state: AgentState, reason: str) -> None:
+        for step in team.steps:
+            if step.status in _STEP_TERMINAL_STATUSES:
+                continue
+            self._mark_cancelled(team, step, reason, writer, state)
 
     def _finish_team(self, team: TeamState, writer: TraceWriter, state: AgentState) -> None:
         failed = [step for step in team.steps if step.status == StepStatus.FAILED]
@@ -454,6 +618,8 @@ class TeamAgent(AgentBase):
         state: AgentState | None,
     ) -> None:
         with self._state_lock:
+            if step.status in _STEP_TERMINAL_STATUSES and step.ended_at:
+                return
             step.status = StepStatus.COMPLETED
             step.result = result.output
             step.error = ""
@@ -470,13 +636,32 @@ class TeamAgent(AgentBase):
         state: AgentState | None,
         *,
         output: str = "",
+        force: bool = False,
     ) -> None:
         with self._state_lock:
+            if not force and step.status in _STEP_TERMINAL_STATUSES and step.ended_at:
+                return
             step.status = StepStatus.FAILED
             step.result = output
             step.error = error or "Step failed."
             step.ended_at = _now()
             self._save_and_emit(writer, state, team, "team.step.failed", step)
+
+    def _mark_cancelled(
+        self,
+        team: TeamState,
+        step: ExecutionStep,
+        reason: str,
+        writer: TraceWriter | None,
+        state: AgentState | None,
+    ) -> None:
+        with self._state_lock:
+            if step.status in _STEP_TERMINAL_STATUSES and step.ended_at:
+                return
+            step.status = StepStatus.CANCELLED
+            step.error = reason or "Step was cancelled."
+            step.ended_at = _now()
+            self._save_and_emit(writer, state, team, "team.step.cancelled", step)
 
     def _make_worker(self, index: int) -> Any:
         if self.worker_factory is not None:
@@ -547,8 +732,9 @@ class TeamAgent(AgentBase):
                 payload.update(extra)
             if writer is not None and state is not None:
                 self._emit_trace(writer, state, event, payload)
-            if self.event_sink is not None:
-                self.event_sink(
+            event_sink = getattr(self._event_local, "sink", None) or self.event_sink
+            if event_sink is not None:
+                event_sink(
                     TeamEvent(
                         event=event,
                         team_id=team.id,
@@ -559,10 +745,11 @@ class TeamAgent(AgentBase):
                 )
 
     def _forward_worker_event(self, event: object) -> None:
-        if self.event_sink is None:
+        event_sink = getattr(self._event_local, "sink", None) or self.event_sink
+        if event_sink is None:
             return
         with self._state_lock:
-            self.event_sink(event)
+            event_sink(event)
 
     def _final_state(
         self,
@@ -634,3 +821,51 @@ def _stop_reason_for_team(team: TeamState) -> str:
 
 def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
+
+
+_STEP_TERMINAL_STATUSES = {
+    StepStatus.COMPLETED,
+    StepStatus.FAILED,
+    StepStatus.SKIPPED,
+    StepStatus.CANCELLED,
+}
+
+
+def _state_cancelled(state: AgentState) -> bool:
+    return bool(state.cancellation_token is not None and state.cancellation_token.is_cancelled())
+
+
+def _token_cancelled(token: CancellationToken | None) -> bool:
+    return bool(token is not None and token.is_cancelled())
+
+
+def _child_token(state: AgentState) -> CancellationToken | None:
+    if state.cancellation_token is None:
+        return None
+    return state.cancellation_token.child()
+
+
+def _execute_worker_step(
+    worker: Any,
+    team: TeamState,
+    step: ExecutionStep,
+    context: str,
+    *,
+    feedback: str,
+    cancellation_token: CancellationToken | None,
+) -> TaskResult:
+    method = worker.execute_step
+    if _accepts_keyword(method, "cancellation_token"):
+        return method(team, step, context, feedback=feedback, cancellation_token=cancellation_token)
+    return method(team, step, context, feedback=feedback)
+
+
+def _accepts_keyword(callable_obj: Callable[..., object], name: str) -> bool:
+    try:
+        signature = inspect.signature(callable_obj)
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD or parameter.name == name
+        for parameter in signature.parameters.values()
+    )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,12 +16,16 @@ add_src_to_path()
 from my_agent.agent_base import AgentBase
 from my_agent.agent_factory import AgentFactory
 from my_agent.config import AgentConfig
-from my_agent.hitl import ApprovalDecision, ApprovalRequest, ApprovalResult, ApprovalScope
+from my_agent.cancellation import CancellationToken
+from my_agent.hitl import ApprovalDecision, ApprovalEvent, ApprovalRequest, ApprovalResult, ApprovalScope
 from my_agent.llm import FakeLLM
 from my_agent.llm.types import ChatResponse, LLMToolCall, MessageLike, messages_to_openai
 from my_agent.memory import MemoryManager, MemoryScope
 from my_agent.plan import AgentMode
 from my_agent.runtime import CodingAgentRuntime, run_agent
+from my_agent.schema import AgentState, TraceEvent
+from my_agent.react import ReActAgent
+from my_agent.tracing import TraceWriter
 
 
 def write_runtime_repo(repo: Path) -> None:
@@ -130,6 +135,95 @@ class RuntimeTests(unittest.TestCase):
                     max_steps=0,
                     trace_dir=repo / "traces",
                 )
+
+    def test_run_agent_preserves_external_cancellation_token(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+            token = CancellationToken()
+
+            state = run_agent(
+                repo_path=repo,
+                task="Return final response.",
+                config=fake_config(base / "traces"),
+                llm=FakeLLM(chat_responses=[ChatResponse(content="done", finish_reason="stop")]),
+                trace_dir=base / "traces",
+                cancellation_token=token,
+            )
+
+            self.assertIs(state.cancellation_token, token)
+            self.assertEqual(state.stop_reason, "assistant_final")
+
+    def test_run_agent_pre_cancelled_token_returns_cancelled_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+            token = CancellationToken()
+            token.cancel("pre_cancel")
+
+            state = run_agent(
+                repo_path=repo,
+                task="Return final response.",
+                config=fake_config(base / "traces"),
+                llm=FakeLLM(chat_responses=[ChatResponse(content="done", finish_reason="stop")]),
+                trace_dir=base / "traces",
+                cancellation_token=token,
+            )
+
+            self.assertEqual(state.stop_reason, "cancelled")
+            self.assertEqual(state.final_answer, "Cancelled.")
+            event_names = [event["event"] for event in read_trace(state.trace_path)]
+            self.assertIn("run.cancelled", event_names)
+
+    def test_trace_writer_is_thread_safe_for_jsonl_appends(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            writer = TraceWriter(Path(tmp) / "trace.jsonl")
+
+            def append_range(start: int) -> None:
+                for index in range(start, start + 25):
+                    writer.append(TraceEvent(event="parallel", payload={"index": index}, run_id="run"))
+
+            threads = [threading.Thread(target=append_range, args=(offset,)) for offset in range(0, 100, 25)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+            events = read_trace(writer.path)
+            self.assertEqual(len(events), 100)
+            self.assertEqual({event["event"] for event in events}, {"parallel"})
+
+    def test_react_flushes_buffered_approval_events_in_tool_call_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            sink_events: list[ApprovalEvent] = []
+            agent = ReActAgent(
+                config=fake_config(base / "traces"),
+                llm=FakeLLM(),
+                trace_dir=base / "traces",
+                command_timeout=60,
+                event_sink=sink_events.append,
+            )
+            state = AgentState.initial(base, "task")
+            writer = TraceWriter(base / "trace.jsonl")
+            events = [
+                ApprovalEvent(event="approval.completed", payload={"tool_call_id": "b"}),
+                ApprovalEvent(event="approval.completed", payload={"tool_call_id": "a"}),
+            ]
+            calls = [
+                LLMToolCall(id="a", name="write_file", arguments={}, arguments_json="{}"),
+                LLMToolCall(id="b", name="write_file", arguments={}, arguments_json="{}"),
+            ]
+
+            agent._flush_approval_events(writer, state, events, calls)
+
+            self.assertEqual([event.payload["tool_call_id"] for event in sink_events], ["a", "b"])
+            trace_events = read_trace(writer.path)
+            self.assertEqual([event["payload"]["tool_call_id"] for event in trace_events], ["a", "b"])
 
     def test_fake_llm_repairs_sample_bug_and_writes_native_trace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -331,6 +425,69 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(state.stop_reason, "assistant_final")
             events = [event for event in read_trace(state.trace_path) if event["event"] == "tool.completed"]
             self.assertEqual([event["payload"]["name"] for event in events], ["list_files", "read_file"])
+            event_names = [event["event"] for event in read_trace(state.trace_path)]
+            self.assertIn("tool.batch.started", event_names)
+            self.assertIn("tool.batch.completed", event_names)
+            completed_batches = [event for event in read_trace(state.trace_path) if event["event"] == "tool.batch.completed"]
+            self.assertTrue(completed_batches[-1]["payload"]["parallel"])
+            self.assertEqual(completed_batches[-1]["payload"]["groups"][0]["reason"], "read_tools")
+
+    def test_single_tool_batch_does_not_reuse_previous_parallel_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+            llm = FakeLLM(
+                chat_responses=[
+                    ChatResponse(
+                        finish_reason="tool_calls",
+                        tool_calls=[
+                            LLMToolCall(
+                                id="call_list",
+                                name="list_files",
+                                arguments={"path": "."},
+                                arguments_json='{"path":"."}',
+                            ),
+                            LLMToolCall(
+                                id="call_read",
+                                name="read_file",
+                                arguments={"path": "calculator.py"},
+                                arguments_json='{"path":"calculator.py"}',
+                            ),
+                        ],
+                    ),
+                    ChatResponse(
+                        finish_reason="tool_calls",
+                        tool_calls=[
+                            LLMToolCall(
+                                id="call_read_again",
+                                name="read_file",
+                                arguments={"path": "tests/test_calculator.py"},
+                                arguments_json='{"path":"tests/test_calculator.py"}',
+                            )
+                        ],
+                    ),
+                    ChatResponse(content="done", finish_reason="stop"),
+                ]
+            )
+
+            state = run_agent(
+                repo_path=repo,
+                task="Inspect files.",
+                config=fake_config(base / "traces"),
+                llm=llm,
+                max_steps=5,
+                trace_dir=base / "traces",
+            )
+
+            self.assertEqual(state.stop_reason, "assistant_final")
+            completed_batches = [event for event in read_trace(state.trace_path) if event["event"] == "tool.batch.completed"]
+            self.assertEqual(len(completed_batches), 2)
+            self.assertTrue(completed_batches[0]["payload"]["parallel"])
+            self.assertFalse(completed_batches[1]["payload"]["parallel"])
+            self.assertEqual(completed_batches[1]["payload"]["groups"][0]["ids"], ["call_read_again"])
+            self.assertEqual(completed_batches[1]["payload"]["groups"][0]["reason"], "single_tool")
 
     def test_max_steps_is_enforced_inside_multi_tool_call_batch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

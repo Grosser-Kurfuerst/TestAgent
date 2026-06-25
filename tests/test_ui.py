@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import io
+import time
+import threading
 import tempfile
 import unittest
 from pathlib import Path
@@ -357,6 +359,40 @@ class ReplTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(run_agent_mock.call_args.kwargs["mode"], AgentMode.PLAN)
         self.assertIn("Mode set to plan.", output.getvalue())
+        self.assertEqual(errors.getvalue(), "")
+
+    def test_cancel_command_requests_current_task_cancellation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            write_runtime_repo(repo)
+            output = io.StringIO()
+            errors = io.StringIO()
+            started = threading.Event()
+
+            def fake_run_agent(**kwargs: object) -> SimpleNamespace:
+                token = kwargs["cancellation_token"]
+                started.set()
+                deadline = time.monotonic() + 2
+                while not token.is_cancelled() and time.monotonic() < deadline:  # type: ignore[attr-defined]
+                    time.sleep(0.001)
+                return SimpleNamespace(trace_path=repo / "traces" / "trace.jsonl", final_answer="Cancelled.")
+
+            repl = AgentRepl(
+                repo_path=repo,
+                config=fake_config(repo / "traces"),
+                trace_dir=repo / "traces",
+                renderer=PlainRenderer(output=output, errors=errors),
+                input_stream=io.StringIO("Long task\n/cancel\n/quit\n"),
+            )
+
+            with mock.patch("my_agent.ui.repl.run_agent", side_effect=fake_run_agent):
+                exit_code = repl.run(show_banner=False)
+
+        self.assertEqual(exit_code, 0)
+        text = output.getvalue()
+        self.assertTrue(started.is_set())
+        self.assertIn("Cancellation requested.", text)
+        self.assertIn("Cancelled.", text)
         self.assertEqual(errors.getvalue(), "")
 
     def test_mode_command_accepts_team_mode(self) -> None:

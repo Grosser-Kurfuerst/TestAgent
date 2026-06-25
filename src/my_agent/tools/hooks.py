@@ -138,6 +138,9 @@ def validate_test_command(command: str, repo_root: Path | None = None) -> list[s
         raise HookViolation(f"Test command cannot be parsed: {command}") from exc
     if not parts:
         parts = ["pytest", "-q"]
+    from my_agent.tools.command_guard import reject_full_scan_command
+
+    reject_full_scan_command(parts, normalized, cwd=repo_root)
     if not _is_allowed_test_command(parts):
         raise HookViolation(
             "Test command is not in allowlist. Use pytest, python -m pytest, "

@@ -134,6 +134,11 @@ class PlanExecuteAgent(AgentBase):
                     store=self.state_store,
                     event_sink=lambda event: self._handle_executor_event(writer, state, event),
                     max_tasks=self.config.plan_max_tasks,
+                    parallel_enabled=self.config.plan_parallel_enabled,
+                    max_parallel_tasks=self.config.plan_max_parallel_tasks,
+                    batch_timeout_seconds=self.config.plan_task_batch_timeout_seconds,
+                    shutdown_grace_seconds=self.config.tool_shutdown_grace_seconds,
+                    cancellation_token=state.cancellation_token,
                 )
                 completed = executor.execute(plan)
                 self._record_plan_task_summaries(memory, completed, run_id=state.run_id)

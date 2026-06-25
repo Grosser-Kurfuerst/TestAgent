@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from my_agent.config import AgentConfig
+from my_agent.cancellation import CancellationToken
 from my_agent.hitl.handler import HitlHandler
 from my_agent.memory import MemoryManager
 from my_agent.plan.types import TaskResult
@@ -25,6 +26,7 @@ class ChildReActRequest:
     run_label: str = "native_tool_calls"
     memory_session_id: str = ""
     failure_prefix: str = "ReAct task failed"
+    cancellation_token: CancellationToken | None = None
 
 
 class ChildReActRunner:
@@ -60,6 +62,7 @@ class ChildReActRunner:
             test_command=request.test_command,
             max_steps=request.max_steps,
             run_id=request.run_id,
+            cancellation_token=request.cancellation_token,
         )
         final_state = ReActAgent(
             config=self.config,

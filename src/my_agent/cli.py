@@ -4,11 +4,14 @@ import argparse
 import json
 import os
 import sys
+import threading
 from dataclasses import replace
 from pathlib import Path
+from queue import Empty, Queue
 from typing import Any, Mapping, Sequence
 
 from my_agent.config import AgentConfig
+from my_agent.cancellation import CancellationToken
 from my_agent.data import (
     build_humaneval,
     build_mbpp,
@@ -261,19 +264,54 @@ def main(argv: Sequence[str] | None = None) -> int:
         repo_path = _resolve_repo_path(args.repo or task_payload["repo"])
         test_command = args.test_command if args.test_command is not None else task_payload.get("test_command")
         trace_dir = _resolve_trace_dir(args.trace_dir, config.trace_dir)
+        cancellation_token = CancellationToken()
+        interrupted = False
+        result_queue: Queue[tuple[str, object]] = Queue(maxsize=1)
+
+        def run_in_background() -> None:
+            try:
+                result_queue.put(
+                    (
+                        "ok",
+                        run_agent(
+                            repo_path=repo_path,
+                            task=args.task or task_payload["task"],
+                            test_command=test_command,
+                            config=config,
+                            max_steps=args.max_steps,
+                            trace_dir=trace_dir,
+                            mode=args.mode,
+                            cancellation_token=cancellation_token,
+                        ),
+                    )
+                )
+            except BaseException as exc:  # noqa: BLE001 - thread boundary relays errors to main.
+                result_queue.put(("error", exc))
+
+        worker = threading.Thread(target=run_in_background, name="agentcli-run", daemon=True)
+        worker.start()
         try:
-            final_state = run_agent(
-                repo_path=repo_path,
-                task=args.task or task_payload["task"],
-                test_command=test_command,
-                config=config,
-                max_steps=args.max_steps,
-                trace_dir=trace_dir,
-                mode=args.mode,
-            )
-        except (RuntimeError, ValueError) as exc:
-            print(f"Error: {exc}", file=sys.stderr)
-            return 1
+            result_kind, result_payload = result_queue.get()
+        except KeyboardInterrupt:
+            interrupted = True
+            cancellation_token.cancel("keyboard_interrupt")
+            try:
+                result_kind, result_payload = result_queue.get(timeout=max(0, config.tool_shutdown_grace_seconds))
+            except (KeyboardInterrupt, Empty):
+                print("Cancelled.", file=sys.stderr)
+                return 130
+        if result_kind == "error":
+            if isinstance(result_payload, KeyboardInterrupt):
+                cancellation_token.cancel("keyboard_interrupt")
+                print("Cancelled.", file=sys.stderr)
+                return 130
+            if isinstance(result_payload, (RuntimeError, ValueError)):
+                print(f"Error: {result_payload}", file=sys.stderr)
+                return 1
+            if isinstance(result_payload, BaseException):
+                raise result_payload
+            raise RuntimeError(result_payload)
+        final_state = result_payload
         print(_section("Plan", final_state.plan))
         print()
         print(_section("Review", final_state.review))
@@ -281,6 +319,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(_section("Final summary", final_state.final_answer))
         print()
         print(f"Trace: {final_state.trace_path}")
+        if interrupted:
+            return 130
         if getattr(final_state, "stop_reason", "") in {
             "plan_failed",
             "plan_validation_failed",
@@ -377,6 +417,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "hitl_non_interactive": config.hitl_non_interactive,
                     "hitl_medium_risk_mode": config.hitl_medium_risk_mode,
                     "hitl_llm_judge_enabled": config.hitl_llm_judge_enabled,
+                    "max_parallel_tools": config.max_parallel_tools,
+                    "tool_batch_timeout_seconds": config.tool_batch_timeout_seconds,
+                    "tool_shutdown_grace_seconds": config.tool_shutdown_grace_seconds,
+                    "max_process_output_chars": config.max_process_output_chars,
+                    "plan_parallel_enabled": config.plan_parallel_enabled,
+                    "plan_max_parallel_tasks": config.plan_max_parallel_tasks,
+                    "plan_task_batch_timeout_seconds": config.plan_task_batch_timeout_seconds,
+                    "team_step_batch_timeout_seconds": config.team_step_batch_timeout_seconds,
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -555,6 +603,22 @@ def _tool_environment_overrides(env: Mapping[str, str]) -> dict[str, str]:
         "MY_AGENT_HITL_MEDIUM_RISK_MODE",
         "AGENTCLI_HITL_LLM_JUDGE",
         "MY_AGENT_HITL_LLM_JUDGE",
+        "AGENTCLI_MAX_PARALLEL_TOOLS",
+        "MY_AGENT_MAX_PARALLEL_TOOLS",
+        "AGENTCLI_TOOL_BATCH_TIMEOUT_SECONDS",
+        "MY_AGENT_TOOL_BATCH_TIMEOUT_SECONDS",
+        "AGENTCLI_TOOL_SHUTDOWN_GRACE_SECONDS",
+        "MY_AGENT_TOOL_SHUTDOWN_GRACE_SECONDS",
+        "AGENTCLI_MAX_PROCESS_OUTPUT_CHARS",
+        "MY_AGENT_MAX_PROCESS_OUTPUT_CHARS",
+        "AGENTCLI_PLAN_PARALLEL",
+        "MY_AGENT_PLAN_PARALLEL",
+        "AGENTCLI_PLAN_MAX_PARALLEL_TASKS",
+        "MY_AGENT_PLAN_MAX_PARALLEL_TASKS",
+        "AGENTCLI_PLAN_TASK_BATCH_TIMEOUT_SECONDS",
+        "MY_AGENT_PLAN_TASK_BATCH_TIMEOUT_SECONDS",
+        "AGENTCLI_TEAM_STEP_BATCH_TIMEOUT_SECONDS",
+        "MY_AGENT_TEAM_STEP_BATCH_TIMEOUT_SECONDS",
     }
     return {key: env[key] for key in keys if key in env}
 

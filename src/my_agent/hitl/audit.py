@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -34,6 +35,7 @@ class AuditRecordResult:
 class AuditLog:
     def __init__(self, audit_dir: str | Path | None = None) -> None:
         self.audit_dir = Path(audit_dir).expanduser() if audit_dir is not None else Path("~/.agentcli/audit").expanduser()
+        self._lock = threading.Lock()
 
     @classmethod
     def from_config(cls, config: Any | None) -> "AuditLog":
@@ -43,8 +45,9 @@ class AuditLog:
         path = self.audit_dir / f"{datetime.now(timezone.utc).date().isoformat()}.jsonl"
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(asdict(entry), ensure_ascii=False, sort_keys=True) + "\n")
+            with self._lock:
+                with path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(asdict(entry), ensure_ascii=False, sort_keys=True) + "\n")
         except OSError as exc:
             return AuditRecordResult(ok=False, path=path, error=f"{type(exc).__name__}: {exc}")
         return AuditRecordResult(ok=True, path=path)

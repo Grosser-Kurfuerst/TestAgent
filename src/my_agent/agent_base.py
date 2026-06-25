@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from my_agent.config import AgentConfig
+from my_agent.cancellation import CancellationToken
 from my_agent.hitl.handler import HitlHandler
 from my_agent.indexer import RepoIndexer
 from my_agent.llm import AgentLLM
@@ -63,6 +64,8 @@ class AgentBase(ABC):
         index_repo: bool = True,
         emit_memory_loaded: bool = True,
     ) -> Iterator[RunContext]:
+        if state.cancellation_token is None:
+            state.cancellation_token = CancellationToken()
         repo_path = Path(repo if repo is not None else state.repo_path).resolve()
         state.repo_path = repo_path
         writer = self._create_writer(state)
@@ -131,7 +134,11 @@ class AgentBase(ABC):
 
     def _repo_snapshot(self, repo: str | Path, query: str, writer: TraceWriter, state: AgentState) -> Any:
         repo_path = Path(repo).resolve()
-        snapshot = RepoIndexer(repo_path, skip_predicate=lambda path: should_skip_path(repo_path, path)).snapshot(query=query)
+        snapshot = RepoIndexer(
+            repo_path,
+            skip_predicate=lambda path: should_skip_path(repo_path, path),
+            cancellation_token=state.cancellation_token,
+        ).snapshot(query=query)
         self._emit_trace(
             writer,
             state,

@@ -62,6 +62,8 @@ class ToolExecutionResult:
         timed_out = timed_out or result.reason == "timeout"
         if not code and timed_out:
             code = "tool_timeout"
+        elif not code and result.reason == "cancelled":
+            code = "cancelled"
         elif not code and result.blocked:
             code = "blocked"
         elif not code and not result.ok:

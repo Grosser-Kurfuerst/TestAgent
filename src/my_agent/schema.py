@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Iterable
 from uuid import uuid4
 
+from my_agent.cancellation import CancellationToken
 from my_agent.text_safety import repair_surrogates, sanitize_json_value
 
 
@@ -94,6 +95,7 @@ class AgentState:
     final_answer: str = ""
     done: bool = False
     stop_reason: str = ""
+    cancellation_token: CancellationToken | None = field(default=None, repr=False, compare=False)
 
     @classmethod
     def initial(
@@ -103,6 +105,7 @@ class AgentState:
         test_command: str | None = None,
         max_steps: int = 8,
         run_id: str | None = None,
+        cancellation_token: CancellationToken | None = None,
     ) -> "AgentState":
         if not str(task).strip():
             raise ValueError("AgentState.task must be non-empty.")
@@ -112,6 +115,7 @@ class AgentState:
             run_id=run_id or str(uuid4()),
             test_command=test_command,
             max_steps=max_steps,
+            cancellation_token=cancellation_token,
         )
 
     def trace_event(self, event: str, payload: dict[str, Any]) -> "TraceEvent":

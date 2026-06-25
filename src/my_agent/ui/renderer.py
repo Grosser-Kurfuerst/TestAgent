@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, TextIO
@@ -132,9 +133,10 @@ class PlainRenderer:
         self.output = output or sys.stdout
         self.errors = errors or sys.stderr
         self.unicode_icons = unicode_icons
+        self._lock = threading.RLock()
 
     def banner(self, info: StartupInfo) -> None:
-        self.output.write(
+        self._write_output(
             "\n".join(
                 [
                     TURA_CLI_BANNER,
@@ -155,57 +157,58 @@ class PlainRenderer:
         return "agentcli> "
 
     def assistant_delta(self, text: str) -> None:
-        self.output.write(text.rstrip() + "\n")
+        self._write_output(text.rstrip() + "\n")
 
     def tool_call_started(self, invocation: ToolInvocation) -> None:
-        self.output.write(f"tool started: {invocation.name}\n")
+        self._write_output(f"tool started: {invocation.name}\n")
 
     def tool_call_completed(self, result: ToolExecutionResult) -> None:
         status = "ok" if result.ok else "failed"
         suffix = f" ({result.error_code})" if result.error_code else ""
-        self.output.write(f"tool completed: {result.name} {status}{suffix}\n")
+        self._write_output(f"tool completed: {result.name} {status}{suffix}\n")
 
     def plan_started(self, plan: PlanState) -> None:
-        self.output.write(f"plan started: {plan.id} {len(plan.tasks)} tasks\n")
+        self._write_output(f"plan started: {plan.id} {len(plan.tasks)} tasks\n")
         if plan.summary:
-            self.output.write(f"summary: {plan.summary}\n")
+            self._write_output(f"summary: {plan.summary}\n")
         for task in plan.tasks:
-            self.output.write(f"{self._task_icon(task.status)} {task.id} {task.type.value} {task.title}\n")
+            self._write_output(f"{self._task_icon(task.status)} {task.id} {task.type.value} {task.title}\n")
 
     def plan_task_updated(self, task: PlanTask, *, plan_id: str) -> None:
-        self.output.write(f"{self._task_icon(task.status)} {task.id} {task.status.value} {task.title}\n")
+        self._write_output(f"{self._task_icon(task.status)} {task.id} {task.status.value} {task.title}\n")
 
     def plan_completed(self, plan: PlanState) -> None:
         counts = _status_counts(plan)
         suffix = ", ".join(f"{status}={count}" for status, count in sorted(counts.items()))
         label = _plan_label(plan.status)
-        self.output.write(f"plan {label}: {suffix or 'no tasks'}\n")
+        self._write_output(f"plan {label}: {suffix or 'no tasks'}\n")
 
     def team_started(self, team: TeamState) -> None:
-        self.output.write(f"team started: {team.id} {len(team.steps)} steps\n")
+        self._write_output(f"team started: {team.id} {len(team.steps)} steps\n")
         if team.summary:
-            self.output.write(f"summary: {team.summary}\n")
+            self._write_output(f"summary: {team.summary}\n")
         for step in team.steps:
-            self.output.write(f"{self._step_icon(step.status)} {step.id} {step.type.value} {step.title}\n")
+            self._write_output(f"{self._step_icon(step.status)} {step.id} {step.type.value} {step.title}\n")
 
     def team_step_updated(self, step: ExecutionStep, *, team_id: str) -> None:
         worker = f" {step.worker_name}" if step.worker_name and step.status == StepStatus.RUNNING else ""
-        self.output.write(f"{self._step_icon(step.status)} {step.id} {step.status.value}{worker} {step.title}\n")
+        self._write_output(f"{self._step_icon(step.status)} {step.id} {step.status.value}{worker} {step.title}\n")
 
     def team_completed(self, team: TeamState) -> None:
         counts = _team_status_counts(team)
         suffix = ", ".join(f"{status}={count}" for status, count in sorted(counts.items()))
-        self.output.write(f"team {_team_label(team.status)}: {suffix or 'no steps'}\n")
+        self._write_output(f"team {_team_label(team.status)}: {suffix or 'no steps'}\n")
 
     def reset_between_iterations(self) -> None:
-        self.output.flush()
-        self.errors.flush()
+        with self._lock:
+            self.output.flush()
+            self.errors.flush()
 
     def status(self, status: str) -> None:
-        self.output.write(status.rstrip() + "\n")
+        self._write_output(status.rstrip() + "\n")
 
     def error(self, message: str) -> None:
-        self.errors.write(message.rstrip() + "\n")
+        self._write_error(message.rstrip() + "\n")
 
     def _task_icon(self, status: TaskStatus) -> str:
         return (TASK_STATUS_ICON if self.unicode_icons else TASK_STATUS_ASCII)[status]
@@ -213,12 +216,21 @@ class PlainRenderer:
     def _step_icon(self, status: StepStatus) -> str:
         return (STEP_STATUS_ICON if self.unicode_icons else STEP_STATUS_ASCII)[status]
 
+    def _write_output(self, text: str) -> None:
+        with self._lock:
+            self.output.write(text)
+
+    def _write_error(self, text: str) -> None:
+        with self._lock:
+            self.errors.write(text)
+
 
 class AnsiRenderer(PlainRenderer):
     def banner(self, info: StartupInfo) -> None:
-        self.output.write("\033[1m")
-        super().banner(info)
-        self.output.write("\033[0m")
+        with self._lock:
+            self.output.write("\033[1m")
+            super().banner(info)
+            self.output.write("\033[0m")
 
 
 def _status_counts(plan: PlanState) -> dict[str, int]:

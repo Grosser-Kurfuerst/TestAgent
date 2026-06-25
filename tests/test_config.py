@@ -231,6 +231,42 @@ class AgentConfigTests(unittest.TestCase):
         self.assertEqual(config.hitl_non_interactive, "reject")
         self.assertEqual(config.hitl_medium_risk_mode, "ask")
         self.assertFalse(config.hitl_llm_judge_enabled)
+        self.assertEqual(config.max_parallel_tools, 4)
+        self.assertEqual(config.tool_batch_timeout_seconds, 60)
+        self.assertEqual(config.tool_shutdown_grace_seconds, 2)
+        self.assertEqual(config.max_process_output_chars, 8_000)
+        self.assertTrue(config.plan_parallel_enabled)
+        self.assertEqual(config.plan_max_parallel_tasks, 4)
+        self.assertEqual(config.plan_task_batch_timeout_seconds, 1_800)
+        self.assertEqual(config.team_step_batch_timeout_seconds, 1_800)
+
+    def test_parallel_config_loaded_from_env_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / ".env"
+            env_file.write_text("", encoding="utf-8")
+
+            config = AgentConfig.from_env(
+                env={
+                    "AGENTCLI_MAX_PARALLEL_TOOLS": "3",
+                    "AGENTCLI_TOOL_BATCH_TIMEOUT_SECONDS": "9",
+                    "AGENTCLI_TOOL_SHUTDOWN_GRACE_SECONDS": "1",
+                    "AGENTCLI_MAX_PROCESS_OUTPUT_CHARS": "2000",
+                    "AGENTCLI_PLAN_PARALLEL": "0",
+                    "AGENTCLI_PLAN_MAX_PARALLEL_TASKS": "2",
+                    "AGENTCLI_PLAN_TASK_BATCH_TIMEOUT_SECONDS": "30",
+                    "AGENTCLI_TEAM_STEP_BATCH_TIMEOUT_SECONDS": "40",
+                },
+                env_file=env_file,
+            )
+
+        self.assertEqual(config.max_parallel_tools, 3)
+        self.assertEqual(config.tool_batch_timeout_seconds, 9)
+        self.assertEqual(config.tool_shutdown_grace_seconds, 1)
+        self.assertEqual(config.max_process_output_chars, 2_000)
+        self.assertFalse(config.plan_parallel_enabled)
+        self.assertEqual(config.plan_max_parallel_tasks, 2)
+        self.assertEqual(config.plan_task_batch_timeout_seconds, 30)
+        self.assertEqual(config.team_step_batch_timeout_seconds, 40)
 
     def test_memory_config_loaded_from_env_mapping(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

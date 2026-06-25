@@ -25,7 +25,9 @@ class BuiltinToolSource(ToolSource):
                     {"path": {"type": "string", "description": "Repository-relative file or directory path."}}
                 ),
                 risk=ToolRisk.READ,
-                handler=lambda args, _: self.owner._list_files(args),
+                handler=lambda args, ctx: self.owner._list_files(args, ctx),
+                resource_resolver=lambda args, ctx: {f"path:{self.owner._resource_path(args.get('path', '.'), ctx)}"},
+                cancellation_safe=True,
             ),
             self._registration(
                 name="read_file",
@@ -45,7 +47,9 @@ class BuiltinToolSource(ToolSource):
                     required=["path"],
                 ),
                 risk=ToolRisk.READ,
-                handler=lambda args, _: self.owner._read_file(args),
+                handler=lambda args, ctx: self.owner._read_file(args, ctx),
+                resource_resolver=lambda args, ctx: {f"file:{self.owner._resource_path(args['path'], ctx)}"},
+                cancellation_safe=True,
             ),
             self._registration(
                 name="grep",
@@ -63,7 +67,9 @@ class BuiltinToolSource(ToolSource):
                     required=["pattern"],
                 ),
                 risk=ToolRisk.READ,
-                handler=lambda args, _: self.owner._grep(args),
+                handler=lambda args, ctx: self.owner._grep(args, ctx),
+                resource_resolver=lambda args, ctx: {f"path:{self.owner._resource_path(args.get('path', '.'), ctx)}"},
+                cancellation_safe=True,
             ),
             self._registration(
                 name="retrieve_context",
@@ -81,7 +87,8 @@ class BuiltinToolSource(ToolSource):
                     required=["query"],
                 ),
                 risk=ToolRisk.READ,
-                handler=lambda args, _: self.owner._retrieve_context(args),
+                handler=lambda args, ctx: self.owner._retrieve_context(args, ctx),
+                cancellation_safe=True,
             ),
             self._registration(
                 name="replace_in_file",
@@ -100,7 +107,8 @@ class BuiltinToolSource(ToolSource):
                     required=["path", "old", "new"],
                 ),
                 risk=ToolRisk.WRITE,
-                handler=lambda args, _: self.owner._replace_in_file(args),
+                handler=lambda args, ctx: self.owner._replace_in_file(args, ctx),
+                resource_resolver=lambda args, ctx: {f"file:{self.owner._resource_path(args['path'], ctx, write=True)}"},
             ),
             self._registration(
                 name="write_file",
@@ -118,7 +126,8 @@ class BuiltinToolSource(ToolSource):
                     required=["path", "content"],
                 ),
                 risk=ToolRisk.WRITE,
-                handler=lambda args, _: self.owner._write_file(args),
+                handler=lambda args, ctx: self.owner._write_file(args, ctx),
+                resource_resolver=lambda args, ctx: {f"file:{self.owner._resource_path(args['path'], ctx, write=True)}"},
             ),
             self._registration(
                 name="run_tests",
@@ -132,7 +141,7 @@ class BuiltinToolSource(ToolSource):
                     {"command": {"type": "string", "description": "Allowlisted test command."}}
                 ),
                 risk=ToolRisk.EXECUTE,
-                handler=lambda args, _: self.owner._run_tests(args),
+                handler=lambda args, ctx: self.owner._run_tests(args, ctx),
             ),
             self._registration(
                 name="git_diff",
@@ -144,7 +153,8 @@ class BuiltinToolSource(ToolSource):
                 ),
                 parameters=object_schema(),
                 risk=ToolRisk.READ,
-                handler=lambda args, _: self.owner._git_diff(args),
+                handler=lambda args, ctx: self.owner._git_diff(args, ctx),
+                cancellation_safe=True,
             ),
             self._registration(
                 name="finish",
@@ -159,7 +169,7 @@ class BuiltinToolSource(ToolSource):
                     required=["summary"],
                 ),
                 risk=ToolRisk.READ,
-                handler=lambda args, _: self.owner._finish(args),
+                handler=lambda args, ctx: self.owner._finish(args, ctx),
             ),
         ]
 
@@ -172,6 +182,9 @@ class BuiltinToolSource(ToolSource):
         parameters: dict[str, Any],
         risk: ToolRisk,
         handler: Any,
+        resource_resolver: Any | None = None,
+        parallel_side_effect_safe: bool = False,
+        cancellation_safe: bool = False,
     ) -> ToolRegistration:
         return ToolRegistration(
             spec=ToolSpec(
@@ -182,6 +195,9 @@ class BuiltinToolSource(ToolSource):
                 source=self.name,
             ),
             handler=handler,
+            resource_resolver=resource_resolver,
+            parallel_side_effect_safe=parallel_side_effect_safe,
+            cancellation_safe=cancellation_safe,
         )
 
 

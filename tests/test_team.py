@@ -17,6 +17,7 @@ add_src_to_path()
 from my_agent.llm import FakeLLM
 from my_agent.llm.types import ChatResponse, MessageLike, messages_to_openai
 from my_agent.config import AgentConfig
+from my_agent.cancellation import CancellationToken
 from my_agent.plan import AgentMode, PlanValidationError, TaskResult, TaskType, normalize_mode, resolve_mode
 from my_agent.memory import MemoryManager, MemoryScope
 from my_agent.schema import AgentState
@@ -233,6 +234,40 @@ class ParallelWorker:
 
     def clear_history(self) -> None:
         self.clear_count += 1
+
+
+class SlowWorker:
+    name = "slow-worker"
+
+    def execute_step(self, state: TeamState, item: ExecutionStep, context: str, feedback: str = "") -> TaskResult:
+        time.sleep(0.05)
+        return TaskResult.success(item.id, f"late {item.id}")
+
+    def clear_history(self) -> None:
+        return None
+
+
+class CooperativeCancelWorker:
+    name = "cooperative-cancel-worker"
+
+    def execute_step(
+        self,
+        state: TeamState,
+        item: ExecutionStep,
+        context: str,
+        feedback: str = "",
+        *,
+        cancellation_token: CancellationToken | None = None,
+    ) -> TaskResult:
+        deadline = time.monotonic() + 1
+        while cancellation_token is None or not cancellation_token.is_cancelled():
+            if time.monotonic() > deadline:
+                return TaskResult.failure(item.id, "Timed out waiting for cancellation.")
+            time.sleep(0.001)
+        return TaskResult.failure(item.id, "Child observed cancellation.", stop_reason="cancelled")
+
+    def clear_history(self) -> None:
+        return None
 
 
 class TeamTypeTests(unittest.TestCase):
@@ -709,6 +744,128 @@ class TeamAgentTests(unittest.TestCase):
             self.assertEqual(stored.steps[1].status, StepStatus.COMPLETED)
             self.assertEqual(stored.steps[2].status, StepStatus.SKIPPED)
             self.assertIn("Worker crashed: RuntimeError: step_1 crashed", stored.steps[0].error)
+
+    def test_parallel_batch_timeout_marks_unfinished_steps_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+            team = TeamState.create(goal="Timeout batch", steps=[step("step_1"), step("step_2")])
+            config = fake_config(base / "traces", team_worker_count=2)
+            object.__setattr__(config, "team_step_batch_timeout_seconds", 0.001)
+            object.__setattr__(config, "tool_shutdown_grace_seconds", 0)
+
+            state = TeamAgent(
+                config=config,
+                llm=FakeLLM(),
+                trace_dir=base / "traces",
+                command_timeout=60,
+                planner=StaticPlanner(team),  # type: ignore[arg-type]
+                worker_factory=lambda _: SlowWorker(),
+                reviewer_factory=lambda _: ScriptedReviewer([ReviewDecision(approved=True)]),
+            ).run(agent_state(repo, "Timeout batch"))
+
+            stored = TeamState.from_dict(json.loads(next((base / "traces" / "teams").glob("team_*.json")).read_text(encoding="utf-8")))
+            self.assertEqual(state.stop_reason, "team_failed")
+            self.assertEqual(stored.steps[0].status, StepStatus.FAILED)
+            self.assertIn("Step batch timed out", stored.steps[0].error)
+
+    def test_parallel_batch_timeout_overrides_cooperative_child_cancellation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+            team = TeamState.create(goal="Timeout batch", steps=[step("step_1"), step("step_2")])
+            config = fake_config(base / "traces", team_worker_count=2)
+            object.__setattr__(config, "team_step_batch_timeout_seconds", 0.001)
+            object.__setattr__(config, "tool_shutdown_grace_seconds", 1)
+            root_token = CancellationToken()
+            state = agent_state(repo, "Timeout batch")
+            state.cancellation_token = root_token
+
+            state = TeamAgent(
+                config=config,
+                llm=FakeLLM(),
+                trace_dir=base / "traces",
+                command_timeout=60,
+                planner=StaticPlanner(team),  # type: ignore[arg-type]
+                worker_factory=lambda _: CooperativeCancelWorker(),
+                reviewer_factory=lambda _: ScriptedReviewer([ReviewDecision(approved=True)]),
+            ).run(state)
+
+            stored = TeamState.from_dict(json.loads(next((base / "traces" / "teams").glob("team_*.json")).read_text(encoding="utf-8")))
+            self.assertFalse(root_token.is_cancelled())
+            self.assertEqual(state.stop_reason, "team_failed")
+            self.assertEqual(stored.steps[0].status, StepStatus.FAILED)
+            self.assertIn("Step batch timed out", stored.steps[0].error)
+            self.assertEqual(stored.steps[1].status, StepStatus.FAILED)
+            self.assertIn("Step batch timed out", stored.steps[1].error)
+
+    def test_parallel_root_cancellation_marks_team_cancelled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+            team = TeamState.create(goal="Cancel batch", steps=[step("step_1"), step("step_2")])
+            config = fake_config(base / "traces", team_worker_count=2)
+            root_token = CancellationToken()
+            state = agent_state(repo, "Cancel batch")
+            state.cancellation_token = root_token
+            timer = threading.Timer(0.01, lambda: root_token.cancel("user_cancelled"))
+
+            timer.start()
+            try:
+                state = TeamAgent(
+                    config=config,
+                    llm=FakeLLM(),
+                    trace_dir=base / "traces",
+                    command_timeout=60,
+                    planner=StaticPlanner(team),  # type: ignore[arg-type]
+                    worker_factory=lambda _: CooperativeCancelWorker(),
+                    reviewer_factory=lambda _: ScriptedReviewer([ReviewDecision(approved=True)]),
+                ).run(state)
+            finally:
+                timer.cancel()
+
+            stored = TeamState.from_dict(json.loads(next((base / "traces" / "teams").glob("team_*.json")).read_text(encoding="utf-8")))
+            self.assertEqual(state.stop_reason, "team_cancelled")
+            self.assertEqual(stored.status, TeamStatus.CANCELLED)
+            self.assertTrue(all(item.status == StepStatus.CANCELLED for item in stored.steps))
+
+    def test_serial_root_cancellation_token_reaches_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+            team = TeamState.create(goal="Cancel serial", steps=[step("step_1")])
+            config = fake_config(base / "traces", team_worker_count=1)
+            root_token = CancellationToken()
+            state = agent_state(repo, "Cancel serial")
+            state.cancellation_token = root_token
+            timer = threading.Timer(0.01, lambda: root_token.cancel("user_cancelled"))
+
+            timer.start()
+            try:
+                state = TeamAgent(
+                    config=config,
+                    llm=FakeLLM(),
+                    trace_dir=base / "traces",
+                    command_timeout=60,
+                    planner=StaticPlanner(team),  # type: ignore[arg-type]
+                    worker_factory=lambda _: CooperativeCancelWorker(),
+                    reviewer_factory=lambda _: ScriptedReviewer([ReviewDecision(approved=True)]),
+                ).run(state)
+            finally:
+                timer.cancel()
+
+            stored = TeamState.from_dict(json.loads(next((base / "traces" / "teams").glob("team_*.json")).read_text(encoding="utf-8")))
+            self.assertEqual(state.stop_reason, "team_cancelled")
+            self.assertEqual(stored.status, TeamStatus.CANCELLED)
+            self.assertEqual(stored.steps[0].status, StepStatus.CANCELLED)
 
     def test_parallel_worker_events_are_serialized_through_orchestrator_sink(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

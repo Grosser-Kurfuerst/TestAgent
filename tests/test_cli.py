@@ -4,7 +4,10 @@ import contextlib
 import io
 import json
 import os
+import signal
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -124,6 +127,10 @@ class CliTests(unittest.TestCase):
                 "AGENTCLI_TEAM_MAX_RETRIES": "0",
                 "AGENTCLI_HITL": "1",
                 "AGENTCLI_HITL_MEDIUM_RISK_MODE": "allow",
+                "AGENTCLI_PLAN_PARALLEL": "0",
+                "AGENTCLI_PLAN_TASK_BATCH_TIMEOUT_SECONDS": "30",
+                "AGENTCLI_TEAM_STEP_BATCH_TIMEOUT_SECONDS": "40",
+                "MY_AGENT_MAX_PARALLEL_TOOLS": "2",
             }
 
             with mock.patch.dict(os.environ, env, clear=True):
@@ -138,6 +145,10 @@ class CliTests(unittest.TestCase):
         self.assertEqual(output["team_max_retries"], 0)
         self.assertTrue(output["hitl_enabled"])
         self.assertEqual(output["hitl_medium_risk_mode"], "allow")
+        self.assertFalse(output["plan_parallel_enabled"])
+        self.assertEqual(output["plan_task_batch_timeout_seconds"], 30)
+        self.assertEqual(output["team_step_batch_timeout_seconds"], 40)
+        self.assertEqual(output["max_parallel_tools"], 2)
 
     def test_cli_run_executes_fake_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -342,6 +353,79 @@ class CliTests(unittest.TestCase):
 
             self.assertEqual(exit_code, 1)
             self.assertIn("No API key configured", stderr.getvalue())
+
+    def test_cli_run_keyboard_interrupt_cancels_token(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+            task_file = base / "task.json"
+            task_file.write_text(
+                json.dumps({"repo": str(repo), "task": "Long task"}),
+                encoding="utf-8",
+            )
+            env_file = _write_env_file(base, "MY_AGENT_LLM_PROVIDER=fake\n")
+            stderr = io.StringIO()
+            seen_tokens: list[object] = []
+
+            def interrupting_run_agent(**kwargs: object) -> object:
+                seen_tokens.append(kwargs["cancellation_token"])
+                raise KeyboardInterrupt()
+
+            with mock.patch("my_agent.config.DEFAULT_ENV_FILE", env_file):
+                with mock.patch("my_agent.cli.run_agent", side_effect=interrupting_run_agent):
+                    with contextlib.redirect_stderr(stderr):
+                        exit_code = main(["run", "--task-file", str(task_file), "--trace-dir", str(base / "traces")])
+
+        self.assertEqual(exit_code, 130)
+        self.assertIn("Cancelled.", stderr.getvalue())
+        self.assertTrue(seen_tokens)
+        self.assertTrue(seen_tokens[0].is_cancelled())
+
+    def test_cli_run_sigint_returns_even_when_worker_does_not_exit_after_cancel(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+            task_file = base / "task.json"
+            task_file.write_text(
+                json.dumps({"repo": str(repo), "task": "Long task"}),
+                encoding="utf-8",
+            )
+            env_file = _write_env_file(
+                base,
+                "MY_AGENT_LLM_PROVIDER=fake\nAGENTCLI_TOOL_SHUTDOWN_GRACE_SECONDS=0\n",
+            )
+            stderr = io.StringIO()
+            seen_tokens: list[object] = []
+
+            def non_cooperative_run_agent(**kwargs: object) -> object:
+                token = kwargs["cancellation_token"]
+                seen_tokens.append(token)
+                while not token.is_cancelled():
+                    time.sleep(0.001)
+                time.sleep(1)
+                return SimpleNamespace(plan="", review="", final_answer="", trace_path="", stop_reason="cancelled")
+
+            timer = threading.Timer(0.02, lambda: os.kill(os.getpid(), signal.SIGINT))
+            with mock.patch("my_agent.config.DEFAULT_ENV_FILE", env_file):
+                with mock.patch("my_agent.cli.run_agent", side_effect=non_cooperative_run_agent):
+                    timer.start()
+                    try:
+                        with contextlib.redirect_stderr(stderr):
+                            started = time.monotonic()
+                            exit_code = main(["run", "--task-file", str(task_file), "--trace-dir", str(base / "traces")])
+                            elapsed = time.monotonic() - started
+                    finally:
+                        timer.cancel()
+
+        self.assertEqual(exit_code, 130)
+        self.assertLess(elapsed, 0.5)
+        self.assertIn("Cancelled.", stderr.getvalue())
+        self.assertTrue(seen_tokens)
+        self.assertTrue(seen_tokens[0].is_cancelled())
 
     def test_cli_config_without_dotenv_returns_clear_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

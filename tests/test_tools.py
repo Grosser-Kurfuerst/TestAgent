@@ -4,6 +4,8 @@ import tempfile
 import unittest
 import json
 import sys
+import threading
+import time
 from pathlib import Path
 
 try:
@@ -15,6 +17,8 @@ add_src_to_path()
 
 from my_agent.schema import ToolResult
 from my_agent.config import AgentConfig
+from my_agent.cancellation import CancelledError, CancellationToken
+from my_agent.indexer import RepoIndexer
 from my_agent.tools import (
     BuiltinToolSource,
     HookViolation,
@@ -27,6 +31,9 @@ from my_agent.tools import (
     ToolSpec,
     validate_test_command,
 )
+from my_agent.tools.command_guard import reject_full_scan_command
+from my_agent.tools.parallel_policy import build_tool_batch_groups
+from my_agent.tools.process import run_process
 
 
 def write_calculator_repo(repo: Path) -> None:
@@ -178,6 +185,19 @@ class ToolRegistryTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertIn("Tool error: RuntimeError: boom", result.content)
 
+    def test_registry_preserves_cancelled_tool_reason_as_error_code(self) -> None:
+        registry = ToolRegistry()
+
+        def cancel(_: dict[str, object], __: ToolContext) -> ToolResult:
+            return ToolResult(ok=False, output="cancelled", reason="cancelled")
+
+        registry.register(tool_registration("cancel", "cancel", cancel))
+
+        result = execute_tool(registry, "cancel", {})
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_code, "cancelled")
+
     def test_registry_marks_hook_violations_as_blocked(self) -> None:
         registry = ToolRegistry()
 
@@ -213,6 +233,200 @@ class ToolRegistryTests(unittest.TestCase):
             registry.register(
                 tool_registration("echo", "echo another message", lambda args, _: ToolResult(ok=True, output="second"))
             )
+
+    def test_execute_tools_runs_read_tools_in_parallel_with_stable_order(self) -> None:
+        registry = ToolRegistry(
+            ToolContext(
+                repo_root=Path.cwd(),
+                max_parallel_tools=3,
+                tool_batch_timeout_seconds=2,
+            )
+        )
+
+        def slow_echo(args: dict[str, object], _: ToolContext) -> ToolResult:
+            time.sleep(0.2)
+            return ToolResult(ok=True, output=str(args["value"]))
+
+        for name in ("read_a", "read_b", "read_c"):
+            registry.register(
+                ToolRegistration(
+                    spec=ToolSpec(
+                        name=name,
+                        description=f"{name} read",
+                        parameters={
+                            "type": "object",
+                            "properties": {"value": {"type": "string"}},
+                            "required": ["value"],
+                            "additionalProperties": False,
+                        },
+                        risk=ToolRisk.READ,
+                        source="builtin",
+                    ),
+                    handler=slow_echo,
+                    cancellation_safe=True,
+                )
+            )
+
+        started = time.monotonic()
+        results = registry.execute_tools(
+            [
+                ToolInvocation.from_arguments("read_a", {"value": "1"}, "a"),
+                ToolInvocation.from_arguments("read_b", {"value": "2"}, "b"),
+                ToolInvocation.from_arguments("read_c", {"value": "3"}, "c"),
+            ]
+        )
+
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertEqual([result.content for result in results], ["1", "2", "3"])
+
+    def test_execute_tools_timeout_cancels_batch_token_not_root_token(self) -> None:
+        root_token = CancellationToken()
+        registry = ToolRegistry(
+            ToolContext(
+                repo_root=Path.cwd(),
+                cancellation_token=root_token,
+                max_parallel_tools=2,
+                tool_batch_timeout_seconds=1,
+                tool_shutdown_grace_seconds=0,
+            )
+        )
+
+        def slow_read(_: dict[str, object], context: ToolContext) -> ToolResult:
+            while not context.cancellation_token.is_cancelled():
+                time.sleep(0.05)
+            return ToolResult(ok=False, output="cancelled", reason="cancelled")
+
+        for name in ("read_a", "read_b"):
+            registry.register(
+                ToolRegistration(
+                    spec=ToolSpec(
+                        name=name,
+                        description=name,
+                        parameters={"type": "object", "properties": {}, "additionalProperties": False},
+                        source="builtin",
+                    ),
+                    handler=slow_read,
+                    cancellation_safe=True,
+                )
+            )
+
+        results = registry.execute_tools(
+            [ToolInvocation.from_arguments("read_a", {}, "a"), ToolInvocation.from_arguments("read_b", {}, "b")]
+        )
+
+        self.assertFalse(root_token.is_cancelled())
+        self.assertEqual([result.error_code for result in results], ["tool_batch_timeout", "tool_batch_timeout"])
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline and any(
+            thread.name.startswith("agentcli-tools") and thread.is_alive() for thread in threading.enumerate()
+        ):
+            time.sleep(0.01)
+        self.assertFalse(any(thread.name.startswith("agentcli-tools") and thread.is_alive() for thread in threading.enumerate()))
+
+    def test_execute_tools_serializes_read_tools_without_cancellation_safe_marker(self) -> None:
+        root_token = CancellationToken()
+        registry = ToolRegistry(
+            ToolContext(
+                repo_root=Path.cwd(),
+                cancellation_token=root_token,
+                max_parallel_tools=2,
+                tool_batch_timeout_seconds=1,
+                tool_shutdown_grace_seconds=0,
+            )
+        )
+
+        def slow_read(_: dict[str, object], __: ToolContext) -> ToolResult:
+            time.sleep(0.05)
+            return ToolResult(ok=True, output="ok")
+
+        for name in ("read_a", "read_b"):
+            registry.register(
+                ToolRegistration(
+                    spec=ToolSpec(
+                        name=name,
+                        description=name,
+                        parameters={"type": "object", "properties": {}, "additionalProperties": False},
+                        risk=ToolRisk.READ,
+                        source="builtin",
+                    ),
+                    handler=slow_read,
+                )
+            )
+
+        started = time.monotonic()
+        results = registry.execute_tools(
+            [ToolInvocation.from_arguments("read_a", {}, "a"), ToolInvocation.from_arguments("read_b", {}, "b")]
+        )
+        elapsed = time.monotonic() - started
+
+        self.assertGreaterEqual(elapsed, 0.09)
+        self.assertFalse(root_token.is_cancelled())
+        self.assertEqual([result.ok for result in results], [True, True])
+        self.assertFalse(any(thread.name.startswith("agentcli-tools") and thread.is_alive() for thread in threading.enumerate()))
+
+    def test_parallel_policy_serializes_conflicting_side_effect_tools(self) -> None:
+        registry = ToolRegistry(ToolContext(repo_root=Path.cwd()))
+
+        def handler(_: dict[str, object], __: ToolContext) -> ToolResult:
+            return ToolResult(ok=True, output="ok")
+
+        registry.register(
+            ToolRegistration(
+                spec=ToolSpec(
+                    name="write_one",
+                    description="write",
+                    parameters={"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"], "additionalProperties": False},
+                    risk=ToolRisk.WRITE,
+                ),
+                handler=handler,
+                resource_resolver=lambda args, _: {f"file:{args['path']}"},
+                parallel_side_effect_safe=True,
+            )
+        )
+
+        invocations = [
+            ToolInvocation.from_arguments("write_one", {"path": "same.txt"}, "a"),
+            ToolInvocation.from_arguments("write_one", {"path": "same.txt"}, "b"),
+        ]
+        groups = build_tool_batch_groups(
+            invocations,
+            registry=registry,
+            parsed_arguments={invocation.id: invocation.arguments() for invocation in invocations},
+            context=registry.context,
+        )
+
+        self.assertEqual([len(group.invocations) for group in groups], [1, 1])
+        self.assertFalse(any(group.parallel for group in groups))
+
+    def test_parallel_policy_serializes_dynamic_read_without_resource_resolver(self) -> None:
+        registry = ToolRegistry(ToolContext(repo_root=Path.cwd()))
+
+        def handler(_: dict[str, object], __: ToolContext) -> ToolResult:
+            return ToolResult(ok=True, output="ok")
+
+        for name in ("dynamic_a", "dynamic_b"):
+            registry.register(
+                ToolRegistration(
+                    spec=ToolSpec(
+                        name=name,
+                        description=name,
+                        parameters={"type": "object", "properties": {}, "additionalProperties": False},
+                        risk=ToolRisk.READ,
+                        source="plugin",
+                    ),
+                    handler=handler,
+                )
+            )
+        invocations = [ToolInvocation.from_arguments("dynamic_a", {}, "a"), ToolInvocation.from_arguments("dynamic_b", {}, "b")]
+        groups = build_tool_batch_groups(
+            invocations,
+            registry=registry,
+            parsed_arguments={invocation.id: invocation.arguments() for invocation in invocations},
+            context=registry.context,
+        )
+
+        self.assertEqual([len(group.invocations) for group in groups], [1, 1])
+        self.assertFalse(any(group.parallel for group in groups))
 
 
 class RepoToolsTests(unittest.TestCase):
@@ -406,6 +620,68 @@ class RepoToolsTests(unittest.TestCase):
             with self.assertRaisesRegex(HookViolation, "escapes repository root"):
                 validate_test_command(f"pytest --cov-report=html:{outside / 'coverage'}", repo_root=repo)
 
+    def test_full_scan_find_command_is_blocked(self) -> None:
+        with self.assertRaisesRegex(HookViolation, "Full filesystem scan"):
+            reject_full_scan_command(["find", "/"], "find /")
+        with self.assertRaisesRegex(HookViolation, "Full filesystem scan"):
+            reject_full_scan_command(["find", "~"], "find ~")
+        with self.assertRaisesRegex(HookViolation, "Full filesystem scan"):
+            reject_full_scan_command(["find", "$HOME"], "find $HOME")
+        with self.assertRaisesRegex(HookViolation, "Full filesystem scan"):
+            reject_full_scan_command(["find", "-L", "/"], "find -L /")
+        with self.assertRaisesRegex(HookViolation, "Full filesystem scan"):
+            reject_full_scan_command(["find", "-H", "~"], "find -H ~")
+        with self.assertRaisesRegex(HookViolation, "Full filesystem scan"):
+            reject_full_scan_command(["find", "-maxdepth", "1", "/"], "find -maxdepth 1 /")
+
+    def test_run_process_truncates_output_and_drains_pipe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_process(
+                [sys.executable, "-c", "print('x' * 20000)"],
+                cwd=Path(tmp),
+                timeout_seconds=5,
+                env={},
+                max_output_chars=1000,
+            )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertLessEqual(len(result.stdout), 1100)
+        self.assertIn("output truncated", result.stdout)
+        self.assertFalse(result.output_reader_leaked)
+
+    def test_run_process_cancel_terminates_subprocess(self) -> None:
+        token = CancellationToken()
+
+        def cancel_soon() -> None:
+            time.sleep(0.2)
+            token.cancel("test_cancel")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            thread = threading.Thread(target=cancel_soon)
+            thread.start()
+            result = run_process(
+                [sys.executable, "-c", "import time; time.sleep(10)"],
+                cwd=Path(tmp),
+                timeout_seconds=5,
+                env={},
+                cancellation_token=token,
+            )
+            thread.join()
+
+        self.assertTrue(result.cancelled)
+        self.assertFalse(result.output_reader_leaked)
+
+    def test_repo_indexer_respects_cancellation_token(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / "sample.py").write_text("needle = 1\n", encoding="utf-8")
+            token = CancellationToken()
+            token.cancel("test_cancel")
+            indexer = RepoIndexer(repo, cancellation_token=token)
+
+            with self.assertRaisesRegex(CancelledError, "test_cancel"):
+                indexer.retrieve("needle")
+
     def test_retrieve_context_skips_protected_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
@@ -538,6 +814,39 @@ class RepoToolsTests(unittest.TestCase):
             self.assertIn("echo_message", tools.tool_names)
             self.assertTrue(result.ok, result.content)
             self.assertIn("hello", result.content)
+
+    def test_config_tool_source_blocks_full_scan_before_subprocess(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            _write_env_file(repo, "")
+            _write_project_tools_config(
+                repo,
+                {
+                    "version": 1,
+                    "tools": [
+                        {
+                            "name": "find_root",
+                            "description": "Find root.",
+                            "kind": "command",
+                            "risk": "execute",
+                            "enabled": True,
+                            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+                            "command": {"argv": ["find", "/"], "timeout_seconds": 5, "cwd": "."},
+                        }
+                    ],
+                },
+            )
+            config = AgentConfig.from_env(
+                env={"AGENTCLI_ENABLE_PROJECT_TOOLS": "1", "AGENTCLI_TOOL_CONFIGS": " "},
+                env_file=repo / ".env",
+            )
+
+            result = execute_tool(RepoTools(repo, config=config), "find_root", {})
+
+            self.assertFalse(result.ok)
+            self.assertTrue(result.blocked)
+            self.assertEqual(result.error_code, "policy_denied")
+            self.assertIn("Full filesystem scan", result.content)
 
     def test_config_tool_source_missing_required_argument_does_not_start_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

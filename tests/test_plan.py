@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import threading
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -14,6 +16,7 @@ add_src_to_path()
 
 from my_agent.llm import FakeLLM
 from my_agent.llm.types import ChatResponse, LLMToolCall
+from my_agent.cancellation import CancellationToken
 from my_agent.memory import MemoryManager, MemoryScope
 from my_agent.schema import AgentState
 from my_agent.plan import (
@@ -140,6 +143,52 @@ class CancellingTaskRunner:
     def run_task(self, plan: PlanState, task: PlanTask) -> TaskResult:
         self.calls.append(task.id)
         raise PlanCancelled("user cancelled")
+
+
+class SynchronizingTaskRunner:
+    def __init__(self) -> None:
+        self.started: list[str] = []
+        self._events = {"task_1": threading.Event(), "task_2": threading.Event()}
+        self._lock = threading.Lock()
+
+    def run_task(self, plan: PlanState, task: PlanTask) -> TaskResult:
+        with self._lock:
+            self.started.append(task.id)
+        if task.id in self._events:
+            self._events[task.id].set()
+            other = "task_2" if task.id == "task_1" else "task_1"
+            if not self._events[other].wait(timeout=1):
+                return TaskResult.failure(task.id, f"{other} did not start concurrently.")
+        return TaskResult.success(task.id, f"done {task.id}")
+
+
+class SlowTaskRunner:
+    def run_task(self, plan: PlanState, task: PlanTask) -> TaskResult:
+        time.sleep(0.05)
+        return TaskResult.success(task.id, f"late {task.id}")
+
+
+class CooperativeCancelTaskRunner:
+    def run_task_with_token(
+        self,
+        plan: PlanState,
+        task: PlanTask,
+        *,
+        cancellation_token: CancellationToken | None = None,
+    ) -> TaskResult:
+        deadline = time.monotonic() + 1
+        while cancellation_token is None or not cancellation_token.is_cancelled():
+            if time.monotonic() > deadline:
+                return TaskResult.failure(task.id, "Timed out waiting for cancellation.")
+            time.sleep(0.001)
+        return TaskResult.failure(task.id, "Child observed cancellation.", stop_reason="cancelled")
+
+
+class MutatingTaskRunner:
+    def run_task(self, plan: PlanState, task: PlanTask) -> TaskResult:
+        plan.summary = "mutated in worker"
+        task.title = "Mutated in worker"
+        return TaskResult.success(task.id, f"done {task.id}")
 
 
 class FailingPlannerLLM(FakeLLM):
@@ -496,6 +545,65 @@ class PlanExecutorTests(unittest.TestCase):
         self.assertEqual(result.status, PlanStatus.CANCELLED)
         self.assertEqual(result.get_task("task_1").status, TaskStatus.CANCELLED)
         self.assertEqual(result.get_task("task_2").status, TaskStatus.CANCELLED)
+
+    def test_parallel_executor_runs_same_batch_tasks_concurrently(self) -> None:
+        runner = SynchronizingTaskRunner()
+        plan = plan_with([task("task_1"), task("task_2"), task("task_3", depends_on=["task_1", "task_2"])])
+
+        result = PlanExecutor(runner, parallel_enabled=True, max_parallel_tasks=2).execute(plan)
+
+        self.assertEqual(result.status, PlanStatus.SUCCEEDED)
+        self.assertEqual(set(runner.started[:2]), {"task_1", "task_2"})
+        self.assertEqual(runner.started[-1], "task_3")
+
+    def test_parallel_executor_marks_still_running_task_batch_timeout(self) -> None:
+        plan = plan_with([task("task_1"), task("task_2")])
+
+        result = PlanExecutor(
+            SlowTaskRunner(),
+            parallel_enabled=True,
+            max_parallel_tasks=2,
+            batch_timeout_seconds=0.001,
+            shutdown_grace_seconds=0,
+        ).execute(plan)
+
+        self.assertEqual(result.status, PlanStatus.FAILED)
+        self.assertEqual(result.get_task("task_1").status, TaskStatus.FAILED)
+        self.assertEqual(result.get_task("task_1").error, "Task batch timed out after 0.001s.")
+
+    def test_parallel_executor_keeps_batch_timeout_when_child_cooperatively_cancels(self) -> None:
+        plan = plan_with([task("task_1"), task("task_2")])
+        root_token = CancellationToken()
+
+        result = PlanExecutor(
+            CooperativeCancelTaskRunner(),
+            parallel_enabled=True,
+            max_parallel_tasks=2,
+            batch_timeout_seconds=0.001,
+            shutdown_grace_seconds=1,
+            cancellation_token=root_token,
+        ).execute(plan)
+
+        self.assertFalse(root_token.is_cancelled())
+        self.assertEqual(result.status, PlanStatus.FAILED)
+        self.assertEqual(result.get_task("task_1").status, TaskStatus.FAILED)
+        self.assertEqual(result.get_task("task_1").error, "Task batch timed out after 0.001s.")
+        self.assertEqual(result.get_task("task_2").status, TaskStatus.FAILED)
+        self.assertEqual(result.get_task("task_2").error, "Task batch timed out after 0.001s.")
+
+    def test_parallel_executor_passes_worker_snapshots(self) -> None:
+        plan = plan_with([task("task_1"), task("task_2")])
+
+        result = PlanExecutor(
+            MutatingTaskRunner(),
+            parallel_enabled=True,
+            max_parallel_tasks=2,
+        ).execute(plan)
+
+        self.assertEqual(result.status, PlanStatus.SUCCEEDED)
+        self.assertEqual(result.summary, "summary")
+        self.assertEqual(result.get_task("task_1").title, "Task task_1")
+        self.assertEqual(result.get_task("task_2").title, "Task task_2")
 
 
 class ReActTaskRunnerTests(unittest.TestCase):

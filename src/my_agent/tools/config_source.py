@@ -3,13 +3,14 @@ from __future__ import annotations
 import json
 import os
 import re
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from my_agent.schema import ToolResult
+from my_agent.tools.command_guard import reject_full_scan_command
 from my_agent.tools.hooks import HookViolation, ensure_inside_repo
+from my_agent.tools.process import run_process
 from my_agent.tools.spec import ToolContext, ToolRegistration, ToolRisk, ToolSource, ToolSpec
 
 
@@ -127,10 +128,11 @@ class ConfigToolSource(ToolSource):
                 configured_env=env,
                 declared_properties=set(declared_properties),
                 arguments=arguments,
+                tool_context=tool_context,
             )
 
         def preflight(arguments: dict[str, Any], tool_context: ToolContext) -> None:
-            _prepare_configured_command(
+            _, rendered_argv, rendered_cwd = _prepare_configured_command(
                 tool_name=name,
                 repo_root=tool_context.repo_root,
                 argv_template=argv,
@@ -139,8 +141,27 @@ class ConfigToolSource(ToolSource):
                 declared_properties=set(declared_properties),
                 arguments=arguments,
             )
+            reject_full_scan_command(rendered_argv, " ".join(rendered_argv), cwd=rendered_cwd)
 
-        return ToolRegistration(spec=spec, handler=handler, preflight=preflight)
+        def resource_resolver(arguments: dict[str, Any], tool_context: ToolContext) -> set[str]:
+            _, rendered_argv, rendered_cwd = _prepare_configured_command(
+                tool_name=name,
+                repo_root=tool_context.repo_root,
+                argv_template=argv,
+                cwd_template=cwd,
+                path_args=path_args,
+                declared_properties=set(declared_properties),
+                arguments=arguments,
+            )
+            resources = {f"cwd:{rendered_cwd.relative_to(tool_context.repo_root).as_posix()}"}
+            for key in path_args.intersection(arguments):
+                safe_path = ensure_inside_repo(tool_context.repo_root, arguments[key])
+                resources.add(f"path:{safe_path.relative_to(tool_context.repo_root).as_posix()}")
+            if rendered_argv:
+                resources.add(f"cmd:{Path(rendered_argv[0]).name}")
+            return resources
+
+        return ToolRegistration(spec=spec, handler=handler, preflight=preflight, resource_resolver=resource_resolver)
 
 
 def _required_string(payload: dict[str, Any], key: str, path: Path) -> str:
@@ -161,6 +182,7 @@ def _run_configured_command(
     configured_env: dict[str, str],
     declared_properties: set[str],
     arguments: dict[str, Any],
+    tool_context: ToolContext,
 ) -> ToolResult:
     try:
         sanitized_arguments, argv, cwd = _prepare_configured_command(
@@ -176,6 +198,10 @@ def _run_configured_command(
         return ToolResult(ok=False, output=str(exc), blocked=True, reason=str(exc))
     except ValueError as exc:
         return ToolResult(ok=False, output=str(exc))
+    try:
+        reject_full_scan_command(argv, " ".join(argv), cwd=cwd)
+    except HookViolation as exc:
+        return ToolResult(ok=False, output=str(exc), blocked=True, reason=str(exc))
 
     env = {
         "PATH": os.environ.get("PATH", ""),
@@ -183,31 +209,33 @@ def _run_configured_command(
         "PYTHONUNBUFFERED": "1",
         **configured_env,
     }
-    try:
-        completed = subprocess.run(
-            argv,
-            cwd=cwd,
-            input=json.dumps(sanitized_arguments, ensure_ascii=False),
-            text=True,
-            capture_output=True,
-            timeout=timeout_seconds,
-            env=env,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        stdout = exc.stdout if isinstance(exc.stdout, str) else ""
-        stderr = exc.stderr if isinstance(exc.stderr, str) else ""
+    result = run_process(
+        argv,
+        cwd=cwd,
+        stdin_text=json.dumps(sanitized_arguments, ensure_ascii=False),
+        timeout_seconds=timeout_seconds,
+        env=env,
+        cancellation_token=tool_context.cancellation_token,
+        max_output_chars=tool_context.max_process_output_chars,
+    )
+    if result.start_failed:
+        return ToolResult(ok=False, output=f"Tool {tool_name} failed to start: {result.start_failed}", reason="start_failed")
+    if result.timed_out:
         return ToolResult(
             ok=False,
-            output=_format_command_output("timeout", stdout, f"{stderr}\nCommand timed out after {timeout_seconds}s."),
+            output=_format_command_output("timeout", result.stdout, f"{result.stderr}\nCommand timed out after {timeout_seconds}s."),
             reason="timeout",
         )
-    except OSError as exc:
-        return ToolResult(ok=False, output=f"Tool {tool_name} failed to start: {exc}", reason="start_failed")
+    if result.cancelled:
+        return ToolResult(
+            ok=False,
+            output=_format_command_output("cancelled", result.stdout, f"{result.stderr}\nCommand cancelled."),
+            reason="cancelled",
+        )
 
     return ToolResult(
-        ok=completed.returncode == 0,
-        output=_format_command_output(completed.returncode, completed.stdout, completed.stderr),
+        ok=result.returncode == 0,
+        output=_format_command_output(result.returncode or 0, result.stdout, result.stderr),
     )
 
 
