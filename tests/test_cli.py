@@ -5,7 +5,9 @@ import io
 import json
 import os
 import signal
+import sys
 import tempfile
+import textwrap
 import threading
 import time
 import unittest
@@ -544,6 +546,72 @@ class CliTests(unittest.TestCase):
         output = stream.getvalue()
         self.assertIn("show_python_version", output)
         self.assertIn("config:project", output)
+
+    def test_cli_tools_list_closes_mcp_servers_on_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            marker = repo / "mcp-pid.txt"
+            server = repo / "sticky_mcp_server.py"
+            server.write_text(
+                textwrap.dedent(
+                    f"""
+                    import json
+                    import os
+                    from pathlib import Path
+                    import sys
+                    import time
+
+                    Path({str(marker)!r}).write_text(str(os.getpid()), encoding="utf-8")
+                    tools = [
+                        {{
+                            "name": "echo",
+                            "description": "Echo.",
+                            "inputSchema": {{"type": "object", "properties": {{}}, "additionalProperties": False}},
+                        }}
+                    ]
+                    for line in sys.stdin:
+                        message = json.loads(line)
+                        method = message.get("method")
+                        request_id = message.get("id")
+                        if method == "initialize":
+                            result = {{"protocolVersion": "2024-11-05", "capabilities": {{"tools": {{}}}}}}
+                        elif method == "tools/list":
+                            result = {{"tools": tools}}
+                        elif method == "notifications/initialized":
+                            continue
+                        else:
+                            result = {{}}
+                        print(json.dumps({{"jsonrpc": "2.0", "id": request_id, "result": result}}), flush=True)
+                        if method == "tools/list":
+                            break
+                    while True:
+                        time.sleep(1)
+                    """
+                ),
+                encoding="utf-8",
+            )
+            config_dir = repo / ".paicli"
+            config_dir.mkdir()
+            (config_dir / "mcp.json").write_text(
+                json.dumps({"mcpServers": {"sticky": {"command": sys.executable, "args": [str(server)]}}}),
+                encoding="utf-8",
+            )
+            stream = io.StringIO()
+
+            with mock.patch.dict(
+                os.environ,
+                {"AGENTCLI_ENABLE_PROJECT_TOOLS": "1", "AGENTCLI_TOOL_CONFIGS": " "},
+                clear=True,
+            ):
+                with contextlib.redirect_stdout(stream):
+                    exit_code = main(["tools", "list", "--repo", str(repo)])
+
+            pid = int(marker.read_text(encoding="utf-8"))
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("mcp__sticky__echo", stream.getvalue())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
 
     def test_cli_run_and_tools_use_same_dynamic_tool_environment_flags(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

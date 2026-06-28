@@ -291,47 +291,50 @@ def main(argv: Sequence[str] | None = None) -> int:
         worker = threading.Thread(target=run_in_background, name="agentcli-run", daemon=True)
         worker.start()
         try:
-            result_kind, result_payload = result_queue.get()
-        except KeyboardInterrupt:
-            interrupted = True
-            cancellation_token.cancel("keyboard_interrupt")
             try:
-                result_kind, result_payload = result_queue.get(timeout=max(0, config.tool_shutdown_grace_seconds))
-            except (KeyboardInterrupt, Empty):
-                print("Cancelled.", file=sys.stderr)
-                return 130
-        if result_kind == "error":
-            if isinstance(result_payload, KeyboardInterrupt):
+                result_kind, result_payload = result_queue.get()
+            except KeyboardInterrupt:
+                interrupted = True
                 cancellation_token.cancel("keyboard_interrupt")
-                print("Cancelled.", file=sys.stderr)
+                try:
+                    result_kind, result_payload = result_queue.get(timeout=max(0, config.tool_shutdown_grace_seconds))
+                except (KeyboardInterrupt, Empty):
+                    print("Cancelled.", file=sys.stderr)
+                    return 130
+            if result_kind == "error":
+                if isinstance(result_payload, KeyboardInterrupt):
+                    cancellation_token.cancel("keyboard_interrupt")
+                    print("Cancelled.", file=sys.stderr)
+                    return 130
+                if isinstance(result_payload, (RuntimeError, ValueError)):
+                    print(f"Error: {result_payload}", file=sys.stderr)
+                    return 1
+                if isinstance(result_payload, BaseException):
+                    raise result_payload
+                raise RuntimeError(result_payload)
+            final_state = result_payload
+            print(_section("Plan", final_state.plan))
+            print()
+            print(_section("Review", final_state.review))
+            print()
+            print(_section("Final summary", final_state.final_answer))
+            print()
+            print(f"Trace: {final_state.trace_path}")
+            if interrupted:
                 return 130
-            if isinstance(result_payload, (RuntimeError, ValueError)):
-                print(f"Error: {result_payload}", file=sys.stderr)
+            if getattr(final_state, "stop_reason", "") in {
+                "plan_failed",
+                "plan_validation_failed",
+                "plan_cancelled",
+                "team_failed",
+                "team_validation_failed",
+                "team_cancelled",
+                "team_planner_failed",
+            }:
                 return 1
-            if isinstance(result_payload, BaseException):
-                raise result_payload
-            raise RuntimeError(result_payload)
-        final_state = result_payload
-        print(_section("Plan", final_state.plan))
-        print()
-        print(_section("Review", final_state.review))
-        print()
-        print(_section("Final summary", final_state.final_answer))
-        print()
-        print(f"Trace: {final_state.trace_path}")
-        if interrupted:
-            return 130
-        if getattr(final_state, "stop_reason", "") in {
-            "plan_failed",
-            "plan_validation_failed",
-            "plan_cancelled",
-            "team_failed",
-            "team_validation_failed",
-            "team_cancelled",
-            "team_planner_failed",
-        }:
-            return 1
-        return 0
+            return 0
+        finally:
+            _close_mcp_servers()
 
     if args.command == "chat":
         try:
@@ -339,13 +342,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             config = _with_hitl_flag(config, args.hitl)
             repo_path = _resolve_repo_path(args.repo)
             trace_dir = _resolve_trace_dir(args.trace_dir, config.trace_dir)
-            return AgentRepl(
-                repo_path=repo_path,
-                config=config,
-                trace_dir=trace_dir,
-                mode=args.mode or config.agent_mode,
-                test_command=args.test_command,
-            ).run(show_banner=not args.no_banner)
+            try:
+                repl = AgentRepl(
+                    repo_path=repo_path,
+                    config=config,
+                    trace_dir=trace_dir,
+                    mode=args.mode or config.agent_mode,
+                    test_command=args.test_command,
+                )
+                return repl.run(show_banner=not args.no_banner)
+            finally:
+                _close_mcp_servers()
         except (FileNotFoundError, ValueError, RuntimeError) as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 1
@@ -425,6 +432,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "plan_max_parallel_tasks": config.plan_max_parallel_tasks,
                     "plan_task_batch_timeout_seconds": config.plan_task_batch_timeout_seconds,
                     "team_step_batch_timeout_seconds": config.team_step_batch_timeout_seconds,
+                    "mcp_enabled": config.mcp_enabled,
+                    "mcp_startup_wait_seconds": config.mcp_startup_wait_seconds,
+                    "mcp_initialize_timeout_seconds": config.mcp_initialize_timeout_seconds,
+                    "mcp_call_timeout_seconds": config.mcp_call_timeout_seconds,
+                    "mcp_max_startup_workers": config.mcp_max_startup_workers,
+                    "mcp_require_approval": config.mcp_require_approval,
+                    "mcp_enable_project_servers": config.mcp_enable_project_servers,
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -493,31 +507,33 @@ def _handle_tools_command(args: argparse.Namespace) -> int:
         config = AgentConfig.from_env(env=_tool_environment_overrides(os.environ), require_env_file=False)
         repo_path = _resolve_repo_path(args.repo)
         tools = RepoTools(repo_path, timeout=config.command_timeout, config=config)
+
+        if args.tools_command == "list":
+            print("name\tsource\trisk\tenabled\tdescription")
+            for tool in tools.registry.tools:
+                print(
+                    "\t".join(
+                        [
+                            tool.spec.name,
+                            tool.spec.source,
+                            tool.spec.risk.value,
+                            "yes" if tool.spec.enabled else "no",
+                            tool.spec.description,
+                        ]
+                    )
+                )
+            return 0
+
+        if args.tools_command == "validate":
+            print(f"Tools validation OK: {len(tools.registry.tools)} tools loaded.")
+            return 0
+
+        raise ValueError(f"Unknown tools command: {args.tools_command}")
     except (FileNotFoundError, ValueError, RuntimeError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
-
-    if args.tools_command == "list":
-        print("name\tsource\trisk\tenabled\tdescription")
-        for tool in tools.registry.tools:
-            print(
-                "\t".join(
-                    [
-                        tool.spec.name,
-                        tool.spec.source,
-                        tool.spec.risk.value,
-                        "yes" if tool.spec.enabled else "no",
-                        tool.spec.description,
-                    ]
-                )
-            )
-        return 0
-
-    if args.tools_command == "validate":
-        print(f"Tools validation OK: {len(tools.registry.tools)} tools loaded.")
-        return 0
-
-    raise ValueError(f"Unknown tools command: {args.tools_command}")
+    finally:
+        _close_mcp_servers()
 
 
 def _tool_environment_overrides(env: Mapping[str, str]) -> dict[str, str]:
@@ -619,8 +635,28 @@ def _tool_environment_overrides(env: Mapping[str, str]) -> dict[str, str]:
         "MY_AGENT_PLAN_TASK_BATCH_TIMEOUT_SECONDS",
         "AGENTCLI_TEAM_STEP_BATCH_TIMEOUT_SECONDS",
         "MY_AGENT_TEAM_STEP_BATCH_TIMEOUT_SECONDS",
+        "AGENTCLI_MCP",
+        "MY_AGENT_MCP",
+        "AGENTCLI_MCP_STARTUP_WAIT_SECONDS",
+        "MY_AGENT_MCP_STARTUP_WAIT_SECONDS",
+        "AGENTCLI_MCP_INITIALIZE_TIMEOUT_SECONDS",
+        "MY_AGENT_MCP_INITIALIZE_TIMEOUT_SECONDS",
+        "AGENTCLI_MCP_CALL_TIMEOUT_SECONDS",
+        "MY_AGENT_MCP_CALL_TIMEOUT_SECONDS",
+        "AGENTCLI_MCP_MAX_STARTUP_WORKERS",
+        "MY_AGENT_MCP_MAX_STARTUP_WORKERS",
+        "AGENTCLI_MCP_REQUIRE_APPROVAL",
+        "MY_AGENT_MCP_REQUIRE_APPROVAL",
+        "AGENTCLI_MCP_ENABLE_PROJECT_SERVERS",
+        "MY_AGENT_MCP_ENABLE_PROJECT_SERVERS",
     }
     return {key: env[key] for key in keys if key in env}
+
+
+def _close_mcp_servers() -> None:
+    from my_agent.mcp.manager import McpServerManagerPool
+
+    McpServerManagerPool.close_all()
 
 
 def _with_hitl_flag(config: AgentConfig, enabled: bool | None) -> AgentConfig:

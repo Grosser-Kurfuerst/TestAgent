@@ -114,12 +114,14 @@ class RepoTools:
         self.registry.load_source(BuiltinToolSource(self), self.context)
 
     def _register_dynamic_sources(self) -> None:
+        from my_agent.mcp.source import McpToolSource
         from my_agent.tools.config_source import ConfigToolSource
         from my_agent.tools.plugin_source import PluginToolSource
 
         for source in ConfigToolSource.sources_for(self.repo_root, self.config):
             self.registry.load_source(source, self.context)
         self.registry.load_source(PluginToolSource(self.repo_root, self.config), self.context)
+        self.registry.load_source(McpToolSource(self.repo_root, self.config), self.context)
 
     def _list_files(self, arguments: dict[str, Any], context: ToolContext | None = None) -> ToolResult:
         context = context or self.context

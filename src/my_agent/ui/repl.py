@@ -211,9 +211,14 @@ class AgentRepl:
         if self._shutdown_complete:
             return
         self._shutdown_complete = True
-        self._cancel_current_task(shutting_down=True)
-        self._run_executor.shutdown(wait=False, cancel_futures=True)
-        self._memory.extract_facts(reason="session_end")
+        try:
+            self._cancel_current_task(shutting_down=True)
+            self._run_executor.shutdown(wait=False, cancel_futures=True)
+            self._memory.extract_facts(reason="session_end")
+        finally:
+            from my_agent.mcp.manager import McpServerManagerPool
+
+            McpServerManagerPool.close_all()
 
     def _run_task(self, text: str, *, mode: AgentMode | None = None) -> None:
         self._collect_current_task(wait=False)

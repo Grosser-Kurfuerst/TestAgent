@@ -239,6 +239,13 @@ class AgentConfigTests(unittest.TestCase):
         self.assertEqual(config.plan_max_parallel_tasks, 4)
         self.assertEqual(config.plan_task_batch_timeout_seconds, 1_800)
         self.assertEqual(config.team_step_batch_timeout_seconds, 1_800)
+        self.assertTrue(config.mcp_enabled)
+        self.assertEqual(config.mcp_startup_wait_seconds, 8)
+        self.assertEqual(config.mcp_initialize_timeout_seconds, 60)
+        self.assertEqual(config.mcp_call_timeout_seconds, 60)
+        self.assertEqual(config.mcp_max_startup_workers, 8)
+        self.assertTrue(config.mcp_require_approval)
+        self.assertTrue(config.mcp_enable_project_servers)
 
     def test_parallel_config_loaded_from_env_mapping(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -267,6 +274,32 @@ class AgentConfigTests(unittest.TestCase):
         self.assertEqual(config.plan_max_parallel_tasks, 2)
         self.assertEqual(config.plan_task_batch_timeout_seconds, 30)
         self.assertEqual(config.team_step_batch_timeout_seconds, 40)
+
+    def test_mcp_config_loaded_from_env_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / ".env"
+            env_file.write_text("", encoding="utf-8")
+
+            config = AgentConfig.from_env(
+                env={
+                    "AGENTCLI_MCP": "0",
+                    "AGENTCLI_MCP_STARTUP_WAIT_SECONDS": "0",
+                    "AGENTCLI_MCP_INITIALIZE_TIMEOUT_SECONDS": "7",
+                    "AGENTCLI_MCP_CALL_TIMEOUT_SECONDS": "8",
+                    "AGENTCLI_MCP_MAX_STARTUP_WORKERS": "2",
+                    "AGENTCLI_MCP_REQUIRE_APPROVAL": "false",
+                    "AGENTCLI_MCP_ENABLE_PROJECT_SERVERS": "0",
+                },
+                env_file=env_file,
+            )
+
+        self.assertFalse(config.mcp_enabled)
+        self.assertEqual(config.mcp_startup_wait_seconds, 0)
+        self.assertEqual(config.mcp_initialize_timeout_seconds, 7)
+        self.assertEqual(config.mcp_call_timeout_seconds, 8)
+        self.assertEqual(config.mcp_max_startup_workers, 2)
+        self.assertFalse(config.mcp_require_approval)
+        self.assertFalse(config.mcp_enable_project_servers)
 
     def test_memory_config_loaded_from_env_mapping(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

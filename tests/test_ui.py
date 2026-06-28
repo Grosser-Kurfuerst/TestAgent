@@ -102,6 +102,26 @@ class ReplTests(unittest.TestCase):
         self.assertIn("Latest trace: none", text)
         self.assertEqual(errors.getvalue(), "")
 
+    def test_repl_shutdown_closes_mcp_manager_pool(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / "sample.py").write_text("x = 1\n", encoding="utf-8")
+            output = io.StringIO()
+            errors = io.StringIO()
+            repl = AgentRepl(
+                repo_path=repo,
+                config=fake_config(repo / "traces"),
+                trace_dir=repo / "traces",
+                renderer=PlainRenderer(output=output, errors=errors),
+                input_stream=io.StringIO("/quit\n"),
+            )
+
+            with mock.patch("my_agent.mcp.manager.McpServerManagerPool.close_all") as close_all:
+                exit_code = repl.run(show_banner=False)
+
+        self.assertEqual(exit_code, 0)
+        close_all.assert_called_once()
+
     def test_hitl_command_toggles_session_approval_and_tools_text(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)

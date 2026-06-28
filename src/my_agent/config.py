@@ -94,6 +94,15 @@ class AgentConfig:
     plan_task_batch_timeout_seconds: int = 1_800
     team_step_batch_timeout_seconds: int = 1_800
 
+    # MCP dynamic tool integration defaults.
+    mcp_enabled: bool = True
+    mcp_startup_wait_seconds: int = 8
+    mcp_initialize_timeout_seconds: int = 60
+    mcp_call_timeout_seconds: int = 60
+    mcp_max_startup_workers: int = 8
+    mcp_require_approval: bool = True
+    mcp_enable_project_servers: bool = True
+
     @classmethod
     def from_env(
         cls,
@@ -281,6 +290,37 @@ class AgentConfig:
                     values.get("MY_AGENT_TEAM_STEP_BATCH_TIMEOUT_SECONDS"),
                 ),
                 1_800,
+            ),
+            mcp_enabled=_as_bool(values.get("AGENTCLI_MCP", values.get("MY_AGENT_MCP", "")), default=True),
+            mcp_startup_wait_seconds=_as_nonnegative_int(
+                values.get("AGENTCLI_MCP_STARTUP_WAIT_SECONDS", values.get("MY_AGENT_MCP_STARTUP_WAIT_SECONDS")),
+                8,
+            ),
+            mcp_initialize_timeout_seconds=_as_positive_int(
+                values.get(
+                    "AGENTCLI_MCP_INITIALIZE_TIMEOUT_SECONDS",
+                    values.get("MY_AGENT_MCP_INITIALIZE_TIMEOUT_SECONDS"),
+                ),
+                60,
+            ),
+            mcp_call_timeout_seconds=_as_positive_int(
+                values.get("AGENTCLI_MCP_CALL_TIMEOUT_SECONDS", values.get("MY_AGENT_MCP_CALL_TIMEOUT_SECONDS")),
+                60,
+            ),
+            mcp_max_startup_workers=_as_positive_int(
+                values.get("AGENTCLI_MCP_MAX_STARTUP_WORKERS", values.get("MY_AGENT_MCP_MAX_STARTUP_WORKERS")),
+                8,
+            ),
+            mcp_require_approval=_as_bool(
+                values.get("AGENTCLI_MCP_REQUIRE_APPROVAL", values.get("MY_AGENT_MCP_REQUIRE_APPROVAL", "")),
+                default=True,
+            ),
+            mcp_enable_project_servers=_as_bool(
+                values.get(
+                    "AGENTCLI_MCP_ENABLE_PROJECT_SERVERS",
+                    values.get("MY_AGENT_MCP_ENABLE_PROJECT_SERVERS", ""),
+                ),
+                default=True,
             ),
         )
 
