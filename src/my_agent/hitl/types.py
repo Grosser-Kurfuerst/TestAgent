@@ -47,6 +47,8 @@ class ApprovalRequest:
             f"Risk: {self.risk_level.value} - {self.risk_description}",
             f"Arguments: {self.arguments_json}",
         ]
+        if self.server_name:
+            parts.insert(2, f"MCP server: {self.server_name}")
         if self.suggestion:
             parts.append(f"Suggestion: {self.suggestion}")
         if self.caller_context:

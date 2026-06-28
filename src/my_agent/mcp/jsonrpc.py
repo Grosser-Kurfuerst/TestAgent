@@ -42,7 +42,7 @@ class JsonRpcClient:
         if params is not None:
             message["params"] = params
         try:
-            self.transport.send(message)
+            self.transport.send(message, timeout_seconds=timeout_seconds)
             if not pending.event.wait(timeout=max(0.001, timeout_seconds)):
                 with self._pending_lock:
                     self._pending.pop(str(request_id), None)

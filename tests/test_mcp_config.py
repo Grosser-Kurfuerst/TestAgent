@@ -131,6 +131,29 @@ class McpConfigLoaderTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "command must be a string"):
             loader.prepare(loaded["bad"])
 
+    def test_prepare_requires_exactly_one_transport(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            config_path = project / "mcp.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "mcpServers": {
+                            "both": {"command": "python", "url": "http://127.0.0.1/mcp"},
+                            "neither": {},
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            loader = McpConfigLoader(project, user_config=project / "none.json", project_config=config_path)
+            loaded = loader.load()
+
+        with self.assertRaisesRegex(ValueError, "exactly one of command or url"):
+            loader.prepare(loaded["both"])
+        with self.assertRaisesRegex(ValueError, "exactly one of command or url"):
+            loader.prepare(loaded["neither"])
+
     def test_mask_sensitive_values(self) -> None:
         masked = mask_sensitive_values({"Authorization": "Bearer x", "NODE_OPTIONS": "--max=1", "api_key": "secret"})
 

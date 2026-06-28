@@ -16,11 +16,13 @@ from my_agent.mcp.jsonrpc import JsonRpcClient, JsonRpcError
 class InMemoryTransport:
     def __init__(self) -> None:
         self.sent: list[dict[str, object]] = []
+        self.timeouts: list[int | None] = []
         self.listeners = []
         self.closed = False
 
-    def send(self, message: dict[str, object]) -> None:
+    def send(self, message: dict[str, object], *, timeout_seconds: int | None = None) -> None:
         self.sent.append(message)
+        self.timeouts.append(timeout_seconds)
 
     def on_receive(self, callback) -> None:
         self.listeners.append(callback)
@@ -59,6 +61,7 @@ class JsonRpcClientTests(unittest.TestCase):
 
         self.assertEqual(result, {"ok": True})
         self.assertEqual(transport.sent[0]["method"], "ping")
+        self.assertEqual(transport.timeouts[0], 1)
 
     def test_request_raises_jsonrpc_error(self) -> None:
         transport = InMemoryTransport()

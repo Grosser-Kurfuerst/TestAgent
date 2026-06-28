@@ -114,6 +114,8 @@ def format_approval_box(request: ApprovalRequest, *, width: int = 72) -> str:
     lines = [top]
     title = f"HITL approval: {request.tool_name}"
     lines.append(f"| {pad_right_display(truncate_display(title, inner_width), inner_width)} |")
+    if request.server_name:
+        lines.append(f"| {pad_right_display(truncate_display('MCP server: ' + request.server_name, inner_width), inner_width)} |")
     lines.append(f"| {pad_right_display(truncate_display('Risk: ' + request.risk_level.value, inner_width), inner_width)} |")
     lines.append(f"| {pad_right_display(truncate_display(request.risk_description, inner_width), inner_width)} |")
     if request.sensitive_notice:

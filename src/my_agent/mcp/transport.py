@@ -6,14 +6,16 @@ from pathlib import Path
 import subprocess
 import threading
 from typing import Callable, Mapping, Protocol, Sequence
+from urllib import request as urllib_request
 
 
 JsonMessage = dict[str, object]
 ReceiveCallback = Callable[[JsonMessage], None]
+MCP_PROTOCOL_VERSION = "2024-11-05"
 
 
 class McpTransport(Protocol):
-    def send(self, message: JsonMessage) -> None:
+    def send(self, message: JsonMessage, *, timeout_seconds: int | None = None) -> None:
         ...
 
     def on_receive(self, callback: ReceiveCallback) -> None:
@@ -78,7 +80,7 @@ class StdioTransport:
         self._stdout_thread.start()
         self._stderr_thread.start()
 
-    def send(self, message: JsonMessage) -> None:
+    def send(self, message: JsonMessage, *, timeout_seconds: int | None = None) -> None:
         with self._send_lock:
             if self._closed:
                 raise OSError("MCP stdio transport already closed.")
@@ -182,3 +184,162 @@ class StdioTransport:
                 close()
             except OSError:
                 pass
+
+
+class StreamableHttpTransport:
+    def __init__(
+        self,
+        url: str,
+        headers: Mapping[str, str] | None = None,
+        *,
+        timeout_seconds: int = 60,
+    ) -> None:
+        self.url = url
+        self.headers = dict(headers or {})
+        self.timeout_seconds = max(1, int(timeout_seconds or 60))
+        self._callbacks: list[ReceiveCallback] = []
+        self._callbacks_lock = threading.Lock()
+        self._send_lock = threading.Lock()
+        self._stderr_ring: deque[str] = deque(maxlen=200)
+        self._stderr_lock = threading.Lock()
+        self._session_id = ""
+        self._closed = False
+
+    @property
+    def session_id(self) -> str:
+        return self._session_id
+
+    def send(self, message: JsonMessage, *, timeout_seconds: int | None = None) -> None:
+        data = json.dumps(message, ensure_ascii=False).encode("utf-8")
+        with self._send_lock:
+            if self._closed:
+                raise OSError("MCP HTTP transport already closed.")
+            headers = self._request_headers()
+        request = urllib_request.Request(
+            self.url,
+            data=data,
+            headers=headers,
+            method="POST",
+        )
+        with urllib_request.urlopen(  # noqa: S310 - user-configured MCP endpoint
+            request,
+            timeout=_positive_timeout(timeout_seconds, self.timeout_seconds),
+        ) as response:
+            session_id = response.headers.get("Mcp-Session-Id")
+            body = response.read().decode("utf-8", errors="replace")
+            content_type = response.headers.get("Content-Type", "")
+        self._remember_session(session_id)
+        self._handle_response(body, content_type)
+
+    def on_receive(self, callback: ReceiveCallback) -> None:
+        with self._callbacks_lock:
+            self._callbacks.append(callback)
+
+    def stderr_lines(self) -> list[str]:
+        with self._stderr_lock:
+            return list(self._stderr_ring)
+
+    def process_id(self) -> int | None:
+        return None
+
+    def transport_name(self) -> str:
+        return "http"
+
+    def close(self) -> None:
+        with self._send_lock:
+            if self._closed:
+                return
+            self._closed = True
+            if not self._session_id:
+                return
+            headers = self._request_headers(include_content_type=False)
+            request = urllib_request.Request(
+                self.url,
+                headers=headers,
+                method="DELETE",
+            )
+        try:
+            with urllib_request.urlopen(request, timeout=min(self.timeout_seconds, 1)):  # noqa: S310 - user-configured MCP endpoint
+                pass
+        except Exception as exc:  # noqa: BLE001 - close must not block shutdown
+            self._append_stderr(f"[agentcli] MCP HTTP DELETE failed: {type(exc).__name__}: {exc}")
+
+    def _request_headers(self, *, include_content_type: bool = True) -> dict[str, str]:
+        headers = {
+            "Accept": "application/json, text/event-stream",
+            "MCP-Protocol-Version": MCP_PROTOCOL_VERSION,
+            **self.headers,
+        }
+        if include_content_type:
+            headers["Content-Type"] = "application/json"
+        if self._session_id:
+            headers["Mcp-Session-Id"] = self._session_id
+        return headers
+
+    def _remember_session(self, value: str | None) -> None:
+        if value and value.strip():
+            with self._send_lock:
+                if not self._closed:
+                    self._session_id = value.strip()
+
+    def _handle_response(self, body: str, content_type: str) -> None:
+        if not body.strip():
+            return
+        if "text/event-stream" in content_type.lower():
+            for payload in _sse_data_messages(body):
+                self._dispatch_json(payload)
+            return
+        self._dispatch_json(body)
+
+    def _dispatch_json(self, payload: str) -> None:
+        try:
+            message = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            self._append_stderr(f"[agentcli] invalid MCP HTTP JSON: {exc}: {payload.strip()}")
+            return
+        if isinstance(message, list):
+            for item in message:
+                if isinstance(item, dict):
+                    self._dispatch(item)
+                else:
+                    self._append_stderr(f"[agentcli] ignored non-object MCP HTTP batch item: {item!r}")
+            return
+        if not isinstance(message, dict):
+            self._append_stderr(f"[agentcli] ignored non-object MCP HTTP message: {payload.strip()}")
+            return
+        self._dispatch(message)
+
+    def _dispatch(self, message: JsonMessage) -> None:
+        with self._callbacks_lock:
+            callbacks = list(self._callbacks)
+        for callback in callbacks:
+            callback(message)
+
+    def _append_stderr(self, line: str) -> None:
+        with self._stderr_lock:
+            self._stderr_ring.append(line)
+
+
+def _sse_data_messages(body: str) -> list[str]:
+    messages: list[str] = []
+    current: list[str] = []
+    for raw_line in body.splitlines():
+        line = raw_line.rstrip("\r")
+        if not line:
+            if current:
+                messages.append("\n".join(current))
+                current = []
+            continue
+        if line.startswith(":"):
+            continue
+        if line.startswith("data:"):
+            current.append(line[5:].lstrip())
+    if current:
+        messages.append("\n".join(current))
+    return messages
+
+
+def _positive_timeout(value: int | None, default: int) -> int:
+    if value is None:
+        return max(1, int(default or 60))
+    return max(1, int(value or default or 60))

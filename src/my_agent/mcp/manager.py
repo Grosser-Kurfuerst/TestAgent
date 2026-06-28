@@ -12,7 +12,7 @@ from my_agent.mcp.client import McpClient
 from my_agent.mcp.config import McpConfigLoader, McpServerConfig
 from my_agent.mcp.protocol import McpToolDescriptor
 from my_agent.mcp.server import McpServer, McpServerStatus
-from my_agent.mcp.transport import McpTransport, StdioTransport
+from my_agent.mcp.transport import McpTransport, StdioTransport, StreamableHttpTransport
 from my_agent.schema import ToolResult
 
 
@@ -40,6 +40,7 @@ class McpServerManager:
         self._lock = threading.RLock()
         self._started = False
         self._closed = False
+        self._startup_threads: list[threading.Thread] = []
 
     def load_configured_servers(self) -> None:
         with self._lock:
@@ -49,26 +50,24 @@ class McpServerManager:
             }
             self._tool_index = {}
             self._started = False
+            self._startup_threads = []
 
     def start_all(self, max_wait_seconds: int | float | None = None) -> None:
         with self._lock:
-            if self._started:
-                return
             self._closed = False
             if not self.servers:
                 self.load_configured_servers()
-            targets = list(self.servers.values())
-            self._started = True
-        if max_wait_seconds is None:
-            for server in targets:
-                self.start(server.name)
-            with self._lock:
-                self._rebuild_tool_index()
-            return
+            if not self._started:
+                targets = list(self.servers.values())
+                self._started = True
+                self._startup_threads = self._start_background_workers(targets)
+            threads = list(self._startup_threads)
 
-        threads = self._start_background_workers(targets)
-        deadline = time.monotonic() + max(0.0, float(max_wait_seconds))
+        deadline = None if max_wait_seconds is None else time.monotonic() + max(0.0, float(max_wait_seconds))
         for thread in threads:
+            if deadline is None:
+                thread.join()
+                continue
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
@@ -215,12 +214,17 @@ class McpServerManager:
             servers = list(self.servers.values())
             self._tool_index = {}
             self._started = False
+            self._startup_threads = []
         for server in servers:
             server.close()
 
     def _create_transport(self, config: McpServerConfig) -> McpTransport:
         if config.is_http:
-            raise NotImplementedError("Streamable HTTP MCP transport is not implemented in phase 9.1.")
+            return StreamableHttpTransport(
+                config.url,
+                headers=config.headers or {},
+                timeout_seconds=int(getattr(self.config, "mcp_call_timeout_seconds", 60) or 60),
+            )
         return StdioTransport(config.command, config.args, config.env or {}, cwd=self.repo_root)
 
     def _rebuild_tool_index(self) -> None:
@@ -239,15 +243,12 @@ class McpServerManagerPool:
     @classmethod
     def get(cls, repo_root: str | Path, config: Any | None = None) -> McpServerManager:
         key = (Path(repo_root).resolve(), _config_signature(config))
-        should_start = False
         with cls._lock:
             manager = cls._managers.get(key)
             if manager is None:
                 manager = McpServerManager(key[0], config)
                 cls._managers[key] = manager
-                should_start = True
-        if should_start:
-            manager.start_all(max_wait_seconds=_startup_wait_seconds(config))
+        manager.start_all(max_wait_seconds=_startup_wait_seconds(config))
         return manager
 
     @classmethod

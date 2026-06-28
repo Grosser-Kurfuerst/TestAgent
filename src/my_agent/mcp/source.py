@@ -25,7 +25,7 @@ class McpToolSource(ToolSource):
         else:
             manager = McpServerManagerPool.get(self.repo_root, self.config)
         registrations: list[ToolRegistration] = []
-        for descriptor in manager.tool_descriptors():
+        for descriptor in manager.ready_tools():
             registrations.append(self._registration_for(manager, descriptor))
         return registrations
 

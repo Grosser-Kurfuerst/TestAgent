@@ -55,6 +55,22 @@ class StaticApprovalPolicy:
         arguments: dict[str, object],
         context: ToolContext,
     ) -> PolicyDecision:
+        if _is_mcp_tool(registered_tool):
+            if not bool(getattr(context.config, "mcp_require_approval", True)):
+                return PolicyDecision(
+                    allowed=True,
+                    requires_approval=False,
+                    risk_level=RiskLevel.MEDIUM,
+                    description="MCP tool approval disabled by configuration.",
+                )
+            return PolicyDecision(
+                allowed=True,
+                requires_approval=True,
+                risk_level=RiskLevel.MEDIUM,
+                reason="MCP tools require approval by default.",
+                description="External MCP tool may access files, network, or third-party services.",
+            )
+
         risk = registered_tool.spec.risk
         if risk == ToolRisk.READ:
             return PolicyDecision(
@@ -111,3 +127,8 @@ class StaticApprovalPolicy:
         if not self.judge_enabled:
             return static
         return self.judge.judge(registered_tool, arguments, static)
+
+
+def _is_mcp_tool(registered_tool: RegisteredTool) -> bool:
+    source = registered_tool.spec.source
+    return registered_tool.spec.name.startswith("mcp__") or source.startswith("mcp:")

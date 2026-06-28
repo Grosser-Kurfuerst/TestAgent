@@ -23,6 +23,7 @@ class AuditEntry:
     outcome: str
     reason: str
     elapsed_ms: int
+    server_name: str = ""
 
 
 @dataclass(frozen=True)

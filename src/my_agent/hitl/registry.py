@@ -165,6 +165,7 @@ class HitlToolRegistry(ToolRegistry):
         )
 
     def _request_approval(self, ctx: _HitlCallContext, decision: PolicyDecision) -> ApprovalResult:
+        server_name = mcp_server_name(ctx.tool.spec.name)
         request = ApprovalRequest(
             request_id=ctx.request_id,
             run_id=self.run_id,
@@ -173,7 +174,7 @@ class HitlToolRegistry(ToolRegistry):
             arguments_json=json.dumps(ctx.arguments, ensure_ascii=False),
             risk_level=decision.risk_level,
             risk_description=decision.description or decision.reason,
-            server_name="",
+            server_name=server_name,
         )
         self._emit(
             "approval.requested",
@@ -182,6 +183,7 @@ class HitlToolRegistry(ToolRegistry):
                 "run_id": request.run_id,
                 "tool_call_id": request.tool_call_id,
                 "tool_name": request.tool_name,
+                "server_name": request.server_name,
                 "risk_level": request.risk_level.value,
                 "reason": decision.reason,
                 "arguments_summary": summarize_arguments(ctx.arguments),
@@ -195,6 +197,7 @@ class HitlToolRegistry(ToolRegistry):
                 "run_id": request.run_id,
                 "tool_call_id": request.tool_call_id,
                 "tool_name": request.tool_name,
+                "server_name": request.server_name,
                 "decision": approval.decision.value,
                 "scope": approval.scope.value,
                 "modified": approval.decision == ApprovalDecision.MODIFIED,
@@ -418,6 +421,7 @@ class HitlToolRegistry(ToolRegistry):
                 outcome=outcome,
                 reason=reason,
                 elapsed_ms=_elapsed_ms(started),
+                server_name=mcp_server_name(tool.spec.name),
             )
         )
         if not result.ok:
@@ -428,6 +432,7 @@ class HitlToolRegistry(ToolRegistry):
                     "run_id": self.run_id,
                     "tool_call_id": invocation.id,
                     "tool_name": tool.spec.name,
+                    "server_name": mcp_server_name(tool.spec.name),
                     "error": result.error,
                 },
             )
@@ -462,3 +467,10 @@ def _policy_reason_from_result(result: ToolExecutionResult) -> str:
     if result.content.startswith(prefix):
         return result.content[len(prefix) :]
     return result.content
+
+
+def mcp_server_name(tool_name: str) -> str:
+    if not tool_name.startswith("mcp__"):
+        return ""
+    parts = tool_name.split("__", 2)
+    return parts[1] if len(parts) == 3 else ""
