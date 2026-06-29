@@ -22,6 +22,8 @@ from my_agent.data import (
     traces_to_sft,
 )
 from my_agent.indexer import RepoIndexer
+from my_agent.mcp.manager import McpServerManagerPool
+from my_agent.mcp.observability import format_mcp_disabled, format_mcp_logs, format_mcp_status
 from my_agent.runtime import run_agent
 from my_agent.stats import collect_trace_stats, format_trace_stats
 from my_agent.tools import RepoTools
@@ -139,6 +141,16 @@ def build_parser() -> argparse.ArgumentParser:
     tools_list_parser.add_argument("--repo", required=True, help="Target repository path.")
     tools_validate_parser = tools_subparsers.add_parser("validate", help="Validate tool configuration for a repository.")
     tools_validate_parser.add_argument("--repo", required=True, help="Target repository path.")
+
+    mcp_parser = subparsers.add_parser("mcp", help="Inspect MCP server status and logs.")
+    mcp_subparsers = mcp_parser.add_subparsers(dest="mcp_command", required=True)
+    mcp_status_parser = mcp_subparsers.add_parser("status", help="Show MCP server status for a repository.")
+    mcp_status_parser.add_argument("--repo", required=True, help="Target repository path.")
+    mcp_logs_parser = mcp_subparsers.add_parser("logs", help="Show recent MCP server stderr lines.")
+    mcp_logs_parser.add_argument("server", help="MCP server name.")
+    mcp_logs_parser.add_argument("--repo", required=True, help="Target repository path.")
+    mcp_reload_parser = mcp_subparsers.add_parser("reload", help="Reload MCP servers for a repository.")
+    mcp_reload_parser.add_argument("--repo", required=True, help="Target repository path.")
 
     _add_data_commands(subparsers)
 
@@ -449,6 +461,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "tools":
         return _handle_tools_command(args)
 
+    if args.command == "mcp":
+        return _handle_mcp_command(args)
+
     data_exit = _handle_data_command(args)
     if data_exit is not None:
         return data_exit
@@ -529,6 +544,40 @@ def _handle_tools_command(args: argparse.Namespace) -> int:
             return 0
 
         raise ValueError(f"Unknown tools command: {args.tools_command}")
+    except (FileNotFoundError, ValueError, RuntimeError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        _close_mcp_servers()
+
+
+def _handle_mcp_command(args: argparse.Namespace) -> int:
+    try:
+        config = AgentConfig.from_env(env=_tool_environment_overrides(os.environ), require_env_file=False)
+        repo_path = _resolve_repo_path(args.repo)
+        if not config.mcp_enabled:
+            if args.mcp_command == "logs":
+                print(format_mcp_logs(args.server, ["MCP is disabled."]))
+            else:
+                print(format_mcp_disabled())
+            return 0
+        manager = McpServerManagerPool.get(repo_path, config, start=args.mcp_command != "reload")
+
+        if args.mcp_command == "status":
+            print(format_mcp_status(manager.status_rows()))
+            return 0
+
+        if args.mcp_command == "logs":
+            print(format_mcp_logs(args.server, manager.logs(args.server)))
+            return 0
+
+        if args.mcp_command == "reload":
+            manager.reload(max_wait_seconds=config.mcp_startup_wait_seconds)
+            print("Reloaded MCP servers.")
+            print(format_mcp_status(manager.status_rows()))
+            return 0
+
+        raise ValueError(f"Unknown MCP command: {args.mcp_command}")
     except (FileNotFoundError, ValueError, RuntimeError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1

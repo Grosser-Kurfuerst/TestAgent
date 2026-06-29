@@ -14,6 +14,8 @@ from my_agent.hitl import SwitchableHitlHandler, TerminalHitlHandler
 from my_agent.llm import build_llm
 from my_agent.llm.types import Message
 from my_agent.memory import MemoryManager, MemoryScope
+from my_agent.mcp.manager import McpServerManager, McpServerManagerPool
+from my_agent.mcp.observability import format_mcp_disabled, format_mcp_logs, format_mcp_status, format_mcp_summary
 from my_agent.plan import AgentMode, PlanState, PlanTask, normalize_mode
 from my_agent.runtime import run_agent
 from my_agent.schema import AgentState
@@ -27,6 +29,10 @@ HELP_TEXT = """Commands:
 /help             Show this help.
 /tools            List enabled tools with source and risk.
 /tools reload     Reload tools from configuration and plugins.
+/mcp              Show MCP server status.
+/mcp status       Show MCP server status.
+/mcp logs <name>  Show recent MCP server stderr.
+/mcp reload       Reload MCP servers and tools.
 /context          Show memory and context budget estimates.
 /memory           Show memory system status and long-term entries.
 /save <fact>      Save a durable fact to long-term memory.
@@ -128,6 +134,9 @@ class AgentRepl:
             self._tools = self._load_tools()
             self.renderer.status(f"Reloaded {len(self._tools.registry.tools)} tools.")
             return False
+        if command == "/mcp" or command.startswith("/mcp "):
+            self._handle_mcp(command)
+            return False
         if command == "/context":
             self.renderer.status(self._context_text())
             return False
@@ -216,8 +225,6 @@ class AgentRepl:
             self._run_executor.shutdown(wait=False, cancel_futures=True)
             self._memory.extract_facts(reason="session_end")
         finally:
-            from my_agent.mcp.manager import McpServerManagerPool
-
             McpServerManagerPool.close_all()
 
     def _run_task(self, text: str, *, mode: AgentMode | None = None) -> None:
@@ -366,7 +373,7 @@ class AgentRepl:
                         tool.spec.name,
                         tool.spec.source,
                         tool.spec.risk.value,
-                        self._approval_label(tool.spec.risk.value),
+                        self._approval_label(source=tool.spec.source, risk=tool.spec.risk.value),
                         tool.spec.description,
                     ]
                 )
@@ -382,6 +389,7 @@ class AgentRepl:
                 f"short-term limit: {status.short_term_token_limit}",
                 f"long-term: {status.long_term_entries} entries, {status.long_term_tokens} tokens",
                 f"tools: {len(self._tools.tool_definitions())} definitions",
+                f"mcp: {self._mcp_summary()}",
                 f"default test command: {self.test_command or 'not configured'}",
                 f"compression trigger: {int(status.short_term_token_limit * status.compression_trigger_ratio)}",
                 f"retain recent turns: {status.retain_recent_turns}",
@@ -416,6 +424,37 @@ class AgentRepl:
                 f"- {entry.id} [{entry.type.value} {entry.scope.value} {entry.source} {timestamp}] {entry.content}"
             )
         return "\n".join(lines)
+
+    def _handle_mcp(self, command: str) -> None:
+        parts = command.split(maxsplit=2)
+        action = parts[1].lower() if len(parts) > 1 else "status"
+        if not self.config.mcp_enabled:
+            if action == "logs" and len(parts) >= 3 and parts[2].strip():
+                self.renderer.status(format_mcp_logs(parts[2].strip(), ["MCP is disabled."]))
+                return
+            self.renderer.status(format_mcp_disabled())
+            return
+        if action == "status":
+            self.renderer.status(format_mcp_status(self._mcp_manager().status_rows()))
+            return
+        if action == "logs":
+            if len(parts) < 3 or not parts[2].strip():
+                self.renderer.status("Usage: /mcp logs <server>")
+                return
+            server_name = parts[2].strip()
+            self.renderer.status(format_mcp_logs(server_name, self._mcp_manager().logs(server_name)))
+            return
+        if action == "reload":
+            manager = self._mcp_manager()
+            manager.reload(max_wait_seconds=self.config.mcp_startup_wait_seconds)
+            self._hitl_handler.clear_approved_all()
+            self._tools = self._load_tools()
+            self.renderer.status(
+                "Reloaded MCP servers and tools. Cleared HITL approve-all grants.\n"
+                f"{format_mcp_status(manager.status_rows())}"
+            )
+            return
+        self.renderer.status("Usage: /mcp [status|logs <server>|reload]")
 
     def _handle_save(self, command: str) -> None:
         content = command.removeprefix("/save").strip()
@@ -466,11 +505,23 @@ class AgentRepl:
             hitl_handler=self._hitl_handler,
         )
 
-    def _approval_label(self, risk: str) -> str:
+    def _mcp_manager(self) -> McpServerManager:
+        if not self.config.mcp_enabled:
+            raise RuntimeError("MCP is disabled.")
+        return McpServerManagerPool.get(self.repo_path, self.config)
+
+    def _mcp_summary(self) -> str:
+        if not self.config.mcp_enabled:
+            return "disabled"
+        return format_mcp_summary(self._mcp_manager().status_rows())
+
+    def _approval_label(self, *, source: str, risk: str) -> str:
         if risk == "read":
             return "none"
         if not self._hitl_handler.is_enabled():
             return "off"
+        if source.startswith("mcp:"):
+            return "ask" if self.config.mcp_require_approval else "none"
         if risk == "execute":
             return "ask"
         return self.config.hitl_medium_risk_mode

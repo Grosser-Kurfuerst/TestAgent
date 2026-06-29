@@ -241,14 +241,15 @@ class McpServerManagerPool:
     _managers: dict[tuple[Path, tuple[object, ...]], McpServerManager] = {}
 
     @classmethod
-    def get(cls, repo_root: str | Path, config: Any | None = None) -> McpServerManager:
+    def get(cls, repo_root: str | Path, config: Any | None = None, *, start: bool = True) -> McpServerManager:
         key = (Path(repo_root).resolve(), _config_signature(config))
         with cls._lock:
             manager = cls._managers.get(key)
             if manager is None:
                 manager = McpServerManager(key[0], config)
                 cls._managers[key] = manager
-        manager.start_all(max_wait_seconds=_startup_wait_seconds(config))
+        if start:
+            manager.start_all(max_wait_seconds=_startup_wait_seconds(config))
         return manager
 
     @classmethod

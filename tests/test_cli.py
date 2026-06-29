@@ -17,8 +17,10 @@ from unittest import mock
 
 try:
     from ._path import add_src_to_path
+    from .test_mcp_repl import mcp_server_config, write_fake_mcp_server_with_logs, write_mcp_config
 except ImportError:  # unittest discover -s tests imports modules as top-level files
     from _path import add_src_to_path
+    from test_mcp_repl import mcp_server_config, write_fake_mcp_server_with_logs, write_mcp_config
 
 add_src_to_path()
 
@@ -612,6 +614,55 @@ class CliTests(unittest.TestCase):
         self.assertIn("mcp__sticky__echo", stream.getvalue())
         with self.assertRaises(ProcessLookupError):
             os.kill(pid, 0)
+
+    def test_cli_mcp_status_logs_and_reload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            marker = repo / "starts.txt"
+            script = write_fake_mcp_server_with_logs(repo)
+            write_mcp_config(repo, {"fake": mcp_server_config(script, env={"START_MARKER": str(marker)})})
+            status_stream = io.StringIO()
+            logs_stream = io.StringIO()
+            reload_stream = io.StringIO()
+
+            with mock.patch.dict(os.environ, {}, clear=True):
+                with contextlib.redirect_stdout(status_stream):
+                    status_exit = main(["mcp", "status", "--repo", str(repo)])
+                with contextlib.redirect_stdout(logs_stream):
+                    logs_exit = main(["mcp", "logs", "fake", "--repo", str(repo)])
+                with contextlib.redirect_stdout(reload_stream):
+                    reload_exit = main(["mcp", "reload", "--repo", str(repo)])
+            marker_text = marker.read_text(encoding="utf-8")
+
+        self.assertEqual(status_exit, 0)
+        self.assertEqual(logs_exit, 0)
+        self.assertEqual(reload_exit, 0)
+        self.assertIn("fake\tready\tstdio\t1", status_stream.getvalue())
+        self.assertIn("fake stderr ready", logs_stream.getvalue())
+        self.assertIn("Reloaded MCP servers.", reload_stream.getvalue())
+        self.assertIn("fake\tready\tstdio\t1", reload_stream.getvalue())
+        self.assertEqual(marker_text, "3")
+
+    def test_cli_mcp_disabled_does_not_start_servers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            marker = repo / "starts.txt"
+            script = write_fake_mcp_server_with_logs(repo)
+            write_mcp_config(repo, {"fake": mcp_server_config(script, env={"START_MARKER": str(marker)})})
+            status_stream = io.StringIO()
+            logs_stream = io.StringIO()
+
+            with mock.patch.dict(os.environ, {"AGENTCLI_MCP": "0"}, clear=True):
+                with contextlib.redirect_stdout(status_stream):
+                    status_exit = main(["mcp", "status", "--repo", str(repo)])
+                with contextlib.redirect_stdout(logs_stream):
+                    logs_exit = main(["mcp", "logs", "fake", "--repo", str(repo)])
+
+        self.assertEqual(status_exit, 0)
+        self.assertEqual(logs_exit, 0)
+        self.assertIn("MCP servers\n- disabled", status_stream.getvalue())
+        self.assertIn("MCP logs: fake\nMCP is disabled.", logs_stream.getvalue())
+        self.assertFalse(marker.exists())
 
     def test_cli_run_and_tools_use_same_dynamic_tool_environment_flags(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
