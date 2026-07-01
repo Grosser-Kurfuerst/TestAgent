@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import unittest
@@ -19,6 +20,7 @@ from my_agent.evaluation.agent_benchmark import (
     EvalResult,
     is_transient_llm_error,
     load_results_file,
+    record_benchmark_result,
     run_import_test_fallback,
     run_benchmark_with_config,
     run_pytest_or_fallback,
@@ -76,6 +78,40 @@ class AgentBenchmarkResultTests(unittest.TestCase):
 
         self.assertEqual([result.status for result in results], ["passed", "failed"])
         self.assertEqual(summarize_results(results)["passed"], 1)
+
+    def test_record_benchmark_result_appends_optional_evaluator_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trace = Path(tmp) / "trace.jsonl"
+            state = SimpleNamespace(trace_path=trace, run_id="run-1")
+
+            record_benchmark_result(
+                state,
+                benchmark="manifest",
+                task_id="t1",
+                status="failed",
+                scored=True,
+                test_command="python -m pytest -q",
+                test_output="visible failed",
+                task_valid=True,
+                initial_visible_ok=False,
+                visible_ok=True,
+                hidden_ok=False,
+                resolved=False,
+                failure_type="hidden_test_failed",
+                patch_apply_ok=True,
+                changed_files=["solution.py"],
+                patch_lines=12,
+            )
+
+            payload = json.loads(trace.read_text(encoding="utf-8").splitlines()[-1])["payload"]
+
+        self.assertEqual(payload["benchmark"], "manifest")
+        self.assertEqual(payload["status"], "failed")
+        self.assertTrue(payload["task_valid"])
+        self.assertFalse(payload["resolved"])
+        self.assertEqual(payload["failure_type"], "hidden_test_failed")
+        self.assertEqual(payload["changed_files"], ["solution.py"])
+        self.assertEqual(payload["patch_lines"], 12)
 
     def test_run_benchmark_can_summarize_full_results_file_on_resume(self) -> None:
         spec = BenchmarkSpec(

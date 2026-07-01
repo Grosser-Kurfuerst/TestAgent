@@ -74,6 +74,10 @@ def write_runtime_repo(repo: Path) -> None:
     )
 
 
+def read_trace(path: Path) -> list[dict[str, object]]:
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
 def agent_state(repo: Path, goal: str, *, test_command: str | None = None) -> AgentState:
     return AgentState.initial(repo_path=repo, task=goal, test_command=test_command)
 
@@ -610,9 +614,23 @@ class TeamAgentTests(unittest.TestCase):
 
             self.assertEqual(state.stop_reason, "team_completed")
             self.assertIn("return a - b", (repo / "calculator.py").read_text(encoding="utf-8"))
-            stored = TeamState.from_dict(json.loads(next((base / "traces" / "teams").glob("team_*.json")).read_text(encoding="utf-8")))
+            stored_path = next((base / "traces" / "teams").glob("team_*.json"))
+            stored = TeamState.from_dict(json.loads(stored_path.read_text(encoding="utf-8")))
             self.assertEqual(stored.status, TeamStatus.SUCCEEDED)
             self.assertEqual([item.status for item in stored.steps], [StepStatus.COMPLETED] * 3)
+            parent_events = read_trace(state.trace_path)
+            parent_event_names = [event["event"] for event in parent_events]
+            self.assertIn("agent.completed", parent_event_names)
+            phases = {
+                event["payload"].get("phase")
+                for event in parent_events
+                if event["event"] == "llm.completed"
+            }
+            self.assertIn("team_planner", phases)
+            self.assertIn("team_reviewer", phases)
+            agent_completed = [event for event in parent_events if event["event"] == "agent.completed"][-1]
+            self.assertEqual(agent_completed["payload"]["mode"], "team")
+            self.assertEqual(len(agent_completed["payload"]["child_trace_paths"]), 3)
             trace_paths = [Path(item.trace_path) for item in stored.steps]
             self.assertEqual(len(set(trace_paths)), 3)
             for trace_path in trace_paths:

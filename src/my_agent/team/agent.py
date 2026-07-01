@@ -25,7 +25,7 @@ from my_agent.team.rendering import render_team_final_answer, render_team_plan, 
 from my_agent.team.store import JsonTeamStore, TeamStore
 from my_agent.team.sub_agent import SubAgent
 from my_agent.team.types import AgentRole, ExecutionStep, ReviewDecision, StepStatus, TeamState, TeamStatus
-from my_agent.tracing import TraceWriter
+from my_agent.tracing import TraceWriter, append_agent_completed
 from my_agent.utils.numbers import positive_or_default
 from my_agent.utils.text import single_line, terminal_summary_text
 
@@ -107,12 +107,19 @@ class TeamAgent(AgentBase):
                     raise RuntimeError("Team execution requires repository context.")
                 repo_context = ctx.repo_snapshot.as_context()
                 memory_context = memory.build_context_for_query(goal).injected_text
+                planner_trace_snapshot = _set_trace_sink(
+                    self.planner,
+                    lambda event, payload: self._emit_trace(writer, state, event, payload),
+                )
                 try:
-                    team = self.planner.create_team_plan(
-                        goal,
-                        repo_context=repo_context,
-                        memory_context=memory_context,
-                    )
+                    try:
+                        team = self.planner.create_team_plan(
+                            goal,
+                            repo_context=repo_context,
+                            memory_context=memory_context,
+                        )
+                    finally:
+                        _restore_trace_sink(self.planner, planner_trace_snapshot)
                 except RuntimeError as exc:
                     team = TeamState.create(goal=goal, summary="Team planning failed.")
                     team.status = TeamStatus.FAILED
@@ -125,7 +132,7 @@ class TeamAgent(AgentBase):
                         "team.validation_failed",
                         extra={"code": "team_planner_failed", "message": str(exc)},
                     )
-                    return self._final_state(state, team, stop_reason="team_planner_failed")
+                    return self._final_state(state, team, writer, stop_reason="team_planner_failed")
                 team.trace_path = str(writer.path)
                 team.status = TeamStatus.RUNNING
                 team.started_at = team.started_at or _now()
@@ -154,7 +161,7 @@ class TeamAgent(AgentBase):
                 completed = self._execute_team(team, writer, state)
                 self._record_team_step_summaries(memory, completed, run_id=state.run_id)
                 memory.extract_facts(reason="team_completed", run_id=state.run_id)
-                return self._final_state(state, completed)
+                return self._final_state(state, completed, writer)
             except PlanValidationError as exc:
                 team = TeamState.create(goal=goal, summary="Team plan validation failed.")
                 team.status = TeamStatus.FAILED
@@ -167,15 +174,19 @@ class TeamAgent(AgentBase):
                     "team.validation_failed",
                     extra={"code": exc.code, "message": exc.message, "details": exc.details},
                 )
-                stop_reason = "team_planner_failed" if exc.code == "team_planner_llm_failed" else "team_validation_failed"
-                return self._final_state(state, team, stop_reason=stop_reason)
+                stop_reason = (
+                    "team_planner_failed"
+                    if exc.code == "team_planner_llm_failed"
+                    else "team_validation_failed"
+                )
+                return self._final_state(state, team, writer, stop_reason=stop_reason)
             except RuntimeError as exc:
                 team = TeamState.create(goal=goal, summary="Team execution failed before completion.")
                 team.status = TeamStatus.FAILED
                 team.error = str(exc)
                 team.trace_path = str(writer.path)
                 self._save_and_emit(writer, state, team, "team.failed")
-                return self._final_state(state, team, stop_reason="team_failed")
+                return self._final_state(state, team, writer, stop_reason="team_failed")
 
     def run_step(
         self,
@@ -193,150 +204,164 @@ class TeamAgent(AgentBase):
         dependency_context = context if context is not None else self.build_dependency_context(team, step)
         active_worker = worker or self._make_worker(1)
         active_reviewer = reviewer or self._make_reviewer(step.id)
+        reviewer_trace_snapshot = _set_trace_sink(
+            active_reviewer,
+            (lambda event, payload: self._emit_trace(writer, state, event, payload))
+            if writer is not None and state is not None
+            else None,
+        )
         max_attempts = self.config.team_max_retries + 1
         last_output = ""
 
-        for attempt in range(1, max_attempts + 1):
-            if _token_cancelled(cancellation_token):
-                self._mark_cancelled(
-                    team,
-                    step,
-                    f"Step was cancelled: {cancellation_token.reason or 'cancelled'}",
-                    writer,
-                    state,
-                )
-                return
-            with self._state_lock:
-                step.attempts = attempt
-                step.status = StepStatus.RUNNING
-                step.started_at = step.started_at or _now()
-                step.worker_name = getattr(active_worker, "name", "")
-                self._save_and_emit(writer, state, team, "team.step.started", step)
+        try:
+            for attempt in range(1, max_attempts + 1):
+                if _token_cancelled(cancellation_token):
+                    self._mark_cancelled(
+                        team,
+                        step,
+                        f"Step was cancelled: {cancellation_token.reason or 'cancelled'}",
+                        writer,
+                        state,
+                    )
+                    return
+                with self._state_lock:
+                    step.attempts = attempt
+                    step.status = StepStatus.RUNNING
+                    step.started_at = step.started_at or _now()
+                    step.worker_name = getattr(active_worker, "name", "")
+                    self._save_and_emit(writer, state, team, "team.step.started", step)
 
-            try:
-                result = _execute_worker_step(
-                    active_worker,
-                    team,
-                    step,
-                    dependency_context,
-                    feedback=feedback,
-                    cancellation_token=cancellation_token,
-                )
-            except Exception as exc:  # noqa: BLE001 - a crashing worker must fail only this step.
-                self._mark_failed(
-                    team,
-                    step,
-                    f"Worker crashed: {type(exc).__name__}: {exc}",
-                    writer,
-                    state,
-                )
-                return
-            with self._state_lock:
-                step.trace_path = result.trace_path
-            if result.stop_reason == "cancelled" or _token_cancelled(cancellation_token):
-                self._mark_cancelled(
-                    team,
-                    step,
-                    result.error
-                    or f"Step was cancelled: {cancellation_token.reason if cancellation_token else 'cancelled'}",
-                    writer,
-                    state,
-                )
-                return
-            if not result.ok:
-                self._mark_failed(team, step, result.error or "Worker failed.", writer, state, output=result.output)
-                return
-            last_output = result.output
-            if _token_cancelled(cancellation_token):
-                self._mark_cancelled(
-                    team,
-                    step,
-                    f"Step was cancelled: {cancellation_token.reason or 'cancelled'}",
-                    writer,
-                    state,
-                )
-                return
-            with self._state_lock:
+                try:
+                    result = _execute_worker_step(
+                        active_worker,
+                        team,
+                        step,
+                        dependency_context,
+                        feedback=feedback,
+                        cancellation_token=cancellation_token,
+                    )
+                except Exception as exc:  # noqa: BLE001 - a crashing worker must fail only this step.
+                    self._mark_failed(
+                        team,
+                        step,
+                        f"Worker crashed: {type(exc).__name__}: {exc}",
+                        writer,
+                        state,
+                    )
+                    return
+                with self._state_lock:
+                    step.trace_path = result.trace_path
+                if result.stop_reason == "cancelled" or _token_cancelled(cancellation_token):
+                    self._mark_cancelled(
+                        team,
+                        step,
+                        result.error
+                        or f"Step was cancelled: {cancellation_token.reason if cancellation_token else 'cancelled'}",
+                        writer,
+                        state,
+                    )
+                    return
+                if not result.ok:
+                    self._mark_failed(team, step, result.error or "Worker failed.", writer, state, output=result.output)
+                    return
+                last_output = result.output
+                if _token_cancelled(cancellation_token):
+                    self._mark_cancelled(
+                        team,
+                        step,
+                        f"Step was cancelled: {cancellation_token.reason or 'cancelled'}",
+                        writer,
+                        state,
+                    )
+                    return
+                with self._state_lock:
+                    self._save_and_emit(
+                        writer,
+                        state,
+                        team,
+                        "team.step.worker_completed",
+                        step,
+                        extra={"attempt": attempt, "worker_result": result.to_dict()},
+                    )
+
+                if _token_cancelled(cancellation_token):
+                    self._mark_cancelled(
+                        team,
+                        step,
+                        f"Step was cancelled: {cancellation_token.reason or 'cancelled'}",
+                        writer,
+                        state,
+                    )
+                    return
+                with self._state_lock:
+                    step.status = StepStatus.REVIEWING
+                    self._save_and_emit(writer, state, team, "team.step.review_started", step)
+                try:
+                    decision: ReviewDecision = active_reviewer.review_step(
+                        team.goal,
+                        step,
+                        dependency_context,
+                        result.output,
+                    )
+                except Exception as exc:  # noqa: BLE001 - reviewer failures must not corrupt team state.
+                    self._mark_failed(
+                        team,
+                        step,
+                        f"Reviewer crashed: {type(exc).__name__}: {exc}",
+                        writer,
+                        state,
+                        output=result.output,
+                    )
+                    return
+                with self._state_lock:
+                    step.review_summary = decision.summary
+                    step.review_issues = list(decision.issues)
+                    step.review_suggestions = list(decision.suggestions)
+                    self._save_and_emit(
+                        writer,
+                        state,
+                        team,
+                        "team.step.review_completed",
+                        step,
+                        extra={"attempt": attempt, "review": _review_payload(decision)},
+                    )
+                if hasattr(active_reviewer, "clear_history"):
+                    active_reviewer.clear_history()
+
+                if _token_cancelled(cancellation_token):
+                    self._mark_cancelled(
+                        team,
+                        step,
+                        f"Step was cancelled: {cancellation_token.reason or 'cancelled'}",
+                        writer,
+                        state,
+                    )
+                    return
+
+                if decision.approved:
+                    self._mark_completed(team, step, result, writer, state)
+                    return
+
+                feedback = decision.feedback_text or "Reviewer rejected the result without additional detail."
                 self._save_and_emit(
                     writer,
                     state,
                     team,
-                    "team.step.worker_completed",
-                    step,
-                    extra={"attempt": attempt, "worker_result": result.to_dict()},
-                )
-
-            if _token_cancelled(cancellation_token):
-                self._mark_cancelled(
-                    team,
-                    step,
-                    f"Step was cancelled: {cancellation_token.reason or 'cancelled'}",
-                    writer,
-                    state,
-                )
-                return
-            with self._state_lock:
-                step.status = StepStatus.REVIEWING
-                self._save_and_emit(writer, state, team, "team.step.review_started", step)
-            try:
-                decision: ReviewDecision = active_reviewer.review_step(team.goal, step, dependency_context, result.output)
-            except Exception as exc:  # noqa: BLE001 - reviewer failures must not corrupt team state.
-                self._mark_failed(
-                    team,
-                    step,
-                    f"Reviewer crashed: {type(exc).__name__}: {exc}",
-                    writer,
-                    state,
-                    output=result.output,
-                )
-                return
-            with self._state_lock:
-                step.review_summary = decision.summary
-                step.review_issues = list(decision.issues)
-                step.review_suggestions = list(decision.suggestions)
-                self._save_and_emit(
-                    writer,
-                    state,
-                    team,
-                    "team.step.review_completed",
+                    "team.step.review_rejected",
                     step,
                     extra={"attempt": attempt, "review": _review_payload(decision)},
                 )
-            if hasattr(active_reviewer, "clear_history"):
-                active_reviewer.clear_history()
-
-            if _token_cancelled(cancellation_token):
-                self._mark_cancelled(
-                    team,
-                    step,
-                    f"Step was cancelled: {cancellation_token.reason or 'cancelled'}",
-                    writer,
-                    state,
-                )
-                return
-
-            if decision.approved:
-                self._mark_completed(team, step, result, writer, state)
-                return
-
-            feedback = decision.feedback_text or "Reviewer rejected the result without additional detail."
-            self._save_and_emit(
-                writer,
-                state,
-                team,
-                "team.step.review_rejected",
-                step,
-                extra={"attempt": attempt, "review": _review_payload(decision)},
-            )
-            if attempt < max_attempts:
-                self._save_and_emit(
-                    writer,
-                    state,
-                    team,
-                    "team.step.retry_started",
-                    step,
-                    extra={"attempt": attempt + 1, "feedback": feedback},
-                )
+                if attempt < max_attempts:
+                    self._save_and_emit(
+                        writer,
+                        state,
+                        team,
+                        "team.step.retry_started",
+                        step,
+                        extra={"attempt": attempt + 1, "feedback": feedback},
+                    )
+        finally:
+            _restore_trace_sink(active_reviewer, reviewer_trace_snapshot)
 
         if self.config.team_allow_unapproved_results:
             self._mark_completed(
@@ -755,6 +780,7 @@ class TeamAgent(AgentBase):
         self,
         state: AgentState,
         team: TeamState,
+        writer: TraceWriter,
         *,
         stop_reason: str | None = None,
     ) -> AgentState:
@@ -765,6 +791,13 @@ class TeamAgent(AgentBase):
         state.steps = sum(step.attempts for step in team.steps)
         state.stop_reason = stop_reason or _stop_reason_for_team(team)
         state.trace_path = Path(team.trace_path) if team.trace_path else state.trace_path
+        append_agent_completed(
+            writer,
+            state,
+            mode="team",
+            run_label="team",
+            child_trace_paths=_team_child_trace_paths(team),
+        )
         return state
 
 
@@ -817,6 +850,28 @@ def _stop_reason_for_team(team: TeamState) -> str:
     if team.status == TeamStatus.FAILED:
         return "team_failed"
     return f"team_{team.status.value}"
+
+
+def _team_child_trace_paths(team: TeamState) -> list[str]:
+    return [step.trace_path for step in team.steps if step.trace_path]
+
+
+_NO_TRACE_SINK_SETTER = object()
+
+
+def _set_trace_sink(target: Any, trace_sink: Callable[[str, dict[str, object]], None] | None) -> Any:
+    setter = getattr(target, "set_trace_sink", None)
+    if not callable(setter):
+        return _NO_TRACE_SINK_SETTER
+    return setter(trace_sink)
+
+
+def _restore_trace_sink(target: Any, snapshot: Any) -> None:
+    if snapshot is _NO_TRACE_SINK_SETTER:
+        return
+    setter = getattr(target, "set_trace_sink", None)
+    if callable(setter):
+        setter(snapshot)
 
 
 def _now() -> str:

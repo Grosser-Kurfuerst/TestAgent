@@ -16,7 +16,7 @@ from my_agent.memory.token import estimate_tokens
 from my_agent.agent_base import AgentBase
 from my_agent.schema import AgentState, ToolCall, ToolRecord, ToolResult
 from my_agent.tools import RepoTools, ToolExecutionResult, ToolInvocation
-from my_agent.tracing import TraceWriter
+from my_agent.tracing import TraceWriter, append_agent_completed
 from my_agent.utils.answers import append_trace_to_answer
 
 EventSink = Callable[[Any], None]
@@ -125,6 +125,7 @@ class ReActAgent(AgentBase):
                     state.trace_event(
                         "llm.requested",
                         {
+                            "phase": "react",
                             "iteration": budget.iterations,
                             "message_count": len(messages),
                             "tool_count": len(tool_definitions),
@@ -153,6 +154,7 @@ class ReActAgent(AgentBase):
                     state.trace_event(
                         "llm.completed",
                         {
+                            "phase": "react",
                             "iteration": budget.iterations,
                             "finish_reason": response.finish_reason,
                             "content_chars": len(response.content),
@@ -402,7 +404,7 @@ class ReActAgent(AgentBase):
     def _stop_by_llm_failure(self, state: AgentState, writer: TraceWriter, exc: Exception) -> None:
         state.done = True
         state.stop_reason = "llm_failed"
-        self._emit(writer, state.trace_event("llm.failed", {"error": f"{type(exc).__name__}: {exc}"}))
+        self._emit(writer, state.trace_event("llm.failed", {"phase": "react", "error": f"{type(exc).__name__}: {exc}"}))
 
     def _stop_cancelled(self, state: AgentState, writer: TraceWriter) -> None:
         state.done = True
@@ -436,6 +438,7 @@ class ReActAgent(AgentBase):
                 },
             )
         )
+        append_agent_completed(writer, state, mode="react", run_label=self.run_label)
 
     def _emit(self, writer: TraceWriter, event: Any) -> None:
         writer.append(event)

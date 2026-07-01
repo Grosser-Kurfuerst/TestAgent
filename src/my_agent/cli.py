@@ -24,6 +24,8 @@ from my_agent.data import (
 from my_agent.indexer import RepoIndexer
 from my_agent.mcp.manager import McpServerManagerPool
 from my_agent.mcp.observability import format_mcp_disabled, format_mcp_logs, format_mcp_status
+from my_agent.evaluation.manifest_benchmark import run_manifest_benchmark
+from my_agent.evaluation.trace_metrics import collect_trace_metrics, format_trace_metrics
 from my_agent.runtime import run_agent
 from my_agent.stats import collect_trace_stats, format_trace_stats
 from my_agent.tools import RepoTools
@@ -130,7 +132,27 @@ def build_parser() -> argparse.ArgumentParser:
 
     stats_parser = subparsers.add_parser("stats", help="Summarize one trace file or a directory of JSONL traces.")
     stats_parser.add_argument("--trace", required=True, help="Trace JSONL file or directory.")
+    stats_parser.add_argument("--recursive", action="store_true", help="Recursively aggregate child trace files.")
     stats_parser.add_argument("--json", action="store_true", help="Print machine-readable JSON stats.")
+
+    manifest_parser = subparsers.add_parser("eval-manifest", help="Run manifest-based agent capability evaluation.")
+    manifest_parser.add_argument("--tasks", required=True, help="Task manifest JSONL or JSON path.")
+    manifest_parser.add_argument("--output-dir", required=True, help="Directory for results, work repos, and traces.")
+    manifest_parser.add_argument(
+        "--mode",
+        choices=("react", "plan", "team", "auto"),
+        default="auto",
+        help="Execution mode for evaluated tasks.",
+    )
+    manifest_parser.add_argument("--max-steps", type=_positive_max_steps, help="Maximum agent steps per task.")
+    manifest_parser.add_argument("--command-timeout", type=int, help="Timeout in seconds for evaluator test commands.")
+    manifest_parser.add_argument(
+        "--env",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Environment override for evaluator commands. May be repeated.",
+    )
 
     config_parser = subparsers.add_parser("config", help="Print resolved local configuration.")
     config_parser.add_argument("--check-api-key", action="store_true", help="Validate provider and API key settings.")
@@ -371,14 +393,38 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "stats":
         try:
-            stats = collect_trace_stats(args.trace)
+            stats = (
+                collect_trace_metrics(args.trace, recursive=True)
+                if args.recursive
+                else collect_trace_stats(args.trace)
+            )
         except (FileNotFoundError, ValueError) as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 1
         if args.json:
             print(json.dumps(stats.to_dict(), ensure_ascii=False, indent=2))
         else:
-            print(format_trace_stats(stats))
+            print(format_trace_metrics(stats) if args.recursive else format_trace_stats(stats))
+        return 0
+
+    if args.command == "eval-manifest":
+        try:
+            config = AgentConfig.from_env(env=_tool_environment_overrides(os.environ), require_env_file=False)
+            result = run_manifest_benchmark(
+                tasks_path=args.tasks,
+                output_dir=args.output_dir,
+                config=config,
+                mode=args.mode,
+                max_steps=args.max_steps,
+                command_timeout=args.command_timeout,
+                env=_parse_env_overrides(args.env),
+            )
+        except (FileNotFoundError, ValueError, RuntimeError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        finally:
+            _close_mcp_servers()
+        print(result.render())
         return 0
 
     if args.command == "config":
@@ -421,6 +467,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "team_dependency_context_chars": config.team_dependency_context_chars,
                     "team_parallel_enabled": config.team_parallel_enabled,
                     "team_allow_unapproved_results": config.team_allow_unapproved_results,
+                    "memory_enabled": config.memory_enabled,
                     "memory_dir": str(config.memory_dir),
                     "memory_short_term_tokens": config.memory_short_term_tokens,
                     "memory_short_term_entries": config.memory_short_term_entries,
@@ -638,6 +685,8 @@ def _tool_environment_overrides(env: Mapping[str, str]) -> dict[str, str]:
         "MY_AGENT_TEAM_DEPENDENCY_CONTEXT_CHARS",
         "MY_AGENT_TEAM_PARALLEL",
         "MY_AGENT_TEAM_ALLOW_UNAPPROVED_RESULTS",
+        "AGENTCLI_MEMORY",
+        "MY_AGENT_MEMORY",
         "AGENTCLI_MEMORY_DIR",
         "MY_AGENT_MEMORY_DIR",
         "AGENTCLI_MEMORY_SHORT_TERM_TOKENS",
@@ -700,6 +749,18 @@ def _tool_environment_overrides(env: Mapping[str, str]) -> dict[str, str]:
         "MY_AGENT_MCP_ENABLE_PROJECT_SERVERS",
     }
     return {key: env[key] for key in keys if key in env}
+
+
+def _parse_env_overrides(items: Sequence[str]) -> dict[str, str]:
+    overrides: dict[str, str] = {}
+    for item in items:
+        if "=" not in item:
+            raise ValueError(f"--env must be KEY=VALUE, got {item!r}.")
+        key, value = item.split("=", 1)
+        if not key.strip():
+            raise ValueError("--env key must not be empty.")
+        overrides[key.strip()] = value
+    return overrides
 
 
 def _close_mcp_servers() -> None:

@@ -308,6 +308,7 @@ class AgentConfigTests(unittest.TestCase):
 
             config = AgentConfig.from_env(
                 env={
+                    "AGENTCLI_MEMORY": "1",
                     "AGENTCLI_MEMORY_DIR": str(Path(tmp) / "mem"),
                     "AGENTCLI_MEMORY_SHORT_TERM_TOKENS": "1000",
                     "AGENTCLI_MEMORY_SHORT_TERM_ENTRIES": "50",
@@ -323,6 +324,7 @@ class AgentConfigTests(unittest.TestCase):
             )
 
         self.assertEqual(config.memory_dir, Path(tmp) / "mem")
+        self.assertTrue(config.memory_enabled)
         self.assertEqual(config.memory_short_term_tokens, 1_000)
         self.assertEqual(config.memory_short_term_entries, 50)
         self.assertEqual(config.memory_context_tokens, 512)
@@ -374,6 +376,18 @@ class AgentConfigTests(unittest.TestCase):
             )
 
         self.assertFalse(config.memory_auto_extract)
+
+    def test_memory_can_be_disabled_explicitly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / ".env"
+            env_file.write_text("", encoding="utf-8")
+
+            config = AgentConfig.from_env(
+                env={"AGENTCLI_MEMORY": "0"},
+                env_file=env_file,
+            )
+
+        self.assertFalse(config.memory_enabled)
 
     def test_my_agent_prefixed_memory_vars_are_supported(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

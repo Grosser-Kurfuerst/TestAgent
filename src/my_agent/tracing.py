@@ -3,8 +3,9 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 import threading
+from typing import Any, Iterable
 
-from my_agent.schema import TraceEvent
+from my_agent.schema import AgentState, TraceEvent
 
 
 class TraceWriter:
@@ -42,8 +43,24 @@ def append_benchmark_result(
     scored: bool,
     test_command: str,
     test_output: str,
+    task_valid: bool | None = None,
+    initial_visible_ok: bool | None = None,
+    initial_hidden_ok: bool | None = None,
+    visible_ok: bool | None = None,
+    hidden_ok: bool | None = None,
+    resolved: bool | None = None,
+    failure_type: str | None = None,
+    patch_apply_ok: bool | None = None,
+    changed_files: Iterable[str] | None = None,
+    patch_lines: int | None = None,
+    visible_test_command: str | None = None,
+    visible_test_output: str | None = None,
+    hidden_test_command: str | None = None,
+    hidden_test_output: str | None = None,
+    initial_visible_output: str | None = None,
+    initial_hidden_output: str | None = None,
 ) -> None:
-    payload = {
+    payload: dict[str, Any] = {
         "benchmark": benchmark,
         "task_id": task_id,
         "status": status,
@@ -51,4 +68,70 @@ def append_benchmark_result(
         "test_command": test_command,
         "test_output": test_output[:2000],
     }
+    _add_optional(
+        payload,
+        task_valid=task_valid,
+        initial_visible_ok=initial_visible_ok,
+        initial_hidden_ok=initial_hidden_ok,
+        visible_ok=visible_ok,
+        hidden_ok=hidden_ok,
+        resolved=resolved,
+        failure_type=failure_type,
+        patch_apply_ok=patch_apply_ok,
+        changed_files=list(changed_files) if changed_files is not None else None,
+        patch_lines=patch_lines,
+        visible_test_command=visible_test_command,
+        visible_test_output=_truncate_optional(visible_test_output),
+        hidden_test_command=hidden_test_command,
+        hidden_test_output=_truncate_optional(hidden_test_output),
+        initial_visible_output=_truncate_optional(initial_visible_output),
+        initial_hidden_output=_truncate_optional(initial_hidden_output),
+    )
     TraceWriter(trace_path).append(TraceEvent(event="benchmark_result", payload=payload, run_id=run_id))
+
+
+def append_agent_completed(
+    writer: TraceWriter,
+    state: AgentState,
+    *,
+    mode: str,
+    run_label: str,
+    child_trace_paths: Iterable[str | Path] = (),
+    status: str | None = None,
+) -> None:
+    payload = {
+        "mode": mode,
+        "run_label": run_label,
+        "stop_reason": state.stop_reason,
+        "steps": state.steps,
+        "done": state.done,
+        "status": status or agent_status(done=state.done, stop_reason=state.stop_reason),
+        "trace_path": str(state.trace_path or writer.path),
+        "child_trace_paths": [str(path) for path in child_trace_paths if str(path)],
+    }
+    writer.append(TraceEvent(event="agent.completed", payload=payload, run_id=state.run_id))
+
+
+def agent_status(*, done: bool, stop_reason: str) -> str:
+    normalized = (stop_reason or "").lower()
+    if "cancelled" in normalized or "canceled" in normalized:
+        return "cancelled"
+    failed_markers = ("failed", "failure", "error", "invalid", "validation", "llm_failed")
+    if any(marker in normalized for marker in failed_markers):
+        return "failed"
+    stopped_markers = ("max_", "budget", "timeout", "timed_out")
+    if any(marker in normalized for marker in stopped_markers):
+        return "stopped"
+    return "completed" if done else "running"
+
+
+def _add_optional(payload: dict[str, Any], **values: Any) -> None:
+    for key, value in values.items():
+        if value is not None:
+            payload[key] = value
+
+
+def _truncate_optional(value: str | None) -> str | None:
+    if value is None:
+        return None
+    return value[:2000]

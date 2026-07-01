@@ -754,6 +754,20 @@ class PlanExecuteAgentTests(unittest.TestCase):
             self.assertIn("status=succeeded", state.review)
             self.assertIn("Plan succeeded", state.final_answer)
             self.assertIn("return a - b", (repo / "calculator.py").read_text(encoding="utf-8"))
+            events = read_trace(state.trace_path)
+            event_names = [event["event"] for event in events]
+            self.assertIn("agent.completed", event_names)
+            planner_llm = [
+                event
+                for event in events
+                if event["event"] == "llm.completed" and event["payload"].get("phase") == "plan_planner"
+            ]
+            self.assertEqual(len(planner_llm), 1)
+            agent_completed = [event for event in events if event["event"] == "agent.completed"][-1]
+            self.assertEqual(agent_completed["payload"]["mode"], "plan")
+            self.assertTrue(agent_completed["payload"]["child_trace_paths"])
+            self.assertGreater(state.steps, 0)
+            self.assertEqual(agent_completed["payload"]["steps"], state.steps)
 
     def test_plan_agent_injects_memory_and_records_parent_task_summaries(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

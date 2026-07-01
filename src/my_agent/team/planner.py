@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from my_agent.llm import AgentLLM
 from my_agent.llm.types import MessageLike
@@ -11,11 +11,19 @@ from my_agent.team.graph import topological_order, validate_team_graph
 from my_agent.team.prompts import build_team_planner_messages
 from my_agent.team.types import ExecutionStep, TeamState
 
+TraceSink = Callable[[str, dict[str, object]], None]
+
 
 class TeamPlanner:
-    def __init__(self, llm: AgentLLM, *, max_steps: int = 12):
+    def __init__(self, llm: AgentLLM, *, max_steps: int = 12, trace_sink: TraceSink | None = None):
         self.llm = llm
         self.max_steps = max_steps
+        self.trace_sink = trace_sink
+
+    def set_trace_sink(self, trace_sink: TraceSink | None) -> TraceSink | None:
+        previous = self.trace_sink
+        self.trace_sink = trace_sink
+        return previous
 
     def create_team_plan(
         self,
@@ -31,15 +39,35 @@ class TeamPlanner:
             memory_context=memory_context,
             conversation=conversation or [],
         )
+        self._trace(
+            "llm.requested",
+            {"phase": "team_planner", "message_count": len(messages), "tool_count": 0},
+        )
         try:
             response = self.llm.chat(messages, tools=None)
         except Exception as exc:
+            self._trace("llm.failed", {"phase": "team_planner", "error": f"{type(exc).__name__}: {exc}"})
             raise PlanValidationError(
                 "team_planner_llm_failed",
                 f"Team planner LLM call failed: {exc}",
                 {"error": str(exc)},
             ) from exc
+        self._trace(
+            "llm.completed",
+            {
+                "phase": "team_planner",
+                "finish_reason": response.finish_reason,
+                "content_chars": len(response.content),
+                "tool_calls": [],
+                "usage": response.usage.to_dict(),
+            },
+        )
         return self.parse_team_plan(goal, response.content)
+
+    def _trace(self, event: str, payload: dict[str, object]) -> None:
+        if self.trace_sink is None:
+            return
+        self.trace_sink(event, payload)
 
     def parse_team_plan(self, goal: str, raw_text: str) -> TeamState:
         try:

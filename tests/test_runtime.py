@@ -262,11 +262,45 @@ class RuntimeTests(unittest.TestCase):
                 "tool.started",
                 "tool.completed",
                 "run.completed",
+                "agent.completed",
             ):
                 self.assertIn(expected, event_names)
+            llm_completed = [event for event in events if event["event"] == "llm.completed"]
+            self.assertTrue(llm_completed)
+            self.assertEqual({event["payload"].get("phase") for event in llm_completed}, {"react"})
+            agent_completed = [event for event in events if event["event"] == "agent.completed"]
+            self.assertEqual(agent_completed[-1]["payload"]["mode"], "react")
+            self.assertEqual(agent_completed[-1]["payload"]["trace_path"], str(state.trace_path))
             self.assertNotIn("tool_call", event_names)
             self.assertNotIn("final_summary", event_names)
             self.assertEqual({event["run_id"] for event in events}, {state.run_id})
+
+    def test_memory_disabled_uses_noop_memory_even_with_external_manager(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+            config = fake_config(base / "traces", memory_dir=base / "memory", memory_enabled=False)
+            memory = MemoryManager.from_config(config=fake_config(base / "other-memory"), llm=FakeLLM(), repo_path=repo)
+            memory.save_fact("This fact must not be injected.", scope=MemoryScope.PROJECT)
+            llm = RecordingFakeLLM([ChatResponse(content="done", finish_reason="stop")])
+
+            state = run_agent(
+                repo_path=repo,
+                task="Return final response.",
+                config=config,
+                llm=llm,
+                trace_dir=base / "traces",
+                memory_manager=memory,
+            )
+
+            events = read_trace(state.trace_path)
+            event_names = [event["event"] for event in events]
+            self.assertIn("memory.loaded", event_names)
+            self.assertNotIn("memory.retrieved", event_names)
+            first_request = json.dumps(llm.requests[0], ensure_ascii=False)
+            self.assertNotIn("This fact must not be injected.", first_request)
 
     def test_hitl_approval_events_are_traced_and_forwarded(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

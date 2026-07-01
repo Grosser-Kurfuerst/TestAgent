@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -17,7 +18,7 @@ from my_agent.plan.store import JsonPlanStore, PlanStore
 from my_agent.plan.types import PlanState, PlanStatus, TaskStatus
 from my_agent.agent_base import AgentBase
 from my_agent.schema import AgentState
-from my_agent.tracing import TraceWriter
+from my_agent.tracing import TraceWriter, append_agent_completed
 from my_agent.utils.text import terminal_summary_text
 
 
@@ -87,7 +88,8 @@ class PlanExecuteAgent(AgentBase):
                     raise RuntimeError("Plan execution requires repository context.")
                 repo_context = ctx.repo_snapshot.as_context()
                 planner_context = _append_memory_context(repo_context, memory.build_context_for_query(goal).injected_text)
-                plan = Planner(self.llm, max_tasks=self.config.plan_max_tasks).create_plan(
+                trace_sink = lambda event, payload: self._emit_trace(writer, state, event, payload)
+                plan = Planner(self.llm, max_tasks=self.config.plan_max_tasks, trace_sink=trace_sink).create_plan(
                     goal,
                     repo_context=planner_context,
                 )
@@ -103,11 +105,11 @@ class PlanExecuteAgent(AgentBase):
                     plan.error = decision.feedback or "Plan execution was cancelled before running tasks."
                     self.state_store.save(plan)
                     self._emit_plan_state(writer, state, "plan.cancelled", plan)
-                    return self._final_state(state, plan)
+                    return self._final_state(state, plan, writer)
                 if decision.action == PlanReviewAction.SUPPLEMENT:
                     supplement = decision.feedback.strip()
                     if supplement:
-                        plan = Planner(self.llm, max_tasks=self.config.plan_max_tasks).create_plan(
+                        plan = Planner(self.llm, max_tasks=self.config.plan_max_tasks, trace_sink=trace_sink).create_plan(
                             f"{goal}\n\nAdditional requirements:\n{supplement}",
                             repo_context=planner_context,
                         )
@@ -143,7 +145,7 @@ class PlanExecuteAgent(AgentBase):
                 completed = executor.execute(plan)
                 self._record_plan_task_summaries(memory, completed, run_id=state.run_id)
                 memory.extract_facts(reason="plan_completed", run_id=state.run_id)
-                return self._final_state(state, completed)
+                return self._final_state(state, completed, writer)
             except PlanValidationError as exc:
                 plan = PlanState.create(goal=goal, summary="Plan validation failed.")
                 plan.status = PlanStatus.FAILED
@@ -157,7 +159,7 @@ class PlanExecuteAgent(AgentBase):
                     {"code": exc.code, "message": exc.message, "details": exc.details, "plan": plan.to_dict()},
                 )
                 self._emit_plan_event("plan.validation_failed", plan)
-                return self._final_state(state, plan, stop_reason="plan_validation_failed")
+                return self._final_state(state, plan, writer, stop_reason="plan_validation_failed")
             except RuntimeError as exc:
                 plan = PlanState.create(goal=goal, summary="Plan failed before execution.")
                 plan.status = PlanStatus.FAILED
@@ -166,7 +168,7 @@ class PlanExecuteAgent(AgentBase):
                 self.state_store.save(plan)
                 self._emit_trace(writer, state, "plan.failed", {"error": str(exc), "plan": plan.to_dict()})
                 self._emit_plan_event("plan.failed", plan)
-                return self._final_state(state, plan, stop_reason="plan_failed")
+                return self._final_state(state, plan, writer, stop_reason="plan_failed")
 
     def _record_plan_task_summaries(self, memory: MemoryManager, plan: PlanState, *, run_id: str) -> None:
         for task in plan.tasks:
@@ -202,6 +204,7 @@ class PlanExecuteAgent(AgentBase):
         self,
         state: AgentState,
         plan: PlanState,
+        writer: TraceWriter,
         *,
         stop_reason: str | None = None,
     ) -> AgentState:
@@ -209,8 +212,16 @@ class PlanExecuteAgent(AgentBase):
         state.review = render_plan_review(plan)
         state.final_answer = render_plan_final_answer(plan)
         state.done = True
+        state.steps = _plan_child_steps(plan)
         state.stop_reason = stop_reason or _stop_reason_for_plan(plan)
         state.trace_path = Path(plan.trace_path) if plan.trace_path else state.trace_path
+        append_agent_completed(
+            writer,
+            state,
+            mode="plan",
+            run_label="plan_execute",
+            child_trace_paths=_plan_child_trace_paths(plan),
+        )
         return state
 
 
@@ -234,3 +245,35 @@ def _stop_reason_for_plan(plan: PlanState) -> str:
     if plan.status == PlanStatus.FAILED:
         return "plan_failed"
     return f"plan_{plan.status.value}"
+
+
+def _plan_child_trace_paths(plan: PlanState) -> list[str]:
+    return [task.trace_path for task in plan.tasks if task.trace_path]
+
+
+def _plan_child_steps(plan: PlanState) -> int:
+    return sum(_trace_steps(Path(trace_path)) for trace_path in _plan_child_trace_paths(plan))
+
+
+def _trace_steps(trace_path: Path) -> int:
+    try:
+        lines = trace_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return 0
+    last_steps = 0
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict) or event.get("event") not in {"run.completed", "agent.completed"}:
+            continue
+        payload = event.get("payload", {})
+        if not isinstance(payload, dict):
+            continue
+        value = payload.get("steps")
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            last_steps = value
+    return last_steps

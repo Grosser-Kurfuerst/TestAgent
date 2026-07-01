@@ -11,7 +11,7 @@ from my_agent.cancellation import CancellationToken
 from my_agent.hitl.handler import HitlHandler
 from my_agent.indexer import RepoIndexer
 from my_agent.llm import AgentLLM
-from my_agent.memory import MemoryManager
+from my_agent.memory import MemoryManager, NoopMemoryManager
 from my_agent.schema import AgentState, TraceEvent
 from my_agent.tools import should_skip_path
 from my_agent.tracing import TraceWriter
@@ -99,6 +99,16 @@ class AgentBase(ABC):
         memory_manager: MemoryManager | None = None,
     ) -> tuple[MemoryManager, MemoryTraceSnapshot | None]:
         trace_sink = lambda event, payload: self._emit_trace(writer, state, event, payload)
+        if not self.config.memory_enabled:
+            return (
+                NoopMemoryManager(
+                    config=self.config,
+                    repo_path=Path(repo).resolve(),
+                    session_id=state.run_id,
+                    trace_sink=trace_sink,
+                ),
+                None,
+            )
         active_memory = memory_manager if memory_manager is not None else self.memory_manager
         if active_memory is not None:
             snapshot = active_memory.set_trace_sink(trace_sink)

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 from pathlib import Path
 from typing import Mapping
@@ -27,6 +27,7 @@ class AgentConfig:
     command_timeout: int
     trace_dir: Path
     use_fake_llm: bool
+    tool_env_overrides: dict[str, str] = field(default_factory=dict)
 
     # Dynamic tool loading is opt-in for project-controlled sources.
     tool_config_paths: tuple[Path, ...] = ()
@@ -65,6 +66,7 @@ class AgentConfig:
     team_allow_unapproved_results: bool = False
 
     # Memory storage, retrieval, and compression defaults.
+    memory_enabled: bool = True
     memory_dir: Path = Path("~/.agentcli/memory").expanduser()
     memory_short_term_tokens: int = 24_000
     memory_short_term_entries: int = 500
@@ -195,6 +197,10 @@ class AgentConfig:
                     "AGENTCLI_TEAM_ALLOW_UNAPPROVED_RESULTS",
                     values.get("MY_AGENT_TEAM_ALLOW_UNAPPROVED_RESULTS", ""),
                 )
+            ),
+            memory_enabled=_as_bool(
+                values.get("AGENTCLI_MEMORY", values.get("MY_AGENT_MEMORY", "")),
+                default=True,
             ),
             memory_dir=_memory_dir(values),
             memory_short_term_tokens=_as_positive_int(

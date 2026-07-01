@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from my_agent.memory.compression import MemoryCompressor
 from my_agent.memory.manager import MemoryManager
+from my_agent.memory.noop import NoopMemoryManager
 from my_agent.memory.types import (
     CompressionResult,
     MemoryContext,
@@ -32,6 +33,7 @@ __all__ = [
     "MemoryContext",
     "MemoryEntry",
     "MemoryManager",
+    "NoopMemoryManager",
     "MemoryScope",
     "MemoryStatus",
     "MemoryType",

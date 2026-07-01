@@ -1,0 +1,794 @@
+from __future__ import annotations
+
+import difflib
+import json
+import os
+import shlex
+import shutil
+import subprocess
+import time
+from dataclasses import dataclass, field, fields, replace
+from pathlib import Path
+from typing import Any, Callable, Mapping, Sequence
+
+from my_agent.config import AgentConfig
+from my_agent.evaluation.agent_benchmark import record_benchmark_result
+from my_agent.evaluation.trace_metrics import collect_trace_metrics
+from my_agent.runtime import run_agent
+
+
+AgentRunnerFn = Callable[..., Any]
+
+_IGNORE_DIRS = {".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
+
+
+@dataclass(frozen=True)
+class CommandResult:
+    command: str
+    ok: bool
+    returncode: int
+    output: str = ""
+    elapsed_sec: float = 0.0
+    skipped: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "command": self.command,
+            "ok": self.ok,
+            "returncode": self.returncode,
+            "output": self.output[:2000],
+            "elapsed_sec": round(self.elapsed_sec, 1),
+            "skipped": self.skipped,
+        }
+
+
+@dataclass
+class ManifestEvalResult:
+    task_id: str
+    status: str
+    resolved: bool
+    task_valid: bool
+    failure_type: str
+    initial_visible: CommandResult
+    source: str = "local"
+    mode: str = "auto"
+    tags: list[str] = field(default_factory=list)
+    env_overrides: dict[str, str] = field(default_factory=dict)
+    resolved_config: dict[str, Any] = field(default_factory=dict)
+    expected_changed_files: list[str] = field(default_factory=list)
+    expected_changed_files_ok: bool | None = None
+    initial_hidden: CommandResult | None = None
+    final_visible: CommandResult | None = None
+    final_hidden: CommandResult | None = None
+    patch_apply_ok: bool = False
+    changed_files: list[str] = field(default_factory=list)
+    patch_lines: int = 0
+    patch_path: str = ""
+    trace_path: str = ""
+    metrics: dict[str, Any] = field(default_factory=dict)
+    agent_steps: int = 0
+    agent_done: bool = False
+    agent_stop_reason: str = ""
+    error: str = ""
+    elapsed_sec: float = 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "task_id": self.task_id,
+            "status": self.status,
+            "resolved": self.resolved,
+            "task_valid": self.task_valid,
+            "failure_type": self.failure_type,
+            "source": self.source,
+            "mode": self.mode,
+            "tags": list(self.tags),
+            "env_overrides": dict(self.env_overrides),
+            "resolved_config": dict(self.resolved_config),
+            "expected_changed_files": list(self.expected_changed_files),
+            "expected_changed_files_ok": self.expected_changed_files_ok,
+            "initial_visible": self.initial_visible.to_dict(),
+            "initial_hidden": self.initial_hidden.to_dict() if self.initial_hidden else None,
+            "initial_visible_ok": self.initial_visible.ok,
+            "initial_hidden_ok": self.initial_hidden.ok if self.initial_hidden else None,
+            "final_visible": self.final_visible.to_dict() if self.final_visible else None,
+            "final_hidden": self.final_hidden.to_dict() if self.final_hidden else None,
+            "visible_ok": self.final_visible.ok if self.final_visible else None,
+            "hidden_ok": self.final_hidden.ok if self.final_hidden else None,
+            "patch_apply_ok": self.patch_apply_ok,
+            "changed_files": list(self.changed_files),
+            "patch_lines": self.patch_lines,
+            "patch_path": self.patch_path,
+            "trace_path": self.trace_path,
+            "metrics": dict(self.metrics),
+            "agent_steps": self.agent_steps,
+            "agent_done": self.agent_done,
+            "agent_stop_reason": self.agent_stop_reason,
+            "error": self.error,
+            "elapsed_sec": round(self.elapsed_sec, 1),
+        }
+
+
+@dataclass(frozen=True)
+class ManifestBenchmarkResult:
+    results: list[ManifestEvalResult]
+    summary: dict[str, Any]
+    output_dir: Path
+    results_path: Path
+    summary_path: Path
+
+    def render(self) -> str:
+        return (
+            f"Manifest eval: {self.summary.get('resolved', 0)}/{self.summary.get('scored', 0)} resolved "
+            f"({self.summary.get('solve_rate', 0.0):.1f}%).\n"
+            f"results: {self.results_path}\n"
+            f"summary: {self.summary_path}"
+        )
+
+
+def run_manifest_benchmark(
+    *,
+    tasks_path: str | Path,
+    output_dir: str | Path,
+    config: AgentConfig,
+    mode: str = "auto",
+    max_steps: int | None = None,
+    command_timeout: int | None = None,
+    env: Mapping[str, str] | None = None,
+    agent_runner: AgentRunnerFn = run_agent,
+) -> ManifestBenchmarkResult:
+    manifest_path = Path(tasks_path)
+    tasks = load_manifest_tasks(manifest_path)
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    results_path = output / "results.jsonl"
+    summary_path = output / "summary.json"
+    work_root = output / "work"
+    trace_root = output / "traces"
+    patch_root = output / "patches"
+    memory_root = output / "memory"
+    work_root.mkdir(parents=True, exist_ok=True)
+    trace_root.mkdir(parents=True, exist_ok=True)
+    patch_root.mkdir(parents=True, exist_ok=True)
+    memory_root.mkdir(parents=True, exist_ok=True)
+    results_path.write_text("", encoding="utf-8")
+
+    timeout = command_timeout if command_timeout is not None else config.command_timeout
+    run_config = replace(config, command_timeout=timeout, trace_dir=trace_root)
+    cli_env = dict(env or {})
+
+    results: list[ManifestEvalResult] = []
+    for index, task in enumerate(tasks, start=1):
+        result = _run_manifest_task(
+            task,
+            index=index,
+            manifest_path=manifest_path,
+            output_dir=output,
+            work_root=work_root,
+            trace_root=trace_root,
+            patch_root=patch_root,
+            memory_root=memory_root,
+            config=run_config,
+            mode=mode,
+            max_steps=max_steps,
+            command_timeout=timeout,
+            cli_env=cli_env,
+            agent_runner=agent_runner,
+        )
+        results.append(result)
+        with results_path.open("a", encoding="utf-8") as file:
+            file.write(json.dumps(result.to_dict(), ensure_ascii=False) + "\n")
+
+    summary = summarize_manifest_results(results)
+    summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return ManifestBenchmarkResult(
+        results=results,
+        summary=summary,
+        output_dir=output,
+        results_path=results_path,
+        summary_path=summary_path,
+    )
+
+
+def load_manifest_tasks(path: str | Path) -> list[dict[str, Any]]:
+    manifest_path = Path(path)
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"Manifest not found: {manifest_path}")
+    if manifest_path.suffix.lower() == ".jsonl":
+        rows: list[dict[str, Any]] = []
+        for line_number, line in enumerate(manifest_path.read_text(encoding="utf-8").splitlines(), start=1):
+            if not line.strip():
+                continue
+            payload = json.loads(line)
+            if not isinstance(payload, dict):
+                raise ValueError(f"{manifest_path}:{line_number} must be a JSON object.")
+            rows.append(payload)
+        return rows
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if isinstance(payload, list):
+        return [dict(item) for item in payload if isinstance(item, dict)]
+    if isinstance(payload, dict) and isinstance(payload.get("tasks"), list):
+        return [dict(item) for item in payload["tasks"] if isinstance(item, dict)]
+    if isinstance(payload, dict):
+        return [dict(payload)]
+    raise ValueError("Manifest must be a JSON object, JSON array, or JSONL objects.")
+
+
+def summarize_manifest_results(results: Sequence[ManifestEvalResult]) -> dict[str, Any]:
+    total = len(results)
+    scored = sum(1 for result in results if result.task_valid)
+    resolved = sum(1 for result in results if result.resolved)
+    failure_counts: dict[str, int] = {}
+    for result in results:
+        key = result.failure_type or "resolved"
+        failure_counts[key] = failure_counts.get(key, 0) + 1
+    return {
+        "total": total,
+        "scored": scored,
+        "resolved": resolved,
+        "invalid_initial_pass": failure_counts.get("invalid_initial_pass", 0),
+        "visible_test_failed": failure_counts.get("visible_test_failed", 0),
+        "hidden_test_failed": failure_counts.get("hidden_test_failed", 0),
+        "agent_error": failure_counts.get("agent_error", 0),
+        "solve_rate": resolved / scored * 100 if scored else 0.0,
+        "end_to_end_rate": resolved / total * 100 if total else 0.0,
+        "failure_counts": failure_counts,
+    }
+
+
+def _run_manifest_task(
+    task: Mapping[str, Any],
+    *,
+    index: int,
+    manifest_path: Path,
+    output_dir: Path,
+    work_root: Path,
+    trace_root: Path,
+    patch_root: Path,
+    memory_root: Path,
+    config: AgentConfig,
+    mode: str,
+    max_steps: int | None,
+    command_timeout: int,
+    cli_env: Mapping[str, str],
+    agent_runner: AgentRunnerFn,
+) -> ManifestEvalResult:
+    started = time.monotonic()
+    task_id = str(task.get("id") or f"task_{index}")
+    source = str(task.get("source") or "local")
+    tags = _string_list(task.get("tags"))
+    expected_changed_files = _string_list(task.get("expected_changed_files"))
+    safe_id = _safe_id(task_id)
+    source_repo = _resolve_repo(task, manifest_path)
+    task_dir = work_root / safe_id
+    baseline_repo = task_dir / "baseline"
+    initial_repo = task_dir / "initial"
+    work_repo = task_dir / "repo"
+    clean_repo = task_dir / "clean"
+    task_trace_dir = trace_root / safe_id
+    task_memory_dir = memory_root / safe_id
+    _copy_repo(source_repo, baseline_repo)
+    _copy_repo(source_repo, initial_repo)
+    _copy_repo(source_repo, work_repo)
+    _init_git_baseline(work_repo)
+    task_trace_dir.mkdir(parents=True, exist_ok=True)
+    task_memory_dir.mkdir(parents=True, exist_ok=True)
+
+    env_overrides = _env_overrides(cli_env, task.get("env_overrides"))
+    command_env = _command_env(env_overrides)
+    task_config = _config_for_eval_env(
+        config,
+        env_overrides,
+        trace_dir=task_trace_dir,
+        memory_dir=task_memory_dir,
+        command_timeout=command_timeout,
+    )
+    agent_test_command = task.get("agent_test_command") or task.get("test_command")
+    visible_command = task.get("visible_test_command") or agent_test_command
+    hidden_command = task.get("hidden_test_command")
+    initial_visible = run_test_command(visible_command, cwd=initial_repo, timeout=command_timeout, env=command_env)
+    initial_hidden = (
+        run_test_command(hidden_command, cwd=initial_repo, timeout=command_timeout, env=command_env)
+        if hidden_command
+        else None
+    )
+    initial_hidden_ok = initial_hidden.ok if initial_hidden is not None else True
+    task_valid = not (initial_visible.ok and initial_hidden_ok)
+    if not task_valid:
+        return ManifestEvalResult(
+            task_id=task_id,
+            status="failed",
+            resolved=False,
+            task_valid=False,
+            failure_type="invalid_initial_pass",
+            initial_visible=initial_visible,
+            source=source,
+            mode=mode,
+            tags=tags,
+            env_overrides=env_overrides,
+            resolved_config=_config_snapshot(task_config),
+            expected_changed_files=expected_changed_files,
+            expected_changed_files_ok=None if not expected_changed_files else False,
+            initial_hidden=initial_hidden,
+            elapsed_sec=time.monotonic() - started,
+        )
+
+    state: Any | None = None
+    error = ""
+    try:
+        state = agent_runner(
+            repo_path=work_repo,
+            task=str(task.get("task") or ""),
+            test_command=_command_label(agent_test_command or visible_command),
+            config=task_config,
+            max_steps=_task_max_steps(task, max_steps, task_config.max_steps),
+            trace_dir=task_trace_dir,
+            mode=mode,
+        )
+    except Exception as exc:  # noqa: BLE001 - evaluator records task-level agent failures.
+        error = f"{type(exc).__name__}: {exc}"
+
+    changed_files = compare_changed_files(baseline_repo, work_repo)
+    expected_changed_files_ok = (
+        None
+        if not expected_changed_files
+        else all(path in set(changed_files) for path in expected_changed_files)
+    )
+    patch_text = build_patch_diff(baseline_repo, work_repo, changed_files)
+    patch_lines = len(patch_text.splitlines())
+    patch_path = patch_root / f"{safe_id}.diff"
+    patch_path.write_text(patch_text, encoding="utf-8")
+    patch_apply_ok = False
+    final_visible: CommandResult | None = None
+    final_hidden: CommandResult | None = None
+    if not error:
+        _copy_repo(source_repo, clean_repo)
+        patch_apply_ok = apply_changed_files(work_repo, clean_repo, changed_files)
+        if patch_apply_ok:
+            final_visible = run_test_command(visible_command, cwd=clean_repo, timeout=command_timeout, env=command_env)
+            final_hidden = (
+                run_test_command(hidden_command, cwd=clean_repo, timeout=command_timeout, env=command_env)
+                if hidden_command
+                else None
+            )
+
+    visible_ok = bool(final_visible and final_visible.ok)
+    hidden_ok = bool(final_hidden.ok) if final_hidden is not None else True
+    resolved = bool(patch_apply_ok and visible_ok and hidden_ok)
+    failure_type = _failure_type(
+        agent_error=bool(error),
+        patch_apply_ok=patch_apply_ok,
+        visible_ok=visible_ok,
+        hidden_ok=hidden_ok,
+        has_hidden=hidden_command is not None,
+    )
+    trace_path = str(getattr(state, "trace_path", "") or "")
+    metrics = _metrics_for_trace(trace_path, task_trace_dir)
+    result = ManifestEvalResult(
+        task_id=task_id,
+        status="passed" if resolved else "failed",
+        resolved=resolved,
+        task_valid=True,
+        failure_type=failure_type,
+        initial_visible=initial_visible,
+        source=source,
+        mode=mode,
+        tags=tags,
+        env_overrides=env_overrides,
+        resolved_config=_config_snapshot(task_config),
+        expected_changed_files=expected_changed_files,
+        expected_changed_files_ok=expected_changed_files_ok,
+        initial_hidden=initial_hidden,
+        final_visible=final_visible,
+        final_hidden=final_hidden,
+        patch_apply_ok=patch_apply_ok,
+        changed_files=changed_files,
+        patch_lines=patch_lines,
+        patch_path=str(patch_path),
+        trace_path=trace_path,
+        metrics=metrics,
+        agent_steps=int(getattr(state, "steps", 0) or 0),
+        agent_done=bool(getattr(state, "done", False)),
+        agent_stop_reason=str(getattr(state, "stop_reason", "") or ""),
+        error=error,
+        elapsed_sec=time.monotonic() - started,
+    )
+    if state is not None:
+        record_benchmark_result(
+            state,
+            benchmark="manifest",
+            task_id=task_id,
+            status=result.status,
+            scored=result.task_valid,
+            test_command=_command_label(visible_command),
+            test_output=final_visible.output if final_visible else error,
+            task_valid=result.task_valid,
+            initial_visible_ok=initial_visible.ok,
+            initial_hidden_ok=initial_hidden.ok if initial_hidden else None,
+            visible_ok=visible_ok,
+            hidden_ok=hidden_ok if hidden_command else None,
+            resolved=resolved,
+            failure_type=failure_type,
+            patch_apply_ok=patch_apply_ok,
+            changed_files=changed_files,
+            patch_lines=patch_lines,
+            visible_test_command=_command_label(visible_command),
+            visible_test_output=final_visible.output if final_visible else None,
+            initial_visible_output=initial_visible.output,
+        )
+    return result
+
+
+def run_test_command(
+    command: str | Sequence[str] | None,
+    *,
+    cwd: Path,
+    timeout: int,
+    env: Mapping[str, str],
+) -> CommandResult:
+    if command is None or (isinstance(command, str) and not command.strip()):
+        return CommandResult(command="", ok=True, returncode=0, skipped=True)
+    argv = _command_argv(command)
+    started = time.monotonic()
+    try:
+        completed = subprocess.run(
+            argv,
+            cwd=str(cwd),
+            env=dict(env),
+            shell=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        output = (completed.stdout + "\n" + completed.stderr).strip()
+        return CommandResult(
+            command=_command_label(command),
+            ok=completed.returncode == 0,
+            returncode=completed.returncode,
+            output=output,
+            elapsed_sec=time.monotonic() - started,
+        )
+    except subprocess.TimeoutExpired as exc:
+        output = ((exc.stdout or "") + "\n" + (exc.stderr or "")).strip()
+        return CommandResult(
+            command=_command_label(command),
+            ok=False,
+            returncode=124,
+            output=output or f"Command timed out after {timeout}s.",
+            elapsed_sec=time.monotonic() - started,
+        )
+    except FileNotFoundError as exc:
+        return CommandResult(
+            command=_command_label(command),
+            ok=False,
+            returncode=127,
+            output=f"Command not found: {exc}",
+            elapsed_sec=time.monotonic() - started,
+        )
+
+
+def compare_changed_files(baseline: Path, changed: Path) -> list[str]:
+    baseline_files = _file_map(baseline)
+    changed_files = _file_map(changed)
+    paths = sorted(set(baseline_files).union(changed_files))
+    result: list[str] = []
+    for rel in paths:
+        old = baseline_files.get(rel)
+        new = changed_files.get(rel)
+        if old is None or new is None or old.read_bytes() != new.read_bytes():
+            result.append(rel)
+    return result
+
+
+def count_patch_lines(baseline: Path, changed: Path, files: Sequence[str]) -> int:
+    return len(build_patch_diff(baseline, changed, files).splitlines())
+
+
+def build_patch_diff(baseline: Path, changed: Path, files: Sequence[str]) -> str:
+    lines: list[str] = []
+    for rel in files:
+        old_path = baseline / rel
+        new_path = changed / rel
+        old_text = _read_text(old_path) if old_path.exists() else ""
+        new_text = _read_text(new_path) if new_path.exists() else ""
+        if old_text is None or new_text is None:
+            lines.append(f"Binary files a/{rel} and b/{rel} differ")
+            continue
+        diff = difflib.unified_diff(
+            old_text.splitlines(),
+            new_text.splitlines(),
+            fromfile=f"a/{rel}",
+            tofile=f"b/{rel}",
+            lineterm="",
+        )
+        lines.extend(diff)
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def apply_changed_files(source: Path, target: Path, files: Sequence[str]) -> bool:
+    try:
+        for rel in files:
+            src = source / rel
+            dst = target / rel
+            if src.exists():
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dst)
+            elif dst.exists():
+                dst.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def _resolve_repo(task: Mapping[str, Any], manifest_path: Path) -> Path:
+    repo = task.get("repo")
+    if not isinstance(repo, str) or not repo.strip():
+        raise ValueError("Manifest task requires a non-empty repo field.")
+    path = Path(repo).expanduser()
+    if not path.is_absolute():
+        path = manifest_path.parent / path
+    if not path.exists():
+        raise FileNotFoundError(f"Task repo not found: {path}")
+    return path.resolve()
+
+
+def _copy_repo(source: Path, destination: Path) -> None:
+    if destination.exists():
+        shutil.rmtree(destination)
+    shutil.copytree(source, destination, ignore=shutil.ignore_patterns(*_IGNORE_DIRS))
+
+
+def _init_git_baseline(repo: Path) -> None:
+    commands = [
+        ["git", "init"],
+        ["git", "config", "user.email", "agentcli@example.invalid"],
+        ["git", "config", "user.name", "AgentCli Evaluator"],
+        ["git", "config", "commit.gpgsign", "false"],
+        ["git", "add", "-A"],
+        ["git", "commit", "--allow-empty", "--no-gpg-sign", "-m", "baseline"],
+    ]
+    for command in commands:
+        _run_git_baseline_command(repo, command)
+
+
+def _run_git_baseline_command(repo: Path, command: Sequence[str]) -> None:
+    try:
+        completed = subprocess.run(
+            list(command),
+            cwd=str(repo),
+            shell=False,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError("Failed to initialize git baseline: git executable was not found.") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"Failed to initialize git baseline: {' '.join(command)} timed out.") from exc
+    if completed.returncode != 0:
+        output = (completed.stderr or completed.stdout or "").strip()
+        detail = f": {output}" if output else ""
+        raise RuntimeError(f"Failed to initialize git baseline with {' '.join(command)}{detail}")
+
+
+def _file_map(root: Path) -> dict[str, Path]:
+    files: dict[str, Path] = {}
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(root)
+        if any(part in _IGNORE_DIRS for part in rel.parts):
+            continue
+        files[rel.as_posix()] = path
+    return files
+
+
+def _command_argv(command: str | Sequence[str]) -> list[str]:
+    if isinstance(command, str):
+        return shlex.split(command)
+    argv = [str(part) for part in command]
+    if not argv:
+        raise ValueError("Command argv list must not be empty.")
+    return argv
+
+
+def _command_label(command: object) -> str:
+    if command is None:
+        return ""
+    if isinstance(command, str):
+        return command
+    if isinstance(command, Sequence):
+        return " ".join(shlex.quote(str(part)) for part in command)
+    return str(command)
+
+
+def _env_overrides(cli_env: Mapping[str, str], task_env: object) -> dict[str, str]:
+    overrides = {str(key): str(value) for key, value in cli_env.items()}
+    if task_env is None:
+        return overrides
+    if not isinstance(task_env, Mapping):
+        raise ValueError("env_overrides must be a JSON object.")
+    overrides.update({str(key): str(value) for key, value in task_env.items()})
+    return overrides
+
+
+def _command_env(env_overrides: Mapping[str, str]) -> dict[str, str]:
+    env = dict(os.environ)
+    env.update({str(key): str(value) for key, value in env_overrides.items()})
+    return env
+
+
+def _config_for_eval_env(
+    config: AgentConfig,
+    env_overrides: Mapping[str, str],
+    *,
+    trace_dir: Path,
+    memory_dir: Path,
+    command_timeout: int,
+) -> AgentConfig:
+    values = _config_env_values(config)
+    overrides = {str(key): str(value) for key, value in env_overrides.items()}
+    values.update(overrides)
+    if "AGENTCLI_MEMORY_DIR" in overrides:
+        values["AGENTCLI_MEMORY_DIR"] = overrides["AGENTCLI_MEMORY_DIR"]
+    elif "MY_AGENT_MEMORY_DIR" in overrides:
+        values["AGENTCLI_MEMORY_DIR"] = overrides["MY_AGENT_MEMORY_DIR"]
+    else:
+        values["AGENTCLI_MEMORY_DIR"] = str(memory_dir)
+    resolved = AgentConfig.from_env(env=values, require_env_file=False)
+    return replace(
+        resolved,
+        trace_dir=trace_dir,
+        command_timeout=command_timeout,
+        tool_env_overrides=overrides,
+    )
+
+
+def _config_snapshot(config: AgentConfig) -> dict[str, Any]:
+    snapshot: dict[str, Any] = {}
+    for item in fields(config):
+        value = getattr(config, item.name)
+        if item.name == "api_key":
+            snapshot[item.name] = "<redacted>" if value else ""
+        elif isinstance(value, Path):
+            snapshot[item.name] = str(value)
+        elif isinstance(value, tuple):
+            snapshot[item.name] = [str(part) if isinstance(part, Path) else part for part in value]
+        elif isinstance(value, Mapping):
+            snapshot[item.name] = {str(key): str(val) for key, val in value.items()}
+        else:
+            snapshot[item.name] = value
+    return snapshot
+
+
+def _config_env_values(config: AgentConfig) -> dict[str, str]:
+    values = {
+        "MY_AGENT_LLM_PROVIDER": config.provider,
+        "MY_AGENT_USE_FAKE_LLM": _bool_env(config.use_fake_llm),
+        "MY_AGENT_API_KEY": config.api_key,
+        "MY_AGENT_MODEL": config.model,
+        "MY_AGENT_TEMPERATURE": str(config.temperature),
+        "MY_AGENT_MAX_STEPS": str(config.max_steps),
+        "MY_AGENT_COMMAND_TIMEOUT": str(config.command_timeout),
+        "MY_AGENT_TRACE_DIR": str(config.trace_dir),
+        "AGENTCLI_ENABLE_PROJECT_TOOLS": _bool_env(config.enable_project_tools),
+        "AGENTCLI_ENABLE_PROJECT_PLUGINS": _bool_env(config.enable_project_plugins),
+        "MY_AGENT_MAX_ITERATIONS": str(config.max_iterations),
+        "MY_AGENT_MAX_TOOL_CALLS": str(config.max_tool_calls),
+        "MY_AGENT_MAX_ELAPSED_SECONDS": str(config.max_elapsed_seconds),
+        "MY_AGENT_STAGNATION_WINDOW": str(config.stagnation_window),
+        "MY_AGENT_REPEATED_FAILURE_WINDOW": str(config.repeated_failure_window),
+        "MY_AGENT_CONTEXT_WINDOW": str(config.context_window),
+        "MY_AGENT_RESPONSE_RESERVE_TOKENS": str(config.response_reserve_tokens),
+        "MY_AGENT_COMPRESSION_BUFFER_TOKENS": str(config.compression_buffer_tokens),
+        "MY_AGENT_RETAIN_RECENT_TURNS": str(config.retain_recent_user_turns),
+        "MY_AGENT_MAX_TOOL_RESULT_CHARS": str(config.max_tool_result_chars),
+        "MY_AGENT_MAX_SUMMARY_INPUT_CHARS": str(config.max_summary_input_chars),
+        "AGENTCLI_PLAN_TASK_MAX_STEPS": str(config.plan_task_max_steps),
+        "AGENTCLI_PLAN_MAX_TASKS": str(config.plan_max_tasks),
+        "AGENTCLI_PLAN_MAX_REPLANS": str(config.plan_max_replans),
+        "AGENTCLI_AGENT_MODE": config.agent_mode,
+        "AGENTCLI_TEAM_WORKERS": str(config.team_worker_count),
+        "AGENTCLI_TEAM_MAX_STEPS": str(config.team_max_steps),
+        "AGENTCLI_TEAM_MAX_RETRIES": str(config.team_max_retries),
+        "AGENTCLI_TEAM_STEP_MAX_STEPS": str(config.team_step_max_steps),
+        "AGENTCLI_TEAM_DEPENDENCY_CONTEXT_CHARS": str(config.team_dependency_context_chars),
+        "AGENTCLI_TEAM_PARALLEL": _bool_env(config.team_parallel_enabled),
+        "AGENTCLI_TEAM_ALLOW_UNAPPROVED_RESULTS": _bool_env(config.team_allow_unapproved_results),
+        "AGENTCLI_MEMORY": _bool_env(config.memory_enabled),
+        "AGENTCLI_MEMORY_DIR": str(config.memory_dir),
+        "AGENTCLI_MEMORY_SHORT_TERM_TOKENS": str(config.memory_short_term_tokens),
+        "AGENTCLI_MEMORY_SHORT_TERM_ENTRIES": str(config.memory_short_term_entries),
+        "AGENTCLI_MEMORY_CONTEXT_TOKENS": str(config.memory_context_tokens),
+        "AGENTCLI_MEMORY_RETRIEVAL_LIMIT": str(config.memory_retrieval_limit),
+        "AGENTCLI_MEMORY_COMPRESSION_TRIGGER_RATIO": str(config.memory_compression_trigger_ratio),
+        "AGENTCLI_MEMORY_RETAIN_RECENT_TURNS": str(config.memory_retain_recent_turns),
+        "AGENTCLI_MEMORY_MAP_CHUNK_SIZE": str(config.memory_map_chunk_size),
+        "AGENTCLI_MEMORY_TOOL_RESULT_CHARS": str(config.memory_tool_result_chars),
+        "AGENTCLI_MEMORY_AUTO_EXTRACT": _bool_env(config.memory_auto_extract),
+        "AGENTCLI_HITL": _bool_env(config.hitl_enabled),
+        "AGENTCLI_HITL_AUDIT_DIR": str(config.hitl_audit_dir),
+        "AGENTCLI_HITL_NON_INTERACTIVE": config.hitl_non_interactive,
+        "AGENTCLI_HITL_MEDIUM_RISK_MODE": config.hitl_medium_risk_mode,
+        "AGENTCLI_HITL_LLM_JUDGE": _bool_env(config.hitl_llm_judge_enabled),
+        "AGENTCLI_MAX_PARALLEL_TOOLS": str(config.max_parallel_tools),
+        "AGENTCLI_TOOL_BATCH_TIMEOUT_SECONDS": str(config.tool_batch_timeout_seconds),
+        "AGENTCLI_TOOL_SHUTDOWN_GRACE_SECONDS": str(config.tool_shutdown_grace_seconds),
+        "AGENTCLI_MAX_PROCESS_OUTPUT_CHARS": str(config.max_process_output_chars),
+        "AGENTCLI_PLAN_PARALLEL": _bool_env(config.plan_parallel_enabled),
+        "AGENTCLI_PLAN_MAX_PARALLEL_TASKS": str(config.plan_max_parallel_tasks),
+        "AGENTCLI_PLAN_TASK_BATCH_TIMEOUT_SECONDS": str(config.plan_task_batch_timeout_seconds),
+        "AGENTCLI_TEAM_STEP_BATCH_TIMEOUT_SECONDS": str(config.team_step_batch_timeout_seconds),
+        "AGENTCLI_MCP": _bool_env(config.mcp_enabled),
+        "AGENTCLI_MCP_STARTUP_WAIT_SECONDS": str(config.mcp_startup_wait_seconds),
+        "AGENTCLI_MCP_INITIALIZE_TIMEOUT_SECONDS": str(config.mcp_initialize_timeout_seconds),
+        "AGENTCLI_MCP_CALL_TIMEOUT_SECONDS": str(config.mcp_call_timeout_seconds),
+        "AGENTCLI_MCP_MAX_STARTUP_WORKERS": str(config.mcp_max_startup_workers),
+        "AGENTCLI_MCP_REQUIRE_APPROVAL": _bool_env(config.mcp_require_approval),
+        "AGENTCLI_MCP_ENABLE_PROJECT_SERVERS": _bool_env(config.mcp_enable_project_servers),
+    }
+    if config.base_url:
+        values["MY_AGENT_BASE_URL"] = config.base_url
+    if config.token_budget is not None:
+        values["MY_AGENT_TOKEN_BUDGET"] = str(config.token_budget)
+    if config.tool_config_paths:
+        values["AGENTCLI_TOOL_CONFIGS"] = os.pathsep.join(str(path) for path in config.tool_config_paths)
+    return values
+
+
+def _bool_env(value: bool) -> str:
+    return "1" if value else "0"
+
+
+def _string_list(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value if str(item)]
+
+
+def _task_max_steps(task: Mapping[str, Any], cli_max_steps: int | None, default: int) -> int:
+    raw = task.get("max_steps")
+    if isinstance(raw, int) and not isinstance(raw, bool) and raw > 0:
+        return raw
+    if cli_max_steps is not None:
+        return max(1, cli_max_steps)
+    return max(1, default)
+
+
+def _failure_type(
+    *,
+    agent_error: bool,
+    patch_apply_ok: bool,
+    visible_ok: bool,
+    hidden_ok: bool,
+    has_hidden: bool,
+) -> str:
+    if agent_error:
+        return "agent_error"
+    if not patch_apply_ok:
+        return "patch_apply_failed"
+    if not visible_ok:
+        return "visible_test_failed"
+    if has_hidden and not hidden_ok:
+        return "hidden_test_failed"
+    return ""
+
+
+def _metrics_for_trace(trace_path: str, trace_dir: Path) -> dict[str, Any]:
+    try:
+        target = Path(trace_path) if trace_path else trace_dir
+        return collect_trace_metrics(target, recursive=True).to_dict()
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def _read_text(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def _safe_id(value: str) -> str:
+    safe = "".join(char if char.isalnum() or char in {"_", "-"} else "_" for char in value)
+    return safe[:80] or "task"

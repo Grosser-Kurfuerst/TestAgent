@@ -22,6 +22,7 @@ from my_agent.team.types import AgentRole, ExecutionStep, ReviewDecision, TeamSt
 from my_agent.utils.numbers import positive_or_default
 
 EventSink = Callable[[Any], None]
+TraceSink = Callable[[str, dict[str, object]], None]
 
 
 class SubAgent:
@@ -40,6 +41,7 @@ class SubAgent:
         hitl_handler: HitlHandler | None = None,
         test_command: str | None = None,
         step_max_steps: int | None = None,
+        trace_sink: TraceSink | None = None,
     ) -> None:
         self.name = name
         self.role = role
@@ -53,6 +55,7 @@ class SubAgent:
         self.hitl_handler = hitl_handler
         self.test_command = test_command
         self.step_max_steps = positive_or_default(step_max_steps, config.team_step_max_steps)
+        self.trace_sink = trace_sink
         self.child_runner = ChildReActRunner(
             config=config,
             llm=llm,
@@ -62,6 +65,11 @@ class SubAgent:
             hitl_handler=hitl_handler,
         )
         self.history: list[MessageLike] = [Message(role="system", content=self._system_prompt())]
+
+    def set_trace_sink(self, trace_sink: TraceSink | None) -> TraceSink | None:
+        previous = self.trace_sink
+        self.trace_sink = trace_sink
+        return previous
 
     def execute_step(
         self,
@@ -119,7 +127,41 @@ class SubAgent:
             result=result,
         )
         self.history.append(Message(role="user", content=prompt))
-        response = self.llm.chat(self.history, tools=None)
+        self._trace(
+            "llm.requested",
+            {
+                "phase": "team_reviewer",
+                "reviewer": self.name,
+                "step_id": step.id,
+                "message_count": len(self.history),
+                "tool_count": 0,
+            },
+        )
+        try:
+            response = self.llm.chat(self.history, tools=None)
+        except Exception as exc:
+            self._trace(
+                "llm.failed",
+                {
+                    "phase": "team_reviewer",
+                    "reviewer": self.name,
+                    "step_id": step.id,
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+            )
+            raise
+        self._trace(
+            "llm.completed",
+            {
+                "phase": "team_reviewer",
+                "reviewer": self.name,
+                "step_id": step.id,
+                "finish_reason": response.finish_reason,
+                "content_chars": len(response.content),
+                "tool_calls": [],
+                "usage": response.usage.to_dict(),
+            },
+        )
         self.history.append(Message(role=response.role or "assistant", content=response.content))
         return parse_review_decision(response.content)
 
@@ -132,3 +174,8 @@ class SubAgent:
         if self.role == AgentRole.REVIEWER:
             return TEAM_REVIEWER_SYSTEM_PROMPT
         return "You are a planner sub-agent in a Multi-Agent coding team."
+
+    def _trace(self, event: str, payload: dict[str, object]) -> None:
+        if self.trace_sink is None:
+            return
+        self.trace_sink(event, payload)

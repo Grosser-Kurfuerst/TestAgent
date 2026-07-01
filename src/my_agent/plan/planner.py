@@ -2,18 +2,21 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from my_agent.llm import AgentLLM
 from my_agent.llm.types import MessageLike
 from my_agent.plan.graph import PlanValidationError, TaskGraph
 from my_agent.plan.types import PlanState, PlanTask, TaskType
 
+TraceSink = Callable[[str, dict[str, object]], None]
+
 
 class Planner:
-    def __init__(self, llm: AgentLLM, *, max_tasks: int = 12):
+    def __init__(self, llm: AgentLLM, *, max_tasks: int = 12, trace_sink: TraceSink | None = None):
         self.llm = llm
         self.max_tasks = max_tasks
+        self.trace_sink = trace_sink
 
     def create_plan(
         self,
@@ -23,15 +26,35 @@ class Planner:
         conversation: Sequence[MessageLike] | None = None,
     ) -> PlanState:
         messages = self._build_messages(goal, repo_context=repo_context, conversation=conversation or [])
+        self._trace(
+            "llm.requested",
+            {"phase": "plan_planner", "message_count": len(messages), "tool_count": 0},
+        )
         try:
             response = self.llm.chat(messages, tools=None)
         except Exception as exc:
+            self._trace("llm.failed", {"phase": "plan_planner", "error": f"{type(exc).__name__}: {exc}"})
             raise PlanValidationError(
                 "planner_llm_failed",
                 f"Planner LLM call failed: {exc}",
                 {"error": str(exc)},
             ) from exc
+        self._trace(
+            "llm.completed",
+            {
+                "phase": "plan_planner",
+                "finish_reason": response.finish_reason,
+                "content_chars": len(response.content),
+                "tool_calls": [],
+                "usage": response.usage.to_dict(),
+            },
+        )
         return self.parse_plan(goal, response.content)
+
+    def _trace(self, event: str, payload: dict[str, object]) -> None:
+        if self.trace_sink is None:
+            return
+        self.trace_sink(event, payload)
 
     def parse_plan(self, goal: str, raw_text: str) -> PlanState:
         try:

@@ -5,7 +5,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, Mapping
 
 from my_agent.cancellation import CancellationToken
 from my_agent.indexer import RepoIndexer, TEXT_EXTENSIONS
@@ -269,7 +269,7 @@ class RepoTools:
             parts,
             cwd=self.repo_root,
             timeout_seconds=self.timeout,
-            env=_test_env(self.repo_root),
+            env=_test_env(self.repo_root, getattr(context.config, "tool_env_overrides", None)),
             cancellation_token=context.cancellation_token,
             max_output_chars=context.max_process_output_chars,
         )
@@ -341,8 +341,10 @@ def _subprocess_command(parts: list[str]) -> list[str]:
     return parts
 
 
-def _test_env(repo_root: Path) -> dict[str, str]:
+def _test_env(repo_root: Path, overrides: Mapping[str, str] | None = None) -> dict[str, str]:
     env = dict(os.environ)
+    if overrides:
+        env.update({str(key): str(value) for key, value in overrides.items()})
     existing_pythonpath = env.get("PYTHONPATH")
     env["PYTHONUNBUFFERED"] = "1"
     env["PYTHONPATH"] = str(repo_root) if not existing_pythonpath else f"{repo_root}{os.pathsep}{existing_pythonpath}"

@@ -13,7 +13,7 @@ from my_agent.cancellation import CancellationToken
 from my_agent.hitl import SwitchableHitlHandler, TerminalHitlHandler
 from my_agent.llm import build_llm
 from my_agent.llm.types import Message
-from my_agent.memory import MemoryManager, MemoryScope
+from my_agent.memory import MemoryManager, MemoryScope, NoopMemoryManager
 from my_agent.mcp.manager import McpServerManager, McpServerManagerPool
 from my_agent.mcp.observability import format_mcp_disabled, format_mcp_logs, format_mcp_status, format_mcp_summary
 from my_agent.plan import AgentMode, PlanState, PlanTask, normalize_mode
@@ -83,7 +83,11 @@ class AgentRepl:
         )
         self._tools = self._load_tools()
         self._profile = ContextProfile.from_config(config)
-        self._memory = MemoryManager.from_config(config=config, llm=build_llm(config), repo_path=self.repo_path)
+        self._memory = (
+            MemoryManager.from_config(config=config, llm=build_llm(config), repo_path=self.repo_path)
+            if config.memory_enabled
+            else NoopMemoryManager(config=config, repo_path=self.repo_path)
+        )
         self._latest_trace: Path | None = None
         self._shutdown_complete = False
         self._run_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="agentcli-repl")

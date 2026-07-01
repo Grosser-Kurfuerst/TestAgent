@@ -12,7 +12,7 @@ from my_agent.llm import AgentLLM, build_llm
 from my_agent.memory import MemoryManager
 from my_agent.plan import AgentMode, resolve_mode
 from my_agent.schema import AgentState, TraceEvent
-from my_agent.tracing import TraceWriter
+from my_agent.tracing import TraceWriter, append_agent_completed
 
 
 class CodingAgentRuntime:
@@ -124,4 +124,5 @@ def _cancelled_state(state: AgentState, trace_dir: Path, *, reason: str) -> Agen
             run_id=state.run_id,
         )
     )
+    append_agent_completed(writer, state, mode="react", run_label="runtime_cancelled")
     return state
