@@ -167,6 +167,19 @@ class ShortTermMemoryTests(unittest.TestCase):
         self.assertEqual([entry.id for entry in old], ["u0", "a0", "t0", "u1", "a1", "t1"])
         self.assertNotIn("u2", [entry.id for entry in old])
 
+    def test_old_entries_for_compression_treats_task_goal_as_boundary(self) -> None:
+        memory = ShortTermMemory(max_tokens=1_000_000, max_entries=100)
+        memory.append(self._entry("goal", "fix subtract", source="task_goal"))
+        for i in range(5):
+            memory.append(self._entry(f"a{i}", f"asst {i}", source="assistant"))
+            memory.append(self._entry(f"t{i}", f"tool {i}", source="tool:read"))
+
+        old = memory.old_entries_for_compression(2)
+
+        self.assertEqual([entry.id for entry in old], ["a0", "t0", "a1", "t1", "a2", "t2"])
+        self.assertNotIn("goal", [entry.id for entry in old])
+        self.assertNotIn("a3", [entry.id for entry in old])
+
     def test_replace_old_entries_with_summary(self) -> None:
         memory = ShortTermMemory(max_tokens=1_000_000, max_entries=100)
         for i in range(3):
@@ -187,6 +200,28 @@ class ShortTermMemoryTests(unittest.TestCase):
         self.assertEqual(ids[0], "sum1")
         self.assertNotIn("u0", ids)
         self.assertEqual(ids[1:], ["u2", "a2"])
+
+    def test_replace_old_entries_keeps_task_goal_before_summary(self) -> None:
+        memory = ShortTermMemory(max_tokens=1_000_000, max_entries=100)
+        memory.append(self._entry("goal", "fix subtract", source="task_goal"))
+        for i in range(4):
+            memory.append(self._entry(f"a{i}", f"asst {i}", source="assistant"))
+            memory.append(self._entry(f"t{i}", f"tool {i}", source="tool:read"))
+        old = memory.old_entries_for_compression(2)
+        summary = MemoryEntry.build(
+            id="sum1",
+            content="compressed summary",
+            type=MemoryType.SUMMARY,
+            scope=MemoryScope.SESSION,
+            source="compressor",
+            token_count=estimate_tokens("compressed summary"),
+        )
+
+        memory.replace_old_entries_with_summary({entry.id for entry in old}, summary)
+
+        ids = [entry.id for entry in memory.all()]
+        self.assertEqual(ids[:2], ["goal", "sum1"])
+        self.assertEqual(ids[-4:], ["a2", "t2", "a3", "t3"])
 
     def test_replace_rejects_non_summary_entry(self) -> None:
         memory = ShortTermMemory(max_tokens=1_000_000, max_entries=100)

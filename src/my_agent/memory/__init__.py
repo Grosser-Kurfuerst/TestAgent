@@ -1,13 +1,12 @@
-"""Unified memory and context-budget management for the agent.
+"""Unified memory storage and retrieval for the agent.
 
-The Agent only talks to :class:`~my_agent.memory.manager.MemoryManager`; the
-remaining modules (types, token, short/long-term storage, retrieval and
-compression) are implementation details that can be swapped without changing
-the call sites.
+The runtime uses :class:`~my_agent.memory.manager.MemoryManager` for memory
+storage, retrieval, and compression primitives. Prompt assembly and
+context-window budgeting live in :mod:`my_agent.context`.
 
 Phase 3 ships the data model, short/long-term storage, config wiring,
-retrieval/context injection, map-reduce compression, fact extraction, the
-:class:`MemoryManager` facade, and the runtime/TUI call-site wiring.
+retrieval, map-reduce compression, fact extraction, and the
+:class:`MemoryManager` entry point.
 """
 
 from __future__ import annotations

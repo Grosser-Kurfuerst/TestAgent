@@ -374,6 +374,12 @@ class ManifestBenchmarkTests(unittest.TestCase):
                 seen_config = kwargs["config"]  # type: ignore[assignment]
                 self.assertIsInstance(seen_config, AgentConfig)
                 self.assertFalse(seen_config.memory_enabled)
+                self.assertFalse(seen_config.context_window_explicit)
+                self.assertFalse(seen_config.response_reserve_tokens_explicit)
+                self.assertFalse(seen_config.compression_buffer_tokens_explicit)
+                self.assertFalse(seen_config.memory_short_term_tokens_explicit)
+                self.assertFalse(seen_config.memory_context_tokens_explicit)
+                self.assertFalse(seen_config.memory_tool_result_chars_explicit)
                 self.assertFalse(seen_config.mcp_enabled)
                 self.assertFalse(seen_config.team_parallel_enabled)
                 tools = RepoTools(Path(kwargs["repo_path"]), config=seen_config)  # type: ignore[arg-type]

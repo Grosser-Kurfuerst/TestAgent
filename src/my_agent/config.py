@@ -49,6 +49,9 @@ class AgentConfig:
     retain_recent_user_turns: int = 3
     max_tool_result_chars: int = 12_000
     max_summary_input_chars: int = 60_000
+    context_window_explicit: bool = False
+    response_reserve_tokens_explicit: bool = False
+    compression_buffer_tokens_explicit: bool = False
 
     # Plan-and-execute defaults.
     plan_task_max_steps: int = 6
@@ -77,6 +80,9 @@ class AgentConfig:
     memory_map_chunk_size: int = 5
     memory_tool_result_chars: int = 500
     memory_auto_extract: bool = True
+    memory_short_term_tokens_explicit: bool = False
+    memory_context_tokens_explicit: bool = False
+    memory_tool_result_chars_explicit: bool = False
 
     # Human-in-the-loop approval; disabled by default.
     hitl_enabled: bool = False
@@ -147,8 +153,11 @@ class AgentConfig:
             stagnation_window=_as_int(values.get("MY_AGENT_STAGNATION_WINDOW"), 3),
             repeated_failure_window=_as_int(values.get("MY_AGENT_REPEATED_FAILURE_WINDOW"), 3),
             context_window=_as_int(values.get("MY_AGENT_CONTEXT_WINDOW"), 128_000),
+            context_window_explicit=_has_value(values, "MY_AGENT_CONTEXT_WINDOW"),
             response_reserve_tokens=_as_int(values.get("MY_AGENT_RESPONSE_RESERVE_TOKENS"), 8_000),
+            response_reserve_tokens_explicit=_has_value(values, "MY_AGENT_RESPONSE_RESERVE_TOKENS"),
             compression_buffer_tokens=_as_int(values.get("MY_AGENT_COMPRESSION_BUFFER_TOKENS"), 8_000),
+            compression_buffer_tokens_explicit=_has_value(values, "MY_AGENT_COMPRESSION_BUFFER_TOKENS"),
             retain_recent_user_turns=_as_int(values.get("MY_AGENT_RETAIN_RECENT_TURNS"), 3),
             max_tool_result_chars=_as_int(values.get("MY_AGENT_MAX_TOOL_RESULT_CHARS"), 12_000),
             max_summary_input_chars=_as_int(values.get("MY_AGENT_MAX_SUMMARY_INPUT_CHARS"), 60_000),
@@ -207,6 +216,11 @@ class AgentConfig:
                 values.get("AGENTCLI_MEMORY_SHORT_TERM_TOKENS", values.get("MY_AGENT_MEMORY_SHORT_TERM_TOKENS")),
                 24_000,
             ),
+            memory_short_term_tokens_explicit=_has_any_value(
+                values,
+                "AGENTCLI_MEMORY_SHORT_TERM_TOKENS",
+                "MY_AGENT_MEMORY_SHORT_TERM_TOKENS",
+            ),
             memory_short_term_entries=_as_positive_int(
                 values.get("AGENTCLI_MEMORY_SHORT_TERM_ENTRIES", values.get("MY_AGENT_MEMORY_SHORT_TERM_ENTRIES")),
                 500,
@@ -214,6 +228,11 @@ class AgentConfig:
             memory_context_tokens=_as_positive_int(
                 values.get("AGENTCLI_MEMORY_CONTEXT_TOKENS", values.get("MY_AGENT_MEMORY_CONTEXT_TOKENS")),
                 2_000,
+            ),
+            memory_context_tokens_explicit=_has_any_value(
+                values,
+                "AGENTCLI_MEMORY_CONTEXT_TOKENS",
+                "MY_AGENT_MEMORY_CONTEXT_TOKENS",
             ),
             memory_retrieval_limit=_as_positive_int(
                 values.get("AGENTCLI_MEMORY_RETRIEVAL_LIMIT", values.get("MY_AGENT_MEMORY_RETRIEVAL_LIMIT")),
@@ -234,6 +253,11 @@ class AgentConfig:
             memory_tool_result_chars=_as_positive_int(
                 values.get("AGENTCLI_MEMORY_TOOL_RESULT_CHARS", values.get("MY_AGENT_MEMORY_TOOL_RESULT_CHARS")),
                 500,
+            ),
+            memory_tool_result_chars_explicit=_has_any_value(
+                values,
+                "AGENTCLI_MEMORY_TOOL_RESULT_CHARS",
+                "MY_AGENT_MEMORY_TOOL_RESULT_CHARS",
             ),
             memory_auto_extract=_as_bool(
                 values.get("AGENTCLI_MEMORY_AUTO_EXTRACT", values.get("MY_AGENT_MEMORY_AUTO_EXTRACT", "")),
@@ -350,6 +374,15 @@ def _as_bool(value: str | None, *, default: bool = False) -> bool:
     if value is None or not value.strip():
         return default
     return value.strip().lower() in TRUE_VALUES
+
+
+def _has_value(values: Mapping[str, str], key: str) -> bool:
+    value = values.get(key)
+    return value is not None and bool(value.strip())
+
+
+def _has_any_value(values: Mapping[str, str], *keys: str) -> bool:
+    return any(_has_value(values, key) for key in keys)
 
 
 def _as_int(value: str | None, default: int) -> int:

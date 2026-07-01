@@ -7,6 +7,7 @@ from typing import Any, Callable
 
 from my_agent.budget import AgentBudget
 from my_agent.config import AgentConfig
+from my_agent.context import AgentContextManager
 from my_agent.hitl.handler import HitlHandler
 from my_agent.hitl.types import ApprovalEvent
 from my_agent.llm import AgentLLM
@@ -69,6 +70,8 @@ class ReActAgent(AgentBase):
             )
             tool_definitions = tools.tool_definitions()
             budget = AgentBudget.from_config(self.config, max_steps=state.max_steps)
+            context_profile = getattr(memory, "context_profile", None) or AgentContextManager.from_config(self.config).profile
+            context_manager = AgentContextManager(context_profile)
 
             self._emit(
                 writer,
@@ -103,7 +106,7 @@ class ReActAgent(AgentBase):
             state.plan = "Use native ReAct tool calls to inspect, edit, verify, and finish the task."
 
             base_messages = self._initial_messages(state)
-            memory.append_user_message(state.task, run_id=state.run_id)
+            memory.append_task_goal(state.task, run_id=state.run_id)
             while not state.done:
                 if _is_cancelled(state):
                     self._stop_cancelled(state, writer)
@@ -113,10 +116,11 @@ class ReActAgent(AgentBase):
                     self._stop_by_budget(state, writer, budget, stop_reason)
                     break
 
-                messages, _, _ = memory.prepare_messages(
+                messages, _, _ = context_manager.prepare_messages(
                     base_messages=base_messages,
                     query=state.task,
                     tools=tool_definitions,
+                    memory=memory,
                 )
 
                 budget.begin_iteration()
@@ -139,6 +143,7 @@ class ReActAgent(AgentBase):
                     writer,
                     state,
                     memory=memory,
+                    context_manager=context_manager,
                     base_messages=base_messages,
                 )
                 if response is None:
@@ -212,16 +217,18 @@ class ReActAgent(AgentBase):
         state: AgentState,
         *,
         memory: MemoryManager,
+        context_manager: AgentContextManager,
         base_messages: list[MessageLike],
     ) -> ChatResponse | None:
         try:
             return self.llm.chat(messages, tools=tool_definitions)
         except RuntimeError as exc:
             if _looks_like_context_error(str(exc)):
-                retry_messages, _, _ = memory.prepare_messages(
+                retry_messages, _, _ = context_manager.prepare_messages(
                     base_messages=base_messages,
                     query=state.task,
                     tools=tool_definitions,
+                    memory=memory,
                     force_compact=True,
                     focus="Retry after context length error.",
                 )

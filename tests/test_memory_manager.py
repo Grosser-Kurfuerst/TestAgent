@@ -14,6 +14,7 @@ except ImportError:  # unittest discover -s tests imports modules as top-level f
 add_src_to_path()
 
 from my_agent.config import AgentConfig
+from my_agent.context import AgentContextManager
 from my_agent.llm import FakeLLM
 from my_agent.llm.types import ChatResponse, LLMToolCall, Message, MessageLike
 from my_agent.memory import MemoryManager, MemoryScope
@@ -115,6 +116,10 @@ def _append_turn(manager: MemoryManager, index: int, *, payload: str = "") -> No
             content=f"result {index}{suffix}",
         )
     )
+
+
+def _prepare_messages(manager: MemoryManager, **kwargs):
+    return AgentContextManager(manager.context_profile).prepare_messages(memory=manager, **kwargs)
 
 
 class MemoryManagerBuildContextTests(unittest.TestCase):
@@ -320,7 +325,8 @@ class MemoryManagerCompressionTests(unittest.TestCase):
             for index in range(12):
                 _append_turn(manager, index)
 
-            _, _, compaction = manager.prepare_messages(
+            _, _, compaction = _prepare_messages(
+                manager,
                 base_messages=[Message(role="system", content="base"), Message(role="user", content="runtime")],
                 query="user turn",
                 tools=[],
@@ -348,8 +354,11 @@ class MemoryManagerCompressionTests(unittest.TestCase):
             manager = MemoryManager.from_config(
                 config=_config(
                     Path(tmp) / "memory",
-                    memory_short_term_tokens=20_000,
-                    memory_compression_trigger_ratio=0.8,
+                    context_window=8_000,
+                    context_window_explicit=True,
+                    response_reserve_tokens=6_000,
+                    compression_buffer_tokens=1_000,
+                    memory_short_term_tokens=100_000,
                     memory_map_chunk_size=5,
                 ),
                 llm=RecordingMemoryLLM(),
@@ -359,7 +368,8 @@ class MemoryManagerCompressionTests(unittest.TestCase):
             for index in range(12):
                 _append_turn(manager, index, payload=payload)
 
-            _, _, compaction = manager.prepare_messages(
+            _, _, compaction = _prepare_messages(
+                manager,
                 base_messages=[Message(role="system", content="base")],
                 query="user turn",
                 tools=[],
@@ -367,6 +377,49 @@ class MemoryManagerCompressionTests(unittest.TestCase):
 
             self.assertIsNotNone(compaction)
             self.assertTrue(compaction.compacted)
+
+    def test_prepare_messages_compacts_single_task_goal_tool_chain(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            manager = MemoryManager.from_config(
+                config=_config(
+                    Path(tmp) / "memory",
+                    context_window=8_000,
+                    context_window_explicit=True,
+                    response_reserve_tokens=6_000,
+                    compression_buffer_tokens=1_000,
+                    memory_short_term_tokens=100_000,
+                    memory_map_chunk_size=3,
+                ),
+                llm=RecordingMemoryLLM(),
+                repo_path=repo,
+            )
+            manager.append_task_goal("fix subtract")
+            payload = "x" * 3000
+            for index in range(6):
+                manager.append_assistant_response(ChatResponse(content=f"assistant cycle {index} {payload}"))
+                manager.append_tool_result(
+                    ToolExecutionResult(
+                        id=f"call_{index}",
+                        name="read_file",
+                        ok=True,
+                        content=f"tool cycle {index} {payload}",
+                    )
+                )
+
+            _, _, compaction = _prepare_messages(
+                manager,
+                base_messages=[Message(role="system", content="base")],
+                query="subtract",
+                tools=[],
+            )
+
+            self.assertIsNotNone(compaction)
+            self.assertTrue(compaction.compacted)
+            entries = manager.short_term.all()
+            self.assertTrue(any(entry.source == "task_goal" and entry.content == "fix subtract" for entry in entries))
+            self.assertLess(len([entry for entry in entries if entry.source == "assistant"]), 6)
 
     def test_prepare_messages_compacts_when_full_prompt_crosses_threshold(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -376,8 +429,11 @@ class MemoryManagerCompressionTests(unittest.TestCase):
             manager = MemoryManager.from_config(
                 config=_config(
                     Path(tmp) / "memory",
-                    memory_short_term_tokens=1_000,
-                    memory_compression_trigger_ratio=0.8,
+                    context_window=8_000,
+                    context_window_explicit=True,
+                    response_reserve_tokens=6_000,
+                    compression_buffer_tokens=1_000,
+                    memory_short_term_tokens=100_000,
                 ),
                 llm=llm,
                 repo_path=repo,
@@ -385,7 +441,8 @@ class MemoryManagerCompressionTests(unittest.TestCase):
             for index in range(4):
                 _append_turn(manager, index)
 
-            _, _, compaction = manager.prepare_messages(
+            _, _, compaction = _prepare_messages(
+                manager,
                 base_messages=[
                     Message(role="system", content="base"),
                     Message(role="user", content="runtime " + ("x" * 4000)),
@@ -404,7 +461,14 @@ class MemoryManagerCompressionTests(unittest.TestCase):
             repo.mkdir()
             traces: list[tuple[str, dict[str, object]]] = []
             manager = MemoryManager.from_config(
-                config=_config(Path(tmp) / "memory", memory_short_term_tokens=1_000),
+                config=_config(
+                    Path(tmp) / "memory",
+                    context_window=8_000,
+                    context_window_explicit=True,
+                    response_reserve_tokens=6_000,
+                    compression_buffer_tokens=1_000,
+                    memory_short_term_tokens=100_000,
+                ),
                 llm=RecordingMemoryLLM(),
                 repo_path=repo,
                 trace_sink=lambda event, payload: traces.append((event, payload)),
@@ -412,7 +476,8 @@ class MemoryManagerCompressionTests(unittest.TestCase):
             for index in range(4):
                 _append_turn(manager, index)
 
-            _, _, compaction = manager.prepare_messages(
+            _, _, compaction = _prepare_messages(
+                manager,
                 base_messages=[
                     Message(role="system", content="base"),
                     Message(role="user", content="runtime " + ("x" * 4000)),
@@ -425,6 +490,33 @@ class MemoryManagerCompressionTests(unittest.TestCase):
             compacted_events = [payload for event, payload in traces if event == "memory.compacted"]
             self.assertEqual(len(compacted_events), 1)
             self.assertEqual(compacted_events[0]["after_tokens"], compaction.after_tokens)
+            self.assertEqual(compacted_events[0]["estimated_prompt_tokens"], compaction.after_tokens)
+
+    def test_direct_compact_short_term_trace_includes_estimated_prompt_tokens(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            traces: list[tuple[str, dict[str, object]]] = []
+            manager = MemoryManager.from_config(
+                config=_config(Path(tmp) / "memory"),
+                llm=RecordingMemoryLLM(),
+                repo_path=repo,
+                trace_sink=lambda event, payload: traces.append((event, payload)),
+            )
+            for index in range(5):
+                _append_turn(manager, index)
+
+            compaction = manager.compact_short_term(tools=[], force=True)
+
+            self.assertIsNotNone(compaction)
+            self.assertTrue(compaction.compacted)
+            compacted = [payload for event, payload in traces if event == "memory.compacted"][-1]
+            self.assertEqual(compacted["estimated_prompt_tokens"], compaction.after_tokens)
+            self.assertEqual(compacted["context_window"], manager.context_profile.max_context_tokens)
+            self.assertEqual(compacted["compression_trigger_tokens"], manager.context_profile.compression_trigger_tokens)
+            self.assertEqual(compacted["short_term_token_limit"], manager.context_profile.short_term_token_limit)
+            self.assertEqual(compacted["tool_result_char_limit"], manager.context_profile.tool_result_char_limit)
+            self.assertEqual(compacted["dynamic_profile_source"], manager.context_profile.dynamic_profile_source)
 
     def test_compaction_fallback_keeps_main_flow_alive_when_llm_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -438,7 +530,8 @@ class MemoryManagerCompressionTests(unittest.TestCase):
             for index in range(5):
                 _append_turn(manager, index)
 
-            _, _, compaction = manager.prepare_messages(
+            _, _, compaction = _prepare_messages(
+                manager,
                 base_messages=[Message(role="system", content="base")],
                 query="user turn",
                 tools=[],
@@ -469,7 +562,8 @@ class MemoryManagerCompressionTests(unittest.TestCase):
             for index in range(5):
                 _append_turn(manager, index, payload="用户偏好：回答中文，先给结论")
 
-            _, _, compaction = manager.prepare_messages(
+            _, _, compaction = _prepare_messages(
+                manager,
                 base_messages=[Message(role="system", content="base")],
                 query="用户偏好",
                 tools=[],
@@ -504,7 +598,8 @@ class MemoryManagerCompressionTests(unittest.TestCase):
             for index in range(5):
                 _append_turn(manager, index, payload="Project uses FastAPI for REST APIs")
 
-            _, _, compaction = manager.prepare_messages(
+            _, _, compaction = _prepare_messages(
+                manager,
                 base_messages=[Message(role="system", content="base")],
                 query="FastAPI",
                 tools=[],
@@ -517,7 +612,7 @@ class MemoryManagerCompressionTests(unittest.TestCase):
             self.assertIn("Project uses FastAPI for REST APIs", facts)
 
 
-class MemoryManagerFacadeTests(unittest.TestCase):
+class AgentContextManagerPromptTests(unittest.TestCase):
     def test_prepare_messages_injects_memory_and_rebuilds_tool_call_history(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "repo"
@@ -544,7 +639,8 @@ class MemoryManagerFacadeTests(unittest.TestCase):
                 )
             )
 
-            messages, context, compaction = manager.prepare_messages(
+            messages, context, compaction = _prepare_messages(
+                manager,
                 base_messages=[Message(role="system", content="base"), Message(role="user", content="runtime")],
                 query="用户偏好 回答中文",
                 tools=[],
@@ -611,7 +707,8 @@ class MemoryManagerFacadeTests(unittest.TestCase):
                 )
             )
 
-            messages, _, _ = manager.prepare_messages(
+            messages, _, _ = _prepare_messages(
+                manager,
                 base_messages=[Message(role="system", content="base")],
                 query="orphan",
                 tools=[],
@@ -651,7 +748,8 @@ class MemoryManagerFacadeTests(unittest.TestCase):
             )
             manager.append_user_message("next user turn")
 
-            messages, _, _ = manager.prepare_messages(
+            messages, _, _ = _prepare_messages(
+                manager,
                 base_messages=[Message(role="system", content="base")],
                 query="tools",
                 tools=[],

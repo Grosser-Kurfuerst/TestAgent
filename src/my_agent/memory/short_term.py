@@ -62,7 +62,7 @@ class ShortTermMemory:
         if retain_user_turns < 1:
             return []
         entries = list(self._entries)
-        user_indices = [idx for idx, entry in enumerate(entries) if entry.source == "user"]
+        user_indices = [idx for idx, entry in enumerate(entries) if _is_user_boundary(entry)]
         if not user_indices:
             # No user boundary yet: keep everything so we never drop the only
             # context we have.
@@ -82,36 +82,49 @@ class ShortTermMemory:
         if retain_user_turns < 1:
             return list(self._entries)
         entries = list(self._entries)
-        user_indices = [idx for idx, entry in enumerate(entries) if entry.source == "user"]
+        user_indices = [idx for idx, entry in enumerate(entries) if _is_user_boundary(entry)]
         if not user_indices:
             return []
         if len(user_indices) <= retain_user_turns:
-            return []
+            if len(user_indices) != 1:
+                return []
+            prefix_end = user_indices[0] + 1
+            tail_entries = max(2, retain_user_turns * 2)
+            if len(entries) - prefix_end <= tail_entries:
+                return []
+            split_idx = max(prefix_end, len(entries) - tail_entries)
+            while split_idx > prefix_end and entries[split_idx].source.startswith("tool:"):
+                split_idx -= 1
+            return entries[prefix_end:split_idx]
         start = user_indices[-retain_user_turns]
         return entries[:start]
 
     def replace_old_entries_with_summary(self, old_ids: set[str], summary: MemoryEntry) -> None:
-        """Drop the compressed entries (by id) and prepend a summary entry.
+        """Drop compressed entries and insert a summary at their first position.
 
-        The summary keeps its own position at the head of the deque so the
-        retained recent turns still follow it in order.
+        For normal multi-turn compression the first removed entry is the head,
+        so this behaves like prepending. For a single task-goal session, the
+        goal is retained and the summary lands after it.
         """
         if summary.type != MemoryType.SUMMARY:
             raise ValueError("summary entry must have MemoryType.SUMMARY.")
         old_id_set = set(old_ids)
         kept: list[MemoryEntry] = []
         removed_tokens = 0
+        inserted_summary = False
         for entry in self._entries:
             if entry.id in old_id_set:
                 removed_tokens += max(0, entry.token_count)
+                if not inserted_summary:
+                    kept.append(summary)
+                    inserted_summary = True
             else:
                 kept.append(entry)
+        if not inserted_summary:
+            kept.insert(0, summary)
         self._entries = deque(kept)
         self._tokens = max(0, self._tokens - removed_tokens)
-        self._entries.appendleft(summary)
         self._tokens += max(0, summary.token_count)
-        # The summary may itself push us over the cap; evict from the tail
-        # (oldest surviving entries) only if absolutely necessary.
         self._evict()
 
     def clear(self) -> list[MemoryEntry]:
@@ -140,6 +153,10 @@ class ShortTermMemory:
             self._tokens = max(0, self._tokens - max(0, oldest.token_count))
             evicted.append(oldest)
         return evicted
+
+
+def _is_user_boundary(entry: MemoryEntry) -> bool:
+    return entry.source in {"user", "task_goal"}
 
 
 __all__ = ["ShortTermMemory"]

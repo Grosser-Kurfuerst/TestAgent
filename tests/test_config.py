@@ -40,6 +40,9 @@ class AgentConfigTests(unittest.TestCase):
         self.assertEqual(config.command_timeout, 60)
         self.assertEqual(str(config.trace_dir), "traces")
         self.assertFalse(config.use_fake_llm)
+        self.assertFalse(config.context_window_explicit)
+        self.assertFalse(config.response_reserve_tokens_explicit)
+        self.assertFalse(config.compression_buffer_tokens_explicit)
         self.assertEqual(config.plan_task_max_steps, 6)
         self.assertEqual(config.plan_max_tasks, 12)
         self.assertEqual(config.plan_max_replans, 1)
@@ -87,6 +90,9 @@ class AgentConfigTests(unittest.TestCase):
                         "MY_AGENT_MAX_STEPS=5",
                         "MY_AGENT_COMMAND_TIMEOUT=12",
                         "MY_AGENT_TRACE_DIR=tmp-traces",
+                        "MY_AGENT_CONTEXT_WINDOW=32000",
+                        "MY_AGENT_RESPONSE_RESERVE_TOKENS=5000",
+                        "MY_AGENT_COMPRESSION_BUFFER_TOKENS=2500",
                     ]
                 ),
                 encoding="utf-8",
@@ -102,6 +108,12 @@ class AgentConfigTests(unittest.TestCase):
         self.assertEqual(config.max_steps, 5)
         self.assertEqual(config.command_timeout, 12)
         self.assertEqual(str(config.trace_dir), "tmp-traces")
+        self.assertEqual(config.context_window, 32_000)
+        self.assertTrue(config.context_window_explicit)
+        self.assertEqual(config.response_reserve_tokens, 5_000)
+        self.assertTrue(config.response_reserve_tokens_explicit)
+        self.assertEqual(config.compression_buffer_tokens, 2_500)
+        self.assertTrue(config.compression_buffer_tokens_explicit)
 
     def test_tool_flags_default_off_and_can_be_enabled_from_env_mapping(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -219,11 +231,14 @@ class AgentConfigTests(unittest.TestCase):
         self.assertEqual(config.memory_short_term_tokens, 24_000)
         self.assertEqual(config.memory_short_term_entries, 500)
         self.assertEqual(config.memory_context_tokens, 2_000)
+        self.assertFalse(config.memory_context_tokens_explicit)
         self.assertEqual(config.memory_retrieval_limit, 8)
         self.assertEqual(config.memory_compression_trigger_ratio, 0.8)
         self.assertEqual(config.memory_retain_recent_turns, 3)
         self.assertEqual(config.memory_map_chunk_size, 5)
         self.assertEqual(config.memory_tool_result_chars, 500)
+        self.assertFalse(config.memory_short_term_tokens_explicit)
+        self.assertFalse(config.memory_tool_result_chars_explicit)
         # memory_auto_extract defaults to True per plan §13 (line 544).
         self.assertTrue(config.memory_auto_extract)
         self.assertFalse(config.hitl_enabled)
@@ -326,13 +341,16 @@ class AgentConfigTests(unittest.TestCase):
         self.assertEqual(config.memory_dir, Path(tmp) / "mem")
         self.assertTrue(config.memory_enabled)
         self.assertEqual(config.memory_short_term_tokens, 1_000)
+        self.assertTrue(config.memory_short_term_tokens_explicit)
         self.assertEqual(config.memory_short_term_entries, 50)
         self.assertEqual(config.memory_context_tokens, 512)
+        self.assertTrue(config.memory_context_tokens_explicit)
         self.assertEqual(config.memory_retrieval_limit, 4)
         self.assertEqual(config.memory_compression_trigger_ratio, 0.6)
         self.assertEqual(config.memory_retain_recent_turns, 2)
         self.assertEqual(config.memory_map_chunk_size, 3)
         self.assertEqual(config.memory_tool_result_chars, 250)
+        self.assertTrue(config.memory_tool_result_chars_explicit)
         self.assertTrue(config.memory_auto_extract)
 
     def test_hitl_config_loaded_from_env_mapping(self) -> None:

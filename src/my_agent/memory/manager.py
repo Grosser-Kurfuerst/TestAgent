@@ -6,8 +6,9 @@ from typing import Any
 from uuid import uuid4
 
 from my_agent.config import AgentConfig
+from my_agent.context import ContextProfile
 from my_agent.llm import AgentLLM
-from my_agent.llm.types import ChatResponse, LLMToolCall, Message, MessageLike, messages_to_openai
+from my_agent.llm.types import ChatResponse, LLMToolCall, Message, MessageLike
 from my_agent.memory.compression import MemoryCompressor
 from my_agent.memory.long_term import LongTermMemoryStore, STORAGE_FILE
 from my_agent.memory.retrieval import MemoryRetriever
@@ -25,10 +26,9 @@ from my_agent.tools import ToolExecutionResult
 
 
 class MemoryManager:
-    """The single memory entry point the Agent depends on (plan §10).
+    """Memory storage, retrieval, and compression entry point.
 
-    Phase 3 ships the memory facade and the storage/retrieval/compression
-    pieces behind it:
+    The manager owns short-term and long-term memory primitives:
 
     * :meth:`from_config` — build a manager wired to the config's memory dir.
     * :meth:`save_fact` — persist a durable fact to long-term memory.
@@ -38,8 +38,8 @@ class MemoryManager:
       :meth:`append_tool_result` — record short-term entries.
     * :meth:`status` — snapshot for ``/memory`` and debugging.
 
-    Runtime and TUI call sites depend on this facade instead of individual
-    storage, retrieval or compression helpers.
+    Prompt assembly and context-window decisions live in
+    :class:`my_agent.context.AgentContextManager`.
     """
 
     def __init__(
@@ -55,9 +55,11 @@ class MemoryManager:
         project_key: str,
         session_id: str = "",
         trace_sink: Any | None = None,
+        context_profile: ContextProfile | None = None,
     ) -> None:
         self.config = config
         self.llm = llm
+        self.context_profile = context_profile or ContextProfile.resolve(config, _model_name(llm, config))
         self.repo_path = Path(repo_path)
         self.short_term = short_term
         self.long_term = long_term
@@ -95,8 +97,9 @@ class MemoryManager:
         memory_dir.mkdir(parents=True, exist_ok=True)
         long_term = LongTermMemoryStore(memory_dir / STORAGE_FILE, trace_sink=trace_sink)
         long_term.load()
+        context_profile = ContextProfile.resolve(config, _model_name(llm, config))
         short_term = ShortTermMemory(
-            max_tokens=config.memory_short_term_tokens,
+            max_tokens=context_profile.short_term_token_limit,
             max_entries=config.memory_short_term_entries,
         )
         retriever = MemoryRetriever()
@@ -118,9 +121,25 @@ class MemoryManager:
             project_key=project_key,
             session_id=session_id or "",
             trace_sink=trace_sink,
+            context_profile=context_profile,
         )
 
     # ------------------------------------------------------------------ writes
+
+    def append_task_goal(self, goal: str, *, run_id: str = "") -> MemoryEntry:
+        entry = MemoryEntry.build(
+            id=_new_id("goal"),
+            content=goal,
+            type=MemoryType.CONVERSATION,
+            scope=MemoryScope.SESSION,
+            source="task_goal",
+            token_count=estimate_tokens(goal),
+            project_key=self.project_key,
+            run_id=run_id,
+            metadata={"kind": "task_goal"},
+        )
+        self.short_term.append(entry)
+        return entry
 
     def append_user_message(self, content: str, *, run_id: str = "") -> MemoryEntry:
         entry = MemoryEntry.build(
@@ -157,7 +176,7 @@ class MemoryManager:
         return entry
 
     def append_tool_result(self, result: ToolExecutionResult, *, run_id: str = "") -> MemoryEntry:
-        truncated = _truncate_tool_result(result.content, self.config.memory_tool_result_chars)
+        truncated = _truncate_tool_result(result.content, self.context_profile.tool_result_char_limit)
         content = _tool_result_message_content(result, truncated)
         was_truncated = truncated != result.content
         entry = MemoryEntry.build(
@@ -259,7 +278,7 @@ class MemoryManager:
         view.
         """
         resolved_limit = limit if limit is not None else self.config.memory_retrieval_limit
-        resolved_tokens = max_tokens if max_tokens is not None else self.config.memory_context_tokens
+        resolved_tokens = max_tokens if max_tokens is not None else self.context_profile.memory_context_tokens
         hits = self.retriever.retrieve(
             query,
             short_term=self.short_term,
@@ -308,7 +327,7 @@ class MemoryManager:
             storage_path=str(self.long_term.path),
             short_term_entries=len(self.short_term),
             short_term_tokens=self.short_term.token_count(),
-            short_term_token_limit=self.config.memory_short_term_tokens,
+            short_term_token_limit=self.context_profile.short_term_token_limit,
             long_term_entries=len(long_entries),
             long_term_tokens=long_tokens,
             compression_trigger_ratio=self.config.memory_compression_trigger_ratio,
@@ -317,67 +336,7 @@ class MemoryManager:
             long_term_entries_detail=tuple(long_entries) if include_entries else (),
         )
 
-    # ------------------------------------------------------------------ facade operations
-
-    def prepare_messages(
-        self,
-        *,
-        base_messages: list[MessageLike],
-        query: str,
-        tools: list[dict[str, Any]],
-        force_compact: bool = False,
-        focus: str = "",
-    ) -> tuple[list[MessageLike], MemoryContext, Any | None]:
-        memory_context = self.build_context_for_query(query)
-        messages = _inject_memory_context(list(base_messages), memory_context)
-        messages.extend(_render_short_term_entries(self.short_term.all()))
-        estimated_prompt_tokens = _estimate_prompt_tokens(messages, tools)
-
-        compaction = None
-        if force_compact or estimated_prompt_tokens >= self._compression_threshold_tokens():
-            compaction = self._compact_if_needed(
-                tools=tools,
-                force=True,
-                focus=focus,
-                before_tokens=estimated_prompt_tokens,
-                trace_completed=False,
-            )
-            if compaction and compaction.compacted:
-                memory_context = self.build_context_for_query(query)
-                messages = _inject_memory_context(list(base_messages), memory_context)
-                messages.extend(_render_short_term_entries(self.short_term.all()))
-                after_prompt_tokens = _estimate_prompt_tokens(messages, tools)
-                self._trace(
-                    "memory.compacted",
-                    {
-                        "before_tokens": compaction.before_tokens,
-                        "after_tokens": after_prompt_tokens,
-                        "map_count": compaction.map_count,
-                        "reduce_used": compaction.reduce_used,
-                        "extracted_facts": compaction.extracted_facts,
-                        "fallback": compaction.fallback,
-                    },
-                )
-                compaction = CompressionResult(
-                    compacted=compaction.compacted,
-                    before_tokens=compaction.before_tokens,
-                    after_tokens=after_prompt_tokens,
-                    map_count=compaction.map_count,
-                    reduce_used=compaction.reduce_used,
-                    extracted_facts=compaction.extracted_facts,
-                    fallback=compaction.fallback,
-                )
-        self._trace(
-            "memory.prepared",
-            {
-                "message_count": len(messages),
-                "memory_hits": len(memory_context.hits),
-                "memory_tokens": memory_context.estimated_tokens,
-                "estimated_prompt_tokens": _estimate_prompt_tokens(messages, tools),
-                "compacted": bool(compaction and compaction.compacted),
-            },
-        )
-        return messages, memory_context, compaction
+    # ------------------------------------------------------------------ memory operations
 
     def extract_facts(self, *, reason: str, run_id: str = "") -> list[MemoryEntry]:
         entries = self.short_term.all()
@@ -391,7 +350,7 @@ class MemoryManager:
             llm=self.llm,
             repo_path=self.repo_path,
             short_term=ShortTermMemory(
-                max_tokens=self.config.memory_short_term_tokens,
+                max_tokens=self.context_profile.short_term_token_limit,
                 max_entries=self.config.memory_short_term_entries,
             ),
             long_term=self.long_term,
@@ -405,6 +364,7 @@ class MemoryManager:
             project_key=self.project_key,
             session_id=session_id,
             trace_sink=self._trace_sink,
+            context_profile=self.context_profile,
         )
 
     def clear_short_term(self, *, extract_first: bool = True, reason: str = "clear") -> tuple[int, list[MemoryEntry]]:
@@ -415,6 +375,31 @@ class MemoryManager:
         self._trace("memory.clear", {"removed": len(removed), "extracted_facts": len(extracted), "reason": reason})
         return len(removed), extracted
 
+    def render_short_term_messages(self) -> list[MessageLike]:
+        return _render_short_term_entries(self.short_term.all())
+
+    def trace_context_event(self, event: str, payload: dict[str, Any]) -> None:
+        self._trace(event, payload)
+
+    def compact_short_term(
+        self,
+        *,
+        tools: list[dict[str, Any]],
+        force: bool = False,
+        focus: str = "",
+        before_tokens: int | None = None,
+        trace_completed: bool = True,
+        trigger_tokens: int | None = None,
+    ) -> CompressionResult | None:
+        return self._compact_if_needed(
+            tools=tools,
+            force=force,
+            focus=focus,
+            before_tokens=before_tokens,
+            trace_completed=trace_completed,
+            trigger_tokens=trigger_tokens,
+        )
+
     def _compact_if_needed(
         self,
         *,
@@ -423,10 +408,12 @@ class MemoryManager:
         focus: str = "",
         before_tokens: int | None = None,
         trace_completed: bool = True,
+        trigger_tokens: int | None = None,
     ) -> CompressionResult | None:
         tools_tokens = estimate_tokens(tools)
         before = before_tokens if before_tokens is not None else self.short_term.token_count() + tools_tokens
-        if not force and before < self._compression_threshold_tokens():
+        threshold = trigger_tokens if trigger_tokens is not None else self._compression_threshold_tokens()
+        if not force and before < threshold:
             return None
 
         old_entries = self.short_term.old_entries_for_compression(self.config.memory_retain_recent_turns)
@@ -470,19 +457,35 @@ class MemoryManager:
         if trace_completed:
             self._trace(
                 "memory.compacted",
-                {
-                    "before_tokens": before,
-                    "after_tokens": after,
-                    "map_count": map_count,
-                    "reduce_used": reduce_used,
-                    "extracted_facts": len(extracted),
-                    "fallback": fallback,
-                },
+                self._context_trace_payload(
+                    {
+                        "before_tokens": before,
+                        "after_tokens": after,
+                        "map_count": map_count,
+                        "reduce_used": reduce_used,
+                        "extracted_facts": len(extracted),
+                        "fallback": fallback,
+                        "estimated_prompt_tokens": after,
+                    }
+                ),
             )
         return result
 
     def _compression_threshold_tokens(self) -> int:
-        return int(max(1, self.config.memory_short_term_tokens) * self.config.memory_compression_trigger_ratio)
+        return self.context_profile.compression_trigger_tokens
+
+    def _context_trace_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        enriched = dict(payload)
+        enriched.update(
+            {
+                "context_window": self.context_profile.max_context_tokens,
+                "compression_trigger_tokens": self.context_profile.compression_trigger_tokens,
+                "short_term_token_limit": self.context_profile.short_term_token_limit,
+                "tool_result_char_limit": self.context_profile.tool_result_char_limit,
+                "dynamic_profile_source": self.context_profile.dynamic_profile_source,
+            }
+        )
+        return enriched
 
     def _extract_and_store_facts(
         self,
@@ -542,13 +545,11 @@ def _new_id(prefix: str) -> str:
     return f"{prefix}_{uuid4().hex[:12]}"
 
 
-def _inject_memory_context(base_messages: list[MessageLike], context: MemoryContext) -> list[MessageLike]:
-    if not context.injected_text:
-        return base_messages
-    memory_message = Message(role="system", content=context.injected_text)
-    if base_messages and _role(base_messages[0]) == "system":
-        return [base_messages[0], memory_message, *base_messages[1:]]
-    return [memory_message, *base_messages]
+def _model_name(llm: AgentLLM | None, config: AgentConfig) -> str:
+    value = getattr(llm, "model", "") if llm is not None else ""
+    if isinstance(value, str) and value.strip():
+        return value
+    return config.model
 
 
 def _render_short_term_entries(entries: list[MemoryEntry]) -> list[MessageLike]:
@@ -558,6 +559,9 @@ def _render_short_term_entries(entries: list[MemoryEntry]) -> list[MessageLike]:
         entry = entries[idx]
         if entry.type == MemoryType.SUMMARY:
             rendered.append(Message(role="user", content=entry.content))
+            idx += 1
+        elif entry.source == "task_goal":
+            rendered.append(Message(role="user", content=f"[Task goal]\n{entry.content}"))
             idx += 1
         elif entry.source == "user":
             rendered.append(Message(role="user", content=entry.content))
@@ -642,17 +646,6 @@ def _tool_calls_from_metadata(metadata: dict[str, Any]) -> list[LLMToolCall]:
         except ValueError:
             continue
     return calls
-
-
-def _role(message: MessageLike) -> str:
-    if isinstance(message, Message):
-        return message.role
-    value = message.get("role", "") if isinstance(message, dict) else ""
-    return value if isinstance(value, str) else ""
-
-
-def _estimate_prompt_tokens(messages: list[MessageLike], tools: list[dict[str, Any]]) -> int:
-    return estimate_tokens({"messages": messages_to_openai(messages), "tools": tools or []})
 
 
 def _normalize_project_key(repo_path: Path) -> str:

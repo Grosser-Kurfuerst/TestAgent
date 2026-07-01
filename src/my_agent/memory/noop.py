@@ -6,12 +6,13 @@ from typing import Any
 from uuid import uuid4
 
 from my_agent.config import AgentConfig
+from my_agent.context import ContextProfile
 from my_agent.llm.types import ChatResponse, MessageLike
 from my_agent.memory.types import MemoryContext, MemoryEntry, MemoryScope, MemoryStatus, MemoryType
 
 
 class NoopMemoryManager:
-    """Memory facade used for no-memory evaluation groups."""
+    """No-op memory implementation used for no-memory evaluation groups."""
 
     last_fact_extraction_error = ""
     last_fact_save_errors: list[str] = []
@@ -28,6 +29,7 @@ class NoopMemoryManager:
         self.repo_path = Path(repo_path)
         self.project_key = str(self.repo_path.resolve())
         self.session_id = session_id
+        self.context_profile = ContextProfile.resolve(config, getattr(config, "model", ""))
         self._trace_sink = trace_sink
 
     def set_trace_sink(self, trace_sink: Any | None) -> tuple[Any | None, Any | None]:
@@ -40,6 +42,15 @@ class NoopMemoryManager:
 
     def append_user_message(self, content: str, *, run_id: str = "") -> MemoryEntry:
         return _entry(content, source="user", run_id=run_id, project_key=self.project_key)
+
+    def append_task_goal(self, goal: str, *, run_id: str = "") -> MemoryEntry:
+        return _entry(
+            goal,
+            source="task_goal",
+            run_id=run_id,
+            project_key=self.project_key,
+            metadata={"kind": "task_goal"},
+        )
 
     def append_assistant_response(self, response: ChatResponse, *, run_id: str = "") -> MemoryEntry:
         return _entry(response.content or "", source="assistant", run_id=run_id, project_key=self.project_key)
@@ -106,13 +117,31 @@ class NoopMemoryManager:
     ) -> list[Any]:
         return []
 
+    def render_short_term_messages(self) -> list[MessageLike]:
+        return []
+
+    def trace_context_event(self, event: str, payload: dict[str, Any]) -> None:
+        return None
+
+    def compact_short_term(
+        self,
+        *,
+        tools: list[dict[str, Any]],
+        force: bool = False,
+        focus: str = "",
+        before_tokens: int | None = None,
+        trace_completed: bool = True,
+        trigger_tokens: int | None = None,
+    ) -> Any | None:
+        return None
+
     def status(self, *, include_entries: bool = True) -> MemoryStatus:
         return MemoryStatus(
             project_key=self.project_key,
             storage_path="disabled",
             short_term_entries=0,
             short_term_tokens=0,
-            short_term_token_limit=self.config.memory_short_term_tokens,
+            short_term_token_limit=self.context_profile.short_term_token_limit,
             long_term_entries=0,
             long_term_tokens=0,
             compression_trigger_ratio=self.config.memory_compression_trigger_ratio,
@@ -120,17 +149,6 @@ class NoopMemoryManager:
             map_chunk_size=self.config.memory_map_chunk_size,
             long_term_entries_detail=(),
         )
-
-    def prepare_messages(
-        self,
-        *,
-        base_messages: list[MessageLike],
-        query: str,
-        tools: list[dict[str, Any]],
-        force_compact: bool = False,
-        focus: str = "",
-    ) -> tuple[list[MessageLike], MemoryContext, Any | None]:
-        return list(base_messages), MemoryContext(injected_text="", hits=[], estimated_tokens=0), None
 
     def extract_facts(self, *, reason: str, run_id: str = "") -> list[MemoryEntry]:
         return []

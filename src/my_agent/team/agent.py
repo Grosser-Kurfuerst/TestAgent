@@ -100,7 +100,7 @@ class TeamAgent(AgentBase):
             memory = ctx.memory
             self._memory = memory
             self._emit_trace(writer, state, "team.requested", {"repo_path": str(repo), "goal": goal})
-            memory.append_user_message(goal, run_id=state.run_id)
+            memory.append_task_goal(goal, run_id=state.run_id)
 
             try:
                 if ctx.repo_snapshot is None:

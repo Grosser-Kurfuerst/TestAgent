@@ -12,6 +12,12 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from my_agent.config import AgentConfig
+from my_agent.context import (
+    DEFAULT_CONTEXT_WINDOW,
+    DEFAULT_MEMORY_CONTEXT_TOKENS,
+    DEFAULT_SHORT_TERM_TOKENS,
+    DEFAULT_TOOL_RESULT_CHARS,
+)
 from my_agent.evaluation.agent_benchmark import record_benchmark_result
 from my_agent.evaluation.trace_metrics import collect_trace_metrics
 from my_agent.runtime import run_agent
@@ -678,9 +684,6 @@ def _config_env_values(config: AgentConfig) -> dict[str, str]:
         "MY_AGENT_MAX_ELAPSED_SECONDS": str(config.max_elapsed_seconds),
         "MY_AGENT_STAGNATION_WINDOW": str(config.stagnation_window),
         "MY_AGENT_REPEATED_FAILURE_WINDOW": str(config.repeated_failure_window),
-        "MY_AGENT_CONTEXT_WINDOW": str(config.context_window),
-        "MY_AGENT_RESPONSE_RESERVE_TOKENS": str(config.response_reserve_tokens),
-        "MY_AGENT_COMPRESSION_BUFFER_TOKENS": str(config.compression_buffer_tokens),
         "MY_AGENT_RETAIN_RECENT_TURNS": str(config.retain_recent_user_turns),
         "MY_AGENT_MAX_TOOL_RESULT_CHARS": str(config.max_tool_result_chars),
         "MY_AGENT_MAX_SUMMARY_INPUT_CHARS": str(config.max_summary_input_chars),
@@ -697,14 +700,11 @@ def _config_env_values(config: AgentConfig) -> dict[str, str]:
         "AGENTCLI_TEAM_ALLOW_UNAPPROVED_RESULTS": _bool_env(config.team_allow_unapproved_results),
         "AGENTCLI_MEMORY": _bool_env(config.memory_enabled),
         "AGENTCLI_MEMORY_DIR": str(config.memory_dir),
-        "AGENTCLI_MEMORY_SHORT_TERM_TOKENS": str(config.memory_short_term_tokens),
         "AGENTCLI_MEMORY_SHORT_TERM_ENTRIES": str(config.memory_short_term_entries),
-        "AGENTCLI_MEMORY_CONTEXT_TOKENS": str(config.memory_context_tokens),
         "AGENTCLI_MEMORY_RETRIEVAL_LIMIT": str(config.memory_retrieval_limit),
         "AGENTCLI_MEMORY_COMPRESSION_TRIGGER_RATIO": str(config.memory_compression_trigger_ratio),
         "AGENTCLI_MEMORY_RETAIN_RECENT_TURNS": str(config.memory_retain_recent_turns),
         "AGENTCLI_MEMORY_MAP_CHUNK_SIZE": str(config.memory_map_chunk_size),
-        "AGENTCLI_MEMORY_TOOL_RESULT_CHARS": str(config.memory_tool_result_chars),
         "AGENTCLI_MEMORY_AUTO_EXTRACT": _bool_env(config.memory_auto_extract),
         "AGENTCLI_HITL": _bool_env(config.hitl_enabled),
         "AGENTCLI_HITL_AUDIT_DIR": str(config.hitl_audit_dir),
@@ -733,7 +733,51 @@ def _config_env_values(config: AgentConfig) -> dict[str, str]:
         values["MY_AGENT_TOKEN_BUDGET"] = str(config.token_budget)
     if config.tool_config_paths:
         values["AGENTCLI_TOOL_CONFIGS"] = os.pathsep.join(str(path) for path in config.tool_config_paths)
+    if _config_value_is_explicit(config, "context_window", DEFAULT_CONTEXT_WINDOW, "context_window_explicit"):
+        values["MY_AGENT_CONTEXT_WINDOW"] = str(config.context_window)
+    if _config_value_is_explicit(
+        config,
+        "response_reserve_tokens",
+        8_000,
+        "response_reserve_tokens_explicit",
+    ):
+        values["MY_AGENT_RESPONSE_RESERVE_TOKENS"] = str(config.response_reserve_tokens)
+    if _config_value_is_explicit(
+        config,
+        "compression_buffer_tokens",
+        8_000,
+        "compression_buffer_tokens_explicit",
+    ):
+        values["MY_AGENT_COMPRESSION_BUFFER_TOKENS"] = str(config.compression_buffer_tokens)
+    if _config_value_is_explicit(
+        config,
+        "memory_short_term_tokens",
+        DEFAULT_SHORT_TERM_TOKENS,
+        "memory_short_term_tokens_explicit",
+    ):
+        values["AGENTCLI_MEMORY_SHORT_TERM_TOKENS"] = str(config.memory_short_term_tokens)
+    if _config_value_is_explicit(
+        config,
+        "memory_context_tokens",
+        DEFAULT_MEMORY_CONTEXT_TOKENS,
+        "memory_context_tokens_explicit",
+    ):
+        values["AGENTCLI_MEMORY_CONTEXT_TOKENS"] = str(config.memory_context_tokens)
+    if _config_value_is_explicit(
+        config,
+        "memory_tool_result_chars",
+        DEFAULT_TOOL_RESULT_CHARS,
+        "memory_tool_result_chars_explicit",
+    ):
+        values["AGENTCLI_MEMORY_TOOL_RESULT_CHARS"] = str(config.memory_tool_result_chars)
     return values
+
+
+def _config_value_is_explicit(config: AgentConfig, field_name: str, default: int, explicit_attr: str) -> bool:
+    if getattr(config, explicit_attr, False):
+        return True
+    value = getattr(config, field_name)
+    return isinstance(value, int) and not isinstance(value, bool) and value != default
 
 
 def _bool_env(value: bool) -> str:

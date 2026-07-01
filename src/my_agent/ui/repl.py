@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import TextIO
 
 from my_agent.config import AgentConfig
-from my_agent.context import ContextProfile
+from my_agent.context import AgentContextManager, ContextProfile
 from my_agent.cancellation import CancellationToken
 from my_agent.hitl import SwitchableHitlHandler, TerminalHitlHandler
 from my_agent.llm import build_llm
@@ -82,12 +82,12 @@ class AgentRepl:
             )
         )
         self._tools = self._load_tools()
-        self._profile = ContextProfile.from_config(config)
-        self._memory = (
-            MemoryManager.from_config(config=config, llm=build_llm(config), repo_path=self.repo_path)
-            if config.memory_enabled
-            else NoopMemoryManager(config=config, repo_path=self.repo_path)
-        )
+        if config.memory_enabled:
+            self._memory = MemoryManager.from_config(config=config, llm=build_llm(config), repo_path=self.repo_path)
+        else:
+            self._memory = NoopMemoryManager(config=config, repo_path=self.repo_path)
+        self._profile = getattr(self._memory, "context_profile", ContextProfile.resolve(config, config.model))
+        self._context_manager = AgentContextManager(self._profile)
         self._latest_trace: Path | None = None
         self._shutdown_complete = False
         self._run_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="agentcli-repl")
@@ -152,10 +152,11 @@ class AgentRepl:
             return False
         if command.startswith("/compact"):
             focus = command.removeprefix("/compact").strip()
-            _, _, result = self._memory.prepare_messages(
+            _, _, result = self._context_manager.prepare_messages(
                 base_messages=[Message(role="system", content="Memory maintenance request.")],
                 query=focus or "session context",
                 tools=self._tools.tool_definitions(),
+                memory=self._memory,
                 force_compact=True,
                 focus=focus,
             )
@@ -389,15 +390,16 @@ class AgentRepl:
         return "\n".join(
             [
                 f"system/project: rebuilt per run",
+                f"context window: {self._profile.max_context_tokens} ({self._profile.dynamic_profile_source})",
                 f"short-term: {status.short_term_entries} entries, {status.short_term_tokens} tokens",
                 f"short-term limit: {status.short_term_token_limit}",
                 f"long-term: {status.long_term_entries} entries, {status.long_term_tokens} tokens",
                 f"tools: {len(self._tools.tool_definitions())} definitions",
                 f"mcp: {self._mcp_summary()}",
                 f"default test command: {self.test_command or 'not configured'}",
-                f"compression trigger: {int(status.short_term_token_limit * status.compression_trigger_ratio)}",
+                f"compression trigger: {self._profile.compression_trigger_tokens}",
                 f"retain recent turns: {status.retain_recent_turns}",
-                f"max tool result chars: {self.config.memory_tool_result_chars}",
+                f"max tool result chars: {self._profile.tool_result_char_limit}",
             ]
         )
 

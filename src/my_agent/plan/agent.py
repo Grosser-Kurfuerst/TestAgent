@@ -81,7 +81,7 @@ class PlanExecuteAgent(AgentBase):
                 "plan.requested",
                 {"repo_path": str(repo), "goal": goal, "require_approval": self.require_approval},
             )
-            memory.append_user_message(goal, run_id=state.run_id)
+            memory.append_task_goal(goal, run_id=state.run_id)
 
             try:
                 if ctx.repo_snapshot is None:
