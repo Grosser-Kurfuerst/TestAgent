@@ -7,7 +7,7 @@ from typing import Any, Callable
 
 from my_agent.budget import AgentBudget
 from my_agent.config import AgentConfig
-from my_agent.context import AgentContextManager
+from my_agent.context import AgentContextManager, ContextOverBudgetError, ToolSchemaBudget, budget_tool_definitions
 from my_agent.hitl.handler import HitlHandler
 from my_agent.hitl.types import ApprovalEvent
 from my_agent.llm import AgentLLM
@@ -68,10 +68,12 @@ class ReActAgent(AgentBase):
                 hitl_handler=self.hitl_handler,
                 approval_observer=lambda event: self._observe_approval_event(writer, state, event),
             )
-            tool_definitions = tools.tool_definitions()
             budget = AgentBudget.from_config(self.config, max_steps=state.max_steps)
             context_profile = getattr(memory, "context_profile", None) or AgentContextManager.from_config(self.config).profile
             context_manager = AgentContextManager(context_profile)
+            all_tool_definitions = tools.tool_definitions()
+            tool_budget = budget_tool_definitions(all_tool_definitions, context_profile)
+            tool_definitions = tool_budget.definitions
 
             self._emit(
                 writer,
@@ -98,10 +100,21 @@ class ReActAgent(AgentBase):
                     },
                 )
             )
+            if tool_budget.omitted_names or tool_budget.over_budget:
+                payload = {
+                    "budget_tokens": tool_budget.budget_tokens,
+                    "estimated_tokens": tool_budget.estimated_tokens,
+                    "included_count": tool_budget.included_count,
+                    "omitted_count": tool_budget.omitted_count,
+                    "included": list(tool_budget.included_names),
+                    "omitted": list(tool_budget.omitted_names),
+                    "over_budget": tool_budget.over_budget,
+                }
+                self._emit(writer, state.trace_event("tools.schema_capped", payload))
             snapshot = ctx.repo_snapshot
             if snapshot is None:
                 raise RuntimeError("ReAct runtime requires repository context.")
-            state.repo_context = snapshot.as_context()
+            state.repo_context = ctx.repo_context
             state.project_rules = snapshot.project_rules
             state.plan = "Use native ReAct tool calls to inspect, edit, verify, and finish the task."
 
@@ -116,12 +129,17 @@ class ReActAgent(AgentBase):
                     self._stop_by_budget(state, writer, budget, stop_reason)
                     break
 
-                messages, _, _ = context_manager.prepare_messages(
-                    base_messages=base_messages,
-                    query=state.task,
-                    tools=tool_definitions,
-                    memory=memory,
-                )
+                try:
+                    messages, _, _ = context_manager.prepare_messages(
+                        base_messages=base_messages,
+                        query=state.task,
+                        tools=tool_definitions,
+                        memory=memory,
+                        tool_budget=tool_budget,
+                    )
+                except ContextOverBudgetError as exc:
+                    self._stop_by_context_over_budget(state, writer, exc)
+                    break
 
                 budget.begin_iteration()
                 self._emit(
@@ -145,6 +163,7 @@ class ReActAgent(AgentBase):
                     memory=memory,
                     context_manager=context_manager,
                     base_messages=base_messages,
+                    tool_budget=tool_budget,
                 )
                 if response is None:
                     break
@@ -179,7 +198,7 @@ class ReActAgent(AgentBase):
                     break
 
                 budget.record_tool_calls(response.tool_calls)
-                results = self._execute_tool_calls(state, writer, tools, response.tool_calls, budget)
+                results = self._execute_tool_calls(state, writer, tools, response.tool_calls, budget, tool_budget)
                 budget.record_tool_results(results, response.tool_calls)
                 for result in results:
                     memory.append_tool_result(result, run_id=state.run_id)
@@ -219,19 +238,25 @@ class ReActAgent(AgentBase):
         memory: MemoryManager,
         context_manager: AgentContextManager,
         base_messages: list[MessageLike],
+        tool_budget: ToolSchemaBudget,
     ) -> ChatResponse | None:
         try:
             return self.llm.chat(messages, tools=tool_definitions)
         except RuntimeError as exc:
             if _looks_like_context_error(str(exc)):
-                retry_messages, _, _ = context_manager.prepare_messages(
-                    base_messages=base_messages,
-                    query=state.task,
-                    tools=tool_definitions,
-                    memory=memory,
-                    force_compact=True,
-                    focus="Retry after context length error.",
-                )
+                try:
+                    retry_messages, _, _ = context_manager.prepare_messages(
+                        base_messages=base_messages,
+                        query=state.task,
+                        tools=tool_definitions,
+                        memory=memory,
+                        force_compact=True,
+                        focus="Retry after context length error.",
+                        tool_budget=tool_budget,
+                    )
+                except ContextOverBudgetError as budget_exc:
+                    self._stop_by_context_over_budget(state, writer, budget_exc)
+                    return None
                 self._emit(
                     writer,
                     state.trace_event(
@@ -254,12 +279,14 @@ class ReActAgent(AgentBase):
         tools: RepoTools,
         tool_calls: list[LLMToolCall],
         budget: AgentBudget,
+        tool_budget: ToolSchemaBudget,
     ) -> list[ToolExecutionResult]:
         self._emit_event(ApprovalEvent(event="render.flush_requested", payload={"reason": "before_tool_calls"}))
         prepared: list[tuple[LLMToolCall, ToolInvocation | ToolExecutionResult, bool]] = []
         invocations: list[ToolInvocation] = []
         slots_used = 0
         allowed = min(max(0, state.max_steps - state.steps), max(0, budget.max_tool_calls - budget.tool_calls))
+        exposed_tools = set(tool_budget.included_names)
         for call in tool_calls:
             if _is_cancelled(state):
                 result = ToolExecutionResult(
@@ -283,6 +310,28 @@ class ReActAgent(AgentBase):
                 state.done = True
                 state.stop_reason = "max_steps_reached"
                 prepared.append((call, result, False))
+            elif call.name not in exposed_tools:
+                result = ToolExecutionResult(
+                    id=call.id,
+                    name=call.name,
+                    ok=False,
+                    content=(
+                        f"Tool '{call.name}' was not exposed to the model because the tool schema budget "
+                        "was exceeded. Use one of the tools available in this turn."
+                    ),
+                    error_code="tool_not_exposed",
+                    retryable=True,
+                    blocked=True,
+                )
+                self._emit(
+                    writer,
+                    state.trace_event(
+                        "tool.blocked",
+                        {"id": call.id, "name": call.name, "reason": "tool_not_exposed"},
+                    ),
+                )
+                prepared.append((call, result, True))
+                slots_used += 1
             elif call.arguments_error:
                 result = ToolExecutionResult(
                     id=call.id,
@@ -412,6 +461,23 @@ class ReActAgent(AgentBase):
         state.done = True
         state.stop_reason = "llm_failed"
         self._emit(writer, state.trace_event("llm.failed", {"phase": "react", "error": f"{type(exc).__name__}: {exc}"}))
+
+    def _stop_by_context_over_budget(
+        self,
+        state: AgentState,
+        writer: TraceWriter,
+        exc: ContextOverBudgetError,
+    ) -> None:
+        state.done = True
+        state.stop_reason = "context_over_budget"
+        state.final_answer = str(exc)
+        self._emit(
+            writer,
+            state.trace_event(
+                "llm.skipped",
+                {"phase": "react", "reason": "context_over_budget", "error": str(exc), "context": exc.payload},
+            ),
+        )
 
     def _stop_cancelled(self, state: AgentState, writer: TraceWriter) -> None:
         state.done = True

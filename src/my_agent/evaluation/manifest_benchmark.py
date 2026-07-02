@@ -15,7 +15,9 @@ from my_agent.config import AgentConfig
 from my_agent.context import (
     DEFAULT_CONTEXT_WINDOW,
     DEFAULT_MEMORY_CONTEXT_TOKENS,
+    DEFAULT_REPO_CONTEXT_BUDGET_TOKENS,
     DEFAULT_SHORT_TERM_TOKENS,
+    DEFAULT_TOOL_SCHEMA_BUDGET_TOKENS,
     DEFAULT_TOOL_RESULT_CHARS,
 )
 from my_agent.evaluation.agent_benchmark import record_benchmark_result
@@ -749,6 +751,20 @@ def _config_env_values(config: AgentConfig) -> dict[str, str]:
         "compression_buffer_tokens_explicit",
     ):
         values["MY_AGENT_COMPRESSION_BUFFER_TOKENS"] = str(config.compression_buffer_tokens)
+    if _config_value_is_explicit(
+        config,
+        "repo_context_budget_tokens",
+        DEFAULT_REPO_CONTEXT_BUDGET_TOKENS,
+        "repo_context_budget_tokens_explicit",
+    ):
+        values["AGENTCLI_REPO_CONTEXT_BUDGET_TOKENS"] = str(config.repo_context_budget_tokens)
+    if _config_value_is_explicit(
+        config,
+        "tool_schema_budget_tokens",
+        DEFAULT_TOOL_SCHEMA_BUDGET_TOKENS,
+        "tool_schema_budget_tokens_explicit",
+    ):
+        values["AGENTCLI_TOOL_SCHEMA_BUDGET_TOKENS"] = str(config.tool_schema_budget_tokens)
     if _config_value_is_explicit(
         config,
         "memory_short_term_tokens",

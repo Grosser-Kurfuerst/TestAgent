@@ -431,7 +431,7 @@ class MemoryManagerCompressionTests(unittest.TestCase):
                     Path(tmp) / "memory",
                     context_window=8_000,
                     context_window_explicit=True,
-                    response_reserve_tokens=6_000,
+                    response_reserve_tokens=5_500,
                     compression_buffer_tokens=1_000,
                     memory_short_term_tokens=100_000,
                 ),
@@ -465,7 +465,7 @@ class MemoryManagerCompressionTests(unittest.TestCase):
                     Path(tmp) / "memory",
                     context_window=8_000,
                     context_window_explicit=True,
-                    response_reserve_tokens=6_000,
+                    response_reserve_tokens=5_500,
                     compression_buffer_tokens=1_000,
                     memory_short_term_tokens=100_000,
                 ),
@@ -514,7 +514,10 @@ class MemoryManagerCompressionTests(unittest.TestCase):
             self.assertEqual(compacted["estimated_prompt_tokens"], compaction.after_tokens)
             self.assertEqual(compacted["context_window"], manager.context_profile.max_context_tokens)
             self.assertEqual(compacted["compression_trigger_tokens"], manager.context_profile.compression_trigger_tokens)
-            self.assertEqual(compacted["short_term_token_limit"], manager.context_profile.short_term_token_limit)
+            self.assertEqual(
+                compacted["short_term_storage_token_limit"],
+                manager.context_profile.short_term_storage_token_limit,
+            )
             self.assertEqual(compacted["tool_result_char_limit"], manager.context_profile.tool_result_char_limit)
             self.assertEqual(compacted["dynamic_profile_source"], manager.context_profile.dynamic_profile_source)
 

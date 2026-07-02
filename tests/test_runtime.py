@@ -51,6 +51,38 @@ def write_runtime_repo(repo: Path) -> None:
     )
 
 
+def write_project_tool_config(repo: Path, description: str) -> None:
+    config_dir = repo / ".agentcli"
+    config_dir.mkdir()
+    (config_dir / "tools.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "tools": [
+                    {
+                        "name": "oversized_project_tool",
+                        "description": description,
+                        "kind": "command",
+                        "risk": "execute",
+                        "enabled": True,
+                        "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+                        "command": {
+                            "argv": [
+                                "python3",
+                                "-c",
+                                "from pathlib import Path; Path('should_not_exist.txt').write_text('bad')",
+                            ],
+                            "timeout_seconds": 5,
+                            "cwd": ".",
+                        },
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
 def read_trace(path: Path) -> list[dict[str, object]]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
@@ -85,12 +117,26 @@ class RecordingFakeLLM(FakeLLM):
     def __init__(self, chat_responses: list[ChatResponse | str]):
         super().__init__(chat_responses=chat_responses)
         self.requests: list[list[dict[str, object]]] = []
+        self.tool_requests: list[list[dict[str, object]]] = []
 
     def chat(self, messages: list[MessageLike], tools: list[dict[str, object]] | None = None) -> ChatResponse:
         self.requests.append(messages_to_openai(messages))
+        self.tool_requests.append(list(tools or []))
         if tools is None:
             return ChatResponse(content="compressed summary", finish_reason="stop")
         return super().chat(messages, tools=tools)  # type: ignore[arg-type]
+
+
+class NoToolChatLLM(FakeLLM):
+    def __init__(self) -> None:
+        super().__init__()
+        self.tool_chat_calls = 0
+
+    def chat(self, messages: list[MessageLike], tools: list[dict[str, object]] | None = None) -> ChatResponse:
+        if tools is not None:
+            self.tool_chat_calls += 1
+            raise AssertionError("tool-call LLM should not be called")
+        return ChatResponse(content="[]", finish_reason="stop")
 
 
 class RecordingHitlHandler:
@@ -744,6 +790,82 @@ class RuntimeTests(unittest.TestCase):
             self.assertIn("memory.loaded", event_names)
             self.assertIn("memory.retrieved", event_names)
             self.assertIn("memory.prepared", event_names)
+
+    def test_runtime_caps_tool_schema_and_blocks_omitted_tool_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+            write_project_tool_config(repo, "oversized project tool " * 5000)
+            llm = RecordingFakeLLM(
+                [
+                    tool_response("oversized_project_tool", {}, "call_omitted"),
+                    tool_response("finish", {"summary": "done"}, "call_finish"),
+                ]
+            )
+
+            state = run_agent(
+                repo_path=repo,
+                task="Try omitted tool, then finish.",
+                config=fake_config(
+                    base / "traces",
+                    memory_dir=base / "memory",
+                    enable_project_tools=True,
+                    mcp_enabled=False,
+                    tool_schema_budget_tokens=500,
+                    tool_schema_budget_tokens_explicit=True,
+                ),
+                llm=llm,
+                max_steps=4,
+                trace_dir=base / "traces",
+            )
+
+            self.assertFalse((repo / "should_not_exist.txt").exists())
+            self.assertEqual(state.stop_reason, "finish_called")
+            first_tool_names = {tool["function"]["name"] for tool in llm.tool_requests[0]}
+            self.assertIn("read_file", first_tool_names)
+            self.assertIn("finish", first_tool_names)
+            self.assertNotIn("oversized_project_tool", first_tool_names)
+            events = read_trace(state.trace_path)
+            capped = [event["payload"] for event in events if event["event"] == "tools.schema_capped"][-1]
+            self.assertIn("oversized_project_tool", capped["omitted"])
+            blocked = [event["payload"] for event in events if event["event"] == "tool.completed" and event["payload"]["id"] == "call_omitted"][-1]
+            self.assertEqual(blocked["error_code"], "tool_not_exposed")
+
+    def test_runtime_stops_before_llm_when_context_is_over_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+            llm = NoToolChatLLM()
+
+            state = run_agent(
+                repo_path=repo,
+                task="Return final response.",
+                config=fake_config(
+                    base / "traces",
+                    memory_dir=base / "memory",
+                    context_window=8_000,
+                    context_window_explicit=True,
+                    response_reserve_tokens=7_000,
+                    response_reserve_tokens_explicit=True,
+                    compression_buffer_tokens=900,
+                    compression_buffer_tokens_explicit=True,
+                    memory_auto_extract=False,
+                ),
+                llm=llm,
+                trace_dir=base / "traces",
+            )
+
+            self.assertEqual(state.stop_reason, "context_over_budget")
+            self.assertEqual(llm.tool_chat_calls, 0)
+            events = read_trace(state.trace_path)
+            event_names = [event["event"] for event in events]
+            self.assertIn("context.over_budget", event_names)
+            self.assertIn("llm.skipped", event_names)
+            self.assertNotIn("llm.requested", event_names)
 
     def test_external_memory_trace_sink_is_restored_after_react_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

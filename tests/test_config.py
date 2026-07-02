@@ -43,6 +43,8 @@ class AgentConfigTests(unittest.TestCase):
         self.assertFalse(config.context_window_explicit)
         self.assertFalse(config.response_reserve_tokens_explicit)
         self.assertFalse(config.compression_buffer_tokens_explicit)
+        self.assertFalse(config.repo_context_budget_tokens_explicit)
+        self.assertFalse(config.tool_schema_budget_tokens_explicit)
         self.assertEqual(config.plan_task_max_steps, 6)
         self.assertEqual(config.plan_max_tasks, 12)
         self.assertEqual(config.plan_max_replans, 1)
@@ -93,6 +95,8 @@ class AgentConfigTests(unittest.TestCase):
                         "MY_AGENT_CONTEXT_WINDOW=32000",
                         "MY_AGENT_RESPONSE_RESERVE_TOKENS=5000",
                         "MY_AGENT_COMPRESSION_BUFFER_TOKENS=2500",
+                        "AGENTCLI_REPO_CONTEXT_BUDGET_TOKENS=20000",
+                        "AGENTCLI_TOOL_SCHEMA_BUDGET_TOKENS=12000",
                     ]
                 ),
                 encoding="utf-8",
@@ -114,6 +118,10 @@ class AgentConfigTests(unittest.TestCase):
         self.assertTrue(config.response_reserve_tokens_explicit)
         self.assertEqual(config.compression_buffer_tokens, 2_500)
         self.assertTrue(config.compression_buffer_tokens_explicit)
+        self.assertEqual(config.repo_context_budget_tokens, 20_000)
+        self.assertTrue(config.repo_context_budget_tokens_explicit)
+        self.assertEqual(config.tool_schema_budget_tokens, 12_000)
+        self.assertTrue(config.tool_schema_budget_tokens_explicit)
 
     def test_tool_flags_default_off_and_can_be_enabled_from_env_mapping(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

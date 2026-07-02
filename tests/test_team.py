@@ -147,6 +147,16 @@ class RecordingPlanner(StaticPlanner):
         return super().create_team_plan(goal, **kwargs)
 
 
+class CountingPlanner(RecordingPlanner):
+    def __init__(self, team: TeamState):
+        super().__init__(team)
+        self.calls = 0
+
+    def create_team_plan(self, goal: str, **kwargs: object) -> TeamState:
+        self.calls += 1
+        return super().create_team_plan(goal, **kwargs)
+
+
 class ScriptedWorker:
     name = "worker-test"
 
@@ -638,6 +648,38 @@ class TeamAgentTests(unittest.TestCase):
                 run_ids = {event["run_id"] for event in events if event["event"] == "run.started"}
                 self.assertEqual(len(run_ids), 1)
 
+    def test_team_agent_stops_before_planner_when_context_is_over_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+            team = TeamState.create(goal="Inspect", summary="single", steps=[step("step_1")])
+            planner = CountingPlanner(team)
+
+            state = TeamAgent(
+                config=fake_config(
+                    base / "traces",
+                    context_window=8_000,
+                    context_window_explicit=True,
+                    response_reserve_tokens=7_000,
+                    response_reserve_tokens_explicit=True,
+                    compression_buffer_tokens=900,
+                    compression_buffer_tokens_explicit=True,
+                ),
+                llm=FakeLLM(),
+                trace_dir=base / "traces",
+                command_timeout=60,
+                planner=planner,  # type: ignore[arg-type]
+            ).run(agent_state(repo, "Create a team plan."))
+
+            self.assertEqual(state.stop_reason, "context_over_budget")
+            self.assertEqual(planner.calls, 0)
+            events = read_trace(state.trace_path)
+            event_names = [event["event"] for event in events]
+            self.assertIn("context.over_budget", event_names)
+            self.assertNotIn("llm.requested", event_names)
+
     def test_parallel_batch_runs_independent_steps_before_dependencies(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -999,7 +1041,7 @@ class TeamAgentTests(unittest.TestCase):
             team = TeamState.create(goal="AgentCli task", steps=[step("step_1")])
             planner = RecordingPlanner(team)
 
-            TeamAgent(
+            state = TeamAgent(
                 config=config,
                 llm=FakeLLM(),
                 trace_dir=base / "traces",
@@ -1012,6 +1054,15 @@ class TeamAgentTests(unittest.TestCase):
 
             self.assertNotIn("AgentCli team memory fact", planner.repo_context)
             self.assertIn("AgentCli team memory fact", planner.memory_context)
+            prepared = [
+                event["payload"]
+                for event in read_trace(state.trace_path)
+                if event["event"] == "memory.prepared" and event["payload"].get("phase") == "team_planner"
+            ]
+            self.assertTrue(prepared)
+            self.assertIn("fixed_tokens", prepared[-1])
+            self.assertIn("memory_budget_tokens", prepared[-1])
+            self.assertIn("long_term_limit", prepared[-1])
 
     def test_planner_llm_failure_uses_team_planner_failed_stop_reason(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Callable
 
 from my_agent.config import AgentConfig
+from my_agent.context import AgentContextManager, ContextOverBudgetError
 from my_agent.hitl.handler import HitlHandler
 from my_agent.llm import AgentLLM
 from my_agent.memory import MemoryManager
@@ -86,10 +87,41 @@ class PlanExecuteAgent(AgentBase):
             try:
                 if ctx.repo_snapshot is None:
                     raise RuntimeError("Plan execution requires repository context.")
-                repo_context = ctx.repo_snapshot.as_context()
-                planner_context = _append_memory_context(repo_context, memory.build_context_for_query(goal).injected_text)
+                repo_context = ctx.repo_context
+                planner = Planner(self.llm, max_tasks=self.config.plan_max_tasks, trace_sink=lambda event, payload: self._emit_trace(writer, state, event, payload))
+                context_manager = AgentContextManager(memory.context_profile)
+                planner_base_messages = planner._build_messages(goal, repo_context=repo_context, conversation=[])
+                budget_plan = context_manager.budget_for_messages(base_messages=planner_base_messages, tools=[])
+                memory_context = memory.build_context_for_query(goal, max_tokens=budget_plan.long_term_limit)
+                planner_context = _append_memory_context(repo_context, memory_context.injected_text)
+                planner_messages_with_memory = planner._build_messages(goal, repo_context=planner_context, conversation=[])
+                fixed_with_memory_tokens = context_manager.estimate_tokens(planner_messages_with_memory, [])
+                planner_memory_payload = {
+                    "phase": "plan_planner",
+                    "message_count": len(planner_messages_with_memory),
+                    "memory_hits": len(memory_context.hits),
+                    "memory_tokens": memory_context.estimated_tokens,
+                    "estimated_prompt_tokens": fixed_with_memory_tokens,
+                    "fixed_tokens": budget_plan.fixed_tokens,
+                    "fixed_with_memory_tokens": fixed_with_memory_tokens,
+                    "memory_budget_tokens": budget_plan.memory_budget_tokens,
+                    "long_term_limit": budget_plan.long_term_limit,
+                    "short_term_allowed": max(0, budget_plan.prompt_limit_tokens - fixed_with_memory_tokens),
+                    "compacted": False,
+                    "over_budget": fixed_with_memory_tokens >= context_manager.profile.compression_trigger_tokens,
+                }
+                memory.trace_context_event(
+                    "memory.prepared",
+                    context_manager._trace_payload(planner_memory_payload),
+                )
+                context_manager.raise_if_over_budget(
+                    memory=memory,
+                    estimated_prompt_tokens=fixed_with_memory_tokens,
+                    payload=planner_memory_payload,
+                )
                 trace_sink = lambda event, payload: self._emit_trace(writer, state, event, payload)
-                plan = Planner(self.llm, max_tasks=self.config.plan_max_tasks, trace_sink=trace_sink).create_plan(
+                planner.trace_sink = trace_sink
+                plan = planner.create_plan(
                     goal,
                     repo_context=planner_context,
                 )
@@ -160,6 +192,25 @@ class PlanExecuteAgent(AgentBase):
                 )
                 self._emit_plan_event("plan.validation_failed", plan)
                 return self._final_state(state, plan, writer, stop_reason="plan_validation_failed")
+            except ContextOverBudgetError as exc:
+                plan = PlanState.create(goal=goal, summary="Plan stopped because context budget was exceeded.")
+                plan.status = PlanStatus.FAILED
+                plan.error = str(exc)
+                plan.trace_path = str(writer.path)
+                self.state_store.save(plan)
+                self._emit_trace(
+                    writer,
+                    state,
+                    "plan.failed",
+                    {
+                        "error": str(exc),
+                        "reason": "context_over_budget",
+                        "context": exc.payload,
+                        "plan": plan.to_dict(),
+                    },
+                )
+                self._emit_plan_event("plan.failed", plan)
+                return self._final_state(state, plan, writer, stop_reason="context_over_budget")
             except RuntimeError as exc:
                 plan = PlanState.create(goal=goal, summary="Plan failed before execution.")
                 plan.status = PlanStatus.FAILED

@@ -316,6 +316,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                             trace_dir=trace_dir,
                             mode=args.mode,
                             cancellation_token=cancellation_token,
+                            event_sink=_run_event_sink,
                         ),
                     )
                 )
@@ -364,6 +365,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "team_validation_failed",
                 "team_cancelled",
                 "team_planner_failed",
+                "context_over_budget",
             }:
                 return 1
             return 0
@@ -455,6 +457,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "max_elapsed_seconds": config.max_elapsed_seconds,
                     "token_budget": config.token_budget,
                     "context_window": config.context_window,
+                    "repo_context_budget_tokens": config.repo_context_budget_tokens,
+                    "tool_schema_budget_tokens": config.tool_schema_budget_tokens,
                     "max_tool_result_chars": config.max_tool_result_chars,
                     "plan_task_max_steps": config.plan_task_max_steps,
                     "plan_max_tasks": config.plan_max_tasks,
@@ -660,6 +664,10 @@ def _tool_environment_overrides(env: Mapping[str, str]) -> dict[str, str]:
         "MY_AGENT_CONTEXT_WINDOW",
         "MY_AGENT_RESPONSE_RESERVE_TOKENS",
         "MY_AGENT_COMPRESSION_BUFFER_TOKENS",
+        "AGENTCLI_REPO_CONTEXT_BUDGET_TOKENS",
+        "MY_AGENT_REPO_CONTEXT_BUDGET_TOKENS",
+        "AGENTCLI_TOOL_SCHEMA_BUDGET_TOKENS",
+        "MY_AGENT_TOOL_SCHEMA_BUDGET_TOKENS",
         "MY_AGENT_RETAIN_RECENT_TURNS",
         "MY_AGENT_MAX_TOOL_RESULT_CHARS",
         "MY_AGENT_MAX_SUMMARY_INPUT_CHARS",
@@ -761,6 +769,36 @@ def _parse_env_overrides(items: Sequence[str]) -> dict[str, str]:
             raise ValueError("--env key must not be empty.")
         overrides[key.strip()] = value
     return overrides
+
+
+def _run_event_sink(event: object) -> None:
+    event_name = getattr(event, "event", "")
+    payload = getattr(event, "payload", {})
+    if event_name != "tools.schema_capped" or not isinstance(payload, dict):
+        return
+    print(_format_tool_schema_capped_status(payload), file=sys.stderr)
+
+
+def _format_tool_schema_capped_status(payload: dict[str, object]) -> str:
+    included = _safe_int(payload.get("included_count"))
+    omitted = _safe_int(payload.get("omitted_count"))
+    omitted_names = payload.get("omitted")
+    names: list[str] = []
+    if isinstance(omitted_names, list):
+        names = [str(name) for name in omitted_names[:5]]
+    suffix = f": {', '.join(names)}" if names else ""
+    return f"Tool schema budget applied: {included} exposed, {omitted} omitted{suffix}."
+
+
+def _safe_int(value: object) -> int:
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return value
+    try:
+        return int(str(value))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _close_mcp_servers() -> None:

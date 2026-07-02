@@ -377,6 +377,8 @@ class ManifestBenchmarkTests(unittest.TestCase):
                 self.assertFalse(seen_config.context_window_explicit)
                 self.assertFalse(seen_config.response_reserve_tokens_explicit)
                 self.assertFalse(seen_config.compression_buffer_tokens_explicit)
+                self.assertFalse(seen_config.repo_context_budget_tokens_explicit)
+                self.assertFalse(seen_config.tool_schema_budget_tokens_explicit)
                 self.assertFalse(seen_config.memory_short_term_tokens_explicit)
                 self.assertFalse(seen_config.memory_context_tokens_explicit)
                 self.assertFalse(seen_config.memory_tool_result_chars_explicit)

@@ -49,9 +49,13 @@ class AgentConfig:
     retain_recent_user_turns: int = 3
     max_tool_result_chars: int = 12_000
     max_summary_input_chars: int = 60_000
+    repo_context_budget_tokens: int = 15_360
+    tool_schema_budget_tokens: int = 10_240
     context_window_explicit: bool = False
     response_reserve_tokens_explicit: bool = False
     compression_buffer_tokens_explicit: bool = False
+    repo_context_budget_tokens_explicit: bool = False
+    tool_schema_budget_tokens_explicit: bool = False
 
     # Plan-and-execute defaults.
     plan_task_max_steps: int = 6
@@ -71,6 +75,7 @@ class AgentConfig:
     # Memory storage, retrieval, and compression defaults.
     memory_enabled: bool = True
     memory_dir: Path = Path("~/.agentcli/memory").expanduser()
+    # Storage hard cap only; prompt rendering uses dynamic short_term_allowed.
     memory_short_term_tokens: int = 24_000
     memory_short_term_entries: int = 500
     memory_context_tokens: int = 2_000
@@ -161,6 +166,24 @@ class AgentConfig:
             retain_recent_user_turns=_as_int(values.get("MY_AGENT_RETAIN_RECENT_TURNS"), 3),
             max_tool_result_chars=_as_int(values.get("MY_AGENT_MAX_TOOL_RESULT_CHARS"), 12_000),
             max_summary_input_chars=_as_int(values.get("MY_AGENT_MAX_SUMMARY_INPUT_CHARS"), 60_000),
+            repo_context_budget_tokens=_as_positive_int(
+                values.get("AGENTCLI_REPO_CONTEXT_BUDGET_TOKENS", values.get("MY_AGENT_REPO_CONTEXT_BUDGET_TOKENS")),
+                15_360,
+            ),
+            repo_context_budget_tokens_explicit=_has_any_value(
+                values,
+                "AGENTCLI_REPO_CONTEXT_BUDGET_TOKENS",
+                "MY_AGENT_REPO_CONTEXT_BUDGET_TOKENS",
+            ),
+            tool_schema_budget_tokens=_as_positive_int(
+                values.get("AGENTCLI_TOOL_SCHEMA_BUDGET_TOKENS", values.get("MY_AGENT_TOOL_SCHEMA_BUDGET_TOKENS")),
+                10_240,
+            ),
+            tool_schema_budget_tokens_explicit=_has_any_value(
+                values,
+                "AGENTCLI_TOOL_SCHEMA_BUDGET_TOKENS",
+                "MY_AGENT_TOOL_SCHEMA_BUDGET_TOKENS",
+            ),
             plan_task_max_steps=_as_positive_int(
                 values.get("AGENTCLI_PLAN_TASK_MAX_STEPS", values.get("MY_AGENT_PLAN_TASK_MAX_STEPS")),
                 6,

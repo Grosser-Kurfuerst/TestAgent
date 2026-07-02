@@ -205,6 +205,20 @@ class FailingPlannerLLM(FakeLLM):
         return super().chat(messages, tools=tools)  # type: ignore[arg-type]
 
 
+class NoPlannerChatLLM(FakeLLM):
+    supports_tools = True
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.planner_calls = 0
+
+    def chat(self, messages: list[object], tools: list[dict[str, object]] | None = None) -> ChatResponse:
+        if tools is None:
+            self.planner_calls += 1
+            raise AssertionError("planner LLM should not be called")
+        return super().chat(messages, tools=tools)  # type: ignore[arg-type]
+
+
 class PlanTypeTests(unittest.TestCase):
     def test_task_round_trips_through_dict(self) -> None:
         original = PlanTask(
@@ -769,6 +783,38 @@ class PlanExecuteAgentTests(unittest.TestCase):
             self.assertGreater(state.steps, 0)
             self.assertEqual(agent_completed["payload"]["steps"], state.steps)
 
+    def test_plan_agent_stops_before_planner_llm_when_context_is_over_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+            llm = NoPlannerChatLLM()
+            agent = PlanExecuteAgent(
+                config=fake_config(
+                    base / "traces",
+                    context_window=8_000,
+                    context_window_explicit=True,
+                    response_reserve_tokens=7_000,
+                    response_reserve_tokens_explicit=True,
+                    compression_buffer_tokens=900,
+                    compression_buffer_tokens_explicit=True,
+                    memory_auto_extract=False,
+                ),
+                llm=llm,
+                trace_dir=base / "traces",
+                command_timeout=60,
+            )
+
+            state = agent.run(AgentState.initial(repo_path=repo, task="Create a plan."))
+
+            self.assertEqual(state.stop_reason, "context_over_budget")
+            self.assertEqual(llm.planner_calls, 0)
+            events = read_trace(state.trace_path)
+            event_names = [event["event"] for event in events]
+            self.assertIn("context.over_budget", event_names)
+            self.assertNotIn("llm.requested", event_names)
+
     def test_plan_agent_injects_memory_and_records_parent_task_summaries(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -801,9 +847,19 @@ class PlanExecuteAgentTests(unittest.TestCase):
             self.assertIn("[plan task task_1 succeeded]", parent_contents)
             self.assertIn("[plan task task_2 succeeded]", parent_contents)
             self.assertNotIn("[read_file]", parent_contents)
-            event_names = [event["event"] for event in read_trace(state.trace_path)]
+            events = read_trace(state.trace_path)
+            event_names = [event["event"] for event in events]
             self.assertIn("memory.loaded", event_names)
             self.assertIn("memory.retrieved", event_names)
+            prepared = [
+                event["payload"]
+                for event in events
+                if event["event"] == "memory.prepared" and event["payload"].get("phase") == "plan_planner"
+            ]
+            self.assertTrue(prepared)
+            self.assertIn("fixed_tokens", prepared[-1])
+            self.assertIn("memory_budget_tokens", prepared[-1])
+            self.assertIn("long_term_limit", prepared[-1])
 
     def test_external_memory_trace_sink_is_restored_after_plan_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

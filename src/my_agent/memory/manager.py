@@ -8,7 +8,7 @@ from uuid import uuid4
 from my_agent.config import AgentConfig
 from my_agent.context import ContextProfile
 from my_agent.llm import AgentLLM
-from my_agent.llm.types import ChatResponse, LLMToolCall, Message, MessageLike
+from my_agent.llm.types import ChatResponse, LLMToolCall, Message, MessageLike, messages_to_openai
 from my_agent.memory.compression import MemoryCompressor
 from my_agent.memory.long_term import LongTermMemoryStore, STORAGE_FILE
 from my_agent.memory.retrieval import MemoryRetriever
@@ -99,7 +99,7 @@ class MemoryManager:
         long_term.load()
         context_profile = ContextProfile.resolve(config, _model_name(llm, config))
         short_term = ShortTermMemory(
-            max_tokens=context_profile.short_term_token_limit,
+            max_tokens=context_profile.short_term_storage_token_limit,
             max_entries=config.memory_short_term_entries,
         )
         retriever = MemoryRetriever()
@@ -327,7 +327,7 @@ class MemoryManager:
             storage_path=str(self.long_term.path),
             short_term_entries=len(self.short_term),
             short_term_tokens=self.short_term.token_count(),
-            short_term_token_limit=self.context_profile.short_term_token_limit,
+            short_term_storage_token_limit=self.context_profile.short_term_storage_token_limit,
             long_term_entries=len(long_entries),
             long_term_tokens=long_tokens,
             compression_trigger_ratio=self.config.memory_compression_trigger_ratio,
@@ -350,7 +350,7 @@ class MemoryManager:
             llm=self.llm,
             repo_path=self.repo_path,
             short_term=ShortTermMemory(
-                max_tokens=self.context_profile.short_term_token_limit,
+                max_tokens=self.context_profile.short_term_storage_token_limit,
                 max_entries=self.config.memory_short_term_entries,
             ),
             long_term=self.long_term,
@@ -375,8 +375,11 @@ class MemoryManager:
         self._trace("memory.clear", {"removed": len(removed), "extracted_facts": len(extracted), "reason": reason})
         return len(removed), extracted
 
-    def render_short_term_messages(self) -> list[MessageLike]:
-        return _render_short_term_entries(self.short_term.all())
+    def render_short_term_messages(self, *, max_tokens: int | None = None) -> list[MessageLike]:
+        entries = self.short_term.all()
+        if max_tokens is not None:
+            entries = _entries_within_token_budget(entries, max_tokens)
+        return _render_short_term_entries(entries)
 
     def trace_context_event(self, event: str, payload: dict[str, Any]) -> None:
         self._trace(event, payload)
@@ -480,7 +483,9 @@ class MemoryManager:
             {
                 "context_window": self.context_profile.max_context_tokens,
                 "compression_trigger_tokens": self.context_profile.compression_trigger_tokens,
-                "short_term_token_limit": self.context_profile.short_term_token_limit,
+                "short_term_storage_token_limit": self.context_profile.short_term_storage_token_limit,
+                "repo_context_budget_tokens": self.context_profile.repo_context_budget_tokens,
+                "tool_schema_budget_tokens": self.context_profile.tool_schema_budget_tokens,
                 "tool_result_char_limit": self.context_profile.tool_result_char_limit,
                 "dynamic_profile_source": self.context_profile.dynamic_profile_source,
             }
@@ -593,6 +598,48 @@ def _render_short_term_entries(entries: list[MemoryEntry]) -> list[MessageLike]:
             rendered.append(Message(role="user", content=entry.content))
             idx += 1
     return rendered
+
+
+def _entries_within_token_budget(entries: list[MemoryEntry], max_tokens: int) -> list[MemoryEntry]:
+    if max_tokens <= 0 or not entries:
+        return []
+    groups = _entry_groups(entries)
+    selected: list[list[MemoryEntry]] = []
+    start_idx = 0
+    if groups and groups[0] and groups[0][0].source == "task_goal":
+        if _rendered_groups_tokens([groups[0]]) <= max_tokens:
+            selected.append(groups[0])
+        start_idx = 1
+    tail: list[list[MemoryEntry]] = []
+    for group in reversed(groups[start_idx:]):
+        candidate_tail = [group, *tail]
+        if _rendered_groups_tokens([*selected, *candidate_tail]) > max_tokens:
+            continue
+        tail = candidate_tail
+    selected.extend(tail)
+    return [entry for group in selected for entry in group]
+
+
+def _entry_groups(entries: list[MemoryEntry]) -> list[list[MemoryEntry]]:
+    groups: list[list[MemoryEntry]] = []
+    idx = 0
+    while idx < len(entries):
+        entry = entries[idx]
+        if entry.source == "assistant":
+            tool_entries, next_idx = _contiguous_tool_entries(entries, idx + 1)
+            groups.append([entry, *tool_entries])
+            idx = next_idx
+            continue
+        groups.append([entry])
+        idx += 1
+    return groups
+
+
+def _rendered_groups_tokens(groups: list[list[MemoryEntry]]) -> int:
+    entries = [entry for group in groups for entry in group]
+    if not entries:
+        return 0
+    return estimate_tokens(messages_to_openai(_render_short_term_entries(entries)))
 
 
 def _contiguous_tool_entries(entries: list[MemoryEntry], start: int) -> tuple[list[MemoryEntry], int]:

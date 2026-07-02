@@ -164,7 +164,7 @@ class MemoryStatus:
     storage_path: str
     short_term_entries: int
     short_term_tokens: int
-    short_term_token_limit: int
+    short_term_storage_token_limit: int
     long_term_entries: int
     long_term_tokens: int
     compression_trigger_ratio: float

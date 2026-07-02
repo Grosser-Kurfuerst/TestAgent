@@ -10,6 +10,7 @@ from queue import Queue
 from typing import Any, Callable
 
 from my_agent.config import AgentConfig
+from my_agent.context import AgentContextManager, ContextOverBudgetError
 from my_agent.cancellation import CancellationToken
 from my_agent.events import BufferedEventSink
 from my_agent.hitl.handler import HitlHandler
@@ -21,6 +22,7 @@ from my_agent.schema import AgentState
 from my_agent.parallel import create_bounded_executor, shutdown_executor
 from my_agent.team.graph import execution_batches, get_executable_steps, validate_team_graph
 from my_agent.team.planner import TeamPlanner
+from my_agent.team.prompts import build_team_planner_messages
 from my_agent.team.rendering import render_team_final_answer, render_team_plan, render_team_review
 from my_agent.team.store import JsonTeamStore, TeamStore
 from my_agent.team.sub_agent import SubAgent
@@ -105,8 +107,47 @@ class TeamAgent(AgentBase):
             try:
                 if ctx.repo_snapshot is None:
                     raise RuntimeError("Team execution requires repository context.")
-                repo_context = ctx.repo_snapshot.as_context()
-                memory_context = memory.build_context_for_query(goal).injected_text
+                repo_context = ctx.repo_context
+                context_manager = AgentContextManager(memory.context_profile)
+                planner_base_messages = build_team_planner_messages(
+                    goal,
+                    repo_context=repo_context,
+                    memory_context="",
+                    conversation=[],
+                )
+                budget_plan = context_manager.budget_for_messages(base_messages=planner_base_messages, tools=[])
+                retrieved_memory_context = memory.build_context_for_query(goal, max_tokens=budget_plan.long_term_limit)
+                memory_context = retrieved_memory_context.injected_text
+                planner_messages_with_memory = build_team_planner_messages(
+                    goal,
+                    repo_context=repo_context,
+                    memory_context=memory_context,
+                    conversation=[],
+                )
+                fixed_with_memory_tokens = context_manager.estimate_tokens(planner_messages_with_memory, [])
+                planner_memory_payload = {
+                    "phase": "team_planner",
+                    "message_count": len(planner_messages_with_memory),
+                    "memory_hits": len(retrieved_memory_context.hits),
+                    "memory_tokens": retrieved_memory_context.estimated_tokens,
+                    "estimated_prompt_tokens": fixed_with_memory_tokens,
+                    "fixed_tokens": budget_plan.fixed_tokens,
+                    "fixed_with_memory_tokens": fixed_with_memory_tokens,
+                    "memory_budget_tokens": budget_plan.memory_budget_tokens,
+                    "long_term_limit": budget_plan.long_term_limit,
+                    "short_term_allowed": max(0, budget_plan.prompt_limit_tokens - fixed_with_memory_tokens),
+                    "compacted": False,
+                    "over_budget": fixed_with_memory_tokens >= context_manager.profile.compression_trigger_tokens,
+                }
+                memory.trace_context_event(
+                    "memory.prepared",
+                    context_manager._trace_payload(planner_memory_payload),
+                )
+                context_manager.raise_if_over_budget(
+                    memory=memory,
+                    estimated_prompt_tokens=fixed_with_memory_tokens,
+                    payload=planner_memory_payload,
+                )
                 planner_trace_snapshot = _set_trace_sink(
                     self.planner,
                     lambda event, payload: self._emit_trace(writer, state, event, payload),
@@ -180,6 +221,19 @@ class TeamAgent(AgentBase):
                     else "team_validation_failed"
                 )
                 return self._final_state(state, team, writer, stop_reason=stop_reason)
+            except ContextOverBudgetError as exc:
+                team = TeamState.create(goal=goal, summary="Team planning stopped because context budget was exceeded.")
+                team.status = TeamStatus.FAILED
+                team.error = str(exc)
+                team.trace_path = str(writer.path)
+                self._save_and_emit(
+                    writer,
+                    state,
+                    team,
+                    "team.failed",
+                    extra={"reason": "context_over_budget", "context": exc.payload},
+                )
+                return self._final_state(state, team, writer, stop_reason="context_over_budget")
             except RuntimeError as exc:
                 team = TeamState.create(goal=goal, summary="Team execution failed before completion.")
                 team.status = TeamStatus.FAILED

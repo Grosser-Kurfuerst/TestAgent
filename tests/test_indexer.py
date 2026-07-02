@@ -35,6 +35,18 @@ class RepoIndexerTests(unittest.TestCase):
         self.assertIn("Make the smallest safe change", snapshot.project_rules)
         self.assertIn("subtract", snapshot.retrieval_notes)
 
+    def test_snapshot_render_context_respects_token_budget(self) -> None:
+        snapshot = RepoIndexer(SAMPLE_REPO).snapshot(query="subtract")
+
+        rendered = snapshot.render_context(max_tokens=80)
+
+        self.assertLessEqual(rendered.estimated_tokens, 80)
+        self.assertTrue(rendered.truncated)
+        self.assertTrue(rendered.truncated_sections)
+        self.assertTrue(rendered.text.startswith("# Retrieval notes"))
+        self.assertNotIn("Make the smallest safe change", rendered.text)
+        self.assertEqual(rendered.to_trace_payload()["repo_context_budget_tokens"], 80)
+
     def test_retrieve_returns_related_file_snippet(self) -> None:
         result = RepoIndexer(SAMPLE_REPO).retrieve("subtract", top_k=2)
 

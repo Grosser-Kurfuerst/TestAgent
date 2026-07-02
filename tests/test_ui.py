@@ -172,6 +172,9 @@ class ReplTests(unittest.TestCase):
         self.assertIn("tool completed: run_tests", text)
         self.assertIn("Updated subtract", text)
         self.assertIn("short-term:", text)
+        self.assertIn("last long-term limit:", text)
+        self.assertIn("last short-term allowed:", text)
+        self.assertNotIn("last long-term limit: not available", text)
         self.assertEqual(errors.getvalue(), "")
 
     def test_memory_save_memory_clear_commands_share_persistent_memory(self) -> None:

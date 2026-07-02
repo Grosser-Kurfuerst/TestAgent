@@ -7,9 +7,10 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from my_agent.config import AgentConfig
+from my_agent.context import ContextProfile
 from my_agent.cancellation import CancellationToken
 from my_agent.hitl.handler import HitlHandler
-from my_agent.indexer import RepoIndexer
+from my_agent.indexer import RepoContextRender, RepoIndexer
 from my_agent.llm import AgentLLM
 from my_agent.memory import MemoryManager, NoopMemoryManager
 from my_agent.schema import AgentState, TraceEvent
@@ -26,6 +27,8 @@ class RunContext:
     writer: TraceWriter
     memory: MemoryManager
     repo_snapshot: Any | None = None
+    repo_context: str = ""
+    repo_context_render: RepoContextRender | None = None
 
 
 class AgentBase(ABC):
@@ -73,8 +76,26 @@ class AgentBase(ABC):
         try:
             if emit_memory_loaded:
                 self._emit_memory_loaded(writer, state, memory)
-            repo_snapshot = self._repo_snapshot(repo_path, query or state.task, writer, state) if index_repo else None
-            yield RunContext(state=state, writer=writer, memory=memory, repo_snapshot=repo_snapshot)
+            repo_snapshot = self._repo_snapshot(
+                repo_path,
+                query or state.task,
+                writer,
+                state,
+                getattr(memory, "context_profile", ContextProfile.resolve(self.config, getattr(self.llm, "model", ""))),
+            ) if index_repo else None
+            repo_context_render = (
+                repo_snapshot.render_context(max_tokens=memory.context_profile.repo_context_budget_tokens)
+                if repo_snapshot is not None
+                else None
+            )
+            yield RunContext(
+                state=state,
+                writer=writer,
+                memory=memory,
+                repo_snapshot=repo_snapshot,
+                repo_context=repo_context_render.text if repo_context_render is not None else "",
+                repo_context_render=repo_context_render,
+            )
         finally:
             self._restore_memory(memory, memory_trace_snapshot)
 
@@ -142,17 +163,27 @@ class AgentBase(ABC):
             },
         )
 
-    def _repo_snapshot(self, repo: str | Path, query: str, writer: TraceWriter, state: AgentState) -> Any:
+    def _repo_snapshot(
+        self,
+        repo: str | Path,
+        query: str,
+        writer: TraceWriter,
+        state: AgentState,
+        context_profile: ContextProfile,
+    ) -> Any:
         repo_path = Path(repo).resolve()
         snapshot = RepoIndexer(
             repo_path,
             skip_predicate=lambda path: should_skip_path(repo_path, path),
             cancellation_token=state.cancellation_token,
         ).snapshot(query=query)
+        render = snapshot.render_context(max_tokens=context_profile.repo_context_budget_tokens)
+        payload = {"repo_path": str(repo_path), "task": query, "tree": snapshot.tree, "symbols": snapshot.symbols}
+        payload.update(render.to_trace_payload())
         self._emit_trace(
             writer,
             state,
             "repo.indexed",
-            {"repo_path": str(repo_path), "task": query, "tree": snapshot.tree, "symbols": snapshot.symbols},
+            payload,
         )
         return snapshot

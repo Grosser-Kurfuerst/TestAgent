@@ -117,7 +117,7 @@ class NoopMemoryManager:
     ) -> list[Any]:
         return []
 
-    def render_short_term_messages(self) -> list[MessageLike]:
+    def render_short_term_messages(self, *, max_tokens: int | None = None) -> list[MessageLike]:
         return []
 
     def trace_context_event(self, event: str, payload: dict[str, Any]) -> None:
@@ -141,7 +141,7 @@ class NoopMemoryManager:
             storage_path="disabled",
             short_term_entries=0,
             short_term_tokens=0,
-            short_term_token_limit=self.context_profile.short_term_token_limit,
+            short_term_storage_token_limit=self.context_profile.short_term_storage_token_limit,
             long_term_entries=0,
             long_term_tokens=0,
             compression_trigger_ratio=self.config.memory_compression_trigger_ratio,

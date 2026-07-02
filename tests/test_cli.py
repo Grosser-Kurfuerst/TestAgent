@@ -135,6 +135,8 @@ class CliTests(unittest.TestCase):
                 "AGENTCLI_PLAN_TASK_BATCH_TIMEOUT_SECONDS": "30",
                 "AGENTCLI_TEAM_STEP_BATCH_TIMEOUT_SECONDS": "40",
                 "MY_AGENT_MAX_PARALLEL_TOOLS": "2",
+                "AGENTCLI_REPO_CONTEXT_BUDGET_TOKENS": "21000",
+                "MY_AGENT_TOOL_SCHEMA_BUDGET_TOKENS": "13000",
             }
 
             with mock.patch.dict(os.environ, env, clear=True):
@@ -153,6 +155,8 @@ class CliTests(unittest.TestCase):
         self.assertEqual(output["plan_task_batch_timeout_seconds"], 30)
         self.assertEqual(output["team_step_batch_timeout_seconds"], 40)
         self.assertEqual(output["max_parallel_tools"], 2)
+        self.assertEqual(output["repo_context_budget_tokens"], 21_000)
+        self.assertEqual(output["tool_schema_budget_tokens"], 13_000)
 
     def test_cli_run_executes_fake_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -189,6 +193,41 @@ class CliTests(unittest.TestCase):
             self.assertIn("Updated subtract", stream.getvalue())
             self.assertIn("return a - b", (repo / "calculator.py").read_text(encoding="utf-8"))
             self.assertEqual(len(list(trace_dir.glob("*.jsonl"))), 1)
+
+    def test_cli_run_reports_tool_schema_capping_to_stderr(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+            task_file = base / "task.json"
+            task_file.write_text(json.dumps({"repo": str(repo), "task": "Do task"}), encoding="utf-8")
+            env_file = _write_env_file(base, "MY_AGENT_LLM_PROVIDER=fake\n")
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            def capped_run_agent(**kwargs: object) -> object:
+                event_sink = kwargs["event_sink"]
+                event_sink(  # type: ignore[operator]
+                    SimpleNamespace(
+                        event="tools.schema_capped",
+                        payload={
+                            "included_count": 9,
+                            "omitted_count": 1,
+                            "omitted": ["oversized_project_tool"],
+                        },
+                    )
+                )
+                return SimpleNamespace(plan="", review="", final_answer="done", trace_path="trace.jsonl", stop_reason="assistant_final")
+
+            with mock.patch("my_agent.config.DEFAULT_ENV_FILE", env_file):
+                with mock.patch("my_agent.cli.run_agent", side_effect=capped_run_agent):
+                    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                        exit_code = main(["run", "--task-file", str(task_file), "--trace-dir", str(base / "traces")])
+
+            self.assertEqual(exit_code, 0)
+            self.assertIn("Tool schema budget applied: 9 exposed, 1 omitted", stderr.getvalue())
+            self.assertIn("oversized_project_tool", stderr.getvalue())
 
     def test_cli_run_mode_plan_executes_fake_plan_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

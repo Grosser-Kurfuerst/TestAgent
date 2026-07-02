@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 from collections import Counter
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -8,7 +9,7 @@ from pathlib import Path
 from typing import TextIO
 
 from my_agent.config import AgentConfig
-from my_agent.context import AgentContextManager, ContextProfile
+from my_agent.context import AgentContextManager, ContextProfile, budget_tool_definitions
 from my_agent.cancellation import CancellationToken
 from my_agent.hitl import SwitchableHitlHandler, TerminalHitlHandler
 from my_agent.llm import build_llm
@@ -89,6 +90,7 @@ class AgentRepl:
         self._profile = getattr(self._memory, "context_profile", ContextProfile.resolve(config, config.model))
         self._context_manager = AgentContextManager(self._profile)
         self._latest_trace: Path | None = None
+        self._last_memory_prepared: dict[str, object] | None = None
         self._shutdown_complete = False
         self._run_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="agentcli-repl")
         self._current_future: Future[AgentState] | None = None
@@ -152,13 +154,15 @@ class AgentRepl:
             return False
         if command.startswith("/compact"):
             focus = command.removeprefix("/compact").strip()
+            tool_budget = budget_tool_definitions(self._tools.tool_definitions(), self._profile)
             _, _, result = self._context_manager.prepare_messages(
                 base_messages=[Message(role="system", content="Memory maintenance request.")],
                 query=focus or "session context",
-                tools=self._tools.tool_definitions(),
+                tools=tool_budget.definitions,
                 memory=self._memory,
                 force_compact=True,
                 focus=focus,
+                tool_budget=tool_budget,
             )
             if result and result.compacted:
                 self.renderer.status(
@@ -271,6 +275,7 @@ class AgentRepl:
             self._current_token = None
             return
         self._latest_trace = state.trace_path
+        self._last_memory_prepared = _last_memory_prepared_from_trace(state.trace_path)
         self.renderer.assistant_delta(state.final_answer)
         self._current_future = None
         self._current_token = None
@@ -340,6 +345,12 @@ class AgentRepl:
             self.renderer.tool_call_completed(result)
         elif event_name == "render.flush_requested":
             self.renderer.reset_between_iterations()
+        elif event_name == "tools.schema_capped":
+            omitted = int(payload.get("omitted_count", 0) or 0)
+            included = int(payload.get("included_count", 0) or 0)
+            self.renderer.status(f"tool schema budget applied: {included} exposed, {omitted} omitted")
+        elif event_name == "memory.prepared":
+            self._last_memory_prepared = dict(payload)
         elif event_name == "approval.requested":
             tool_name = str(payload.get("tool_name", ""))
             risk_level = str(payload.get("risk_level", ""))
@@ -387,14 +398,22 @@ class AgentRepl:
 
     def _context_text(self) -> str:
         status = self._memory.status(include_entries=False)
+        tool_budget = budget_tool_definitions(self._tools.tool_definitions(), self._profile)
+        prepared = self._last_memory_prepared or _last_memory_prepared_from_trace(self._latest_trace)
         return "\n".join(
             [
                 f"system/project: rebuilt per run",
                 f"context window: {self._profile.max_context_tokens} ({self._profile.dynamic_profile_source})",
+                f"prompt limit: {self._profile.compression_trigger_tokens}",
+                f"repo index budget: {self._profile.repo_context_budget_tokens}",
+                f"tool schema budget: {self._profile.tool_schema_budget_tokens}",
+                f"last memory budget: {_payload_value(prepared, 'memory_budget_tokens')}",
+                f"last long-term limit: {_payload_value(prepared, 'long_term_limit')}",
+                f"last short-term allowed: {_payload_value(prepared, 'short_term_allowed')}",
                 f"short-term: {status.short_term_entries} entries, {status.short_term_tokens} tokens",
-                f"short-term limit: {status.short_term_token_limit}",
+                f"short-term storage cap: {status.short_term_storage_token_limit}",
                 f"long-term: {status.long_term_entries} entries, {status.long_term_tokens} tokens",
-                f"tools: {len(self._tools.tool_definitions())} definitions",
+                f"tools: {tool_budget.included_count} exposed, {tool_budget.omitted_count} omitted",
                 f"mcp: {self._mcp_summary()}",
                 f"default test command: {self.test_command or 'not configured'}",
                 f"compression trigger: {self._profile.compression_trigger_tokens}",
@@ -411,7 +430,7 @@ class AgentRepl:
             f"storage: {status.storage_path}",
             (
                 f"short-term: {status.short_term_entries} entries, {status.short_term_tokens} tokens, "
-                f"limit {status.short_term_token_limit}"
+                f"storage cap {status.short_term_storage_token_limit}"
             ),
             f"long-term: {status.long_term_entries} entries, {status.long_term_tokens} tokens",
             (
@@ -566,6 +585,38 @@ def _renderer_output(renderer: Renderer) -> TextIO:
     if output is not None:
         return output
     return sys.stdout
+
+
+def _last_memory_prepared_from_trace(trace_path: Path | None) -> dict[str, object] | None:
+    if trace_path is None:
+        return None
+    try:
+        lines = trace_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    latest: dict[str, object] | None = None
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict) or event.get("event") != "memory.prepared":
+            continue
+        payload = event.get("payload")
+        if isinstance(payload, dict):
+            latest = dict(payload)
+    return latest
+
+
+def _payload_value(payload: dict[str, object] | None, key: str) -> str:
+    if payload is None:
+        return "not available"
+    value = payload.get(key)
+    if value is None or isinstance(value, bool):
+        return "not available"
+    return str(value)
 
 
 def _discover_test_command(repo_path: Path) -> str | None:
