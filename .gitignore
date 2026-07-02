@@ -16,6 +16,10 @@ outputs/
 traces/
 evaluationResults/
 data/
+!tests/data/
+!tests/data/**
+tests/data/**/__pycache__/
+tests/data/**/*.py[cod]
 models/
 docs/*
 AGENTS.md
