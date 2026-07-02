@@ -248,7 +248,7 @@ def _short_term_budget(window: int) -> int:
 
 
 def _memory_context_tokens(window: int) -> int:
-    return max(500, min(5_000, window // 200))
+    return _clamp(int(max(1, window) * 0.01), 1_000, 20_000)
 
 
 def _tool_result_char_limit(window: int) -> int:

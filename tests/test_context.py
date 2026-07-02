@@ -62,11 +62,24 @@ class ContextProfileTests(unittest.TestCase):
         self.assertEqual(profile.max_context_tokens, 1_000_000)
         self.assertEqual(profile.dynamic_profile_source, "model")
         self.assertEqual(profile.short_term_token_limit, 450_000)
-        self.assertEqual(profile.memory_context_tokens, 5_000)
+        self.assertEqual(profile.memory_context_tokens, 10_000)
         self.assertEqual(profile.tool_result_char_limit, 60_000)
         self.assertEqual(profile.response_reserve_tokens, 100_000)
         self.assertEqual(profile.compression_buffer_tokens, 50_000)
         self.assertEqual(profile.compression_trigger_tokens, 850_000)
+
+    def test_explicit_memory_context_tokens_override_dynamic_budget(self) -> None:
+        config = _config(
+            Path("memory"),
+            model="gpt-4.1-mini",
+            memory_context_tokens=2_048,
+            memory_context_tokens_explicit=True,
+        )
+
+        profile = ContextProfile.resolve(config, config.model)
+
+        self.assertEqual(profile.max_context_tokens, 1_000_000)
+        self.assertEqual(profile.memory_context_tokens, 2_048)
 
     def test_compression_trigger_uses_configured_reserve_and_buffer(self) -> None:
         config = _config(
@@ -91,6 +104,7 @@ class ContextProfileTests(unittest.TestCase):
         profile = ContextProfile.resolve(config, config.model)
 
         self.assertEqual(profile.max_context_tokens, 128_000)
+        self.assertEqual(profile.memory_context_tokens, 1_280)
         self.assertEqual(profile.response_reserve_tokens, 12_800)
         self.assertEqual(profile.compression_buffer_tokens, 6_400)
         self.assertEqual(profile.compression_trigger_tokens, 108_800)
