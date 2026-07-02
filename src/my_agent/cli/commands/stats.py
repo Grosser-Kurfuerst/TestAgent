@@ -5,8 +5,8 @@ import json
 import sys
 
 from my_agent.cli.common import CliContext
-from my_agent.evaluation.trace_metrics import collect_trace_metrics, format_trace_metrics
-from my_agent.stats import collect_trace_stats, format_trace_stats
+from my_agent.observability.stats import collect_trace_stats, format_trace_stats
+from my_agent.observability.trace_metrics import collect_trace_metrics, format_trace_metrics
 
 
 def add_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:

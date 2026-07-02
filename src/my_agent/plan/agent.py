@@ -19,7 +19,7 @@ from my_agent.plan.store import JsonPlanStore, PlanStore
 from my_agent.plan.types import PlanState, PlanStatus, TaskStatus
 from my_agent.agent_base import AgentBase
 from my_agent.schema import AgentState
-from my_agent.tracing import TraceWriter, append_agent_completed
+from my_agent.observability.tracing import TraceWriter, append_agent_completed
 from my_agent.utils.text import terminal_summary_text
 
 

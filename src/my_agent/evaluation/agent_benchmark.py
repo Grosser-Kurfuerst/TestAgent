@@ -13,7 +13,7 @@ from typing import Any, Callable
 
 from my_agent.config import AgentConfig
 from my_agent.runtime import run_agent
-from my_agent.tracing import append_benchmark_result
+from my_agent.observability.tracing import append_benchmark_result
 
 
 TEST_COMMAND = "python -m pytest -q"

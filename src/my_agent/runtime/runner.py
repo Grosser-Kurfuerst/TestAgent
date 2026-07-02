@@ -8,11 +8,11 @@ from my_agent.config import AgentConfig
 from my_agent.hitl.handler import HitlHandler, NonInteractiveHitlHandler, TerminalHitlHandler
 from my_agent.llm import AgentLLM, build_llm
 from my_agent.memory import MemoryManager
+from my_agent.observability.tracing import TraceWriter, append_agent_completed
 from my_agent.plan import AgentMode, resolve_mode
 from my_agent.runtime.cancellation import CancelledError, CancellationToken
 from my_agent.runtime.factory import AgentFactory
 from my_agent.schema import AgentState, TraceEvent
-from my_agent.tracing import TraceWriter, append_agent_completed
 
 
 class CodingAgentRuntime:

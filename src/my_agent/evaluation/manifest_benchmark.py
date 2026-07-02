@@ -21,7 +21,7 @@ from my_agent.context import (
     DEFAULT_TOOL_RESULT_CHARS,
 )
 from my_agent.evaluation.agent_benchmark import record_benchmark_result
-from my_agent.evaluation.trace_metrics import collect_trace_metrics
+from my_agent.observability.trace_metrics import collect_trace_metrics
 from my_agent.runtime import run_agent
 
 

@@ -9,13 +9,13 @@ from typing import Any, Callable, Iterator
 from my_agent.config import AgentConfig
 from my_agent.context import ContextProfile
 from my_agent.hitl.handler import HitlHandler
-from my_agent.indexer import RepoContextRender, RepoIndexer
 from my_agent.llm import AgentLLM
 from my_agent.memory import MemoryManager, NoopMemoryManager
+from my_agent.observability.tracing import TraceWriter
+from my_agent.repo import RepoContextRender, RepoIndexer
 from my_agent.runtime.cancellation import CancellationToken
 from my_agent.schema import AgentState, TraceEvent
 from my_agent.tools import should_skip_path
-from my_agent.tracing import TraceWriter
 
 EventSink = Callable[[Any], None]
 MemoryTraceSnapshot = tuple[Any | None, Any | None]

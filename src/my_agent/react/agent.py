@@ -17,7 +17,7 @@ from my_agent.memory.token import estimate_tokens
 from my_agent.agent_base import AgentBase
 from my_agent.schema import AgentState, ToolCall, ToolRecord, ToolResult
 from my_agent.tools import RepoTools, ToolExecutionResult, ToolInvocation
-from my_agent.tracing import TraceWriter, append_agent_completed
+from my_agent.observability.tracing import TraceWriter, append_agent_completed
 from my_agent.utils.answers import append_trace_to_answer
 
 EventSink = Callable[[Any], None]

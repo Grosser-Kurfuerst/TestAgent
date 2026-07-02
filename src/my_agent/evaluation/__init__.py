@@ -38,7 +38,7 @@ from my_agent.evaluation.protocol_metrics import (
     score_response,
 )
 from my_agent.evaluation.protocol_runner import load_response_file, load_samples, run_evaluation
-from my_agent.evaluation.trace_metrics import TraceMetrics, collect_trace_metrics, format_trace_metrics
+from my_agent.observability.trace_metrics import TraceMetrics, collect_trace_metrics, format_trace_metrics
 
 __all__ = [
     "TEST_COMMAND",

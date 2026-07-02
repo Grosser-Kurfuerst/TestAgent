@@ -27,7 +27,7 @@ from my_agent.team.rendering import render_team_final_answer, render_team_plan, 
 from my_agent.team.store import JsonTeamStore, TeamStore
 from my_agent.team.sub_agent import SubAgent
 from my_agent.team.types import AgentRole, ExecutionStep, ReviewDecision, StepStatus, TeamState, TeamStatus
-from my_agent.tracing import TraceWriter, append_agent_completed
+from my_agent.observability.tracing import TraceWriter, append_agent_completed
 from my_agent.utils.numbers import positive_or_default
 from my_agent.utils.text import single_line, terminal_summary_text
 

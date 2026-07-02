@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 
 from my_agent.cli.common import CliContext, positive_top_k, section
-from my_agent.indexer import RepoIndexer
+from my_agent.repo import RepoIndexer
 
 
 def add_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:

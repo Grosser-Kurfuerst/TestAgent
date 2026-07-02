@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Mapping
 
 from my_agent.cancellation import CancellationToken
-from my_agent.indexer import RepoIndexer, TEXT_EXTENSIONS
+from my_agent.repo import RepoIndexer, TEXT_EXTENSIONS
 from my_agent.schema import ToolResult
 from my_agent.tools.execution import ToolExecutionResult, ToolInvocation
 from my_agent.tools.hooks import (
