@@ -59,6 +59,16 @@ def append_benchmark_result(
     hidden_test_output: str | None = None,
     initial_visible_output: str | None = None,
     initial_hidden_output: str | None = None,
+    memory_mode: str | None = None,
+    stream_id: str | None = None,
+    memory_dir: str | None = None,
+    memory_project_key: str | None = None,
+    memory_entries_before: int | None = None,
+    memory_entries_after: int | None = None,
+    memory_growth: int | None = None,
+    memory_entries_total_before: int | None = None,
+    memory_entries_total_after: int | None = None,
+    memory_total_growth: int | None = None,
 ) -> None:
     payload: dict[str, Any] = {
         "benchmark": benchmark,
@@ -86,6 +96,16 @@ def append_benchmark_result(
         hidden_test_output=_truncate_optional(hidden_test_output),
         initial_visible_output=_truncate_optional(initial_visible_output),
         initial_hidden_output=_truncate_optional(initial_hidden_output),
+        memory_mode=memory_mode,
+        stream_id=stream_id,
+        memory_dir=memory_dir,
+        memory_project_key=memory_project_key,
+        memory_entries_before=memory_entries_before,
+        memory_entries_after=memory_entries_after,
+        memory_growth=memory_growth,
+        memory_entries_total_before=memory_entries_total_before,
+        memory_entries_total_after=memory_entries_total_after,
+        memory_total_growth=memory_total_growth,
     )
     TraceWriter(trace_path).append(TraceEvent(event="benchmark_result", payload=payload, run_id=run_id))
 

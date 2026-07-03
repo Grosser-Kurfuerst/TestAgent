@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import difflib
+import hashlib
 import json
 import os
 import shlex
@@ -21,6 +22,7 @@ from my_agent.context import (
     DEFAULT_TOOL_RESULT_CHARS,
 )
 from my_agent.evaluation.agent_benchmark import record_benchmark_result
+from my_agent.memory.long_term import LongTermMemoryStore
 from my_agent.observability.trace_metrics import collect_trace_metrics
 from my_agent.runtime import run_agent
 
@@ -96,6 +98,16 @@ class ManifestEvalResult:
     patch_path: str = ""
     trace_path: str = ""
     metrics: dict[str, Any] = field(default_factory=dict)
+    memory_mode: str = MEMORY_MODE_PER_TASK
+    stream_id: str = ""
+    memory_dir: str = ""
+    memory_project_key: str = ""
+    memory_entries_before: int = 0
+    memory_entries_after: int = 0
+    memory_growth: int = 0
+    memory_entries_total_before: int = 0
+    memory_entries_total_after: int = 0
+    memory_total_growth: int = 0
     agent_steps: int = 0
     agent_done: bool = False
     agent_stop_reason: str = ""
@@ -130,6 +142,16 @@ class ManifestEvalResult:
             "patch_path": self.patch_path,
             "trace_path": self.trace_path,
             "metrics": dict(self.metrics),
+            "memory_mode": self.memory_mode,
+            "stream_id": self.stream_id,
+            "memory_dir": self.memory_dir,
+            "memory_project_key": self.memory_project_key,
+            "memory_entries_before": self.memory_entries_before,
+            "memory_entries_after": self.memory_entries_after,
+            "memory_growth": self.memory_growth,
+            "memory_entries_total_before": self.memory_entries_total_before,
+            "memory_entries_total_after": self.memory_entries_total_after,
+            "memory_total_growth": self.memory_total_growth,
             "agent_steps": self.agent_steps,
             "agent_done": self.agent_done,
             "agent_stop_reason": self.agent_stop_reason,
@@ -308,6 +330,40 @@ def _memory_project_key(manifest_path: Path, mode: str, stream_id: str) -> str:
     return f"manifest:{_safe_id(str(manifest_path.resolve()))}:memory:{mode}:stream:{_safe_id(stream_id)}"
 
 
+def _memory_counts(memory_dir: Path, *, project_key: str = "") -> dict[str, int]:
+    store = LongTermMemoryStore.from_dir(memory_dir)
+    store.load()
+    total = len(store.all())
+    visible = len(store.all(project_key=project_key)) if project_key else total
+    return {"total": total, "visible": visible}
+
+
+def _memory_result_fields(
+    *,
+    memory_stream: MemoryStreamResolution,
+    memory_dir: Path,
+    memory_project_key: str,
+    before_counts: Mapping[str, int],
+    after_counts: Mapping[str, int],
+) -> dict[str, Any]:
+    before_visible = int(before_counts.get("visible", 0))
+    after_visible = int(after_counts.get("visible", 0))
+    before_total = int(before_counts.get("total", 0))
+    after_total = int(after_counts.get("total", 0))
+    return {
+        "memory_mode": memory_stream.memory_mode,
+        "stream_id": memory_stream.stream_id,
+        "memory_dir": str(memory_dir),
+        "memory_project_key": memory_project_key,
+        "memory_entries_before": before_visible,
+        "memory_entries_after": after_visible,
+        "memory_growth": after_visible - before_visible,
+        "memory_entries_total_before": before_total,
+        "memory_entries_total_after": after_total,
+        "memory_total_growth": after_total - before_total,
+    }
+
+
 def _first_nonblank(*values: object) -> str:
     for value in values:
         text = str(value or "").strip()
@@ -321,9 +377,46 @@ def summarize_manifest_results(results: Sequence[ManifestEvalResult]) -> dict[st
     scored = sum(1 for result in results if result.task_valid)
     resolved = sum(1 for result in results if result.resolved)
     failure_counts: dict[str, int] = {}
+    memory_modes: dict[str, int] = {}
+    stream_keys = _stream_summary_keys(results)
+    streams: dict[str, dict[str, Any]] = {}
     for result in results:
         key = result.failure_type or "resolved"
         failure_counts[key] = failure_counts.get(key, 0) + 1
+        memory_modes[result.memory_mode] = memory_modes.get(result.memory_mode, 0) + 1
+        if result.memory_mode in {MEMORY_MODE_SHARED_STREAM, MEMORY_MODE_SHARED_BY_GROUP}:
+            stream_key = stream_keys.get(id(result), result.stream_id or result.task_id)
+            stream = streams.setdefault(
+                stream_key,
+                {
+                    "memory_mode": result.memory_mode,
+                    "stream_id": result.stream_id,
+                    "total": 0,
+                    "scored": 0,
+                    "resolved": 0,
+                    "solve_rate": 0.0,
+                    "memory_dir": result.memory_dir,
+                    "memory_project_key": result.memory_project_key,
+                    "memory_entries_before": result.memory_entries_before,
+                    "memory_entries_after": result.memory_entries_after,
+                    "memory_growth": 0,
+                    "memory_entries_total_before": result.memory_entries_total_before,
+                    "memory_entries_total_after": result.memory_entries_total_after,
+                    "memory_total_growth": 0,
+                },
+            )
+            stream["total"] = int(stream["total"]) + 1
+            stream["scored"] = int(stream["scored"]) + (1 if result.task_valid else 0)
+            stream["resolved"] = int(stream["resolved"]) + (1 if result.resolved else 0)
+            stream["memory_entries_after"] = result.memory_entries_after
+            stream["memory_entries_total_after"] = result.memory_entries_total_after
+            stream["memory_growth"] = result.memory_entries_after - int(stream["memory_entries_before"])
+            stream["memory_total_growth"] = (
+                result.memory_entries_total_after - int(stream["memory_entries_total_before"])
+            )
+    for stream in streams.values():
+        stream_scored = int(stream["scored"])
+        stream["solve_rate"] = int(stream["resolved"]) / stream_scored * 100 if stream_scored else 0.0
     return {
         "total": total,
         "scored": scored,
@@ -335,7 +428,51 @@ def summarize_manifest_results(results: Sequence[ManifestEvalResult]) -> dict[st
         "solve_rate": resolved / scored * 100 if scored else 0.0,
         "end_to_end_rate": resolved / total * 100 if total else 0.0,
         "failure_counts": failure_counts,
+        "memory": {
+            "modes": memory_modes,
+            "total_growth": sum(result.memory_total_growth for result in results),
+            "visible_growth": sum(result.memory_growth for result in results),
+        },
+        "streams": streams,
     }
+
+
+def _stream_summary_keys(results: Sequence[ManifestEvalResult]) -> dict[int, str]:
+    shared = [
+        result for result in results
+        if result.memory_mode in {MEMORY_MODE_SHARED_STREAM, MEMORY_MODE_SHARED_BY_GROUP}
+    ]
+    identities_by_base: dict[str, set[tuple[str, str, str, str]]] = {}
+    identities_by_mode_base: dict[tuple[str, str], set[tuple[str, str, str, str]]] = {}
+    for result in shared:
+        base = result.stream_id or result.task_id
+        identity = _stream_summary_identity(result)
+        identities_by_base.setdefault(base, set()).add(identity)
+        identities_by_mode_base.setdefault((result.memory_mode, base), set()).add(identity)
+
+    keys: dict[int, str] = {}
+    for result in shared:
+        base = result.stream_id or result.task_id
+        if len(identities_by_base.get(base, set())) <= 1:
+            keys[id(result)] = base
+            continue
+        mode_base = f"{result.memory_mode}:{base}"
+        if len(identities_by_mode_base.get((result.memory_mode, base), set())) <= 1:
+            keys[id(result)] = mode_base
+            continue
+        suffix_payload = json.dumps(_stream_summary_identity(result), ensure_ascii=False, sort_keys=True)
+        suffix = hashlib.sha1(suffix_payload.encode("utf-8")).hexdigest()[:12]
+        keys[id(result)] = f"{mode_base}:{suffix}"
+    return keys
+
+
+def _stream_summary_identity(result: ManifestEvalResult) -> tuple[str, str, str, str]:
+    return (
+        result.memory_mode,
+        result.stream_id or result.task_id,
+        result.memory_dir,
+        result.memory_project_key,
+    )
 
 
 def _run_manifest_task(
@@ -394,6 +531,7 @@ def _run_manifest_task(
         memory_project_key=memory_stream.memory_project_key,
         command_timeout=command_timeout,
     )
+    before_counts = _memory_counts(task_config.memory_dir, project_key=task_config.memory_project_key)
     agent_test_command = task.get("agent_test_command") or task.get("test_command")
     visible_command = task.get("visible_test_command") or agent_test_command
     hidden_command = task.get("hidden_test_command")
@@ -406,6 +544,14 @@ def _run_manifest_task(
     initial_hidden_ok = initial_hidden.ok if initial_hidden is not None else True
     task_valid = not (initial_visible.ok and initial_hidden_ok)
     if not task_valid:
+        after_counts = _memory_counts(task_config.memory_dir, project_key=task_config.memory_project_key)
+        memory_fields = _memory_result_fields(
+            memory_stream=memory_stream,
+            memory_dir=task_config.memory_dir,
+            memory_project_key=task_config.memory_project_key,
+            before_counts=before_counts,
+            after_counts=after_counts,
+        )
         return ManifestEvalResult(
             task_id=task_id,
             status="failed",
@@ -421,6 +567,7 @@ def _run_manifest_task(
             expected_changed_files=expected_changed_files,
             expected_changed_files_ok=None if not expected_changed_files else False,
             initial_hidden=initial_hidden,
+            **memory_fields,
             elapsed_sec=time.monotonic() - started,
         )
 
@@ -475,6 +622,14 @@ def _run_manifest_task(
     )
     trace_path = str(getattr(state, "trace_path", "") or "")
     metrics = _metrics_for_trace(trace_path, task_trace_dir)
+    after_counts = _memory_counts(task_config.memory_dir, project_key=task_config.memory_project_key)
+    memory_fields = _memory_result_fields(
+        memory_stream=memory_stream,
+        memory_dir=task_config.memory_dir,
+        memory_project_key=task_config.memory_project_key,
+        before_counts=before_counts,
+        after_counts=after_counts,
+    )
     result = ManifestEvalResult(
         task_id=task_id,
         status="passed" if resolved else "failed",
@@ -498,6 +653,7 @@ def _run_manifest_task(
         patch_path=str(patch_path),
         trace_path=trace_path,
         metrics=metrics,
+        **memory_fields,
         agent_steps=int(getattr(state, "steps", 0) or 0),
         agent_done=bool(getattr(state, "done", False)),
         agent_stop_reason=str(getattr(state, "stop_reason", "") or ""),
@@ -526,6 +682,16 @@ def _run_manifest_task(
             visible_test_command=_command_label(visible_command),
             visible_test_output=final_visible.output if final_visible else None,
             initial_visible_output=initial_visible.output,
+            memory_mode=result.memory_mode,
+            stream_id=result.stream_id,
+            memory_dir=result.memory_dir,
+            memory_project_key=result.memory_project_key,
+            memory_entries_before=result.memory_entries_before,
+            memory_entries_after=result.memory_entries_after,
+            memory_growth=result.memory_growth,
+            memory_entries_total_before=result.memory_entries_total_before,
+            memory_entries_total_after=result.memory_entries_total_after,
+            memory_total_growth=result.memory_total_growth,
         )
     return result
 

@@ -75,6 +75,7 @@ class AgentConfig:
     # Memory storage, retrieval, and compression defaults.
     memory_enabled: bool = True
     memory_dir: Path = Path("~/.agentcli/memory").expanduser()
+    # Optional visibility key for project-scope long-term memory entries.
     memory_project_key: str = ""
     # Storage hard cap only; prompt rendering uses dynamic short_term_allowed.
     memory_short_term_tokens: int = 24_000

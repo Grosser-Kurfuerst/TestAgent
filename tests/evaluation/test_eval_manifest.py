@@ -13,10 +13,13 @@ add_src_to_path()
 
 from my_agent.config import AgentConfig
 from my_agent.evaluation.manifest_benchmark import (
+    CommandResult,
+    ManifestEvalResult,
     _config_env_values,
     _load_manifest,
     load_manifest_tasks,
     run_manifest_benchmark,
+    summarize_manifest_results,
 )
 from my_agent.memory import MemoryManager, MemoryScope
 from my_agent.tools import RepoTools
@@ -157,6 +160,111 @@ class ManifestBenchmarkTests(unittest.TestCase):
 
         self.assertEqual(values["AGENTCLI_MEMORY_PROJECT_KEY"], "stream:alpha")
 
+    def test_manifest_summary_separates_same_stream_id_across_shared_modes(self) -> None:
+        initial_visible = CommandResult(command="", ok=False, returncode=1)
+        results = [
+            ManifestEvalResult(
+                task_id="stream-task",
+                status="passed",
+                resolved=True,
+                task_valid=True,
+                failure_type="",
+                initial_visible=initial_visible,
+                memory_mode="shared_stream",
+                stream_id="python",
+                memory_dir="/tmp/streams/python",
+                memory_project_key="stream-key",
+                memory_entries_before=0,
+                memory_entries_after=2,
+                memory_growth=2,
+                memory_entries_total_before=0,
+                memory_entries_total_after=2,
+                memory_total_growth=2,
+            ),
+            ManifestEvalResult(
+                task_id="group-task",
+                status="failed",
+                resolved=False,
+                task_valid=True,
+                failure_type="visible_test_failed",
+                initial_visible=initial_visible,
+                memory_mode="shared_by_group",
+                stream_id="python",
+                memory_dir="/tmp/groups/python",
+                memory_project_key="group-key",
+                memory_entries_before=0,
+                memory_entries_after=3,
+                memory_growth=3,
+                memory_entries_total_before=0,
+                memory_entries_total_after=3,
+                memory_total_growth=3,
+            ),
+        ]
+
+        summary = summarize_manifest_results(results)
+
+        self.assertNotIn("python", summary["streams"])
+        self.assertIn("shared_stream:python", summary["streams"])
+        self.assertIn("shared_by_group:python", summary["streams"])
+        self.assertEqual(summary["streams"]["shared_stream:python"]["memory_dir"], "/tmp/streams/python")
+        self.assertEqual(summary["streams"]["shared_by_group:python"]["memory_dir"], "/tmp/groups/python")
+        self.assertEqual(summary["streams"]["shared_stream:python"]["solve_rate"], 100.0)
+        self.assertEqual(summary["streams"]["shared_by_group:python"]["solve_rate"], 0.0)
+        self.assertEqual(summary["memory"]["visible_growth"], 5)
+
+    def test_manifest_summary_separates_same_stream_id_with_memory_dir_override(self) -> None:
+        initial_visible = CommandResult(command="", ok=False, returncode=1)
+        results = [
+            ManifestEvalResult(
+                task_id="one",
+                status="passed",
+                resolved=True,
+                task_valid=True,
+                failure_type="",
+                initial_visible=initial_visible,
+                memory_mode="shared_stream",
+                stream_id="python",
+                memory_dir="/tmp/one",
+                memory_project_key="same-key",
+                memory_entries_before=0,
+                memory_entries_after=1,
+                memory_growth=1,
+                memory_entries_total_before=0,
+                memory_entries_total_after=1,
+                memory_total_growth=1,
+            ),
+            ManifestEvalResult(
+                task_id="two",
+                status="passed",
+                resolved=True,
+                task_valid=True,
+                failure_type="",
+                initial_visible=initial_visible,
+                memory_mode="shared_stream",
+                stream_id="python",
+                memory_dir="/tmp/two",
+                memory_project_key="same-key",
+                memory_entries_before=0,
+                memory_entries_after=2,
+                memory_growth=2,
+                memory_entries_total_before=0,
+                memory_entries_total_after=2,
+                memory_total_growth=2,
+            ),
+        ]
+
+        summary = summarize_manifest_results(results)
+        stream_items = {
+            payload["memory_dir"]: payload
+            for key, payload in summary["streams"].items()
+            if key.startswith("shared_stream:python:")
+        }
+
+        self.assertEqual(set(stream_items), {"/tmp/one", "/tmp/two"})
+        self.assertEqual(stream_items["/tmp/one"]["memory_growth"], 1)
+        self.assertEqual(stream_items["/tmp/two"]["memory_growth"], 2)
+        self.assertEqual(summary["memory"]["visible_growth"], 3)
+
     def test_initial_visible_and_hidden_pass_marks_invalid_without_agent_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -193,6 +301,17 @@ class ManifestBenchmarkTests(unittest.TestCase):
         self.assertEqual(result.results[0].failure_type, "invalid_initial_pass")
         self.assertFalse(result.results[0].task_valid)
         self.assertEqual(result.summary["invalid_initial_pass"], 1)
+        record = result.results[0].to_dict()
+        self.assertEqual(record["memory_mode"], "per_task")
+        self.assertEqual(record["stream_id"], "already-fixed")
+        self.assertEqual(record["memory_project_key"], "")
+        self.assertTrue(str(record["memory_dir"]).endswith("out/memory/already-fixed"))
+        self.assertEqual(record["memory_entries_before"], 0)
+        self.assertEqual(record["memory_entries_after"], 0)
+        self.assertEqual(record["memory_growth"], 0)
+        self.assertEqual(record["memory_entries_total_before"], 0)
+        self.assertEqual(record["memory_entries_total_after"], 0)
+        self.assertEqual(record["memory_total_growth"], 0)
 
     def test_visible_pass_hidden_fail_records_clean_copy_result_and_trace_payload(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -283,6 +402,14 @@ class ManifestBenchmarkTests(unittest.TestCase):
         benchmark_payload = [event["payload"] for event in trace_events if event["event"] == "benchmark_result"][-1]
         self.assertFalse(benchmark_payload["hidden_ok"])
         self.assertEqual(benchmark_payload["failure_type"], "hidden_test_failed")
+        self.assertEqual(benchmark_payload["memory_mode"], "per_task")
+        self.assertEqual(benchmark_payload["stream_id"], "hidden-case")
+        self.assertEqual(benchmark_payload["memory_entries_before"], 0)
+        self.assertEqual(benchmark_payload["memory_entries_after"], 0)
+        self.assertEqual(benchmark_payload["memory_growth"], 0)
+        self.assertEqual(benchmark_payload["memory_entries_total_before"], 0)
+        self.assertEqual(benchmark_payload["memory_entries_total_after"], 0)
+        self.assertEqual(benchmark_payload["memory_total_growth"], 0)
         self.assertNotIn("hidden_test_command", benchmark_payload)
         self.assertNotIn("hidden_test_output", benchmark_payload)
         self.assertNotIn("initial_hidden_output", benchmark_payload)
@@ -549,9 +676,35 @@ class ManifestBenchmarkTests(unittest.TestCase):
                 config=fake_config(base / "traces", memory_enabled=True, memory_auto_extract=False),
                 agent_runner=fake_agent_runner,
             )
+            result_records = read_jsonl(result.results_path)
 
         self.assertTrue(all(item.resolved for item in result.results))
         self.assertTrue(second_saw_marker)
+        self.assertEqual(result.results[0].memory_mode, "shared_stream")
+        self.assertEqual(result.results[0].stream_id, "memory-stream")
+        self.assertEqual(result.results[0].memory_entries_before, 0)
+        self.assertEqual(result.results[0].memory_entries_after, 1)
+        self.assertEqual(result.results[0].memory_growth, 1)
+        self.assertEqual(result.results[1].memory_entries_before, 1)
+        self.assertEqual(result.results[1].memory_entries_after, 1)
+        self.assertEqual(result.results[1].memory_growth, 0)
+        self.assertEqual(result_records[0]["memory_mode"], "shared_stream")
+        self.assertEqual(result_records[0]["stream_id"], "memory-stream")
+        self.assertTrue(result_records[0]["memory_project_key"])
+        self.assertEqual(result_records[0]["memory_entries_total_before"], 0)
+        self.assertEqual(result_records[0]["memory_entries_total_after"], 1)
+        self.assertEqual(result.summary["memory"]["modes"]["shared_stream"], 2)
+        self.assertEqual(result.summary["memory"]["visible_growth"], 1)
+        self.assertEqual(result.summary["memory"]["total_growth"], 1)
+        self.assertIn("memory-stream", result.summary["streams"])
+        stream_summary = result.summary["streams"]["memory-stream"]
+        self.assertEqual(stream_summary["total"], 2)
+        self.assertEqual(stream_summary["scored"], 2)
+        self.assertEqual(stream_summary["resolved"], 2)
+        self.assertEqual(stream_summary["solve_rate"], 100.0)
+        self.assertEqual(stream_summary["memory_entries_before"], 0)
+        self.assertEqual(stream_summary["memory_entries_after"], 1)
+        self.assertEqual(stream_summary["memory_growth"], 1)
 
     def test_my_agent_memory_project_key_override_wins_over_base_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
