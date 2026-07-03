@@ -28,6 +28,28 @@ from my_agent.runtime import run_agent
 AgentRunnerFn = Callable[..., Any]
 
 _IGNORE_DIRS = {".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
+MEMORY_MODE_PER_TASK = "per_task"
+MEMORY_MODE_SHARED_STREAM = "shared_stream"
+MEMORY_MODE_SHARED_BY_GROUP = "shared_by_group"
+MEMORY_MODES = {
+    MEMORY_MODE_PER_TASK,
+    MEMORY_MODE_SHARED_STREAM,
+    MEMORY_MODE_SHARED_BY_GROUP,
+}
+
+
+@dataclass(frozen=True)
+class ManifestSettings:
+    memory_mode: str = MEMORY_MODE_PER_TASK
+    stream_id: str = ""
+
+
+@dataclass(frozen=True)
+class MemoryStreamResolution:
+    memory_mode: str
+    stream_id: str
+    memory_dir: Path
+    memory_project_key: str
 
 
 @dataclass(frozen=True)
@@ -145,7 +167,7 @@ def run_manifest_benchmark(
     agent_runner: AgentRunnerFn = run_agent,
 ) -> ManifestBenchmarkResult:
     manifest_path = Path(tasks_path)
-    tasks = load_manifest_tasks(manifest_path)
+    tasks, manifest_settings = _load_manifest(manifest_path)
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     results_path = output / "results.jsonl"
@@ -175,6 +197,7 @@ def run_manifest_benchmark(
             trace_root=trace_root,
             patch_root=patch_root,
             memory_root=memory_root,
+            manifest_settings=manifest_settings,
             config=run_config,
             mode=mode,
             max_steps=max_steps,
@@ -198,6 +221,11 @@ def run_manifest_benchmark(
 
 
 def load_manifest_tasks(path: str | Path) -> list[dict[str, Any]]:
+    tasks, _settings = _load_manifest(path)
+    return tasks
+
+
+def _load_manifest(path: str | Path) -> tuple[list[dict[str, Any]], ManifestSettings]:
     manifest_path = Path(path)
     if not manifest_path.exists():
         raise FileNotFoundError(f"Manifest not found: {manifest_path}")
@@ -210,15 +238,82 @@ def load_manifest_tasks(path: str | Path) -> list[dict[str, Any]]:
             if not isinstance(payload, dict):
                 raise ValueError(f"{manifest_path}:{line_number} must be a JSON object.")
             rows.append(payload)
-        return rows
+        return rows, ManifestSettings()
     payload = json.loads(manifest_path.read_text(encoding="utf-8"))
     if isinstance(payload, list):
-        return [dict(item) for item in payload if isinstance(item, dict)]
+        return [dict(item) for item in payload if isinstance(item, dict)], ManifestSettings()
     if isinstance(payload, dict) and isinstance(payload.get("tasks"), list):
-        return [dict(item) for item in payload["tasks"] if isinstance(item, dict)]
+        settings = ManifestSettings(
+            memory_mode=_memory_mode_value(payload.get("memory_mode"), default=MEMORY_MODE_PER_TASK),
+            stream_id=str(payload.get("stream_id") or "").strip(),
+        )
+        return [dict(item) for item in payload["tasks"] if isinstance(item, dict)], settings
     if isinstance(payload, dict):
-        return [dict(payload)]
+        return [dict(payload)], ManifestSettings()
     raise ValueError("Manifest must be a JSON object, JSON array, or JSONL objects.")
+
+
+def _resolve_memory_stream(
+    task: Mapping[str, Any],
+    *,
+    manifest_settings: ManifestSettings,
+    manifest_path: Path,
+    memory_root: Path,
+    safe_id: str,
+) -> MemoryStreamResolution:
+    mode = _memory_mode_value(task.get("memory_mode"), default=manifest_settings.memory_mode)
+    if mode == MEMORY_MODE_PER_TASK:
+        stream_id = _first_nonblank(task.get("stream_id"), task.get("group"), task.get("id"), safe_id) or safe_id
+        return MemoryStreamResolution(
+            memory_mode=mode,
+            stream_id=stream_id,
+            memory_dir=memory_root / safe_id,
+            memory_project_key="",
+        )
+    if mode == MEMORY_MODE_SHARED_STREAM:
+        stream_id = _first_nonblank(
+            task.get("stream_id"),
+            task.get("group"),
+            manifest_settings.stream_id,
+            manifest_path.stem,
+            "manifest",
+        )
+        return MemoryStreamResolution(
+            memory_mode=mode,
+            stream_id=stream_id,
+            memory_dir=memory_root / "streams" / _safe_id(stream_id),
+            memory_project_key=_memory_project_key(manifest_path, mode, stream_id),
+        )
+
+    stream_id = _first_nonblank(task.get("stream_id"), task.get("group"))
+    if not stream_id:
+        raise ValueError("shared_by_group requires task.stream_id or task.group.")
+    return MemoryStreamResolution(
+        memory_mode=mode,
+        stream_id=stream_id,
+        memory_dir=memory_root / "groups" / _safe_id(stream_id),
+        memory_project_key=_memory_project_key(manifest_path, mode, stream_id),
+    )
+
+
+def _memory_mode_value(value: object, *, default: str) -> str:
+    mode = str(value or default or MEMORY_MODE_PER_TASK).strip() or MEMORY_MODE_PER_TASK
+    if mode not in MEMORY_MODES:
+        expected = ", ".join(sorted(MEMORY_MODES))
+        raise ValueError(f"Unsupported memory_mode: {mode!r}. Expected one of: {expected}.")
+    return mode
+
+
+def _memory_project_key(manifest_path: Path, mode: str, stream_id: str) -> str:
+    return f"manifest:{_safe_id(str(manifest_path.resolve()))}:memory:{mode}:stream:{_safe_id(stream_id)}"
+
+
+def _first_nonblank(*values: object) -> str:
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
 
 
 def summarize_manifest_results(results: Sequence[ManifestEvalResult]) -> dict[str, Any]:
@@ -253,6 +348,7 @@ def _run_manifest_task(
     trace_root: Path,
     patch_root: Path,
     memory_root: Path,
+    manifest_settings: ManifestSettings,
     config: AgentConfig,
     mode: str,
     max_steps: int | None,
@@ -273,7 +369,14 @@ def _run_manifest_task(
     work_repo = task_dir / "repo"
     clean_repo = task_dir / "clean"
     task_trace_dir = trace_root / safe_id
-    task_memory_dir = memory_root / safe_id
+    memory_stream = _resolve_memory_stream(
+        task,
+        manifest_settings=manifest_settings,
+        manifest_path=manifest_path,
+        memory_root=memory_root,
+        safe_id=safe_id,
+    )
+    task_memory_dir = memory_stream.memory_dir
     _copy_repo(source_repo, baseline_repo)
     _copy_repo(source_repo, initial_repo)
     _copy_repo(source_repo, work_repo)
