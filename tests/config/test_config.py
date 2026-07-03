@@ -233,6 +233,7 @@ class AgentConfigTests(unittest.TestCase):
             config = AgentConfig.from_env(env_file=env_file)
 
         self.assertEqual(config.memory_dir, Path("~/.agentcli/memory").expanduser())
+        self.assertEqual(config.memory_project_key, "")
         self.assertEqual(config.memory_short_term_tokens, 24_000)
         self.assertEqual(config.memory_short_term_entries, 500)
         self.assertEqual(config.memory_context_tokens, 2_000)
@@ -330,6 +331,7 @@ class AgentConfigTests(unittest.TestCase):
                 env={
                     "AGENTCLI_MEMORY": "1",
                     "AGENTCLI_MEMORY_DIR": str(Path(tmp) / "mem"),
+                    "AGENTCLI_MEMORY_PROJECT_KEY": "stream:alpha",
                     "AGENTCLI_MEMORY_SHORT_TERM_TOKENS": "1000",
                     "AGENTCLI_MEMORY_SHORT_TERM_ENTRIES": "50",
                     "AGENTCLI_MEMORY_CONTEXT_TOKENS": "512",
@@ -344,6 +346,7 @@ class AgentConfigTests(unittest.TestCase):
             )
 
         self.assertEqual(config.memory_dir, Path(tmp) / "mem")
+        self.assertEqual(config.memory_project_key, "stream:alpha")
         self.assertTrue(config.memory_enabled)
         self.assertEqual(config.memory_short_term_tokens, 1_000)
         self.assertTrue(config.memory_short_term_tokens_explicit)
@@ -420,12 +423,14 @@ class AgentConfigTests(unittest.TestCase):
             config = AgentConfig.from_env(
                 env={
                     "MY_AGENT_MEMORY_CONTEXT_TOKENS": "1024",
+                    "MY_AGENT_MEMORY_PROJECT_KEY": "stream:legacy",
                     "MY_AGENT_MEMORY_AUTO_EXTRACT": "on",
                 },
                 env_file=env_file,
             )
 
         self.assertEqual(config.memory_context_tokens, 1_024)
+        self.assertEqual(config.memory_project_key, "stream:legacy")
         self.assertTrue(config.memory_auto_extract)
 
     def test_invalid_compression_ratio_is_rejected(self) -> None:

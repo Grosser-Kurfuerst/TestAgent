@@ -159,6 +159,8 @@ def tool_environment_overrides(env: Mapping[str, str]) -> dict[str, str]:
         "MY_AGENT_MEMORY",
         "AGENTCLI_MEMORY_DIR",
         "MY_AGENT_MEMORY_DIR",
+        "AGENTCLI_MEMORY_PROJECT_KEY",
+        "MY_AGENT_MEMORY_PROJECT_KEY",
         "AGENTCLI_MEMORY_SHORT_TERM_TOKENS",
         "MY_AGENT_MEMORY_SHORT_TERM_TOKENS",
         "AGENTCLI_MEMORY_SHORT_TERM_ENTRIES",

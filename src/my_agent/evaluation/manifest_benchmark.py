@@ -297,7 +297,7 @@ def _resolve_memory_stream(
 
 
 def _memory_mode_value(value: object, *, default: str) -> str:
-    mode = str(value or default or MEMORY_MODE_PER_TASK).strip() or MEMORY_MODE_PER_TASK
+    mode = _first_nonblank(value, default, MEMORY_MODE_PER_TASK)
     if mode not in MEMORY_MODES:
         expected = ", ".join(sorted(MEMORY_MODES))
         raise ValueError(f"Unsupported memory_mode: {mode!r}. Expected one of: {expected}.")
@@ -391,6 +391,7 @@ def _run_manifest_task(
         env_overrides,
         trace_dir=task_trace_dir,
         memory_dir=task_memory_dir,
+        memory_project_key=memory_stream.memory_project_key,
         command_timeout=command_timeout,
     )
     agent_test_command = task.get("agent_test_command") or task.get("test_command")
@@ -735,6 +736,7 @@ def _config_for_eval_env(
     *,
     trace_dir: Path,
     memory_dir: Path,
+    memory_project_key: str = "",
     command_timeout: int,
 ) -> AgentConfig:
     values = _config_env_values(config)
@@ -746,6 +748,12 @@ def _config_for_eval_env(
         values["AGENTCLI_MEMORY_DIR"] = overrides["MY_AGENT_MEMORY_DIR"]
     else:
         values["AGENTCLI_MEMORY_DIR"] = str(memory_dir)
+    if "AGENTCLI_MEMORY_PROJECT_KEY" in overrides:
+        values["AGENTCLI_MEMORY_PROJECT_KEY"] = overrides["AGENTCLI_MEMORY_PROJECT_KEY"]
+    elif "MY_AGENT_MEMORY_PROJECT_KEY" in overrides:
+        values["AGENTCLI_MEMORY_PROJECT_KEY"] = overrides["MY_AGENT_MEMORY_PROJECT_KEY"]
+    elif memory_project_key:
+        values["AGENTCLI_MEMORY_PROJECT_KEY"] = memory_project_key
     resolved = AgentConfig.from_env(env=values, require_env_file=False)
     return replace(
         resolved,
@@ -805,6 +813,7 @@ def _config_env_values(config: AgentConfig) -> dict[str, str]:
         "AGENTCLI_TEAM_ALLOW_UNAPPROVED_RESULTS": _bool_env(config.team_allow_unapproved_results),
         "AGENTCLI_MEMORY": _bool_env(config.memory_enabled),
         "AGENTCLI_MEMORY_DIR": str(config.memory_dir),
+        "AGENTCLI_MEMORY_PROJECT_KEY": config.memory_project_key,
         "AGENTCLI_MEMORY_SHORT_TERM_ENTRIES": str(config.memory_short_term_entries),
         "AGENTCLI_MEMORY_RETRIEVAL_LIMIT": str(config.memory_retrieval_limit),
         "AGENTCLI_MEMORY_COMPRESSION_TRIGGER_RATIO": str(config.memory_compression_trigger_ratio),

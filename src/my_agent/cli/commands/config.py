@@ -60,6 +60,7 @@ def _config_payload(config: object) -> dict[str, object]:
         "team_allow_unapproved_results": config.team_allow_unapproved_results,
         "memory_enabled": config.memory_enabled,
         "memory_dir": str(config.memory_dir),
+        "memory_project_key": config.memory_project_key,
         "memory_short_term_tokens": config.memory_short_term_tokens,
         "memory_short_term_entries": config.memory_short_term_entries,
         "memory_context_tokens": config.memory_context_tokens,

@@ -27,7 +27,7 @@ class NoopMemoryManager:
     ) -> None:
         self.config = config
         self.repo_path = Path(repo_path)
-        self.project_key = str(self.repo_path.resolve())
+        self.project_key = str(getattr(config, "memory_project_key", "") or "").strip() or str(self.repo_path.resolve())
         self.session_id = session_id
         self.context_profile = ContextProfile.resolve(config, getattr(config, "model", ""))
         self._trace_sink = trace_sink

@@ -12,7 +12,13 @@ from tests._path import add_src_to_path
 add_src_to_path()
 
 from my_agent.config import AgentConfig
-from my_agent.evaluation.manifest_benchmark import _load_manifest, load_manifest_tasks, run_manifest_benchmark
+from my_agent.evaluation.manifest_benchmark import (
+    _config_env_values,
+    _load_manifest,
+    load_manifest_tasks,
+    run_manifest_benchmark,
+)
+from my_agent.memory import MemoryManager, MemoryScope
 from my_agent.tools import RepoTools
 
 
@@ -143,6 +149,13 @@ class ManifestBenchmarkTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "Unsupported memory_mode"):
                 _load_manifest(manifest)
+
+    def test_config_env_values_preserves_memory_project_key(self) -> None:
+        config = fake_config(memory_project_key="stream:alpha")
+
+        values = _config_env_values(config)
+
+        self.assertEqual(values["AGENTCLI_MEMORY_PROJECT_KEY"], "stream:alpha")
 
     def test_initial_visible_and_hidden_pass_marks_invalid_without_agent_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -439,12 +452,14 @@ class ManifestBenchmarkTests(unittest.TestCase):
                 encoding="utf-8",
             )
             seen_memory_dirs: dict[str, Path] = {}
+            seen_project_keys: dict[str, str] = {}
 
             def fake_agent_runner(**kwargs: object) -> object:
                 trace_dir = Path(kwargs["trace_dir"])  # type: ignore[arg-type]
                 config = kwargs["config"]
                 self.assertIsInstance(config, AgentConfig)
                 seen_memory_dirs[trace_dir.name] = config.memory_dir
+                seen_project_keys[trace_dir.name] = config.memory_project_key
                 work_repo = Path(kwargs["repo_path"])  # type: ignore[arg-type]
                 (work_repo / "solution.py").write_text("VALUE = 1\n", encoding="utf-8")
                 trace_path = write_agent_trace(trace_dir, f"run-{trace_dir.name}")
@@ -464,11 +479,188 @@ class ManifestBenchmarkTests(unittest.TestCase):
             )
             expected_memory_dir = base / "out" / "memory" / "streams" / "humaneval-python"
             expected_memory_dir_exists = expected_memory_dir.is_dir()
+            snapshots = {item.task_id: item.resolved_config["memory_project_key"] for item in result.results}
 
         self.assertTrue(all(item.resolved for item in result.results))
         self.assertEqual(seen_memory_dirs["stream-first"], expected_memory_dir)
         self.assertEqual(seen_memory_dirs["stream-second"], expected_memory_dir)
+        self.assertTrue(seen_project_keys["stream-first"])
+        self.assertEqual(seen_project_keys["stream-first"], seen_project_keys["stream-second"])
+        self.assertEqual(snapshots["stream-first"], seen_project_keys["stream-first"])
+        self.assertEqual(snapshots["stream-second"], seen_project_keys["stream-first"])
         self.assertTrue(expected_memory_dir_exists)
+
+    def test_shared_stream_project_memory_is_visible_across_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            write_repo(repo, value=0)
+            manifest = base / "tasks.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "memory_mode": "shared_stream",
+                        "stream_id": "memory-stream",
+                        "tasks": [
+                            {
+                                "id": "first",
+                                "repo": str(repo),
+                                "task": "Save stream memory.",
+                                "visible_test_command": [sys.executable, "visible_check.py"],
+                            },
+                            {
+                                "id": "second",
+                                "repo": str(repo),
+                                "task": "Read stream memory.",
+                                "visible_test_command": [sys.executable, "visible_check.py"],
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            second_saw_marker = False
+
+            def fake_agent_runner(**kwargs: object) -> object:
+                nonlocal second_saw_marker
+                trace_dir = Path(kwargs["trace_dir"])  # type: ignore[arg-type]
+                config = kwargs["config"]
+                self.assertIsInstance(config, AgentConfig)
+                repo_path = Path(kwargs["repo_path"])  # type: ignore[arg-type]
+                memory = MemoryManager.from_config(config=config, llm=None, repo_path=repo_path)
+                if trace_dir.name == "first":
+                    memory.save_fact("stream marker: prefer VALUE = 1", scope=MemoryScope.PROJECT)
+                else:
+                    hits = memory.retrieve_hits("stream marker VALUE", limit=5)
+                    second_saw_marker = any("stream marker" in hit.entry.content for hit in hits)
+                (repo_path / "solution.py").write_text("VALUE = 1\n", encoding="utf-8")
+                trace_path = write_agent_trace(trace_dir, f"run-{trace_dir.name}")
+                return SimpleNamespace(
+                    trace_path=trace_path,
+                    run_id=f"run-{trace_dir.name}",
+                    steps=1,
+                    done=True,
+                    stop_reason="finish_called",
+                )
+
+            result = run_manifest_benchmark(
+                tasks_path=manifest,
+                output_dir=base / "out",
+                config=fake_config(base / "traces", memory_enabled=True, memory_auto_extract=False),
+                agent_runner=fake_agent_runner,
+            )
+
+        self.assertTrue(all(item.resolved for item in result.results))
+        self.assertTrue(second_saw_marker)
+
+    def test_my_agent_memory_project_key_override_wins_over_base_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            write_repo(repo, value=0)
+            manifest = base / "tasks.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "memory_mode": "shared_stream",
+                        "stream_id": "memory-stream",
+                        "tasks": [
+                            {
+                                "id": "override-key",
+                                "repo": str(repo),
+                                "task": "Use explicit project key.",
+                                "visible_test_command": [sys.executable, "visible_check.py"],
+                                "env_overrides": {"MY_AGENT_MEMORY_PROJECT_KEY": "task:legacy"},
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            seen_project_key = ""
+
+            def fake_agent_runner(**kwargs: object) -> object:
+                nonlocal seen_project_key
+                trace_dir = Path(kwargs["trace_dir"])  # type: ignore[arg-type]
+                config = kwargs["config"]
+                self.assertIsInstance(config, AgentConfig)
+                seen_project_key = config.memory_project_key
+                work_repo = Path(kwargs["repo_path"])  # type: ignore[arg-type]
+                (work_repo / "solution.py").write_text("VALUE = 1\n", encoding="utf-8")
+                trace_path = write_agent_trace(trace_dir, f"run-{trace_dir.name}")
+                return SimpleNamespace(
+                    trace_path=trace_path,
+                    run_id=f"run-{trace_dir.name}",
+                    steps=1,
+                    done=True,
+                    stop_reason="finish_called",
+                )
+
+            result = run_manifest_benchmark(
+                tasks_path=manifest,
+                output_dir=base / "out",
+                config=fake_config(base / "traces", memory_enabled=True, memory_project_key="base:key"),
+                agent_runner=fake_agent_runner,
+            )
+
+        self.assertTrue(result.results[0].resolved)
+        self.assertEqual(seen_project_key, "task:legacy")
+        self.assertEqual(result.results[0].resolved_config["memory_project_key"], "task:legacy")
+
+    def test_per_task_project_memory_is_isolated_between_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            write_repo(repo, value=0)
+            manifest = base / "tasks.jsonl"
+            rows = [
+                {
+                    "id": "first",
+                    "repo": str(repo),
+                    "task": "Save per-task memory.",
+                    "visible_test_command": [sys.executable, "visible_check.py"],
+                },
+                {
+                    "id": "second",
+                    "repo": str(repo),
+                    "task": "Do not see per-task memory.",
+                    "visible_test_command": [sys.executable, "visible_check.py"],
+                },
+            ]
+            manifest.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+            second_saw_marker = False
+
+            def fake_agent_runner(**kwargs: object) -> object:
+                nonlocal second_saw_marker
+                trace_dir = Path(kwargs["trace_dir"])  # type: ignore[arg-type]
+                config = kwargs["config"]
+                self.assertIsInstance(config, AgentConfig)
+                repo_path = Path(kwargs["repo_path"])  # type: ignore[arg-type]
+                memory = MemoryManager.from_config(config=config, llm=None, repo_path=repo_path)
+                if trace_dir.name == "first":
+                    memory.save_fact("isolated stream marker VALUE", scope=MemoryScope.PROJECT)
+                else:
+                    hits = memory.retrieve_hits("isolated stream marker VALUE", limit=5)
+                    second_saw_marker = any("isolated stream marker" in hit.entry.content for hit in hits)
+                (repo_path / "solution.py").write_text("VALUE = 1\n", encoding="utf-8")
+                trace_path = write_agent_trace(trace_dir, f"run-{trace_dir.name}")
+                return SimpleNamespace(
+                    trace_path=trace_path,
+                    run_id=f"run-{trace_dir.name}",
+                    steps=1,
+                    done=True,
+                    stop_reason="finish_called",
+                )
+
+            result = run_manifest_benchmark(
+                tasks_path=manifest,
+                output_dir=base / "out",
+                config=fake_config(base / "traces", memory_enabled=True, memory_auto_extract=False),
+                agent_runner=fake_agent_runner,
+            )
+
+        self.assertTrue(all(item.resolved for item in result.results))
+        self.assertFalse(second_saw_marker)
 
     def test_shared_by_group_uses_group_memory_dirs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

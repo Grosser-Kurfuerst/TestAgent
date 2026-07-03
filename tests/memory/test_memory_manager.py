@@ -213,6 +213,33 @@ class MemoryManagerSaveFactTests(unittest.TestCase):
             ctx = manager_b.build_context_for_query("config")
             self.assertIn("global rule about config", ctx.injected_text)
 
+    def test_memory_project_key_override_controls_project_scope_visibility(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_a = Path(tmp) / "repo_a"
+            repo_b = Path(tmp) / "repo_b"
+            repo_c = Path(tmp) / "repo_c"
+            repo_a.mkdir()
+            repo_b.mkdir()
+            repo_c.mkdir()
+            memory_dir = Path(tmp) / "memory"
+            config_x = _config(memory_dir, memory_project_key="stream:x")
+            config_y = _config(memory_dir, memory_project_key="stream:y")
+
+            manager_a = MemoryManager.from_config(config=config_x, llm=FakeLLM(), repo_path=repo_a)
+            manager_a.save_fact("stream marker VALUE equals 1", scope=MemoryScope.PROJECT)
+
+            manager_b = MemoryManager.from_config(config=config_x, llm=FakeLLM(), repo_path=repo_b)
+            manager_c = MemoryManager.from_config(config=config_y, llm=FakeLLM(), repo_path=repo_c)
+
+            ctx_b = manager_b.build_context_for_query("stream marker VALUE")
+            ctx_c = manager_c.build_context_for_query("stream marker VALUE")
+
+        self.assertEqual(manager_a.project_key, "stream:x")
+        self.assertEqual(manager_b.project_key, "stream:x")
+        self.assertEqual(manager_c.project_key, "stream:y")
+        self.assertIn("stream marker VALUE equals 1", ctx_b.injected_text)
+        self.assertNotIn("stream marker VALUE equals 1", ctx_c.injected_text)
+
 
 class MemoryManagerAppendTests(unittest.TestCase):
     def test_append_messages_record_short_term_entries(self) -> None:

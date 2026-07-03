@@ -133,6 +133,7 @@ class CliTests(unittest.TestCase):
                 "MY_AGENT_MAX_PARALLEL_TOOLS": "2",
                 "AGENTCLI_REPO_CONTEXT_BUDGET_TOKENS": "21000",
                 "MY_AGENT_TOOL_SCHEMA_BUDGET_TOKENS": "13000",
+                "AGENTCLI_MEMORY_PROJECT_KEY": "stream:cli",
             }
 
             with mock.patch.dict(os.environ, env, clear=True):
@@ -153,6 +154,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(output["max_parallel_tools"], 2)
         self.assertEqual(output["repo_context_budget_tokens"], 21_000)
         self.assertEqual(output["tool_schema_budget_tokens"], 13_000)
+        self.assertEqual(output["memory_project_key"], "stream:cli")
 
     def test_cli_run_executes_fake_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

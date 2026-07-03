@@ -109,7 +109,9 @@ class MemoryManager:
             retain_recent_turns=config.memory_retain_recent_turns,
             max_input_chars=config.max_summary_input_chars,
         )
-        project_key = _normalize_project_key(repo_path)
+        project_key = str(getattr(config, "memory_project_key", "") or "").strip()
+        if not project_key:
+            project_key = _normalize_project_key(repo_path)
         return cls(
             config=config,
             llm=llm,

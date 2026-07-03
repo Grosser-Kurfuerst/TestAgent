@@ -75,6 +75,7 @@ class AgentConfig:
     # Memory storage, retrieval, and compression defaults.
     memory_enabled: bool = True
     memory_dir: Path = Path("~/.agentcli/memory").expanduser()
+    memory_project_key: str = ""
     # Storage hard cap only; prompt rendering uses dynamic short_term_allowed.
     memory_short_term_tokens: int = 24_000
     memory_short_term_entries: int = 500
@@ -235,6 +236,9 @@ class AgentConfig:
                 default=True,
             ),
             memory_dir=_memory_dir(values),
+            memory_project_key=str(
+                values.get("AGENTCLI_MEMORY_PROJECT_KEY") or values.get("MY_AGENT_MEMORY_PROJECT_KEY") or ""
+            ).strip(),
             memory_short_term_tokens=_as_positive_int(
                 values.get("AGENTCLI_MEMORY_SHORT_TERM_TOKENS", values.get("MY_AGENT_MEMORY_SHORT_TERM_TOKENS")),
                 24_000,
