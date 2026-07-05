@@ -10,6 +10,7 @@ from my_agent.context import ContextProfile
 from my_agent.llm import AgentLLM
 from my_agent.llm.types import ChatResponse, LLMToolCall, Message, MessageLike, messages_to_openai
 from my_agent.memory.compression import MemoryCompressor
+from my_agent.memory.evolver import ExperienceCreatedBy, ExperienceTier, build_experience_entry
 from my_agent.memory.long_term import LongTermMemoryStore, STORAGE_FILE
 from my_agent.memory.retrieval import MemoryRetriever
 from my_agent.memory.short_term import ShortTermMemory
@@ -236,6 +237,44 @@ class MemoryManager:
                 "scope": stored.scope.value,
                 "source": stored.source,
                 "tokens": stored.token_count,
+            },
+        )
+        return stored, created
+
+    def save_experience(
+        self,
+        content: str,
+        *,
+        tier: ExperienceTier | str,
+        scope: MemoryScope = MemoryScope.PROJECT,
+        source_task: str = "",
+        created_by: ExperienceCreatedBy | str = ExperienceCreatedBy.MANUAL,
+        run_id: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> tuple[MemoryEntry, bool]:
+        project_key = "" if scope == MemoryScope.GLOBAL else self.project_key
+        entry = build_experience_entry(
+            id=_new_id("exp"),
+            content=content,
+            tier=tier,
+            project_key=project_key,
+            scope=scope,
+            run_id=run_id,
+            source_task=source_task,
+            created_by=created_by,
+            extra_metadata=metadata,
+        )
+        stored, created = self.long_term.add(entry)
+        self._trace(
+            "memory.evolver_saved",
+            {
+                "id": stored.id,
+                "created": created,
+                "tier": stored.metadata.get("evolver_tier", ""),
+                "scope": stored.scope.value,
+                "tokens": stored.token_count,
+                "source_task": str(stored.metadata.get("source_task") or ""),
+                "created_by": str(stored.metadata.get("created_by") or ""),
             },
         )
         return stored, created

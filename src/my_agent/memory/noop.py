@@ -8,6 +8,7 @@ from uuid import uuid4
 from my_agent.config import AgentConfig
 from my_agent.context import ContextProfile
 from my_agent.llm.types import ChatResponse, MessageLike
+from my_agent.memory.evolver import ExperienceCreatedBy, ExperienceTier, build_experience_entry
 from my_agent.memory.types import MemoryContext, MemoryEntry, MemoryScope, MemoryStatus, MemoryType
 
 
@@ -78,6 +79,31 @@ class NoopMemoryManager:
             source=source,
             project_key=self.project_key,
             metadata=metadata,
+        )
+        return entry, False
+
+    def save_experience(
+        self,
+        content: str,
+        *,
+        tier: ExperienceTier | str,
+        scope: MemoryScope = MemoryScope.PROJECT,
+        source_task: str = "",
+        created_by: ExperienceCreatedBy | str = ExperienceCreatedBy.MANUAL,
+        run_id: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> tuple[MemoryEntry, bool]:
+        project_key = "" if scope == MemoryScope.GLOBAL else self.project_key
+        entry = build_experience_entry(
+            id=f"noop_exp_{uuid4().hex[:12]}",
+            content=content,
+            tier=tier,
+            project_key=project_key,
+            scope=scope,
+            run_id=run_id,
+            source_task=source_task,
+            created_by=created_by,
+            extra_metadata=metadata,
         )
         return entry, False
 

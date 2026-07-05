@@ -12,6 +12,16 @@ retrieval, map-reduce compression, fact extraction, and the
 from __future__ import annotations
 
 from my_agent.memory.compression import MemoryCompressor
+from my_agent.memory.evolver import (
+    ExperienceCreatedBy,
+    ExperienceRecord,
+    ExperienceTier,
+    ExperienceTrajectoryStep,
+    build_experience_entry,
+    experience_record_from_entry,
+    experience_tier,
+    is_experience_entry,
+)
 from my_agent.memory.manager import MemoryManager
 from my_agent.memory.noop import NoopMemoryManager
 from my_agent.memory.types import (
@@ -28,6 +38,10 @@ from my_agent.memory.types import (
 
 __all__ = [
     "CompressionResult",
+    "ExperienceCreatedBy",
+    "ExperienceRecord",
+    "ExperienceTier",
+    "ExperienceTrajectoryStep",
     "MemoryCompressor",
     "MemoryContext",
     "MemoryEntry",
@@ -37,6 +51,10 @@ __all__ = [
     "MemoryStatus",
     "MemoryType",
     "RetrievalHit",
+    "build_experience_entry",
     "content_fingerprint",
+    "experience_record_from_entry",
+    "experience_tier",
+    "is_experience_entry",
     "normalize_content",
 ]

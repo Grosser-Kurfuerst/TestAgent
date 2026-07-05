@@ -14,7 +14,15 @@ from my_agent.config import AgentConfig
 from my_agent.context import AgentContextManager
 from my_agent.llm import FakeLLM
 from my_agent.llm.types import ChatResponse, LLMToolCall, Message, MessageLike
-from my_agent.memory import MemoryManager, MemoryScope
+from my_agent.memory import (
+    ExperienceCreatedBy,
+    ExperienceTier,
+    MemoryManager,
+    MemoryScope,
+    NoopMemoryManager,
+    experience_record_from_entry,
+    is_experience_entry,
+)
 from my_agent.memory.long_term import LongTermMemoryStore
 from my_agent.tools import ToolExecutionResult
 
@@ -239,6 +247,209 @@ class MemoryManagerSaveFactTests(unittest.TestCase):
         self.assertEqual(manager_c.project_key, "stream:y")
         self.assertIn("stream marker VALUE equals 1", ctx_b.injected_text)
         self.assertNotIn("stream marker VALUE equals 1", ctx_c.injected_text)
+
+
+class MemoryManagerSaveExperienceTests(unittest.TestCase):
+    def test_save_experience_persists_metadata_and_traces(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            traces: list[tuple[str, dict[str, object]]] = []
+            manager = MemoryManager.from_config(
+                config=_config(Path(tmp) / "memory"),
+                llm=FakeLLM(),
+                repo_path=repo,
+                trace_sink=lambda event, payload: traces.append((event, payload)),
+            )
+
+            entry, created = manager.save_experience(
+                "Always run compileall after package migration.",
+                tier=ExperienceTier.SKILL,
+                source_task="task-1",
+                created_by=ExperienceCreatedBy.WRITER,
+                run_id="run-1",
+                metadata={
+                    "category": "debugging",
+                    "technique": "import smoke",
+                    "steps": ["compileall", "import smoke"],
+                    "usage_count": 3,
+                    "success_count": 2,
+                    "last_used": "2026-06-18T12:00:00+00:00",
+                },
+            )
+
+            self.assertTrue(created)
+            self.assertTrue(is_experience_entry(entry))
+            self.assertEqual(entry.source, "evolver:skill")
+            self.assertEqual(entry.scope, MemoryScope.PROJECT)
+            self.assertEqual(entry.project_key, str(repo.resolve()))
+            self.assertEqual(entry.run_id, "run-1")
+            self.assertEqual(entry.metadata["evolver_tier"], "skill")
+            self.assertEqual(entry.metadata["source_task"], "task-1")
+            self.assertEqual(entry.metadata["created_by"], "writer")
+            self.assertEqual(entry.metadata["technique"], "import smoke")
+            self.assertEqual(entry.metadata["usage_count"], 3)
+
+            events = [(event, payload) for event, payload in traces if event == "memory.evolver_saved"]
+            self.assertEqual(len(events), 1)
+            payload = events[0][1]
+            self.assertEqual(payload["id"], entry.id)
+            self.assertEqual(payload["created"], True)
+            self.assertEqual(payload["tier"], "skill")
+            self.assertEqual(payload["scope"], "project")
+            self.assertEqual(payload["tokens"], entry.token_count)
+            self.assertEqual(payload["source_task"], "task-1")
+            self.assertEqual(payload["created_by"], "writer")
+
+    def test_save_experience_dedup_and_project_visibility_are_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_a = Path(tmp) / "repo_a"
+            repo_b = Path(tmp) / "repo_b"
+            repo_c = Path(tmp) / "repo_c"
+            repo_a.mkdir()
+            repo_b.mkdir()
+            repo_c.mkdir()
+            memory_dir = Path(tmp) / "memory"
+            config_x = _config(memory_dir, memory_project_key="stream:x")
+            config_y = _config(memory_dir, memory_project_key="stream:y")
+            manager_a = MemoryManager.from_config(config=config_x, llm=FakeLLM(), repo_path=repo_a)
+
+            entry, created = manager_a.save_experience("same project tip", tier="tip")
+            duplicate, created_duplicate = manager_a.save_experience("same project tip", tier="tip")
+            global_entry, created_global = manager_a.save_experience(
+                "global evolver skill",
+                tier="skill",
+                scope=MemoryScope.GLOBAL,
+            )
+            manager_b = MemoryManager.from_config(config=config_x, llm=FakeLLM(), repo_path=repo_b)
+            manager_c = MemoryManager.from_config(config=config_y, llm=FakeLLM(), repo_path=repo_c)
+
+            self.assertTrue(created)
+            self.assertFalse(created_duplicate)
+            self.assertEqual(duplicate.id, entry.id)
+            self.assertTrue(created_global)
+            self.assertEqual(global_entry.project_key, "")
+            visible_b = {item.content for item in manager_b.long_term.all(project_key=manager_b.project_key)}
+            visible_c = {item.content for item in manager_c.long_term.all(project_key=manager_c.project_key)}
+            self.assertIn("same project tip", visible_b)
+            self.assertIn("global evolver skill", visible_b)
+            self.assertNotIn("same project tip", visible_c)
+            self.assertIn("global evolver skill", visible_c)
+
+    def test_save_experience_preserves_tool_and_trajectory_metadata_after_reload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            config = _config(Path(tmp) / "memory")
+            manager = MemoryManager.from_config(config=config, llm=FakeLLM(), repo_path=repo)
+            manager.save_experience(
+                "Reusable command template for one pytest file.",
+                tier="tool",
+                metadata={
+                    "name": "pytest_single_file",
+                    "language": "bash",
+                    "code": "pytest {test_path} -q",
+                    "input_description": "test_path: path to one pytest file",
+                    "output_description": "pytest summary",
+                    "tool_name": "run_tests",
+                    "command": "pytest tests/test_parser.py -q",
+                    "args_schema": {"test_path": "str"},
+                    "repo_context": "run from repo root",
+                    "template": "pytest {test_path} -q",
+                },
+            )
+            manager.save_experience(
+                "Parser fix trajectory.",
+                tier="trajectory",
+                source_task="task-trajectory",
+                metadata={
+                    "task_description": "Fix parser test",
+                    "steps": [
+                        {
+                            "step_num": 1,
+                            "observation": "pytest failed",
+                            "action": "run_tests",
+                            "action_params": {"command": "pytest tests/test_parser.py -q"},
+                            "result": "passed after fix",
+                            "reward": 1.0,
+                        }
+                    ],
+                    "outcome": "success",
+                    "total_reward": 1.0,
+                    "key_learnings": ["parser strips comments before tokenization"],
+                    "tags": ["parser"],
+                    "usage_count": 1,
+                    "success_count": 1,
+                    "last_used": "2026-06-18T12:00:00+00:00",
+                },
+            )
+
+            reopened = MemoryManager.from_config(config=config, llm=FakeLLM(), repo_path=repo)
+            entries = {entry.metadata["evolver_tier"]: entry for entry in reopened.long_term.all(project_key=str(repo.resolve()))}
+
+            tool = entries["tool"]
+            self.assertEqual(tool.metadata["name"], "pytest_single_file")
+            self.assertEqual(tool.metadata["code"], "pytest {test_path} -q")
+            self.assertEqual(tool.metadata["tool_name"], "run_tests")
+            self.assertEqual(tool.metadata["args_schema"], {"test_path": "str"})
+            trajectory = entries["trajectory"]
+            self.assertEqual(trajectory.metadata["source_task"], "task-trajectory")
+            self.assertEqual(trajectory.metadata["steps"][0]["action"], "run_tests")
+            self.assertEqual(trajectory.metadata["usage_count"], 1)
+            record = experience_record_from_entry(trajectory)
+            self.assertIsNotNone(record)
+            self.assertEqual(record.tier, ExperienceTier.TRAJECTORY)
+
+    def test_experience_entries_are_retrievable_as_regular_long_term_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            manager = MemoryManager.from_config(
+                config=_config(Path(tmp) / "memory"),
+                llm=FakeLLM(),
+                repo_path=repo,
+            )
+            manager.save_fact("ordinary durable fact about config", scope=MemoryScope.PROJECT)
+            manager.save_experience(
+                "pytest fixture cleanup issue: clear tmp_path state before rerun",
+                tier="tip",
+            )
+
+            fact_ctx = manager.build_context_for_query("ordinary config")
+            experience_ctx = manager.build_context_for_query("pytest fixture cleanup")
+
+            self.assertIn("ordinary durable fact about config", fact_ctx.injected_text)
+            self.assertIn("pytest fixture cleanup issue", experience_ctx.injected_text)
+
+    def test_noop_save_experience_returns_entry_without_writing_or_tracing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            traces: list[tuple[str, dict[str, object]]] = []
+            config = _config(Path(tmp) / "memory")
+            manager = NoopMemoryManager(
+                config=config,
+                repo_path=repo,
+                trace_sink=lambda event, payload: traces.append((event, payload)),
+            )
+
+            entry, created = manager.save_experience(
+                "No-op tool template",
+                tier="tool",
+                source_task="task-noop",
+                created_by="manual",
+                run_id="run-noop",
+                metadata={"tool_name": "run_tests", "command": "pytest -q"},
+            )
+
+            self.assertFalse(created)
+            self.assertTrue(is_experience_entry(entry))
+            self.assertEqual(entry.metadata["evolver_tier"], "tool")
+            self.assertEqual(entry.metadata["source_task"], "task-noop")
+            self.assertEqual(entry.metadata["tool_name"], "run_tests")
+            self.assertEqual(entry.run_id, "run-noop")
+            self.assertFalse((Path(config.memory_dir) / "long_term_memory.jsonl").exists())
+            self.assertNotIn("memory.evolver_saved", [event for event, _ in traces])
 
 
 class MemoryManagerAppendTests(unittest.TestCase):

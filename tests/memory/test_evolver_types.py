@@ -45,6 +45,27 @@ def _plain_entry() -> MemoryEntry:
 
 
 class EvolverMetadataTests(unittest.TestCase):
+    def test_public_memory_package_exports_evolver_types(self) -> None:
+        from my_agent.memory import (
+            ExperienceCreatedBy as ExportedCreatedBy,
+            ExperienceRecord as ExportedRecord,
+            ExperienceTier as ExportedTier,
+            ExperienceTrajectoryStep as ExportedStep,
+            build_experience_entry as exported_build,
+            experience_record_from_entry as exported_record_from_entry,
+            experience_tier as exported_tier,
+            is_experience_entry as exported_is_experience,
+        )
+
+        self.assertIs(ExportedCreatedBy, ExperienceCreatedBy)
+        self.assertIs(ExportedRecord, ExperienceRecord)
+        self.assertIs(ExportedTier, ExperienceTier)
+        self.assertIs(ExportedStep, ExperienceTrajectoryStep)
+        self.assertIs(exported_build, build_experience_entry)
+        self.assertIs(exported_record_from_entry, experience_record_from_entry)
+        self.assertIs(exported_tier, experience_tier)
+        self.assertIs(exported_is_experience, is_experience_entry)
+
     def test_all_valid_tiers_build_metadata(self) -> None:
         for tier in ExperienceTier:
             metadata = experience_metadata(tier=tier, source_task="task-1")
