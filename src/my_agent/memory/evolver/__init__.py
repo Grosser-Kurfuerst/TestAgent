@@ -1,5 +1,17 @@
 from __future__ import annotations
 
+from my_agent.memory.evolver.selector import (
+    ExperienceCandidate,
+    ExperienceSelector,
+    SelectedExperience,
+    SelectionResult,
+    candidate_tier,
+    candidate_value,
+    render_selected_experiences,
+    selection_candidate_summary,
+    selection_score,
+    selection_tier_counts,
+)
 from my_agent.memory.evolver.types import (
     EVOLVER_SCHEMA_VERSION,
     ExperienceCreatedBy,
@@ -16,14 +28,24 @@ from my_agent.memory.evolver.types import (
 
 __all__ = [
     "EVOLVER_SCHEMA_VERSION",
+    "ExperienceCandidate",
     "ExperienceCreatedBy",
     "ExperienceRecord",
+    "ExperienceSelector",
     "ExperienceTier",
     "ExperienceTrajectoryStep",
+    "SelectedExperience",
+    "SelectionResult",
     "build_experience_entry",
+    "candidate_tier",
+    "candidate_value",
     "experience_metadata",
     "experience_record_from_entry",
     "experience_tier",
     "is_experience_entry",
     "normalize_experience_tier",
+    "render_selected_experiences",
+    "selection_candidate_summary",
+    "selection_score",
+    "selection_tier_counts",
 ]
