@@ -21,6 +21,7 @@ from tests.ui.test_mcp_repl import mcp_server_config, write_fake_mcp_server_with
 add_src_to_path()
 
 from my_agent.cli import DEFAULT_TASK_FILE, build_parser, format_task, load_task, main
+from my_agent.cli.common import config_from_env as cli_config_from_env
 
 
 def write_runtime_repo(repo: Path) -> None:
@@ -134,6 +135,11 @@ class CliTests(unittest.TestCase):
                 "AGENTCLI_REPO_CONTEXT_BUDGET_TOKENS": "21000",
                 "MY_AGENT_TOOL_SCHEMA_BUDGET_TOKENS": "13000",
                 "AGENTCLI_MEMORY_PROJECT_KEY": "stream:cli",
+                "AGENTCLI_MEMORY_EVOLVER_MODE": "retrieve_select",
+                "AGENTCLI_MEMORY_EVOLVER_TOP_K_PER_TIER": "7",
+                "AGENTCLI_MEMORY_EVOLVER_SELECTED_MAX_ITEMS": "6",
+                "AGENTCLI_MEMORY_EVOLVER_MIN_SCORE": "0.25",
+                "AGENTCLI_MEMORY_EVOLVER_MIN_EXPERIENCE_ENTRIES": "3",
             }
 
             with mock.patch.dict(os.environ, env, clear=True):
@@ -155,6 +161,30 @@ class CliTests(unittest.TestCase):
         self.assertEqual(output["repo_context_budget_tokens"], 21_000)
         self.assertEqual(output["tool_schema_budget_tokens"], 13_000)
         self.assertEqual(output["memory_project_key"], "stream:cli")
+        self.assertEqual(output["memory_evolver_mode"], "retrieve_select")
+        self.assertEqual(output["memory_evolver_top_k_per_tier"], 7)
+        self.assertEqual(output["memory_evolver_selected_max_items"], 6)
+        self.assertEqual(output["memory_evolver_min_score"], 0.25)
+        self.assertEqual(output["memory_evolver_min_experience_entries"], 3)
+
+    def test_cli_config_from_env_allows_evolver_environment_overrides(self) -> None:
+        config = cli_config_from_env(
+            env={
+                "MY_AGENT_LLM_PROVIDER": "fake",
+                "AGENTCLI_MEMORY_EVOLVER": "1",
+                "MY_AGENT_MEMORY_EVOLVER_TOP_K_PER_TIER": "8",
+                "AGENTCLI_MEMORY_EVOLVER_SELECTED_MAX_ITEMS": "5",
+                "MY_AGENT_MEMORY_EVOLVER_MIN_SCORE": "0.4",
+                "AGENTCLI_MEMORY_EVOLVER_MIN_EXPERIENCE_ENTRIES": "2",
+            },
+            require_env_file=False,
+        )
+
+        self.assertEqual(config.memory_evolver_mode, "retrieve_select")
+        self.assertEqual(config.memory_evolver_top_k_per_tier, 8)
+        self.assertEqual(config.memory_evolver_selected_max_items, 5)
+        self.assertEqual(config.memory_evolver_min_score, 0.4)
+        self.assertEqual(config.memory_evolver_min_experience_entries, 2)
 
     def test_cli_run_executes_fake_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

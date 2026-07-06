@@ -32,6 +32,7 @@ class NoopMemoryManager:
         self.session_id = session_id
         self.context_profile = ContextProfile.resolve(config, getattr(config, "model", ""))
         self._trace_sink = trace_sink
+        self.last_evolver_selection = None
 
     def set_trace_sink(self, trace_sink: Any | None) -> tuple[Any | None, Any | None]:
         previous = (self._trace_sink, None)
@@ -131,6 +132,16 @@ class NoopMemoryManager:
         max_tokens: int | None = None,
         limit: int | None = None,
         include_short_term: bool = False,
+    ) -> MemoryContext:
+        return MemoryContext(injected_text="", hits=[], estimated_tokens=0)
+
+    def build_evolver_context_for_query(
+        self,
+        query: str,
+        *,
+        max_tokens: int | None = None,
+        top_k_per_tier: int | None = None,
+        max_items: int | None = None,
     ) -> MemoryContext:
         return MemoryContext(injected_text="", hits=[], estimated_tokens=0)
 

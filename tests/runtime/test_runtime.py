@@ -788,6 +788,51 @@ class RuntimeTests(unittest.TestCase):
             self.assertIn("memory.retrieved", event_names)
             self.assertIn("memory.prepared", event_names)
 
+    def test_runtime_uses_evolver_selected_memory_when_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+            config = fake_config(
+                base / "traces",
+                memory_dir=base / "memory",
+                memory_evolver_mode="retrieve_select",
+                memory_evolver_selected_max_items=1,
+            )
+            llm = RecordingFakeLLM([ChatResponse(content="done", finish_reason="stop")])
+            memory = MemoryManager.from_config(config=config, llm=llm, repo_path=repo)
+            memory.save_fact("ordinary calculator memory should not be selected", scope=MemoryScope.PROJECT)
+            memory.save_experience(
+                "calculator selected skill: inspect subtract before editing",
+                tier="skill",
+                source_task="task-runtime",
+            )
+
+            state = run_agent(
+                repo_path=repo,
+                task="Inspect calculator memory.",
+                config=config,
+                llm=llm,
+                trace_dir=base / "traces",
+                memory_manager=memory,
+            )
+
+            self.assertEqual(state.stop_reason, "assistant_final")
+            first_request = json.dumps(llm.requests[0], ensure_ascii=False)
+            self.assertIn("Relevant selected experience:", first_request)
+            self.assertIn("calculator selected skill", first_request)
+            self.assertNotIn("ordinary calculator memory", first_request)
+            events = read_trace(state.trace_path)
+            event_names = [event["event"] for event in events]
+            self.assertIn("memory.evolver_candidates", event_names)
+            self.assertIn("memory.evolver_selected", event_names)
+            prepared = [event for event in events if event["event"] == "memory.prepared"][-1]
+            selected = [event for event in events if event["event"] == "memory.evolver_selected"][-1]
+            completed = [event for event in events if event["event"] == "agent.completed"][-1]
+            self.assertEqual(prepared["payload"]["memory_hits"], selected["payload"]["selected_count"])
+            self.assertEqual(selected["run_id"], completed["run_id"])
+
     def test_runtime_caps_tool_schema_and_blocks_omitted_tool_execution(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)

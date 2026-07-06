@@ -247,6 +247,78 @@ class AgentContextManagerTests(unittest.TestCase):
         self.assertLess(prepared["long_term_limit"], manager.context_profile.memory_context_tokens)
         self.assertGreaterEqual(prepared["short_term_allowed"], 0)
 
+    def test_prepare_messages_uses_evolver_selected_context_budget(self) -> None:
+        events: list[tuple[str, dict[str, object]]] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            manager = MemoryManager.from_config(
+                config=_config(
+                    Path(tmp) / "memory",
+                    memory_evolver_mode="retrieve_select",
+                    memory_context_tokens=50,
+                    memory_context_tokens_explicit=True,
+                ),
+                llm=FakeLLM(),
+                repo_path=repo,
+                trace_sink=lambda event, payload: events.append((event, payload)),
+            )
+            manager.save_experience("pytest oversized tip " * 120, tier="tip")
+            manager.save_experience("pytest compact skill", tier="skill")
+
+            messages, memory_context, _ = AgentContextManager(manager.context_profile).prepare_messages(
+                base_messages=[Message(role="system", content="base")],
+                query="pytest",
+                tools=[],
+                memory=manager,
+            )
+
+        rendered = json.dumps(messages_to_openai(messages), ensure_ascii=False)
+        prepared = [payload for event, payload in events if event == "memory.prepared"][-1]
+        self.assertIn("Relevant selected experience:", rendered)
+        self.assertIn("pytest compact skill", rendered)
+        self.assertNotIn("pytest oversized tip", rendered)
+        self.assertEqual(prepared["memory_hits"], len(memory_context.hits))
+        self.assertLessEqual(memory_context.estimated_tokens, prepared["long_term_limit"])
+
+    def test_prepare_messages_shrinks_evolver_long_term_limit_when_fixed_content_grows(self) -> None:
+        def _prepared_for(base_content: str) -> dict[str, object]:
+            events: list[tuple[str, dict[str, object]]] = []
+            with tempfile.TemporaryDirectory() as tmp:
+                repo = Path(tmp) / "repo"
+                repo.mkdir()
+                manager = MemoryManager.from_config(
+                    config=_config(
+                        Path(tmp) / "memory",
+                        memory_evolver_mode="retrieve_select",
+                        context_window=8_000,
+                        context_window_explicit=True,
+                        response_reserve_tokens=4_000,
+                        response_reserve_tokens_explicit=True,
+                        compression_buffer_tokens=2_000,
+                        compression_buffer_tokens_explicit=True,
+                        memory_context_tokens=1_000,
+                        memory_context_tokens_explicit=True,
+                    ),
+                    llm=FakeLLM(),
+                    repo_path=repo,
+                    trace_sink=lambda event, payload: events.append((event, payload)),
+                )
+                manager.save_experience("pytest selected skill", tier="skill")
+                AgentContextManager(manager.context_profile).prepare_messages(
+                    base_messages=[Message(role="system", content=base_content)],
+                    query="pytest",
+                    tools=[],
+                    memory=manager,
+                )
+            return [payload for event, payload in events if event == "memory.prepared"][-1]
+
+        small = _prepared_for("base")
+        large = _prepared_for("x" * 7_000)
+
+        self.assertLess(large["long_term_limit"], small["long_term_limit"])
+        self.assertLess(large["short_term_allowed"], small["short_term_allowed"])
+
     def test_prepare_messages_raises_when_prompt_remains_over_budget(self) -> None:
         events: list[tuple[str, dict[str, object]]] = []
         with tempfile.TemporaryDirectory() as tmp:

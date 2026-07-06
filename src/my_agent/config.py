@@ -11,6 +11,7 @@ from dotenv import dotenv_values
 TRUE_VALUES = {"1", "true", "yes", "on"}
 SUPPORTED_PROVIDERS = {"openai", "fake"}
 SUPPORTED_AGENT_MODES = {"react", "plan", "team", "auto"}
+SUPPORTED_MEMORY_EVOLVER_MODES = {"off", "retrieve_select", "full"}
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_ENV_FILE = PROJECT_ROOT / ".env"
 
@@ -90,6 +91,27 @@ class AgentConfig:
     memory_short_term_tokens_explicit: bool = False
     memory_context_tokens_explicit: bool = False
     memory_tool_result_chars_explicit: bool = False
+    memory_evolver_mode: str = "off"
+    memory_evolver_top_k_per_tier: int = 50
+    memory_evolver_selected_max_items: int = 20
+    memory_evolver_min_score: float = 0.0
+    memory_evolver_min_experience_entries: int = 0
+    memory_evolver_tier_caps: dict[str, int] = field(
+        default_factory=lambda: {
+            "trajectory": 1,
+            "tip": 2,
+            "skill": 2,
+            "tool": 2,
+        }
+    )
+    memory_evolver_tier_weights: dict[str, float] = field(
+        default_factory=lambda: {
+            "trajectory": 0.90,
+            "tip": 1.00,
+            "skill": 1.20,
+            "tool": 1.10,
+        }
+    )
 
     # Human-in-the-loop approval; disabled by default.
     hitl_enabled: bool = False
@@ -291,6 +313,36 @@ class AgentConfig:
                 values.get("AGENTCLI_MEMORY_AUTO_EXTRACT", values.get("MY_AGENT_MEMORY_AUTO_EXTRACT", "")),
                 default=True,
             ),
+            memory_evolver_mode=_memory_evolver_mode(values),
+            memory_evolver_top_k_per_tier=_as_min_int(
+                values.get(
+                    "AGENTCLI_MEMORY_EVOLVER_TOP_K_PER_TIER",
+                    values.get("MY_AGENT_MEMORY_EVOLVER_TOP_K_PER_TIER"),
+                ),
+                50,
+                1,
+            ),
+            memory_evolver_selected_max_items=_as_min_int(
+                values.get(
+                    "AGENTCLI_MEMORY_EVOLVER_SELECTED_MAX_ITEMS",
+                    values.get("MY_AGENT_MEMORY_EVOLVER_SELECTED_MAX_ITEMS"),
+                ),
+                20,
+                1,
+            ),
+            memory_evolver_min_score=_as_min_float(
+                values.get("AGENTCLI_MEMORY_EVOLVER_MIN_SCORE", values.get("MY_AGENT_MEMORY_EVOLVER_MIN_SCORE")),
+                0.0,
+                0.0,
+            ),
+            memory_evolver_min_experience_entries=_as_min_int(
+                values.get(
+                    "AGENTCLI_MEMORY_EVOLVER_MIN_EXPERIENCE_ENTRIES",
+                    values.get("MY_AGENT_MEMORY_EVOLVER_MIN_EXPERIENCE_ENTRIES"),
+                ),
+                0,
+                0,
+            ),
             hitl_enabled=_as_bool(values.get("AGENTCLI_HITL", values.get("MY_AGENT_HITL", ""))),
             hitl_audit_dir=_hitl_audit_dir(values),
             hitl_non_interactive=_hitl_non_interactive(
@@ -447,6 +499,20 @@ def _agent_mode(value: str | None) -> str:
     return normalized
 
 
+def _memory_evolver_mode(values: Mapping[str, str]) -> str:
+    raw_mode = values.get("AGENTCLI_MEMORY_EVOLVER_MODE", values.get("MY_AGENT_MEMORY_EVOLVER_MODE"))
+    if raw_mode is not None and raw_mode.strip():
+        normalized = raw_mode.strip().lower()
+    elif _as_bool(values.get("AGENTCLI_MEMORY_EVOLVER", values.get("MY_AGENT_MEMORY_EVOLVER", ""))):
+        normalized = "retrieve_select"
+    else:
+        normalized = "off"
+    if normalized not in SUPPORTED_MEMORY_EVOLVER_MODES:
+        supported = ", ".join(sorted(SUPPORTED_MEMORY_EVOLVER_MODES))
+        raise ValueError(f"Unsupported AGENTCLI_MEMORY_EVOLVER_MODE={raw_mode!r}. Supported modes: {supported}.")
+    return normalized
+
+
 def _as_ratio(value: str | None, default: float) -> float:
     if value is None or not value.strip():
         return default
@@ -454,6 +520,26 @@ def _as_ratio(value: str | None, default: float) -> float:
     if not (0.0 < parsed <= 1.0):
         raise ValueError("memory_compression_trigger_ratio must be in (0, 1].")
     return parsed
+
+
+def _as_min_int(value: str | None, default: int, minimum: int) -> int:
+    if value is None or not value.strip():
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        return default
+    return max(minimum, parsed)
+
+
+def _as_min_float(value: str | None, default: float, minimum: float) -> float:
+    if value is None or not value.strip():
+        return default
+    try:
+        parsed = float(value)
+    except ValueError:
+        return default
+    return max(minimum, parsed)
 
 
 def _memory_dir(values: Mapping[str, str]) -> Path:

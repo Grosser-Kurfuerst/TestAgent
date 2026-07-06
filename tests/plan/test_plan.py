@@ -12,7 +12,7 @@ from tests._path import add_src_to_path
 add_src_to_path()
 
 from my_agent.llm import FakeLLM
-from my_agent.llm.types import ChatResponse, LLMToolCall
+from my_agent.llm.types import ChatResponse, LLMToolCall, MessageLike, messages_to_openai
 from my_agent.cancellation import CancellationToken
 from my_agent.memory import MemoryManager, MemoryScope
 from my_agent.schema import AgentState
@@ -213,6 +213,17 @@ class NoPlannerChatLLM(FakeLLM):
         if tools is None:
             self.planner_calls += 1
             raise AssertionError("planner LLM should not be called")
+        return super().chat(messages, tools=tools)  # type: ignore[arg-type]
+
+
+class RecordingPlannerLLM(FakeLLM):
+    def __init__(self) -> None:
+        super().__init__()
+        self.planner_requests: list[list[dict[str, object]]] = []
+
+    def chat(self, messages: list[MessageLike], tools: list[dict[str, object]] | None = None) -> ChatResponse:
+        if tools is None:
+            self.planner_requests.append(messages_to_openai(messages))
         return super().chat(messages, tools=tools)  # type: ignore[arg-type]
 
 
@@ -857,6 +868,59 @@ class PlanExecuteAgentTests(unittest.TestCase):
             self.assertIn("fixed_tokens", prepared[-1])
             self.assertIn("memory_budget_tokens", prepared[-1])
             self.assertIn("long_term_limit", prepared[-1])
+
+    def test_plan_agent_injects_selected_evolver_experience_into_planner(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+            config = fake_config(
+                base / "traces",
+                memory_dir=base / "memory",
+                memory_evolver_mode="retrieve_select",
+                memory_evolver_selected_max_items=1,
+            )
+            llm = RecordingPlannerLLM()
+            memory = MemoryManager.from_config(config=config, llm=llm, repo_path=repo)
+            memory.save_fact("ordinary calculator planner fact", scope=MemoryScope.PROJECT)
+            memory.save_experience(
+                "calculator selected planner skill",
+                tier="skill",
+                source_task="task-plan",
+            )
+            agent = PlanExecuteAgent(
+                config=config,
+                llm=llm,
+                trace_dir=base / "traces",
+                command_timeout=60,
+                memory_manager=memory,
+            )
+
+            state = agent.run(
+                AgentState.initial(
+                    repo_path=repo,
+                    task="修复 calculator subtract",
+                    test_command="python -m unittest discover -s tests -q",
+                )
+            )
+
+            self.assertEqual(state.stop_reason, "plan_completed")
+            planner_prompt = json.dumps(llm.planner_requests[0], ensure_ascii=False)
+            self.assertIn("Relevant selected experience:", planner_prompt)
+            self.assertIn("calculator selected planner skill", planner_prompt)
+            self.assertNotIn("ordinary calculator planner fact", planner_prompt)
+            events = read_trace(state.trace_path)
+            event_names = [event["event"] for event in events]
+            self.assertIn("memory.evolver_candidates", event_names)
+            self.assertIn("memory.evolver_selected", event_names)
+            prepared = [
+                event["payload"]
+                for event in events
+                if event["event"] == "memory.prepared" and event["payload"].get("phase") == "plan_planner"
+            ][-1]
+            selected = [event["payload"] for event in events if event["event"] == "memory.evolver_selected"][-1]
+            self.assertEqual(prepared["memory_hits"], selected["selected_count"])
 
     def test_external_memory_trace_sink_is_restored_after_plan_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

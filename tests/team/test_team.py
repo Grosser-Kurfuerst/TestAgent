@@ -1061,6 +1061,55 @@ class TeamAgentTests(unittest.TestCase):
             self.assertIn("memory_budget_tokens", prepared[-1])
             self.assertIn("long_term_limit", prepared[-1])
 
+    def test_team_planner_receives_selected_evolver_experience_from_shared_long_term_store(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+            config = fake_config(
+                base / "traces",
+                memory_evolver_mode="retrieve_select",
+                memory_evolver_selected_max_items=1,
+            )
+            memory = MemoryManager.from_config(config=config, llm=FakeLLM(), repo_path=repo)
+            memory.save_fact("ordinary AgentCli team fact", scope=MemoryScope.PROJECT)
+            memory.save_experience(
+                "AgentCli selected team skill",
+                tier="skill",
+                source_task="task-team",
+            )
+            memory.append_user_message("AgentCli short-term note must not become candidate")
+            team = TeamState.create(goal="AgentCli task", steps=[step("step_1")])
+            planner = RecordingPlanner(team)
+
+            state = TeamAgent(
+                config=config,
+                llm=FakeLLM(),
+                trace_dir=base / "traces",
+                command_timeout=60,
+                planner=planner,  # type: ignore[arg-type]
+                worker_factory=lambda _: ScriptedWorker({"step_1": [TaskResult.success("step_1", "done")]}),
+                reviewer_factory=lambda _: ScriptedReviewer([ReviewDecision(approved=True)]),
+                memory_manager=memory,
+            ).run(agent_state(repo, "AgentCli task"))
+
+            self.assertIn("Relevant selected experience:", planner.memory_context)
+            self.assertIn("AgentCli selected team skill", planner.memory_context)
+            self.assertNotIn("ordinary AgentCli team fact", planner.memory_context)
+            self.assertNotIn("short-term note", planner.memory_context)
+            events = read_trace(state.trace_path)
+            event_names = [event["event"] for event in events]
+            self.assertIn("memory.evolver_candidates", event_names)
+            self.assertIn("memory.evolver_selected", event_names)
+            prepared = [
+                event["payload"]
+                for event in events
+                if event["event"] == "memory.prepared" and event["payload"].get("phase") == "team_planner"
+            ][-1]
+            selected = [event["payload"] for event in events if event["event"] == "memory.evolver_selected"][-1]
+            self.assertEqual(prepared["memory_hits"], selected["selected_count"])
+
     def test_planner_llm_failure_uses_team_planner_failed_stop_reason(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)

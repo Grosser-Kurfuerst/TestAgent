@@ -10,7 +10,16 @@ from my_agent.context import ContextProfile
 from my_agent.llm import AgentLLM
 from my_agent.llm.types import ChatResponse, LLMToolCall, Message, MessageLike, messages_to_openai
 from my_agent.memory.compression import MemoryCompressor
-from my_agent.memory.evolver import ExperienceCreatedBy, ExperienceTier, build_experience_entry
+from my_agent.memory.evolver import (
+    ExperienceCreatedBy,
+    ExperienceSelector,
+    ExperienceTier,
+    SelectionResult,
+    build_experience_entry,
+    candidate_tier,
+    selection_candidate_summary,
+    selection_tier_counts,
+)
 from my_agent.memory.long_term import LongTermMemoryStore, STORAGE_FILE
 from my_agent.memory.retrieval import MemoryRetriever
 from my_agent.memory.short_term import ShortTermMemory
@@ -71,6 +80,13 @@ class MemoryManager:
         self._trace_sink = trace_sink
         self.last_fact_extraction_error = ""
         self.last_fact_save_errors: list[str] = []
+        self.evolver_selector = ExperienceSelector(
+            tier_weights=self.config.memory_evolver_tier_weights,
+            tier_caps=self.config.memory_evolver_tier_caps,
+            selected_max_items=self.config.memory_evolver_selected_max_items,
+            min_score=self.config.memory_evolver_min_score,
+        )
+        self.last_evolver_selection: SelectionResult | None = None
 
     def set_trace_sink(self, trace_sink: Any | None) -> tuple[Any | None, Any | None]:
         previous = (self._trace_sink, getattr(self.long_term, "_trace_sink", None))
@@ -311,6 +327,27 @@ class MemoryManager:
         limit: int | None = None,
         include_short_term: bool = False,
     ) -> MemoryContext:
+        if self.config.memory_evolver_mode in {"retrieve_select", "full"}:
+            return self.build_evolver_context_for_query(
+                query,
+                max_tokens=max_tokens,
+                top_k_per_tier=limit,
+            )
+        return self._build_legacy_context_for_query(
+            query,
+            max_tokens=max_tokens,
+            limit=limit,
+            include_short_term=include_short_term,
+        )
+
+    def _build_legacy_context_for_query(
+        self,
+        query: str,
+        *,
+        max_tokens: int | None = None,
+        limit: int | None = None,
+        include_short_term: bool = False,
+    ) -> MemoryContext:
         """Retrieve memory and return a token-bounded injection block.
 
         This is the 3.2 acceptance target (plan §15). By default only
@@ -339,6 +376,209 @@ class MemoryManager:
             },
         )
         return context
+
+    def retrieve_evolver_candidates(
+        self,
+        query: str,
+        *,
+        top_k_per_tier: int | None = None,
+    ) -> list:
+        resolved_top_k = top_k_per_tier if top_k_per_tier is not None else self.config.memory_evolver_top_k_per_tier
+        resolved_top_k = max(1, int(resolved_top_k))
+        hits = self.retriever.retrieve(
+            query,
+            short_term=self.short_term,
+            long_term=self.long_term,
+            project_key=self.project_key,
+            limit=0,
+            include_short_term=False,
+        )
+        groups: dict[ExperienceTier, list] = {tier: [] for tier in ExperienceTier}
+        for hit in hits:
+            tier = candidate_tier(hit.entry)
+            if tier is None:
+                continue
+            groups[tier].append(hit)
+
+        selected: list = []
+        for tier in ExperienceTier:
+            selected.extend(groups[tier][:resolved_top_k])
+        selected.sort(key=lambda hit: hit.score, reverse=True)
+        return selected
+
+    def count_visible_experiences(self) -> int:
+        return sum(1 for entry in self.long_term.all(project_key=self.project_key) if candidate_tier(entry) is not None)
+
+    def build_evolver_context_for_query(
+        self,
+        query: str,
+        *,
+        max_tokens: int | None = None,
+        top_k_per_tier: int | None = None,
+        max_items: int | None = None,
+    ) -> MemoryContext:
+        resolved_tokens = max_tokens if max_tokens is not None else self.context_profile.memory_context_tokens
+        resolved_top_k = top_k_per_tier if top_k_per_tier is not None else self.config.memory_evolver_top_k_per_tier
+        resolved_top_k = max(1, int(resolved_top_k))
+        visible_count = self.count_visible_experiences()
+        if resolved_tokens <= 0 or visible_count < self.config.memory_evolver_min_experience_entries:
+            result = SelectionResult(
+                candidates=(),
+                selected=(),
+                context=MemoryContext(injected_text="", hits=[], estimated_tokens=0),
+                policy="rule_tier_weighted_v1",
+                estimated_tokens=0,
+                metadata={
+                    "query_chars": len(query),
+                    "candidate_count": 0,
+                    "selected_count": 0,
+                    "candidate_tier_counts": {},
+                    "selected_tier_counts": {},
+                    "insufficient_experience_entries": visible_count < self.config.memory_evolver_min_experience_entries,
+                },
+            )
+            self.last_evolver_selection = result
+            self._trace_evolver_selection(
+                query=query,
+                result=result,
+                candidates=[],
+                max_tokens=resolved_tokens,
+                top_k_per_tier=resolved_top_k,
+                max_items=max_items,
+                visible_experience_count=visible_count,
+                insufficient_experience_entries=visible_count < self.config.memory_evolver_min_experience_entries,
+            )
+            return result.context
+
+        candidates = self.retrieve_evolver_candidates(query, top_k_per_tier=resolved_top_k)
+        try:
+            result = self.evolver_selector.select(
+                query=query,
+                hits=candidates,
+                max_tokens=resolved_tokens,
+                max_items=max_items,
+            )
+        except Exception as exc:  # noqa: BLE001 - selector failures must not fall back to unselected legacy memory
+            error = f"{type(exc).__name__}: {exc}"
+            result = SelectionResult(
+                candidates=(),
+                selected=(),
+                context=MemoryContext(injected_text="", hits=[], estimated_tokens=0),
+                policy="rule_tier_weighted_v1",
+                estimated_tokens=0,
+                metadata={
+                    "query_chars": len(query),
+                    "candidate_count": 0,
+                    "selected_count": 0,
+                    "candidate_tier_counts": {},
+                    "selected_tier_counts": {},
+                    "fallback": True,
+                    "error": error,
+                },
+            )
+            self.last_evolver_selection = result
+            self._trace(
+                "memory.evolver_selection_failed",
+                {
+                    "query_chars": len(query),
+                    "candidate_count": len(candidates),
+                    "error": error,
+                    "fallback": "empty_context",
+                    "mode": self.config.memory_evolver_mode,
+                    "memory_project_key": self.project_key,
+                },
+            )
+            self._trace_evolver_selection(
+                query=query,
+                result=result,
+                candidates=candidates,
+                max_tokens=resolved_tokens,
+                top_k_per_tier=resolved_top_k,
+                max_items=max_items,
+                visible_experience_count=visible_count,
+                insufficient_experience_entries=False,
+                fallback=True,
+            )
+            return result.context
+        self.last_evolver_selection = result
+        self._trace_evolver_selection(
+            query=query,
+            result=result,
+            candidates=candidates,
+            max_tokens=resolved_tokens,
+            top_k_per_tier=resolved_top_k,
+            max_items=max_items,
+            visible_experience_count=visible_count,
+            insufficient_experience_entries=False,
+        )
+        return result.context
+
+    def _trace_evolver_selection(
+        self,
+        *,
+        query: str,
+        result: SelectionResult,
+        candidates: list,
+        max_tokens: int,
+        top_k_per_tier: int,
+        max_items: int | None,
+        visible_experience_count: int,
+        insufficient_experience_entries: bool,
+        fallback: bool = False,
+    ) -> None:
+        retrieved_tiers = _hit_tier_counts(candidates)
+        candidate_tiers = selection_tier_counts(result.candidates)
+        selected_candidates = [item.candidate for item in result.selected]
+        selected_tiers = selection_tier_counts(selected_candidates)
+        candidate_payload = {
+            "query_chars": len(query),
+            "candidate_count": len(result.candidates),
+            "top_k_per_tier": top_k_per_tier,
+            "tiers": candidate_tiers,
+            "retrieved_candidate_count": len(candidates),
+            "retrieved_tiers": retrieved_tiers,
+            "candidate_ids": [candidate.id for candidate in result.candidates],
+            "candidate_summaries": [selection_candidate_summary(candidate) for candidate in result.candidates],
+            "selection_policy": result.policy,
+            "mode": self.config.memory_evolver_mode,
+            "insufficient_experience_entries": insufficient_experience_entries,
+            "visible_experience_count": visible_experience_count,
+            "memory_project_key": self.project_key,
+        }
+        selected_payload = {
+            "selected_count": len(result.selected),
+            "selected_ids": [item.candidate.id for item in result.selected],
+            "omitted_ids": list(result.omitted_ids),
+            "tiers": selected_tiers,
+            "estimated_tokens": result.context.estimated_tokens,
+            "max_tokens": max_tokens,
+            "max_items": max_items if max_items is not None else self.config.memory_evolver_selected_max_items,
+            "selection_policy": result.policy,
+            "selection_reasons": [
+                {
+                    "id": item.candidate.id,
+                    "reason": f"selected: score={item.candidate.selection_score:.2f} "
+                    f"tier={item.candidate.tier.value if item.candidate.tier is not None else ''} "
+                    f"rank={item.rank}",
+                }
+                for item in result.selected
+            ],
+            "fallback": fallback,
+            "memory_project_key": self.project_key,
+        }
+        self._trace("memory.evolver_candidates", candidate_payload)
+        self._trace("memory.evolver_selected", selected_payload)
+        self._trace(
+            "memory.retrieved",
+            {
+                "query_chars": len(query),
+                "hits": len(result.context.hits),
+                "tokens": result.context.estimated_tokens,
+                "include_short_term": False,
+                "mode": self.config.memory_evolver_mode,
+                "selection_policy": result.policy,
+            },
+        )
 
     def retrieve_hits(
         self,
@@ -589,6 +829,16 @@ class MemoryManager:
 
 def _new_id(prefix: str) -> str:
     return f"{prefix}_{uuid4().hex[:12]}"
+
+
+def _hit_tier_counts(hits: list) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for hit in hits:
+        tier = candidate_tier(hit.entry)
+        if tier is None:
+            continue
+        counts[tier.value] = counts.get(tier.value, 0) + 1
+    return counts
 
 
 def _model_name(llm: AgentLLM | None, config: AgentConfig) -> str:

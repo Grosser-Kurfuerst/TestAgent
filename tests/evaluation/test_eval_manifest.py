@@ -15,6 +15,7 @@ from my_agent.config import AgentConfig
 from my_agent.evaluation.manifest_benchmark import (
     CommandResult,
     ManifestEvalResult,
+    _config_for_eval_env,
     _config_env_values,
     _load_manifest,
     load_manifest_tasks,
@@ -159,6 +160,111 @@ class ManifestBenchmarkTests(unittest.TestCase):
         values = _config_env_values(config)
 
         self.assertEqual(values["AGENTCLI_MEMORY_PROJECT_KEY"], "stream:alpha")
+
+    def test_config_env_values_preserves_evolver_config(self) -> None:
+        config = fake_config(
+            memory_evolver_mode="retrieve_select",
+            memory_evolver_top_k_per_tier=7,
+            memory_evolver_selected_max_items=6,
+            memory_evolver_min_score=0.25,
+            memory_evolver_min_experience_entries=3,
+        )
+
+        values = _config_env_values(config)
+
+        self.assertEqual(values["AGENTCLI_MEMORY_EVOLVER_MODE"], "retrieve_select")
+        self.assertEqual(values["AGENTCLI_MEMORY_EVOLVER_TOP_K_PER_TIER"], "7")
+        self.assertEqual(values["AGENTCLI_MEMORY_EVOLVER_SELECTED_MAX_ITEMS"], "6")
+        self.assertEqual(values["AGENTCLI_MEMORY_EVOLVER_MIN_SCORE"], "0.25")
+        self.assertEqual(values["AGENTCLI_MEMORY_EVOLVER_MIN_EXPERIENCE_ENTRIES"], "3")
+
+    def test_config_for_eval_env_preserves_and_overrides_evolver_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            config = fake_config(
+                base / "traces",
+                memory_evolver_mode="retrieve_select",
+                memory_evolver_top_k_per_tier=7,
+                memory_evolver_selected_max_items=6,
+                memory_evolver_min_score=0.25,
+                memory_evolver_min_experience_entries=3,
+                memory_evolver_tier_caps={"trajectory": 2, "tip": 1, "skill": 3, "tool": 4},
+                memory_evolver_tier_weights={"trajectory": 1.3, "tip": 0.8, "skill": 1.7, "tool": 1.1},
+            )
+
+            preserved = _config_for_eval_env(
+                config,
+                {},
+                trace_dir=base / "task-traces",
+                memory_dir=base / "memory",
+                command_timeout=11,
+            )
+            overridden = _config_for_eval_env(
+                config,
+                {
+                    "AGENTCLI_MEMORY_EVOLVER_MODE": "off",
+                    "MY_AGENT_MEMORY_EVOLVER_TOP_K_PER_TIER": "2",
+                    "AGENTCLI_MEMORY_EVOLVER_SELECTED_MAX_ITEMS": "4",
+                    "MY_AGENT_MEMORY_EVOLVER_MIN_SCORE": "0.5",
+                    "AGENTCLI_MEMORY_EVOLVER_MIN_EXPERIENCE_ENTRIES": "9",
+                },
+                trace_dir=base / "task-traces-override",
+                memory_dir=base / "memory-override",
+                command_timeout=13,
+            )
+
+        self.assertEqual(preserved.memory_evolver_mode, "retrieve_select")
+        self.assertEqual(preserved.memory_evolver_top_k_per_tier, 7)
+        self.assertEqual(preserved.memory_evolver_selected_max_items, 6)
+        self.assertEqual(preserved.memory_evolver_min_score, 0.25)
+        self.assertEqual(preserved.memory_evolver_min_experience_entries, 3)
+        self.assertEqual(preserved.memory_evolver_tier_caps, {"trajectory": 2, "tip": 1, "skill": 3, "tool": 4})
+        self.assertEqual(preserved.memory_evolver_tier_weights, {"trajectory": 1.3, "tip": 0.8, "skill": 1.7, "tool": 1.1})
+        self.assertEqual(overridden.memory_evolver_mode, "off")
+        self.assertEqual(overridden.memory_evolver_top_k_per_tier, 2)
+        self.assertEqual(overridden.memory_evolver_selected_max_items, 4)
+        self.assertEqual(overridden.memory_evolver_min_score, 0.5)
+        self.assertEqual(overridden.memory_evolver_min_experience_entries, 9)
+        self.assertEqual(overridden.memory_evolver_tier_caps, {"trajectory": 2, "tip": 1, "skill": 3, "tool": 4})
+        self.assertEqual(overridden.memory_evolver_tier_weights, {"trajectory": 1.3, "tip": 0.8, "skill": 1.7, "tool": 1.1})
+
+    def test_config_for_eval_env_applies_evolver_bool_alias_after_mode_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            config = fake_config(base / "traces")
+
+            agentcli_bool = _config_for_eval_env(
+                config,
+                {"AGENTCLI_MEMORY_EVOLVER": "1"},
+                trace_dir=base / "trace-agentcli-bool",
+                memory_dir=base / "memory-agentcli-bool",
+                command_timeout=11,
+            )
+            mode_beats_bool = _config_for_eval_env(
+                config,
+                {
+                    "MY_AGENT_MEMORY_EVOLVER_MODE": "retrieve_select",
+                    "MY_AGENT_MEMORY_EVOLVER": "0",
+                },
+                trace_dir=base / "trace-mode",
+                memory_dir=base / "memory-mode",
+                command_timeout=11,
+            )
+            agentcli_mode_beats_my_agent_mode = _config_for_eval_env(
+                config,
+                {
+                    "AGENTCLI_MEMORY_EVOLVER_MODE": "off",
+                    "MY_AGENT_MEMORY_EVOLVER_MODE": "retrieve_select",
+                    "AGENTCLI_MEMORY_EVOLVER": "1",
+                },
+                trace_dir=base / "trace-agentcli-mode",
+                memory_dir=base / "memory-agentcli-mode",
+                command_timeout=11,
+            )
+
+        self.assertEqual(agentcli_bool.memory_evolver_mode, "retrieve_select")
+        self.assertEqual(mode_beats_bool.memory_evolver_mode, "retrieve_select")
+        self.assertEqual(agentcli_mode_beats_my_agent_mode.memory_evolver_mode, "off")
 
     def test_manifest_summary_separates_same_stream_id_across_shared_modes(self) -> None:
         initial_visible = CommandResult(command="", ok=False, returncode=1)

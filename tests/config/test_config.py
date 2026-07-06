@@ -245,6 +245,13 @@ class AgentConfigTests(unittest.TestCase):
         self.assertEqual(config.memory_tool_result_chars, 500)
         self.assertFalse(config.memory_short_term_tokens_explicit)
         self.assertFalse(config.memory_tool_result_chars_explicit)
+        self.assertEqual(config.memory_evolver_mode, "off")
+        self.assertEqual(config.memory_evolver_top_k_per_tier, 50)
+        self.assertEqual(config.memory_evolver_selected_max_items, 20)
+        self.assertEqual(config.memory_evolver_min_score, 0.0)
+        self.assertEqual(config.memory_evolver_min_experience_entries, 0)
+        self.assertEqual(config.memory_evolver_tier_caps["trajectory"], 1)
+        self.assertEqual(config.memory_evolver_tier_weights["skill"], 1.20)
         # memory_auto_extract defaults to True per plan §13 (line 544).
         self.assertTrue(config.memory_auto_extract)
         self.assertFalse(config.hitl_enabled)
@@ -432,6 +439,121 @@ class AgentConfigTests(unittest.TestCase):
         self.assertEqual(config.memory_context_tokens, 1_024)
         self.assertEqual(config.memory_project_key, "stream:legacy")
         self.assertTrue(config.memory_auto_extract)
+
+    def test_memory_evolver_bool_alias_enables_retrieve_select(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / ".env"
+            env_file.write_text("", encoding="utf-8")
+
+            config = AgentConfig.from_env(
+                env={"AGENTCLI_MEMORY_EVOLVER": "1"},
+                env_file=env_file,
+            )
+
+        self.assertEqual(config.memory_evolver_mode, "retrieve_select")
+
+    def test_memory_evolver_mode_env_takes_precedence_over_bool_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / ".env"
+            env_file.write_text("", encoding="utf-8")
+
+            config = AgentConfig.from_env(
+                env={
+                    "AGENTCLI_MEMORY_EVOLVER": "1",
+                    "AGENTCLI_MEMORY_EVOLVER_MODE": "off",
+                },
+                env_file=env_file,
+            )
+
+        self.assertEqual(config.memory_evolver_mode, "off")
+
+    def test_memory_evolver_config_values_are_loaded_from_env_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / ".env"
+            env_file.write_text("", encoding="utf-8")
+
+            config = AgentConfig.from_env(
+                env={
+                    "AGENTCLI_MEMORY_EVOLVER_MODE": "retrieve_select",
+                    "AGENTCLI_MEMORY_EVOLVER_TOP_K_PER_TIER": "7",
+                    "AGENTCLI_MEMORY_EVOLVER_SELECTED_MAX_ITEMS": "6",
+                    "AGENTCLI_MEMORY_EVOLVER_MIN_SCORE": "0.25",
+                    "AGENTCLI_MEMORY_EVOLVER_MIN_EXPERIENCE_ENTRIES": "3",
+                },
+                env_file=env_file,
+            )
+
+        self.assertEqual(config.memory_evolver_mode, "retrieve_select")
+        self.assertEqual(config.memory_evolver_top_k_per_tier, 7)
+        self.assertEqual(config.memory_evolver_selected_max_items, 6)
+        self.assertEqual(config.memory_evolver_min_score, 0.25)
+        self.assertEqual(config.memory_evolver_min_experience_entries, 3)
+
+    def test_my_agent_prefixed_memory_evolver_vars_are_supported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / ".env"
+            env_file.write_text("", encoding="utf-8")
+
+            config = AgentConfig.from_env(
+                env={
+                    "MY_AGENT_MEMORY_EVOLVER": "true",
+                    "MY_AGENT_MEMORY_EVOLVER_TOP_K_PER_TIER": "4",
+                    "MY_AGENT_MEMORY_EVOLVER_SELECTED_MAX_ITEMS": "5",
+                    "MY_AGENT_MEMORY_EVOLVER_MIN_SCORE": "0.5",
+                    "MY_AGENT_MEMORY_EVOLVER_MIN_EXPERIENCE_ENTRIES": "2",
+                },
+                env_file=env_file,
+            )
+
+        self.assertEqual(config.memory_evolver_mode, "retrieve_select")
+        self.assertEqual(config.memory_evolver_top_k_per_tier, 4)
+        self.assertEqual(config.memory_evolver_selected_max_items, 5)
+        self.assertEqual(config.memory_evolver_min_score, 0.5)
+        self.assertEqual(config.memory_evolver_min_experience_entries, 2)
+
+    def test_invalid_memory_evolver_mode_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / ".env"
+            env_file.write_text("", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "AGENTCLI_MEMORY_EVOLVER_MODE"):
+                AgentConfig.from_env(
+                    env={"AGENTCLI_MEMORY_EVOLVER_MODE": "legacy"},
+                    env_file=env_file,
+                )
+
+    def test_invalid_memory_evolver_numeric_values_fall_back_or_clamp(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / ".env"
+            env_file.write_text("", encoding="utf-8")
+
+            config = AgentConfig.from_env(
+                env={
+                    "AGENTCLI_MEMORY_EVOLVER_TOP_K_PER_TIER": "0",
+                    "AGENTCLI_MEMORY_EVOLVER_SELECTED_MAX_ITEMS": "-10",
+                    "AGENTCLI_MEMORY_EVOLVER_MIN_SCORE": "-0.1",
+                    "AGENTCLI_MEMORY_EVOLVER_MIN_EXPERIENCE_ENTRIES": "-1",
+                },
+                env_file=env_file,
+            )
+            fallback = AgentConfig.from_env(
+                env={
+                    "AGENTCLI_MEMORY_EVOLVER_TOP_K_PER_TIER": "bad",
+                    "AGENTCLI_MEMORY_EVOLVER_SELECTED_MAX_ITEMS": "bad",
+                    "AGENTCLI_MEMORY_EVOLVER_MIN_SCORE": "bad",
+                    "AGENTCLI_MEMORY_EVOLVER_MIN_EXPERIENCE_ENTRIES": "bad",
+                },
+                env_file=env_file,
+            )
+
+        self.assertEqual(config.memory_evolver_top_k_per_tier, 1)
+        self.assertEqual(config.memory_evolver_selected_max_items, 1)
+        self.assertEqual(config.memory_evolver_min_score, 0.0)
+        self.assertEqual(config.memory_evolver_min_experience_entries, 0)
+        self.assertEqual(fallback.memory_evolver_top_k_per_tier, 50)
+        self.assertEqual(fallback.memory_evolver_selected_max_items, 20)
+        self.assertEqual(fallback.memory_evolver_min_score, 0.0)
+        self.assertEqual(fallback.memory_evolver_min_experience_entries, 0)
 
     def test_invalid_compression_ratio_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

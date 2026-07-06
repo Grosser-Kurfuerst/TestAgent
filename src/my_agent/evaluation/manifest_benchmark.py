@@ -920,13 +920,50 @@ def _config_for_eval_env(
         values["AGENTCLI_MEMORY_PROJECT_KEY"] = overrides["MY_AGENT_MEMORY_PROJECT_KEY"]
     elif memory_project_key:
         values["AGENTCLI_MEMORY_PROJECT_KEY"] = memory_project_key
+    _normalize_evolver_mode_overrides(values, overrides)
+    for agentcli_key, my_agent_key in (
+        ("AGENTCLI_MEMORY_EVOLVER_TOP_K_PER_TIER", "MY_AGENT_MEMORY_EVOLVER_TOP_K_PER_TIER"),
+        ("AGENTCLI_MEMORY_EVOLVER_SELECTED_MAX_ITEMS", "MY_AGENT_MEMORY_EVOLVER_SELECTED_MAX_ITEMS"),
+        ("AGENTCLI_MEMORY_EVOLVER_MIN_SCORE", "MY_AGENT_MEMORY_EVOLVER_MIN_SCORE"),
+        ("AGENTCLI_MEMORY_EVOLVER_MIN_EXPERIENCE_ENTRIES", "MY_AGENT_MEMORY_EVOLVER_MIN_EXPERIENCE_ENTRIES"),
+    ):
+        _prefer_my_agent_override(values, overrides, agentcli_key, my_agent_key)
     resolved = AgentConfig.from_env(env=values, require_env_file=False)
     return replace(
         resolved,
         trace_dir=trace_dir,
         command_timeout=command_timeout,
+        memory_evolver_tier_caps=dict(config.memory_evolver_tier_caps),
+        memory_evolver_tier_weights=dict(config.memory_evolver_tier_weights),
         tool_env_overrides=overrides,
     )
+
+
+def _normalize_evolver_mode_overrides(values: dict[str, str], overrides: Mapping[str, str]) -> None:
+    if "AGENTCLI_MEMORY_EVOLVER_MODE" in overrides:
+        return
+    if "MY_AGENT_MEMORY_EVOLVER_MODE" in overrides:
+        values["AGENTCLI_MEMORY_EVOLVER_MODE"] = overrides["MY_AGENT_MEMORY_EVOLVER_MODE"]
+        return
+    if "AGENTCLI_MEMORY_EVOLVER" in overrides:
+        values["AGENTCLI_MEMORY_EVOLVER_MODE"] = (
+            "retrieve_select" if _bool_from_env(overrides["AGENTCLI_MEMORY_EVOLVER"]) else "off"
+        )
+        return
+    if "MY_AGENT_MEMORY_EVOLVER" in overrides:
+        values["AGENTCLI_MEMORY_EVOLVER_MODE"] = (
+            "retrieve_select" if _bool_from_env(overrides["MY_AGENT_MEMORY_EVOLVER"]) else "off"
+        )
+
+
+def _prefer_my_agent_override(
+    values: dict[str, str],
+    overrides: Mapping[str, str],
+    agentcli_key: str,
+    my_agent_key: str,
+) -> None:
+    if my_agent_key in overrides and agentcli_key not in overrides:
+        values[agentcli_key] = overrides[my_agent_key]
 
 
 def _config_snapshot(config: AgentConfig) -> dict[str, Any]:
@@ -986,6 +1023,11 @@ def _config_env_values(config: AgentConfig) -> dict[str, str]:
         "AGENTCLI_MEMORY_RETAIN_RECENT_TURNS": str(config.memory_retain_recent_turns),
         "AGENTCLI_MEMORY_MAP_CHUNK_SIZE": str(config.memory_map_chunk_size),
         "AGENTCLI_MEMORY_AUTO_EXTRACT": _bool_env(config.memory_auto_extract),
+        "AGENTCLI_MEMORY_EVOLVER_MODE": config.memory_evolver_mode,
+        "AGENTCLI_MEMORY_EVOLVER_TOP_K_PER_TIER": str(config.memory_evolver_top_k_per_tier),
+        "AGENTCLI_MEMORY_EVOLVER_SELECTED_MAX_ITEMS": str(config.memory_evolver_selected_max_items),
+        "AGENTCLI_MEMORY_EVOLVER_MIN_SCORE": str(config.memory_evolver_min_score),
+        "AGENTCLI_MEMORY_EVOLVER_MIN_EXPERIENCE_ENTRIES": str(config.memory_evolver_min_experience_entries),
         "AGENTCLI_HITL": _bool_env(config.hitl_enabled),
         "AGENTCLI_HITL_AUDIT_DIR": str(config.hitl_audit_dir),
         "AGENTCLI_HITL_NON_INTERACTIVE": config.hitl_non_interactive,
@@ -1076,6 +1118,10 @@ def _config_value_is_explicit(config: AgentConfig, field_name: str, default: int
 
 def _bool_env(value: bool) -> str:
     return "1" if value else "0"
+
+
+def _bool_from_env(value: str) -> bool:
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _string_list(value: object) -> list[str]:
