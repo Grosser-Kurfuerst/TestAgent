@@ -94,6 +94,7 @@ class ReplTests(unittest.TestCase):
         self.assertIn("team", text)
         self.assertIn("read_file", text)
         self.assertIn("compression trigger", text)
+        self.assertNotIn("evolver selector:", text)
         self.assertIn("No conversation history was compacted", text)
         self.assertIn("Extracted 0 facts, cleared 0 short-term entries", text)
         self.assertIn("Latest trace: none", text)
@@ -172,6 +173,85 @@ class ReplTests(unittest.TestCase):
         self.assertIn("last long-term limit:", text)
         self.assertIn("last short-term allowed:", text)
         self.assertNotIn("last long-term limit: not available", text)
+        self.assertEqual(errors.getvalue(), "")
+
+    def test_context_command_shows_cached_evolver_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / "sample.py").write_text("x = 1\n", encoding="utf-8")
+            output = io.StringIO()
+            errors = io.StringIO()
+            repl = AgentRepl(
+                repo_path=repo,
+                config=fake_config(repo / "traces", memory_evolver_mode="retrieve_select"),
+                trace_dir=repo / "traces",
+                renderer=PlainRenderer(output=output, errors=errors),
+                input_stream=io.StringIO("/context\n/quit\n"),
+            )
+            repl._last_evolver_candidates = {
+                "candidate_count": 3,
+                "selection_policy": "rule_tier_weighted_v1",
+            }
+            repl._last_evolver_selected = {
+                "selected_count": 2,
+                "selected_ids": ["tip-1", "tool-1"],
+                "tiers": {"tip": 1, "tool": 1},
+                "selection_policy": "rule_tier_weighted_v1",
+            }
+
+            exit_code = repl.run(show_banner=False)
+
+        self.assertEqual(exit_code, 0)
+        text = output.getvalue()
+        self.assertIn("evolver selector: enabled (retrieve_select)", text)
+        self.assertIn("evolver selection: candidates=3, selected=2", text)
+        self.assertIn("evolver selected tiers: tip:1, tool:1", text)
+        self.assertIn("evolver selection policy: rule_tier_weighted_v1", text)
+        self.assertEqual(errors.getvalue(), "")
+
+    def test_context_command_shows_no_evolver_selection_when_enabled_without_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / "sample.py").write_text("x = 1\n", encoding="utf-8")
+            output = io.StringIO()
+            errors = io.StringIO()
+            repl = AgentRepl(
+                repo_path=repo,
+                config=fake_config(repo / "traces", memory_evolver_mode="retrieve_select"),
+                trace_dir=repo / "traces",
+                renderer=PlainRenderer(output=output, errors=errors),
+                input_stream=io.StringIO("/context\n/quit\n"),
+            )
+
+            exit_code = repl.run(show_banner=False)
+
+        self.assertEqual(exit_code, 0)
+        text = output.getvalue()
+        self.assertIn("evolver selector: enabled (retrieve_select)", text)
+        self.assertIn("No evolver selection has been prepared in this session.", text)
+        self.assertEqual(errors.getvalue(), "")
+
+    def test_context_command_uses_memory_prepared_as_evolver_selected_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / "sample.py").write_text("x = 1\n", encoding="utf-8")
+            output = io.StringIO()
+            errors = io.StringIO()
+            repl = AgentRepl(
+                repo_path=repo,
+                config=fake_config(repo / "traces", memory_evolver_mode="retrieve_select"),
+                trace_dir=repo / "traces",
+                renderer=PlainRenderer(output=output, errors=errors),
+                input_stream=io.StringIO("/context\n/quit\n"),
+            )
+            repl._last_memory_prepared = {"memory_hits": 2}
+
+            exit_code = repl.run(show_banner=False)
+
+        self.assertEqual(exit_code, 0)
+        text = output.getvalue()
+        self.assertIn("evolver selector: enabled (retrieve_select)", text)
+        self.assertIn("evolver selection: candidates=not available, selected=2", text)
         self.assertEqual(errors.getvalue(), "")
 
     def test_memory_save_memory_clear_commands_share_persistent_memory(self) -> None:

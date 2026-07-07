@@ -23,6 +23,8 @@ from my_agent.ui.repl.commands import handle_repl_command
 from my_agent.ui.repl.events import dispatch_repl_event
 from my_agent.ui.repl.status import (
     _discover_test_command,
+    _last_evolver_candidates_from_trace,
+    _last_evolver_selected_from_trace,
     _last_memory_prepared_from_trace,
     _tool_summary,
 )
@@ -66,6 +68,8 @@ class AgentRepl:
         self._context_manager = AgentContextManager(self._profile)
         self._latest_trace: Path | None = None
         self._last_memory_prepared: dict[str, object] | None = None
+        self._last_evolver_candidates: dict[str, object] | None = None
+        self._last_evolver_selected: dict[str, object] | None = None
         self._shutdown_complete = False
         self._run_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="agentcli-repl")
         self._current_future: Future[AgentState] | None = None
@@ -153,6 +157,8 @@ class AgentRepl:
             return
         self._latest_trace = state.trace_path
         self._last_memory_prepared = _last_memory_prepared_from_trace(state.trace_path)
+        self._last_evolver_candidates = _last_evolver_candidates_from_trace(state.trace_path)
+        self._last_evolver_selected = _last_evolver_selected_from_trace(state.trace_path)
         self.renderer.assistant_delta(state.final_answer)
         self._current_future = None
         self._current_token = None
@@ -172,6 +178,13 @@ class AgentRepl:
             self.renderer.status("Cancellation requested.")
 
     def _handle_event(self, event: object) -> None:
+        event_name = getattr(event, "event", "")
+        payload = getattr(event, "payload", {})
+        if isinstance(payload, dict):
+            if event_name == "memory.evolver_candidates":
+                self._last_evolver_candidates = dict(payload)
+            elif event_name == "memory.evolver_selected":
+                self._last_evolver_selected = dict(payload)
         prepared = dispatch_repl_event(event, self.renderer)
         if prepared is not None:
             self._last_memory_prepared = prepared

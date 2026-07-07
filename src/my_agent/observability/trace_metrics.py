@@ -30,6 +30,12 @@ class TraceMetrics:
     stop_reason_distribution: dict[str, int] = field(default_factory=dict)
     no_test_finish: int = 0
     budget_stop: int = 0
+    evolver_candidate_events: int = 0
+    evolver_selected_events: int = 0
+    evolver_candidates_total: int = 0
+    evolver_selected_total: int = 0
+    evolver_selected_by_tier: dict[str, int] = field(default_factory=dict)
+    evolver_selection_policies: dict[str, int] = field(default_factory=dict)
 
     @property
     def tool_success_rate(self) -> float:
@@ -60,6 +66,12 @@ class TraceMetrics:
             "stop_reason_distribution": self.stop_reason_distribution,
             "no_test_finish": self.no_test_finish,
             "budget_stop": self.budget_stop,
+            "evolver_candidate_events": self.evolver_candidate_events,
+            "evolver_selected_events": self.evolver_selected_events,
+            "evolver_candidates_total": self.evolver_candidates_total,
+            "evolver_selected_total": self.evolver_selected_total,
+            "evolver_selected_by_tier": self.evolver_selected_by_tier,
+            "evolver_selection_policies": self.evolver_selection_policies,
         }
 
 
@@ -84,6 +96,12 @@ def collect_trace_metrics(path: str | Path, *, recursive: bool = True) -> TraceM
     completion_tokens = 0
     total_tokens = 0
     phase_tokens: dict[str, Counter[str]] = defaultdict(Counter)
+    evolver_candidate_events = 0
+    evolver_selected_events = 0
+    evolver_candidates_total = 0
+    evolver_selected_total = 0
+    evolver_selected_by_tier: Counter[str] = Counter()
+    evolver_selection_policies: Counter[str] = Counter()
 
     scanned: set[Path] = set()
     pending = list(trace_files)
@@ -140,6 +158,25 @@ def collect_trace_metrics(path: str | Path, *, recursive: bool = True) -> TraceM
 
             if event_name == "budget.exceeded" and isinstance(run_id, str) and run_id:
                 budget_runs.add(run_id)
+
+            if event_name == "memory.evolver_candidates":
+                evolver_candidate_events += 1
+                evolver_candidates_total += _payload_count(
+                    payload,
+                    count_key="candidate_count",
+                    fallback_keys=("candidate_ids", "candidate_summaries"),
+                )
+            elif event_name == "memory.evolver_selected":
+                evolver_selected_events += 1
+                evolver_selected_total += _payload_count(
+                    payload,
+                    count_key="selected_count",
+                    fallback_keys=("selected_ids",),
+                )
+                evolver_selected_by_tier.update(_tier_counts(payload.get("tiers")))
+                policy = payload.get("selection_policy")
+                if isinstance(policy, str) and policy:
+                    evolver_selection_policies[policy] += 1
 
             if event_name == "agent.completed":
                 reason = str(payload.get("stop_reason") or "")
@@ -202,6 +239,12 @@ def collect_trace_metrics(path: str | Path, *, recursive: bool = True) -> TraceM
         stop_reason_distribution=dict(sorted(stop_distribution.items())),
         no_test_finish=no_test_finish,
         budget_stop=budget_stop,
+        evolver_candidate_events=evolver_candidate_events,
+        evolver_selected_events=evolver_selected_events,
+        evolver_candidates_total=evolver_candidates_total,
+        evolver_selected_total=evolver_selected_total,
+        evolver_selected_by_tier=dict(sorted(evolver_selected_by_tier.items())),
+        evolver_selection_policies=dict(sorted(evolver_selection_policies.items())),
     )
 
 
@@ -221,6 +264,13 @@ def format_trace_metrics(metrics: TraceMetrics) -> str:
         f"Tokens: prompt={metrics.prompt_tokens}, completion={metrics.completion_tokens}, total={metrics.total_tokens}",
         f"No-test finishes: {metrics.no_test_finish}",
         f"Budget stops: {metrics.budget_stop}",
+        (
+            "Evolver selection: "
+            f"candidate_events={metrics.evolver_candidate_events}, "
+            f"candidates={metrics.evolver_candidates_total}, "
+            f"selected_events={metrics.evolver_selected_events}, "
+            f"selected={metrics.evolver_selected_total}"
+        ),
         "Tool distribution:",
     ]
     if metrics.tool_distribution:
@@ -241,6 +291,16 @@ def format_trace_metrics(metrics: TraceMetrics) -> str:
                 f"total={values.get('total_tokens', 0)}, "
                 f"iterations={values.get('llm_iterations', 0)}"
             )
+    else:
+        lines.append("- none: 0")
+    lines.append("Evolver selected by tier:")
+    if metrics.evolver_selected_by_tier:
+        lines.extend(f"- {tier}: {count}" for tier, count in metrics.evolver_selected_by_tier.items())
+    else:
+        lines.append("- none: 0")
+    lines.append("Evolver selection policies:")
+    if metrics.evolver_selection_policies:
+        lines.extend(f"- {policy}: {count}" for policy, count in metrics.evolver_selection_policies.items())
     else:
         lines.append("- none: 0")
     return "\n".join(lines)
@@ -278,6 +338,29 @@ def _resolve_child_path(parent_trace: Path, child: object) -> Path | None:
 
 def _nonnegative_int(value: object) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+
+def _payload_count(payload: dict[str, Any], *, count_key: str, fallback_keys: tuple[str, ...]) -> int:
+    count = payload.get(count_key)
+    if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
+        return count
+    for key in fallback_keys:
+        values = payload.get(key)
+        if isinstance(values, list):
+            return len(values)
+    return 0
+
+
+def _tier_counts(value: object) -> Counter[str]:
+    counts: Counter[str] = Counter()
+    if not isinstance(value, dict):
+        return counts
+    for tier, count in value.items():
+        if not isinstance(tier, str) or not tier:
+            continue
+        if isinstance(count, int) and not isinstance(count, bool) and count > 0:
+            counts[tier] += count
+    return counts
 
 
 def _tests_for_run_tree(

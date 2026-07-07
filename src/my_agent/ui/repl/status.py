@@ -10,6 +10,18 @@ from my_agent.tools import RepoTools
 
 
 def _last_memory_prepared_from_trace(trace_path: Path | None) -> dict[str, object] | None:
+    return _last_trace_payload(trace_path, "memory.prepared")
+
+
+def _last_evolver_candidates_from_trace(trace_path: Path | None) -> dict[str, object] | None:
+    return _last_trace_payload(trace_path, "memory.evolver_candidates")
+
+
+def _last_evolver_selected_from_trace(trace_path: Path | None) -> dict[str, object] | None:
+    return _last_trace_payload(trace_path, "memory.evolver_selected")
+
+
+def _last_trace_payload(trace_path: Path | None, event_name: str) -> dict[str, object] | None:
     if trace_path is None:
         return None
     try:
@@ -24,7 +36,7 @@ def _last_memory_prepared_from_trace(trace_path: Path | None) -> dict[str, objec
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if not isinstance(event, dict) or event.get("event") != "memory.prepared":
+        if not isinstance(event, dict) or event.get("event") != event_name:
             continue
         payload = event.get("payload")
         if isinstance(payload, dict):
@@ -39,6 +51,32 @@ def _payload_value(payload: dict[str, object] | None, key: str) -> str:
     if value is None or isinstance(value, bool):
         return "not available"
     return str(value)
+
+
+def _payload_count(payload: dict[str, object] | None, key: str, fallback_key: str = "") -> str:
+    if payload is None:
+        return "not available"
+    value = payload.get(key)
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return str(value)
+    if fallback_key:
+        fallback = payload.get(fallback_key)
+        if isinstance(fallback, list):
+            return str(len(fallback))
+    return "not available"
+
+
+def _payload_tier_distribution(payload: dict[str, object] | None) -> str:
+    if payload is None:
+        return "not available"
+    tiers = payload.get("tiers")
+    if not isinstance(tiers, dict) or not tiers:
+        return "none"
+    parts: list[str] = []
+    for tier, count in sorted(tiers.items()):
+        if isinstance(tier, str) and tier and isinstance(count, int) and not isinstance(count, bool):
+            parts.append(f"{tier}:{count}")
+    return ", ".join(parts) if parts else "none"
 
 
 def _discover_test_command(repo_path: Path) -> str | None:
@@ -114,10 +152,15 @@ def format_context_text(
     last_memory_prepared: dict[str, object] | None,
     mcp_summary: str,
     test_command: str | None,
+    last_evolver_candidates: dict[str, object] | None = None,
+    last_evolver_selected: dict[str, object] | None = None,
 ) -> str:
     status = memory.status(include_entries=False)
     tool_budget = budget_tool_definitions(tools.tool_definitions(), profile)
     prepared = last_memory_prepared or _last_memory_prepared_from_trace(latest_trace)
+    evolver_candidates = last_evolver_candidates or _last_evolver_candidates_from_trace(latest_trace)
+    evolver_selected = last_evolver_selected or _last_evolver_selected_from_trace(latest_trace)
+    evolver_lines = _format_evolver_context_lines(memory, evolver_candidates, evolver_selected, prepared)
     return "\n".join(
         [
             f"system/project: rebuilt per run",
@@ -131,6 +174,7 @@ def format_context_text(
             f"short-term: {status.short_term_entries} entries, {status.short_term_tokens} tokens",
             f"short-term storage cap: {status.short_term_storage_token_limit}",
             f"long-term: {status.long_term_entries} entries, {status.long_term_tokens} tokens",
+            *evolver_lines,
             f"tools: {tool_budget.included_count} exposed, {tool_budget.omitted_count} omitted",
             f"mcp: {mcp_summary}",
             f"default test command: {test_command or 'not configured'}",
@@ -139,6 +183,84 @@ def format_context_text(
             f"max tool result chars: {profile.tool_result_char_limit}",
         ]
     )
+
+
+def _format_evolver_context_lines(
+    memory: object,
+    candidates_payload: dict[str, object] | None,
+    selected_payload: dict[str, object] | None,
+    prepared_payload: dict[str, object] | None,
+) -> list[str]:
+    config = getattr(memory, "config", None)
+    mode = str(getattr(config, "memory_evolver_mode", "off") or "off")
+    if mode not in {"retrieve_select", "full"}:
+        return []
+
+    candidates_payload = candidates_payload or _last_evolver_candidates_from_memory(memory)
+    selected_payload = selected_payload or _last_evolver_selected_from_memory(memory)
+    selected_payload = selected_payload or _evolver_selected_from_prepared(prepared_payload)
+    lines = [f"evolver selector: enabled ({mode})"]
+    if candidates_payload is None and selected_payload is None:
+        lines.append("evolver selection: No evolver selection has been prepared in this session.")
+        return lines
+    lines.extend(
+        [
+            (
+                "evolver selection: "
+                f"candidates={_payload_count(candidates_payload, 'candidate_count', 'candidate_ids')}, "
+                f"selected={_payload_count(selected_payload, 'selected_count', 'selected_ids')}"
+            ),
+            f"evolver selected tiers: {_payload_tier_distribution(selected_payload)}",
+            f"evolver selection policy: {_payload_value(selected_payload or candidates_payload, 'selection_policy')}",
+        ]
+    )
+    return lines
+
+
+def _evolver_selected_from_prepared(payload: dict[str, object] | None) -> dict[str, object] | None:
+    if payload is None:
+        return None
+    memory_hits = payload.get("memory_hits")
+    if not isinstance(memory_hits, int) or isinstance(memory_hits, bool) or memory_hits < 0:
+        return None
+    if memory_hits == 0:
+        return None
+    return {"selected_count": memory_hits}
+
+
+def _last_evolver_candidates_from_memory(memory: object) -> dict[str, object] | None:
+    selection = getattr(memory, "last_evolver_selection", None)
+    candidates = getattr(selection, "candidates", None)
+    if candidates is None:
+        return None
+    return {
+        "candidate_count": len(candidates),
+        "selection_policy": str(getattr(selection, "policy", "") or ""),
+    }
+
+
+def _last_evolver_selected_from_memory(memory: object) -> dict[str, object] | None:
+    selection = getattr(memory, "last_evolver_selection", None)
+    selected = getattr(selection, "selected", None)
+    if selected is None:
+        return None
+    tiers: Counter[str] = Counter()
+    selected_ids: list[str] = []
+    for item in selected:
+        candidate = getattr(item, "candidate", None)
+        if candidate is None:
+            continue
+        selected_ids.append(str(getattr(candidate, "id", "") or ""))
+        tier = getattr(candidate, "tier", None)
+        tier_value = str(getattr(tier, "value", "") or "")
+        if tier_value:
+            tiers[tier_value] += 1
+    return {
+        "selected_count": len(selected),
+        "selected_ids": selected_ids,
+        "tiers": dict(sorted(tiers.items())),
+        "selection_policy": str(getattr(selection, "policy", "") or ""),
+    }
 
 
 def format_memory_text(memory: object) -> str:

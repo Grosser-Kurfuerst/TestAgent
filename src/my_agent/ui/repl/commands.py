@@ -71,6 +71,8 @@ def handle_repl_command(repl: "AgentRepl", command: str) -> bool:
                 last_memory_prepared=repl._last_memory_prepared,
                 mcp_summary=repl._mcp_summary(),
                 test_command=repl.test_command,
+                last_evolver_candidates=repl._last_evolver_candidates,
+                last_evolver_selected=repl._last_evolver_selected,
             )
         )
         return False

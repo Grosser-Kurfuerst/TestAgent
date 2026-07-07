@@ -38,6 +38,40 @@ class TraceStatsTests(unittest.TestCase):
         self.assertEqual(stats.edit_count, 1)
         self.assertEqual(stats.tool_distribution["run_tests"], 1)
         self.assertIn("Tool success rate: 3/4", format_trace_stats(stats))
+        self.assertEqual(stats.evolver_candidate_events, 0)
+        self.assertEqual(stats.evolver_selected_events, 0)
+
+    def test_collects_evolver_selection_for_nonrecursive_stats(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trace = Path(tmp) / "trace.jsonl"
+            events = [
+                {
+                    "run_id": "run-1",
+                    "event": "memory.evolver_candidates",
+                    "payload": {"candidate_count": 4, "selection_policy": "rule_tier_weighted_v1"},
+                },
+                {
+                    "run_id": "run-1",
+                    "event": "memory.evolver_selected",
+                    "payload": {
+                        "selected_count": 2,
+                        "tiers": {"tip": 1, "tool": 1},
+                        "selection_policy": "rule_tier_weighted_v1",
+                    },
+                },
+            ]
+            trace.write_text("\n".join(json.dumps(event) for event in events), encoding="utf-8")
+
+            stats = collect_trace_stats(trace)
+
+        self.assertEqual(stats.evolver_candidate_events, 1)
+        self.assertEqual(stats.evolver_selected_events, 1)
+        self.assertEqual(stats.evolver_candidates_total, 4)
+        self.assertEqual(stats.evolver_selected_total, 2)
+        self.assertEqual(stats.evolver_selected_by_tier, {"tip": 1, "tool": 1})
+        self.assertEqual(stats.evolver_selection_policies, {"rule_tier_weighted_v1": 1})
+        self.assertEqual(stats.to_dict()["evolver_candidates_total"], 4)
+        self.assertIn("Evolver selection: candidate_events=1", format_trace_stats(stats))
 
     def test_recursive_metrics_follow_child_traces_and_tokens_by_phase(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
