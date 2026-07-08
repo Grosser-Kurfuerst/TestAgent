@@ -36,6 +36,11 @@ class TraceMetrics:
     evolver_selected_total: int = 0
     evolver_selected_by_tier: dict[str, int] = field(default_factory=dict)
     evolver_selection_policies: dict[str, int] = field(default_factory=dict)
+    evolver_writer_started_events: int = 0
+    evolver_writer_saved_events: int = 0
+    evolver_writer_saved_total: int = 0
+    evolver_writer_saved_by_tier: dict[str, int] = field(default_factory=dict)
+    evolver_writer_failed_events: int = 0
 
     @property
     def tool_success_rate(self) -> float:
@@ -72,6 +77,11 @@ class TraceMetrics:
             "evolver_selected_total": self.evolver_selected_total,
             "evolver_selected_by_tier": self.evolver_selected_by_tier,
             "evolver_selection_policies": self.evolver_selection_policies,
+            "evolver_writer_started_events": self.evolver_writer_started_events,
+            "evolver_writer_saved_events": self.evolver_writer_saved_events,
+            "evolver_writer_saved_total": self.evolver_writer_saved_total,
+            "evolver_writer_saved_by_tier": self.evolver_writer_saved_by_tier,
+            "evolver_writer_failed_events": self.evolver_writer_failed_events,
         }
 
 
@@ -102,6 +112,11 @@ def collect_trace_metrics(path: str | Path, *, recursive: bool = True) -> TraceM
     evolver_selected_total = 0
     evolver_selected_by_tier: Counter[str] = Counter()
     evolver_selection_policies: Counter[str] = Counter()
+    evolver_writer_started_events = 0
+    evolver_writer_saved_events = 0
+    evolver_writer_saved_total = 0
+    evolver_writer_saved_by_tier: Counter[str] = Counter()
+    evolver_writer_failed_events = 0
 
     scanned: set[Path] = set()
     pending = list(trace_files)
@@ -178,6 +193,19 @@ def collect_trace_metrics(path: str | Path, *, recursive: bool = True) -> TraceM
                 if isinstance(policy, str) and policy:
                     evolver_selection_policies[policy] += 1
 
+            if event_name == "memory.evolver_writer_started":
+                evolver_writer_started_events += 1
+            elif event_name == "memory.evolver_writer_saved":
+                evolver_writer_saved_events += 1
+                evolver_writer_saved_total += _payload_count(
+                    payload,
+                    count_key="saved_count",
+                    fallback_keys=("saved_ids", "saved_records"),
+                )
+                evolver_writer_saved_by_tier.update(_tier_counts(payload.get("tiers")))
+            elif event_name == "memory.evolver_writer_failed":
+                evolver_writer_failed_events += 1
+
             if event_name == "agent.completed":
                 reason = str(payload.get("stop_reason") or "")
                 if isinstance(run_id, str) and run_id:
@@ -245,6 +273,11 @@ def collect_trace_metrics(path: str | Path, *, recursive: bool = True) -> TraceM
         evolver_selected_total=evolver_selected_total,
         evolver_selected_by_tier=dict(sorted(evolver_selected_by_tier.items())),
         evolver_selection_policies=dict(sorted(evolver_selection_policies.items())),
+        evolver_writer_started_events=evolver_writer_started_events,
+        evolver_writer_saved_events=evolver_writer_saved_events,
+        evolver_writer_saved_total=evolver_writer_saved_total,
+        evolver_writer_saved_by_tier=dict(sorted(evolver_writer_saved_by_tier.items())),
+        evolver_writer_failed_events=evolver_writer_failed_events,
     )
 
 
@@ -270,6 +303,13 @@ def format_trace_metrics(metrics: TraceMetrics) -> str:
             f"candidates={metrics.evolver_candidates_total}, "
             f"selected_events={metrics.evolver_selected_events}, "
             f"selected={metrics.evolver_selected_total}"
+        ),
+        (
+            "Evolver writer: "
+            f"started_events={metrics.evolver_writer_started_events}, "
+            f"saved_events={metrics.evolver_writer_saved_events}, "
+            f"saved={metrics.evolver_writer_saved_total}, "
+            f"failed_events={metrics.evolver_writer_failed_events}"
         ),
         "Tool distribution:",
     ]
@@ -301,6 +341,11 @@ def format_trace_metrics(metrics: TraceMetrics) -> str:
     lines.append("Evolver selection policies:")
     if metrics.evolver_selection_policies:
         lines.extend(f"- {policy}: {count}" for policy, count in metrics.evolver_selection_policies.items())
+    else:
+        lines.append("- none: 0")
+    lines.append("Evolver writer saved by tier:")
+    if metrics.evolver_writer_saved_by_tier:
+        lines.extend(f"- {tier}: {count}" for tier, count in metrics.evolver_writer_saved_by_tier.items())
     else:
         lines.append("- none: 0")
     return "\n".join(lines)

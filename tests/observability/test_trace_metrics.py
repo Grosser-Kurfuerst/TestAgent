@@ -118,6 +118,132 @@ class TraceMetricsEvolverTests(unittest.TestCase):
         self.assertEqual(metrics.evolver_selected_total, 0)
         self.assertEqual(metrics.evolver_selected_by_tier, {})
         self.assertEqual(metrics.evolver_selection_policies, {})
+        self.assertEqual(metrics.evolver_writer_started_events, 0)
+        self.assertEqual(metrics.evolver_writer_saved_events, 0)
+        self.assertEqual(metrics.evolver_writer_saved_total, 0)
+        self.assertEqual(metrics.evolver_writer_saved_by_tier, {})
+        self.assertEqual(metrics.evolver_writer_failed_events, 0)
+
+    def test_collects_evolver_writer_saved_total_and_tiers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trace = Path(tmp) / "trace.jsonl"
+            trace.write_text(
+                "\n".join(
+                    json.dumps(event)
+                    for event in [
+                        {
+                            "run_id": "run-1",
+                            "event": "memory.evolver_writer_started",
+                            "payload": {
+                                "mode": "fallback",
+                                "outcome": "success",
+                                "selected_count": 2,
+                                "candidate_count": 5,
+                            },
+                        },
+                        {
+                            "run_id": "run-1",
+                            "event": "memory.evolver_writer_saved",
+                            "payload": {
+                                "saved_count": 2,
+                                "duplicate_count": 1,
+                                "saved_records": [{"id": "exp_1", "tier": "skill"}, {"id": "exp_2", "tier": "tool"}],
+                                "tiers": {"skill": 1, "tool": 1},
+                                "writer_policy": "fallback_runtime_v1",
+                            },
+                        },
+                        {
+                            "run_id": "run-1",
+                            "event": "memory.evolver_writer_failed",
+                            "payload": {"phase": "unknown", "error": "ValueError: boom"},
+                        },
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            metrics = collect_trace_metrics(trace, recursive=False)
+
+        self.assertEqual(metrics.evolver_writer_started_events, 1)
+        self.assertEqual(metrics.evolver_writer_saved_events, 1)
+        self.assertEqual(metrics.evolver_writer_saved_total, 2)
+        self.assertEqual(metrics.evolver_writer_saved_by_tier, {"skill": 1, "tool": 1})
+        self.assertEqual(metrics.evolver_writer_failed_events, 1)
+        self.assertEqual(metrics.to_dict()["evolver_writer_saved_total"], 2)
+        self.assertIn("Evolver writer: started_events=1", format_trace_metrics(metrics))
+        self.assertIn("saved=2", format_trace_metrics(metrics))
+
+    def test_recursive_metrics_include_child_evolver_writer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            parent = base / "parent.jsonl"
+            child = base / "child.jsonl"
+            parent.write_text(
+                "\n".join(
+                    json.dumps(event)
+                    for event in [
+                        {
+                            "run_id": "parent",
+                            "event": "memory.evolver_writer_started",
+                            "payload": {"mode": "fallback"},
+                        },
+                        {
+                            "run_id": "parent",
+                            "event": "agent.completed",
+                            "payload": {"stop_reason": "plan_completed", "child_trace_paths": [str(child)]},
+                        },
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            child.write_text(
+                "\n".join(
+                    json.dumps(event)
+                    for event in [
+                        {
+                            "run_id": "child",
+                            "event": "memory.evolver_writer_saved",
+                            "payload": {
+                                "saved_count": 3,
+                                "tiers": {"tip": 2, "skill": 1},
+                            },
+                        },
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            shallow = collect_trace_metrics(parent, recursive=False)
+            recursive = collect_trace_metrics(parent, recursive=True)
+
+        self.assertEqual(shallow.evolver_writer_started_events, 1)
+        self.assertEqual(shallow.evolver_writer_saved_total, 0)
+        self.assertEqual(recursive.trace_files, 2)
+        self.assertEqual(recursive.evolver_writer_started_events, 1)
+        self.assertEqual(recursive.evolver_writer_saved_total, 3)
+        self.assertEqual(recursive.evolver_writer_saved_by_tier, {"skill": 1, "tip": 2})
+
+    def test_writer_saved_count_falls_back_to_saved_records(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trace = Path(tmp) / "trace.jsonl"
+            trace.write_text(
+                json.dumps(
+                    {
+                        "run_id": "run-1",
+                        "event": "memory.evolver_writer_saved",
+                        "payload": {
+                            "saved_records": [{"id": "exp_1", "tier": "tip"}, {"id": "exp_2", "tier": "skill"}],
+                            "tiers": {"tip": 1, "skill": 1},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            metrics = collect_trace_metrics(trace, recursive=False)
+
+        self.assertEqual(metrics.evolver_writer_saved_total, 2)
+        self.assertEqual(metrics.evolver_writer_saved_by_tier, {"skill": 1, "tip": 1})
 
 
 if __name__ == "__main__":

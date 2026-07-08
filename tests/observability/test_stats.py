@@ -40,6 +40,11 @@ class TraceStatsTests(unittest.TestCase):
         self.assertIn("Tool success rate: 3/4", format_trace_stats(stats))
         self.assertEqual(stats.evolver_candidate_events, 0)
         self.assertEqual(stats.evolver_selected_events, 0)
+        self.assertEqual(stats.evolver_writer_started_events, 0)
+        self.assertEqual(stats.evolver_writer_saved_events, 0)
+        self.assertEqual(stats.evolver_writer_saved_total, 0)
+        self.assertEqual(stats.evolver_writer_saved_by_tier, {})
+        self.assertEqual(stats.evolver_writer_failed_events, 0)
 
     def test_collects_evolver_selection_for_nonrecursive_stats(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -72,6 +77,43 @@ class TraceStatsTests(unittest.TestCase):
         self.assertEqual(stats.evolver_selection_policies, {"rule_tier_weighted_v1": 1})
         self.assertEqual(stats.to_dict()["evolver_candidates_total"], 4)
         self.assertIn("Evolver selection: candidate_events=1", format_trace_stats(stats))
+
+    def test_collects_evolver_writer_stats_for_nonrecursive_trace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trace = Path(tmp) / "trace.jsonl"
+            events = [
+                {
+                    "run_id": "run-1",
+                    "event": "memory.evolver_writer_started",
+                    "payload": {"mode": "fallback", "outcome": "success"},
+                },
+                {
+                    "run_id": "run-1",
+                    "event": "memory.evolver_writer_saved",
+                    "payload": {
+                        "saved_count": 2,
+                        "saved_ids": ["exp_1", "exp_2"],
+                        "tiers": {"skill": 1, "tool": 1},
+                    },
+                },
+                {
+                    "run_id": "run-1",
+                    "event": "memory.evolver_writer_failed",
+                    "payload": {"phase": "dataset"},
+                },
+            ]
+            trace.write_text("\n".join(json.dumps(event) for event in events), encoding="utf-8")
+
+            stats = collect_trace_stats(trace)
+
+        self.assertEqual(stats.evolver_writer_started_events, 1)
+        self.assertEqual(stats.evolver_writer_saved_events, 1)
+        self.assertEqual(stats.evolver_writer_saved_total, 2)
+        self.assertEqual(stats.evolver_writer_saved_by_tier, {"skill": 1, "tool": 1})
+        self.assertEqual(stats.evolver_writer_failed_events, 1)
+        self.assertEqual(stats.to_dict()["evolver_writer_saved_total"], 2)
+        self.assertIn("Evolver writer: started_events=1", format_trace_stats(stats))
+        self.assertIn("- skill: 1", format_trace_stats(stats))
 
     def test_recursive_metrics_follow_child_traces_and_tokens_by_phase(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
