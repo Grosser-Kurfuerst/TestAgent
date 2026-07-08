@@ -168,6 +168,13 @@ class ManifestBenchmarkTests(unittest.TestCase):
             memory_evolver_selected_max_items=6,
             memory_evolver_min_score=0.25,
             memory_evolver_min_experience_entries=3,
+            memory_evolver_writer_enabled=True,
+            memory_evolver_writer_mode="llm",
+            memory_evolver_writer_min_confidence=0.8,
+            memory_evolver_writer_max_records=4,
+            memory_evolver_writer_max_input_chars=5000,
+            memory_evolver_writer_max_content_chars=700,
+            memory_evolver_writer_dataset_path=Path("/tmp/writer.jsonl"),
         )
 
         values = _config_env_values(config)
@@ -177,6 +184,13 @@ class ManifestBenchmarkTests(unittest.TestCase):
         self.assertEqual(values["AGENTCLI_MEMORY_EVOLVER_SELECTED_MAX_ITEMS"], "6")
         self.assertEqual(values["AGENTCLI_MEMORY_EVOLVER_MIN_SCORE"], "0.25")
         self.assertEqual(values["AGENTCLI_MEMORY_EVOLVER_MIN_EXPERIENCE_ENTRIES"], "3")
+        self.assertEqual(values["AGENTCLI_MEMORY_EVOLVER_WRITER"], "1")
+        self.assertEqual(values["AGENTCLI_MEMORY_EVOLVER_WRITER_MODE"], "llm")
+        self.assertEqual(values["AGENTCLI_MEMORY_EVOLVER_WRITER_MIN_CONFIDENCE"], "0.8")
+        self.assertEqual(values["AGENTCLI_MEMORY_EVOLVER_WRITER_MAX_RECORDS"], "4")
+        self.assertEqual(values["AGENTCLI_MEMORY_EVOLVER_WRITER_MAX_INPUT_CHARS"], "5000")
+        self.assertEqual(values["AGENTCLI_MEMORY_EVOLVER_WRITER_MAX_CONTENT_CHARS"], "700")
+        self.assertEqual(values["AGENTCLI_MEMORY_EVOLVER_WRITER_DATASET_PATH"], "/tmp/writer.jsonl")
 
     def test_config_for_eval_env_preserves_and_overrides_evolver_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -188,6 +202,13 @@ class ManifestBenchmarkTests(unittest.TestCase):
                 memory_evolver_selected_max_items=6,
                 memory_evolver_min_score=0.25,
                 memory_evolver_min_experience_entries=3,
+                memory_evolver_writer_enabled=True,
+                memory_evolver_writer_mode="fallback",
+                memory_evolver_writer_min_confidence=0.8,
+                memory_evolver_writer_max_records=4,
+                memory_evolver_writer_max_input_chars=5000,
+                memory_evolver_writer_max_content_chars=700,
+                memory_evolver_writer_dataset_path=base / "writer.jsonl",
                 memory_evolver_tier_caps={"trajectory": 2, "tip": 1, "skill": 3, "tool": 4},
                 memory_evolver_tier_weights={"trajectory": 1.3, "tip": 0.8, "skill": 1.7, "tool": 1.1},
             )
@@ -207,6 +228,13 @@ class ManifestBenchmarkTests(unittest.TestCase):
                     "AGENTCLI_MEMORY_EVOLVER_SELECTED_MAX_ITEMS": "4",
                     "MY_AGENT_MEMORY_EVOLVER_MIN_SCORE": "0.5",
                     "AGENTCLI_MEMORY_EVOLVER_MIN_EXPERIENCE_ENTRIES": "9",
+                    "MY_AGENT_MEMORY_EVOLVER_WRITER": "0",
+                    "MY_AGENT_MEMORY_EVOLVER_WRITER_MODE": "llm",
+                    "MY_AGENT_MEMORY_EVOLVER_WRITER_MIN_CONFIDENCE": "0.6",
+                    "MY_AGENT_MEMORY_EVOLVER_WRITER_MAX_RECORDS": "2",
+                    "MY_AGENT_MEMORY_EVOLVER_WRITER_MAX_INPUT_CHARS": "3000",
+                    "MY_AGENT_MEMORY_EVOLVER_WRITER_MAX_CONTENT_CHARS": "400",
+                    "MY_AGENT_MEMORY_EVOLVER_WRITER_DATASET_PATH": str(base / "override-writer.jsonl"),
                 },
                 trace_dir=base / "task-traces-override",
                 memory_dir=base / "memory-override",
@@ -218,6 +246,13 @@ class ManifestBenchmarkTests(unittest.TestCase):
         self.assertEqual(preserved.memory_evolver_selected_max_items, 6)
         self.assertEqual(preserved.memory_evolver_min_score, 0.25)
         self.assertEqual(preserved.memory_evolver_min_experience_entries, 3)
+        self.assertTrue(preserved.memory_evolver_writer_enabled)
+        self.assertEqual(preserved.memory_evolver_writer_mode, "fallback")
+        self.assertEqual(preserved.memory_evolver_writer_min_confidence, 0.8)
+        self.assertEqual(preserved.memory_evolver_writer_max_records, 4)
+        self.assertEqual(preserved.memory_evolver_writer_max_input_chars, 5000)
+        self.assertEqual(preserved.memory_evolver_writer_max_content_chars, 700)
+        self.assertEqual(preserved.memory_evolver_writer_dataset_path, base / "writer.jsonl")
         self.assertEqual(preserved.memory_evolver_tier_caps, {"trajectory": 2, "tip": 1, "skill": 3, "tool": 4})
         self.assertEqual(preserved.memory_evolver_tier_weights, {"trajectory": 1.3, "tip": 0.8, "skill": 1.7, "tool": 1.1})
         self.assertEqual(overridden.memory_evolver_mode, "off")
@@ -225,6 +260,13 @@ class ManifestBenchmarkTests(unittest.TestCase):
         self.assertEqual(overridden.memory_evolver_selected_max_items, 4)
         self.assertEqual(overridden.memory_evolver_min_score, 0.5)
         self.assertEqual(overridden.memory_evolver_min_experience_entries, 9)
+        self.assertFalse(overridden.memory_evolver_writer_enabled)
+        self.assertEqual(overridden.memory_evolver_writer_mode, "llm")
+        self.assertEqual(overridden.memory_evolver_writer_min_confidence, 0.6)
+        self.assertEqual(overridden.memory_evolver_writer_max_records, 2)
+        self.assertEqual(overridden.memory_evolver_writer_max_input_chars, 3000)
+        self.assertEqual(overridden.memory_evolver_writer_max_content_chars, 400)
+        self.assertEqual(overridden.memory_evolver_writer_dataset_path, base / "override-writer.jsonl")
         self.assertEqual(overridden.memory_evolver_tier_caps, {"trajectory": 2, "tip": 1, "skill": 3, "tool": 4})
         self.assertEqual(overridden.memory_evolver_tier_weights, {"trajectory": 1.3, "tip": 0.8, "skill": 1.7, "tool": 1.1})
 
@@ -418,6 +460,83 @@ class ManifestBenchmarkTests(unittest.TestCase):
         self.assertEqual(record["memory_entries_total_before"], 0)
         self.assertEqual(record["memory_entries_total_after"], 0)
         self.assertEqual(record["memory_total_growth"], 0)
+
+    def test_manifest_runner_passes_writer_context_metadata_to_agent_runner(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            write_repo(repo, value=0)
+            manifest = base / "tasks.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "memory_mode": "shared_stream",
+                        "stream_id": "python-stream",
+                        "tasks": [
+                            {
+                                "id": "task-one",
+                                "source": "manifest",
+                                "repo": str(repo),
+                                "task": "Fix VALUE.",
+                                "tags": ["python", "writer"],
+                                "env_overrides": {"MY_AGENT_MEMORY_PROJECT_KEY": "override:key"},
+                                "visible_test_command": [sys.executable, "visible_check.py"],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            seen_metadata: list[dict[str, object]] = []
+            seen_project_key = ""
+            seen_writer_enabled = False
+            seen_writer_mode = ""
+
+            def fake_agent_runner(**kwargs: object) -> object:
+                nonlocal seen_project_key, seen_writer_enabled, seen_writer_mode
+                seen_metadata.append(dict(kwargs["metadata"]))  # type: ignore[arg-type]
+                config = kwargs["config"]
+                self.assertIsInstance(config, AgentConfig)
+                seen_project_key = config.memory_project_key
+                seen_writer_enabled = config.memory_evolver_writer_enabled
+                seen_writer_mode = config.memory_evolver_writer_mode
+                work_repo = Path(kwargs["repo_path"])  # type: ignore[arg-type]
+                (work_repo / "solution.py").write_text("VALUE = 1\n", encoding="utf-8")
+                trace_dir = Path(kwargs["trace_dir"])  # type: ignore[arg-type]
+                trace_path = write_agent_trace(trace_dir, "run-task-one")
+                return SimpleNamespace(
+                    trace_path=trace_path,
+                    run_id="run-task-one",
+                    steps=1,
+                    done=True,
+                    stop_reason="finish_called",
+                )
+
+            result = run_manifest_benchmark(
+                tasks_path=manifest,
+                output_dir=base / "out",
+                config=fake_config(
+                    base / "traces",
+                    memory_enabled=True,
+                    memory_evolver_writer_enabled=True,
+                    memory_evolver_writer_mode="fallback",
+                ),
+                agent_runner=fake_agent_runner,
+            )
+
+        self.assertTrue(result.results[0].resolved)
+        self.assertTrue(seen_writer_enabled)
+        self.assertEqual(seen_writer_mode, "fallback")
+        self.assertEqual(len(seen_metadata), 1)
+        metadata = seen_metadata[0]
+        self.assertEqual(metadata["source_task"], "task-one")
+        self.assertEqual(metadata["task_id"], "task-one")
+        self.assertEqual(metadata["task_type"], "manifest")
+        self.assertEqual(metadata["stream_id"], "python-stream")
+        self.assertEqual(metadata["memory_mode"], "shared_stream")
+        self.assertEqual(seen_project_key, "override:key")
+        self.assertEqual(metadata["memory_project_key"], "override:key")
+        self.assertEqual(metadata["tags"], ["python", "writer"])
 
     def test_visible_pass_hidden_fail_records_clean_copy_result_and_trace_payload(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

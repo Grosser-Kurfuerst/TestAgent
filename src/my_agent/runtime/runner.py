@@ -68,6 +68,7 @@ def run_agent(
     memory_manager: MemoryManager | None = None,
     hitl_handler: HitlHandler | None = None,
     cancellation_token: CancellationToken | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> AgentState:
     resolved_config = config or AgentConfig.from_env()
     selected_mode = resolve_mode(mode if mode is not None else resolved_config.agent_mode, task, default=AgentMode.AUTO)
@@ -78,6 +79,7 @@ def run_agent(
         test_command=test_command,
         max_steps=default_max_steps if max_steps is None else max_steps,
         cancellation_token=cancellation_token,
+        metadata=metadata,
     )
     runtime = CodingAgentRuntime(
         config=resolved_config,

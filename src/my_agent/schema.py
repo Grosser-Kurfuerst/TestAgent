@@ -95,6 +95,7 @@ class AgentState:
     final_answer: str = ""
     done: bool = False
     stop_reason: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
     cancellation_token: CancellationToken | None = field(default=None, repr=False, compare=False)
 
     @classmethod
@@ -106,6 +107,7 @@ class AgentState:
         max_steps: int = 8,
         run_id: str | None = None,
         cancellation_token: CancellationToken | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> "AgentState":
         if not str(task).strip():
             raise ValueError("AgentState.task must be non-empty.")
@@ -116,6 +118,7 @@ class AgentState:
             test_command=test_command,
             max_steps=max_steps,
             cancellation_token=cancellation_token,
+            metadata=dict(metadata or {}),
         )
 
     def trace_event(self, event: str, payload: dict[str, Any]) -> "TraceEvent":

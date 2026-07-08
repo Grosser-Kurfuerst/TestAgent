@@ -582,6 +582,15 @@ def _run_manifest_task(
             max_steps=_task_max_steps(task, max_steps, task_config.max_steps),
             trace_dir=task_trace_dir,
             mode=mode,
+            metadata={
+                "source_task": task_id,
+                "task_id": task_id,
+                "task_type": source or mode,
+                "stream_id": memory_stream.stream_id,
+                "memory_mode": memory_stream.memory_mode,
+                "memory_project_key": task_config.memory_project_key,
+                "tags": tags,
+            },
         )
     except Exception as exc:  # noqa: BLE001 - evaluator records task-level agent failures.
         error = f"{type(exc).__name__}: {exc}"
@@ -926,6 +935,13 @@ def _config_for_eval_env(
         ("AGENTCLI_MEMORY_EVOLVER_SELECTED_MAX_ITEMS", "MY_AGENT_MEMORY_EVOLVER_SELECTED_MAX_ITEMS"),
         ("AGENTCLI_MEMORY_EVOLVER_MIN_SCORE", "MY_AGENT_MEMORY_EVOLVER_MIN_SCORE"),
         ("AGENTCLI_MEMORY_EVOLVER_MIN_EXPERIENCE_ENTRIES", "MY_AGENT_MEMORY_EVOLVER_MIN_EXPERIENCE_ENTRIES"),
+        ("AGENTCLI_MEMORY_EVOLVER_WRITER", "MY_AGENT_MEMORY_EVOLVER_WRITER"),
+        ("AGENTCLI_MEMORY_EVOLVER_WRITER_MODE", "MY_AGENT_MEMORY_EVOLVER_WRITER_MODE"),
+        ("AGENTCLI_MEMORY_EVOLVER_WRITER_MIN_CONFIDENCE", "MY_AGENT_MEMORY_EVOLVER_WRITER_MIN_CONFIDENCE"),
+        ("AGENTCLI_MEMORY_EVOLVER_WRITER_MAX_RECORDS", "MY_AGENT_MEMORY_EVOLVER_WRITER_MAX_RECORDS"),
+        ("AGENTCLI_MEMORY_EVOLVER_WRITER_MAX_INPUT_CHARS", "MY_AGENT_MEMORY_EVOLVER_WRITER_MAX_INPUT_CHARS"),
+        ("AGENTCLI_MEMORY_EVOLVER_WRITER_MAX_CONTENT_CHARS", "MY_AGENT_MEMORY_EVOLVER_WRITER_MAX_CONTENT_CHARS"),
+        ("AGENTCLI_MEMORY_EVOLVER_WRITER_DATASET_PATH", "MY_AGENT_MEMORY_EVOLVER_WRITER_DATASET_PATH"),
     ):
         _prefer_my_agent_override(values, overrides, agentcli_key, my_agent_key)
     resolved = AgentConfig.from_env(env=values, require_env_file=False)
@@ -1028,6 +1044,15 @@ def _config_env_values(config: AgentConfig) -> dict[str, str]:
         "AGENTCLI_MEMORY_EVOLVER_SELECTED_MAX_ITEMS": str(config.memory_evolver_selected_max_items),
         "AGENTCLI_MEMORY_EVOLVER_MIN_SCORE": str(config.memory_evolver_min_score),
         "AGENTCLI_MEMORY_EVOLVER_MIN_EXPERIENCE_ENTRIES": str(config.memory_evolver_min_experience_entries),
+        "AGENTCLI_MEMORY_EVOLVER_WRITER": _bool_env(config.memory_evolver_writer_enabled),
+        "AGENTCLI_MEMORY_EVOLVER_WRITER_MODE": config.memory_evolver_writer_mode,
+        "AGENTCLI_MEMORY_EVOLVER_WRITER_MIN_CONFIDENCE": str(config.memory_evolver_writer_min_confidence),
+        "AGENTCLI_MEMORY_EVOLVER_WRITER_MAX_RECORDS": str(config.memory_evolver_writer_max_records),
+        "AGENTCLI_MEMORY_EVOLVER_WRITER_MAX_INPUT_CHARS": str(config.memory_evolver_writer_max_input_chars),
+        "AGENTCLI_MEMORY_EVOLVER_WRITER_MAX_CONTENT_CHARS": str(config.memory_evolver_writer_max_content_chars),
+        "AGENTCLI_MEMORY_EVOLVER_WRITER_DATASET_PATH": (
+            str(config.memory_evolver_writer_dataset_path) if config.memory_evolver_writer_dataset_path else ""
+        ),
         "AGENTCLI_HITL": _bool_env(config.hitl_enabled),
         "AGENTCLI_HITL_AUDIT_DIR": str(config.hitl_audit_dir),
         "AGENTCLI_HITL_NON_INTERACTIVE": config.hitl_non_interactive,

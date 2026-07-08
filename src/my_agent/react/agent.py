@@ -13,6 +13,7 @@ from my_agent.hitl.types import ApprovalEvent
 from my_agent.llm import AgentLLM
 from my_agent.llm.types import ChatResponse, LLMToolCall, Message, MessageLike, messages_to_openai
 from my_agent.memory import MemoryManager
+from my_agent.memory.evolver import runtime_outcome_from_tool_records
 from my_agent.memory.token import estimate_tokens
 from my_agent.agent_base import AgentBase
 from my_agent.schema import AgentState, ToolCall, ToolRecord, ToolResult
@@ -209,6 +210,21 @@ class ReActAgent(AgentBase):
                     self._stop_by_budget(state, writer, budget, stop_reason)
 
             memory.extract_facts(reason="run_completed", run_id=state.run_id)
+            tool_history = [record.to_dict() for record in state.tool_history]
+            writer_metadata = dict(getattr(state, "metadata", {}) or {})
+            memory.write_experiences_from_run(
+                task=state.task,
+                run_id=state.run_id,
+                trace_path=state.trace_path,
+                stop_reason=state.stop_reason,
+                final_answer=state.final_answer,
+                tool_history=tool_history,
+                outcome=runtime_outcome_from_tool_records(state.stop_reason, tool_history),
+                outcome_source="runtime",
+                source_task=str(writer_metadata.get("source_task") or writer_metadata.get("task_id") or ""),
+                stream_id=str(writer_metadata.get("stream_id") or ""),
+                task_type=str(writer_metadata.get("task_type") or ""),
+            )
             self._finalize(state, writer, budget)
             return state
 

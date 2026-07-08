@@ -17,7 +17,7 @@ from my_agent.cancellation import CancellationToken
 from my_agent.hitl import ApprovalDecision, ApprovalEvent, ApprovalRequest, ApprovalResult, ApprovalScope
 from my_agent.llm import FakeLLM
 from my_agent.llm.types import ChatResponse, LLMToolCall, MessageLike, messages_to_openai
-from my_agent.memory import MemoryManager, MemoryScope
+from my_agent.memory import MemoryManager, MemoryScope, is_experience_entry
 from my_agent.plan import AgentMode
 from my_agent.runtime import CodingAgentRuntime, run_agent
 from my_agent.schema import AgentState, TraceEvent
@@ -199,6 +199,28 @@ class RuntimeTests(unittest.TestCase):
             self.assertIs(state.cancellation_token, token)
             self.assertEqual(state.stop_reason, "assistant_final")
 
+    def test_agent_state_metadata_is_copied_and_run_agent_preserves_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+            metadata = {"source_task": "task-1"}
+
+            initial = AgentState.initial(repo, "Return final response.", metadata=metadata)
+            metadata["source_task"] = "mutated"
+            state = run_agent(
+                repo_path=repo,
+                task="Return final response.",
+                config=fake_config(base / "traces"),
+                llm=FakeLLM(chat_responses=[ChatResponse(content="done", finish_reason="stop")]),
+                trace_dir=base / "traces",
+                metadata={"source_task": "task-2"},
+            )
+
+        self.assertEqual(initial.metadata["source_task"], "task-1")
+        self.assertEqual(state.metadata["source_task"], "task-2")
+
     def test_run_agent_pre_cancelled_token_returns_cancelled_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -317,6 +339,68 @@ class RuntimeTests(unittest.TestCase):
             self.assertNotIn("tool_call", event_names)
             self.assertNotIn("final_summary", event_names)
             self.assertEqual({event["run_id"] for event in events}, {state.run_id})
+
+    def test_runtime_default_config_does_not_emit_writer_trace_or_experience(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+            config = fake_config(base / "traces", memory_dir=base / "memory", memory_auto_extract=False)
+
+            state = run_agent(
+                repo_path=repo,
+                task="Fix the subtract function so it returns the first number minus the second number.",
+                test_command="python -m unittest discover -s tests -q",
+                config=config,
+                llm=FakeLLM(),
+                max_steps=8,
+                trace_dir=base / "traces",
+            )
+
+            events = read_trace(state.trace_path)
+            self.assertNotIn("memory.evolver_writer_started", [event["event"] for event in events])
+            self.assertFalse((Path(config.memory_dir) / "long_term_memory.jsonl").exists())
+
+    def test_runtime_writer_enabled_saves_experience_before_completed_trace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+            config = fake_config(
+                base / "traces",
+                memory_dir=base / "memory",
+                memory_auto_extract=False,
+                memory_evolver_writer_enabled=True,
+                memory_project_key="stream:a",
+            )
+
+            state = run_agent(
+                repo_path=repo,
+                task="Fix the subtract function so it returns the first number minus the second number.",
+                test_command="python -m unittest discover -s tests -q",
+                config=config,
+                llm=FakeLLM(),
+                max_steps=8,
+                trace_dir=base / "traces",
+                metadata={"source_task": "manifest-task-1", "stream_id": "stream-a", "task_type": "manifest"},
+            )
+
+            events = read_trace(state.trace_path)
+            event_names = [event["event"] for event in events]
+            self.assertLess(event_names.index("memory.evolver_writer_saved"), event_names.index("run.completed"))
+            saved_payload = [event["payload"] for event in events if event["event"] == "memory.evolver_writer_saved"][-1]
+            self.assertEqual(saved_payload["source_task"], "manifest-task-1")
+            self.assertEqual(saved_payload["stream_id"], "stream-a")
+            self.assertEqual(saved_payload["memory_project_key"], "stream:a")
+
+            manager = MemoryManager.from_config(config=config, llm=FakeLLM(), repo_path=repo)
+            entries = [entry for entry in manager.long_term.all(project_key="stream:a") if is_experience_entry(entry)]
+            self.assertTrue(entries)
+            self.assertTrue(any(entry.run_id == state.run_id for entry in entries))
+            self.assertTrue(all(entry.metadata["source_task"] == "manifest-task-1" for entry in entries))
+            self.assertTrue(any(entry.metadata["created_by"] == "writer" for entry in entries))
 
     def test_memory_disabled_uses_noop_memory_even_with_external_manager(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
