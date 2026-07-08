@@ -252,6 +252,13 @@ class AgentConfigTests(unittest.TestCase):
         self.assertEqual(config.memory_evolver_min_experience_entries, 0)
         self.assertEqual(config.memory_evolver_tier_caps["trajectory"], 1)
         self.assertEqual(config.memory_evolver_tier_weights["skill"], 1.20)
+        self.assertFalse(config.memory_evolver_writer_enabled)
+        self.assertEqual(config.memory_evolver_writer_mode, "fallback")
+        self.assertEqual(config.memory_evolver_writer_min_confidence, 0.70)
+        self.assertEqual(config.memory_evolver_writer_max_records, 6)
+        self.assertEqual(config.memory_evolver_writer_max_input_chars, 12_000)
+        self.assertEqual(config.memory_evolver_writer_max_content_chars, 1_200)
+        self.assertIsNone(config.memory_evolver_writer_dataset_path)
         # memory_auto_extract defaults to True per plan §13 (line 544).
         self.assertTrue(config.memory_auto_extract)
         self.assertFalse(config.hitl_enabled)
@@ -554,6 +561,125 @@ class AgentConfigTests(unittest.TestCase):
         self.assertEqual(fallback.memory_evolver_selected_max_items, 20)
         self.assertEqual(fallback.memory_evolver_min_score, 0.0)
         self.assertEqual(fallback.memory_evolver_min_experience_entries, 0)
+
+    def test_memory_evolver_writer_config_values_are_loaded_from_env_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / ".env"
+            env_file.write_text("", encoding="utf-8")
+            dataset_path = Path(tmp) / "writer.jsonl"
+
+            config = AgentConfig.from_env(
+                env={
+                    "AGENTCLI_MEMORY_EVOLVER_WRITER": "1",
+                    "AGENTCLI_MEMORY_EVOLVER_WRITER_MODE": "llm",
+                    "AGENTCLI_MEMORY_EVOLVER_WRITER_MIN_CONFIDENCE": "0.8",
+                    "AGENTCLI_MEMORY_EVOLVER_WRITER_MAX_RECORDS": "3",
+                    "AGENTCLI_MEMORY_EVOLVER_WRITER_MAX_INPUT_CHARS": "4000",
+                    "AGENTCLI_MEMORY_EVOLVER_WRITER_MAX_CONTENT_CHARS": "500",
+                    "AGENTCLI_MEMORY_EVOLVER_WRITER_DATASET_PATH": str(dataset_path),
+                },
+                env_file=env_file,
+            )
+
+        self.assertTrue(config.memory_evolver_writer_enabled)
+        self.assertEqual(config.memory_evolver_writer_mode, "llm")
+        self.assertEqual(config.memory_evolver_writer_min_confidence, 0.8)
+        self.assertEqual(config.memory_evolver_writer_max_records, 3)
+        self.assertEqual(config.memory_evolver_writer_max_input_chars, 4_000)
+        self.assertEqual(config.memory_evolver_writer_max_content_chars, 500)
+        self.assertEqual(config.memory_evolver_writer_dataset_path, dataset_path)
+
+    def test_my_agent_prefixed_memory_evolver_writer_vars_are_supported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / ".env"
+            env_file.write_text("", encoding="utf-8")
+
+            config = AgentConfig.from_env(
+                env={
+                    "MY_AGENT_MEMORY_EVOLVER_WRITER": "true",
+                    "MY_AGENT_MEMORY_EVOLVER_WRITER_MODE": "fallback",
+                    "MY_AGENT_MEMORY_EVOLVER_WRITER_MIN_CONFIDENCE": "0.6",
+                    "MY_AGENT_MEMORY_EVOLVER_WRITER_MAX_RECORDS": "2",
+                    "MY_AGENT_MEMORY_EVOLVER_WRITER_MAX_INPUT_CHARS": "3000",
+                    "MY_AGENT_MEMORY_EVOLVER_WRITER_MAX_CONTENT_CHARS": "400",
+                    "MY_AGENT_MEMORY_EVOLVER_WRITER_DATASET_PATH": "~/writer.jsonl",
+                },
+                env_file=env_file,
+            )
+
+        self.assertTrue(config.memory_evolver_writer_enabled)
+        self.assertEqual(config.memory_evolver_writer_mode, "fallback")
+        self.assertEqual(config.memory_evolver_writer_min_confidence, 0.6)
+        self.assertEqual(config.memory_evolver_writer_max_records, 2)
+        self.assertEqual(config.memory_evolver_writer_max_input_chars, 3_000)
+        self.assertEqual(config.memory_evolver_writer_max_content_chars, 400)
+        self.assertEqual(config.memory_evolver_writer_dataset_path, Path("~/writer.jsonl").expanduser())
+
+    def test_invalid_memory_evolver_writer_mode_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / ".env"
+            env_file.write_text("", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "AGENTCLI_MEMORY_EVOLVER_WRITER_MODE"):
+                AgentConfig.from_env(
+                    env={"AGENTCLI_MEMORY_EVOLVER_WRITER_MODE": "agent"},
+                    env_file=env_file,
+                )
+
+    def test_memory_evolver_full_does_not_implicitly_enable_writer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / ".env"
+            env_file.write_text("", encoding="utf-8")
+
+            full_config = AgentConfig.from_env(
+                env={"AGENTCLI_MEMORY_EVOLVER_MODE": "full"},
+                env_file=env_file,
+            )
+            writer_config = AgentConfig.from_env(
+                env={
+                    "AGENTCLI_MEMORY_EVOLVER_MODE": "full",
+                    "AGENTCLI_MEMORY_EVOLVER_WRITER": "1",
+                },
+                env_file=env_file,
+            )
+
+        self.assertEqual(full_config.memory_evolver_mode, "full")
+        self.assertFalse(full_config.memory_evolver_writer_enabled)
+        self.assertEqual(writer_config.memory_evolver_mode, "full")
+        self.assertTrue(writer_config.memory_evolver_writer_enabled)
+
+    def test_invalid_memory_evolver_writer_numeric_values_fall_back_or_clamp(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / ".env"
+            env_file.write_text("", encoding="utf-8")
+
+            config = AgentConfig.from_env(
+                env={
+                    "AGENTCLI_MEMORY_EVOLVER_WRITER_MIN_CONFIDENCE": "1.5",
+                    "AGENTCLI_MEMORY_EVOLVER_WRITER_MAX_RECORDS": "-1",
+                    "AGENTCLI_MEMORY_EVOLVER_WRITER_MAX_INPUT_CHARS": "-20",
+                    "AGENTCLI_MEMORY_EVOLVER_WRITER_MAX_CONTENT_CHARS": "-30",
+                },
+                env_file=env_file,
+            )
+            fallback = AgentConfig.from_env(
+                env={
+                    "AGENTCLI_MEMORY_EVOLVER_WRITER_MIN_CONFIDENCE": "bad",
+                    "AGENTCLI_MEMORY_EVOLVER_WRITER_MAX_RECORDS": "bad",
+                    "AGENTCLI_MEMORY_EVOLVER_WRITER_MAX_INPUT_CHARS": "bad",
+                    "AGENTCLI_MEMORY_EVOLVER_WRITER_MAX_CONTENT_CHARS": "bad",
+                },
+                env_file=env_file,
+            )
+
+        self.assertEqual(config.memory_evolver_writer_min_confidence, 1.0)
+        self.assertEqual(config.memory_evolver_writer_max_records, 0)
+        self.assertEqual(config.memory_evolver_writer_max_input_chars, 0)
+        self.assertEqual(config.memory_evolver_writer_max_content_chars, 0)
+        self.assertEqual(fallback.memory_evolver_writer_min_confidence, 0.70)
+        self.assertEqual(fallback.memory_evolver_writer_max_records, 6)
+        self.assertEqual(fallback.memory_evolver_writer_max_input_chars, 12_000)
+        self.assertEqual(fallback.memory_evolver_writer_max_content_chars, 1_200)
 
     def test_invalid_compression_ratio_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

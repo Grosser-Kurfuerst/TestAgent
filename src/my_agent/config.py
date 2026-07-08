@@ -12,6 +12,7 @@ TRUE_VALUES = {"1", "true", "yes", "on"}
 SUPPORTED_PROVIDERS = {"openai", "fake"}
 SUPPORTED_AGENT_MODES = {"react", "plan", "team", "auto"}
 SUPPORTED_MEMORY_EVOLVER_MODES = {"off", "retrieve_select", "full"}
+SUPPORTED_MEMORY_EVOLVER_WRITER_MODES = {"fallback", "llm"}
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_ENV_FILE = PROJECT_ROOT / ".env"
 
@@ -112,6 +113,13 @@ class AgentConfig:
             "tool": 1.10,
         }
     )
+    memory_evolver_writer_enabled: bool = False
+    memory_evolver_writer_mode: str = "fallback"
+    memory_evolver_writer_min_confidence: float = 0.70
+    memory_evolver_writer_max_records: int = 6
+    memory_evolver_writer_max_input_chars: int = 12_000
+    memory_evolver_writer_max_content_chars: int = 1_200
+    memory_evolver_writer_dataset_path: Path | None = None
 
     # Human-in-the-loop approval; disabled by default.
     hitl_enabled: bool = False
@@ -343,6 +351,47 @@ class AgentConfig:
                 0,
                 0,
             ),
+            memory_evolver_writer_enabled=_as_bool(
+                values.get("AGENTCLI_MEMORY_EVOLVER_WRITER", values.get("MY_AGENT_MEMORY_EVOLVER_WRITER", ""))
+            ),
+            memory_evolver_writer_mode=_memory_evolver_writer_mode(values),
+            memory_evolver_writer_min_confidence=_as_probability(
+                values.get(
+                    "AGENTCLI_MEMORY_EVOLVER_WRITER_MIN_CONFIDENCE",
+                    values.get("MY_AGENT_MEMORY_EVOLVER_WRITER_MIN_CONFIDENCE"),
+                ),
+                0.70,
+            ),
+            memory_evolver_writer_max_records=_as_min_int(
+                values.get(
+                    "AGENTCLI_MEMORY_EVOLVER_WRITER_MAX_RECORDS",
+                    values.get("MY_AGENT_MEMORY_EVOLVER_WRITER_MAX_RECORDS"),
+                ),
+                6,
+                0,
+            ),
+            memory_evolver_writer_max_input_chars=_as_min_int(
+                values.get(
+                    "AGENTCLI_MEMORY_EVOLVER_WRITER_MAX_INPUT_CHARS",
+                    values.get("MY_AGENT_MEMORY_EVOLVER_WRITER_MAX_INPUT_CHARS"),
+                ),
+                12_000,
+                0,
+            ),
+            memory_evolver_writer_max_content_chars=_as_min_int(
+                values.get(
+                    "AGENTCLI_MEMORY_EVOLVER_WRITER_MAX_CONTENT_CHARS",
+                    values.get("MY_AGENT_MEMORY_EVOLVER_WRITER_MAX_CONTENT_CHARS"),
+                ),
+                1_200,
+                0,
+            ),
+            memory_evolver_writer_dataset_path=_optional_path(
+                values.get(
+                    "AGENTCLI_MEMORY_EVOLVER_WRITER_DATASET_PATH",
+                    values.get("MY_AGENT_MEMORY_EVOLVER_WRITER_DATASET_PATH"),
+                )
+            ),
             hitl_enabled=_as_bool(values.get("AGENTCLI_HITL", values.get("MY_AGENT_HITL", ""))),
             hitl_audit_dir=_hitl_audit_dir(values),
             hitl_non_interactive=_hitl_non_interactive(
@@ -513,6 +562,17 @@ def _memory_evolver_mode(values: Mapping[str, str]) -> str:
     return normalized
 
 
+def _memory_evolver_writer_mode(values: Mapping[str, str]) -> str:
+    raw_mode = values.get("AGENTCLI_MEMORY_EVOLVER_WRITER_MODE", values.get("MY_AGENT_MEMORY_EVOLVER_WRITER_MODE"))
+    normalized = (raw_mode or "fallback").strip().lower()
+    if normalized not in SUPPORTED_MEMORY_EVOLVER_WRITER_MODES:
+        supported = ", ".join(sorted(SUPPORTED_MEMORY_EVOLVER_WRITER_MODES))
+        raise ValueError(
+            f"Unsupported AGENTCLI_MEMORY_EVOLVER_WRITER_MODE={raw_mode!r}. Supported modes: {supported}."
+        )
+    return normalized
+
+
 def _as_ratio(value: str | None, default: float) -> float:
     if value is None or not value.strip():
         return default
@@ -540,6 +600,22 @@ def _as_min_float(value: str | None, default: float, minimum: float) -> float:
     except ValueError:
         return default
     return max(minimum, parsed)
+
+
+def _as_probability(value: str | None, default: float) -> float:
+    if value is None or not value.strip():
+        return default
+    try:
+        parsed = float(value)
+    except ValueError:
+        return default
+    return max(0.0, min(1.0, parsed))
+
+
+def _optional_path(value: str | None) -> Path | None:
+    if value is None or not value.strip():
+        return None
+    return Path(value).expanduser()
 
 
 def _memory_dir(values: Mapping[str, str]) -> Path:

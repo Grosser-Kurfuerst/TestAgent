@@ -25,6 +25,15 @@ from my_agent.memory.evolver.types import (
     is_experience_entry,
     normalize_experience_tier,
 )
+from my_agent.memory.evolver.writer import (
+    ExperienceWriteProposal,
+    ExperienceWriteRequest,
+    ExperienceWriteResult,
+    ExperienceWriteStep,
+    ExperienceWriter,
+    build_write_steps_from_tool_history,
+    runtime_outcome_from_tool_records,
+)
 
 __all__ = [
     "EVOLVER_SCHEMA_VERSION",
@@ -34,9 +43,15 @@ __all__ = [
     "ExperienceSelector",
     "ExperienceTier",
     "ExperienceTrajectoryStep",
+    "ExperienceWriteProposal",
+    "ExperienceWriteRequest",
+    "ExperienceWriteResult",
+    "ExperienceWriteStep",
+    "ExperienceWriter",
     "SelectedExperience",
     "SelectionResult",
     "build_experience_entry",
+    "build_write_steps_from_tool_history",
     "candidate_tier",
     "candidate_value",
     "experience_metadata",
@@ -45,6 +60,7 @@ __all__ = [
     "is_experience_entry",
     "normalize_experience_tier",
     "render_selected_experiences",
+    "runtime_outcome_from_tool_records",
     "selection_candidate_summary",
     "selection_score",
     "selection_tier_counts",
