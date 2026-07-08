@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 from uuid import uuid4
 
 from my_agent.config import AgentConfig
@@ -39,6 +39,8 @@ from my_agent.memory.types import (
     MemoryType,
 )
 from my_agent.tools import ToolExecutionResult
+
+WRITER_METADATA_STRING_CHARS = 1_000
 
 
 class MemoryManager:
@@ -721,7 +723,9 @@ class MemoryManager:
             saved: list[MemoryEntry] = []
             duplicate_ids: list[str] = []
             for proposal in proposed.proposals:
+                proposal_metadata = _sanitize_writer_metadata(proposal.metadata)
                 metadata = {
+                    **proposal_metadata,
                     "confidence": proposal.confidence,
                     "outcome": request.outcome,
                     "outcome_source": request.outcome_source,
@@ -735,7 +739,6 @@ class MemoryManager:
                     "memory_project_key": request.project_key,
                     "writer_policy": "fallback_runtime_v1",
                     "writer_reason": proposal.reason,
-                    **proposal.metadata,
                 }
                 entry, created = self.save_experience(
                     proposal.content,
@@ -1010,6 +1013,27 @@ def _writer_context_payload(request: ExperienceWriteRequest) -> dict[str, Any]:
         "task_type": request.task_type,
         "memory_project_key": request.project_key,
     }
+
+
+def _sanitize_writer_metadata(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            _truncate_writer_metadata_string(str(key)): _sanitize_writer_metadata(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_sanitize_writer_metadata(item) for item in value]
+    if isinstance(value, tuple):
+        return [_sanitize_writer_metadata(item) for item in value]
+    if isinstance(value, str):
+        return _truncate_writer_metadata_string(value)
+    return value
+
+
+def _truncate_writer_metadata_string(value: str) -> str:
+    if len(value) <= WRITER_METADATA_STRING_CHARS:
+        return value
+    return value[: WRITER_METADATA_STRING_CHARS - 3].rstrip() + "..."
 
 
 def _rejected_reason_counts(rejected: tuple[dict[str, Any], ...]) -> dict[str, int]:

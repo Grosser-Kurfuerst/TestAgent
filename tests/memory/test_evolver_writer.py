@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 import unittest
 
 from tests._path import add_src_to_path
 
 add_src_to_path()
 
+from my_agent.llm.types import ChatResponse, MessageLike
 from my_agent.memory.evolver import (
     ExperienceTier,
     ExperienceWriteProposal,
@@ -15,6 +17,18 @@ from my_agent.memory.evolver import (
     build_write_steps_from_tool_history,
     runtime_outcome_from_tool_records,
 )
+
+
+class FakeWriterLLM:
+    supports_tools = True
+
+    def __init__(self, response: str) -> None:
+        self.response = response
+        self.prompts: list[str] = []
+
+    def chat(self, messages: list[MessageLike], tools: list[dict[str, object]] | None = None) -> ChatResponse:
+        self.prompts.append("\n".join(str(message.get("content", "")) for message in messages if isinstance(message, dict)))
+        return ChatResponse(content=self.response)
 
 
 class EvolverWriterTests(unittest.TestCase):
@@ -150,6 +164,188 @@ class EvolverWriterTests(unittest.TestCase):
         self.assertEqual(result.proposals, ())
         self.assertEqual(result.rejected[0]["reason"], "low_confidence")
 
+    def test_llm_writer_accepts_json_array_proposals(self) -> None:
+        llm = FakeWriterLLM(
+            json.dumps(
+                [
+                    {
+                        "tier": "skill",
+                        "content": "For focused pytest failures, rerun the narrow test after the smallest patch.",
+                        "confidence": 0.82,
+                        "metadata": {"category": "debugging"},
+                        "reason": "reusable loop",
+                    }
+                ]
+            )
+        )
+
+        result = ExperienceWriter(llm=llm).propose(_successful_request(), mode="llm")
+
+        self.assertTrue(result.llm_used)
+        self.assertFalse(result.fallback_used)
+        self.assertEqual(len(result.proposals), 1)
+        self.assertEqual(result.proposals[0].tier, ExperienceTier.SKILL)
+        self.assertEqual(result.proposals[0].metadata["category"], "debugging")
+
+    def test_llm_writer_accepts_fenced_json(self) -> None:
+        llm = FakeWriterLLM(
+            "```json\n"
+            "[{\"tier\":\"tip\",\"content\":\"Inspect the latest failing assertion before broad reruns.\","
+            "\"confidence\":0.77,\"metadata\":{\"category\":\"debugging\"}}]\n"
+            "```"
+        )
+
+        result = ExperienceWriter(llm=llm).propose(_request(outcome="failure"), mode="llm")
+
+        self.assertTrue(result.llm_used)
+        self.assertEqual(result.proposals[0].tier, ExperienceTier.TIP)
+
+    def test_llm_writer_falls_back_on_invalid_json(self) -> None:
+        result = ExperienceWriter(llm=FakeWriterLLM("not json")).propose(_successful_request(), mode="llm")
+
+        self.assertTrue(result.llm_used)
+        self.assertTrue(result.fallback_used)
+        self.assertTrue(result.proposals)
+        self.assertEqual(result.rejected[0]["reason"], "llm_parse_failed")
+
+    def test_llm_writer_rejects_low_confidence_secret_hidden_and_destructive_proposals(self) -> None:
+        secret_like = "".join(("gh", "p_", "abcdefghijklmnopqrstuvwxyz123456"))
+        llm = FakeWriterLLM(
+            json.dumps(
+                [
+                    {
+                        "tier": "skill",
+                        "content": "Useful but low confidence",
+                        "confidence": 0.2,
+                    },
+                    {
+                        "tier": "tip",
+                        "content": f"Never save {secret_like}",
+                        "confidence": 0.9,
+                    },
+                    {
+                        "tier": "trajectory",
+                        "content": "Do not save hidden_test_output details.",
+                        "confidence": 0.9,
+                    },
+                    {
+                        "tier": "tool",
+                        "content": "Reset the repo.",
+                        "confidence": 0.9,
+                        "metadata": {"command": "git reset --hard"},
+                    },
+                ]
+            )
+        )
+
+        result = ExperienceWriter(llm=llm).propose(_successful_request(), mode="llm")
+
+        self.assertTrue(result.fallback_used)
+        self.assertIn("low_confidence", [item["reason"] for item in result.rejected])
+        self.assertGreaterEqual([item["reason"] for item in result.rejected].count("unsafe_content"), 2)
+        self.assertIn("unsafe_tool_command", [item["reason"] for item in result.rejected])
+
+    def test_llm_writer_rejects_unsafe_reason(self) -> None:
+        llm = FakeWriterLLM(
+            json.dumps(
+                [
+                    {
+                        "tier": "skill",
+                        "content": "Use focused pytest verification after a small patch.",
+                        "confidence": 0.9,
+                        "reason": "contains hidden_test_output",
+                    }
+                ]
+            )
+        )
+
+        result = ExperienceWriter(llm=llm).propose(_successful_request(), mode="llm")
+
+        self.assertTrue(result.fallback_used)
+        self.assertIn("unsafe_content", [item["reason"] for item in result.rejected])
+
+    def test_llm_writer_truncates_nested_metadata_strings_and_removes_reserved_keys(self) -> None:
+        long_log = "x" * 2_000
+        long_key = "k" * 2_000
+        llm = FakeWriterLLM(
+            json.dumps(
+                [
+                    {
+                        "tier": "skill",
+                        "content": "Use focused pytest verification after a small patch.",
+                        "confidence": 0.9,
+                        "metadata": {
+                            "debug_log": long_log,
+                            "nested": {"log": long_log},
+                            long_key: "long key value",
+                            "source_task": "llm-overrides-task",
+                            "memory_project_key": "llm-overrides-project",
+                        },
+                        "reason": long_log,
+                    }
+                ]
+            )
+        )
+
+        result = ExperienceWriter(llm=llm).propose(_successful_request(), mode="llm")
+
+        proposal = result.proposals[0]
+        self.assertNotIn("source_task", proposal.metadata)
+        self.assertNotIn("memory_project_key", proposal.metadata)
+        self.assertNotIn(long_key, proposal.metadata)
+        self.assertTrue(any(key.startswith("k" * 100) for key in proposal.metadata))
+        self.assertTrue(all(len(key) <= 1_000 for key in proposal.metadata))
+        self.assertLessEqual(len(proposal.metadata["debug_log"]), 1_000)
+        self.assertLessEqual(len(proposal.metadata["nested"]["log"]), 1_000)
+        self.assertLessEqual(len(proposal.reason), 500)
+
+    def test_llm_prompt_truncates_tool_output(self) -> None:
+        llm = FakeWriterLLM("[]")
+        long_output = "x" * 2_000
+        request = _request(
+            outcome="success",
+            steps=(ExperienceWriteStep(step_num=1, tool="run_tests", ok=True, output=long_output),),
+        )
+
+        ExperienceWriter(llm=llm, max_input_chars=12_000).propose(request, mode="llm")
+
+        self.assertNotIn(long_output, llm.prompts[0])
+        self.assertIn("x" * 997 + "...", llm.prompts[0])
+
+    def test_llm_writer_truncates_trajectory_metadata_step_results(self) -> None:
+        long_result = "x" * 2_000
+        llm = FakeWriterLLM(
+            json.dumps(
+                [
+                    {
+                        "tier": "trajectory",
+                        "content": "Task: fix tests\nOutcome: success\nKey steps: run_tests passed",
+                        "confidence": 0.9,
+                        "metadata": {
+                            "steps": [
+                                {
+                                    "step_num": 1,
+                                    "action": "run_tests",
+                                    "result": long_result,
+                                    "output": long_result,
+                                }
+                            ],
+                            "outcome": "success",
+                        },
+                    }
+                ]
+            )
+        )
+
+        result = ExperienceWriter(llm=llm).propose(_successful_request(), mode="llm")
+
+        step = result.proposals[0].metadata["steps"][0]
+        self.assertNotEqual(step["result"], long_result)
+        self.assertNotEqual(step["output"], long_result)
+        self.assertLessEqual(len(step["result"]), 240)
+        self.assertLessEqual(len(step["output"]), 240)
+
+
 def _request(
     *,
     outcome: str,
@@ -168,6 +364,21 @@ def _request(
         stream_id="stream-a",
         task_type="manifest",
         project_key="stream:a",
+    )
+
+
+def _successful_request() -> ExperienceWriteRequest:
+    return _request(
+        outcome="success",
+        steps=(
+            ExperienceWriteStep(
+                step_num=1,
+                tool="run_tests",
+                arguments={"command": "pytest tests/test_example.py -q"},
+                ok=True,
+                output="passed",
+            ),
+        ),
     )
 
 

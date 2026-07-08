@@ -124,6 +124,32 @@ class RecordingFakeLLM(FakeLLM):
         return super().chat(messages, tools=tools)  # type: ignore[arg-type]
 
 
+class WriterAwareFakeLLM(FakeLLM):
+    def __init__(self) -> None:
+        super().__init__()
+        self.writer_prompts: list[str] = []
+
+    def chat(self, messages: list[MessageLike], tools: list[dict[str, object]] | None = None) -> ChatResponse:
+        if tools is None:
+            prompt = json.dumps(messages_to_openai(messages), ensure_ascii=False)
+            if "experience writer" in prompt.casefold() or "Run summary" in prompt:
+                self.writer_prompts.append(prompt)
+                return ChatResponse(
+                    content=json.dumps(
+                        [
+                            {
+                                "tier": "skill",
+                                "content": "For pytest regressions, use the focused failing test as the repair loop.",
+                                "confidence": 0.84,
+                                "metadata": {"category": "debugging", "technique": "LLM writer focused pytest loop"},
+                                "reason": "writer proposal",
+                            }
+                        ]
+                    )
+                )
+        return super().chat(messages, tools=tools)
+
+
 class NoToolChatLLM(FakeLLM):
     def __init__(self) -> None:
         super().__init__()
@@ -401,6 +427,43 @@ class RuntimeTests(unittest.TestCase):
             self.assertTrue(any(entry.run_id == state.run_id for entry in entries))
             self.assertTrue(all(entry.metadata["source_task"] == "manifest-task-1" for entry in entries))
             self.assertTrue(any(entry.metadata["created_by"] == "writer" for entry in entries))
+
+    def test_runtime_llm_writer_saves_llm_proposal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+            llm = WriterAwareFakeLLM()
+            config = fake_config(
+                base / "traces",
+                memory_dir=base / "memory",
+                memory_auto_extract=False,
+                memory_evolver_writer_enabled=True,
+                memory_evolver_writer_mode="llm",
+                memory_project_key="stream:a",
+            )
+
+            state = run_agent(
+                repo_path=repo,
+                task="Fix the subtract function so it returns the first number minus the second number.",
+                test_command="python -m unittest discover -s tests -q",
+                config=config,
+                llm=llm,
+                max_steps=8,
+                trace_dir=base / "traces",
+            )
+
+            events = read_trace(state.trace_path)
+            proposed = [event["payload"] for event in events if event["event"] == "memory.evolver_writer_proposed"][-1]
+            self.assertTrue(proposed["llm_used"])
+            self.assertFalse(proposed["fallback_used"])
+            self.assertTrue(llm.writer_prompts)
+            manager = MemoryManager.from_config(config=config, llm=FakeLLM(), repo_path=repo)
+            entries = [entry for entry in manager.long_term.all(project_key="stream:a") if is_experience_entry(entry)]
+            self.assertEqual(len(entries), 1)
+            self.assertIn("focused failing test", entries[0].content)
+            self.assertEqual(entries[0].metadata["technique"], "LLM writer focused pytest loop")
 
     def test_memory_disabled_uses_noop_memory_even_with_external_manager(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

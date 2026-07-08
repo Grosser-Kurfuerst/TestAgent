@@ -23,6 +23,7 @@ from my_agent.memory import (
     experience_record_from_entry,
     is_experience_entry,
 )
+from my_agent.memory.evolver import ExperienceWriteProposal, ExperienceWriteResult
 from my_agent.memory.long_term import LongTermMemoryStore
 from my_agent.tools import ToolExecutionResult
 
@@ -542,6 +543,67 @@ class MemoryManagerSaveExperienceTests(unittest.TestCase):
             self.assertEqual(saved_payload["memory_project_key"], "stream:a")
             self.assertEqual(saved_payload["source_task"], "manifest-task-1")
             self.assertEqual(saved_payload["saved_records"][0]["tier"], "skill")
+
+    def test_write_experiences_reserved_metadata_fields_override_proposal_metadata(self) -> None:
+        long_key = "k" * 2_000
+
+        class ReservedOverrideWriter:
+            def propose(self, *_: object, **__: object) -> ExperienceWriteResult:
+                return ExperienceWriteResult(
+                    proposals=(
+                        ExperienceWriteProposal(
+                            ExperienceTier.SKILL,
+                            "Use focused pytest verification after a small patch.",
+                            0.9,
+                            metadata={
+                                "source_task": "llm-task",
+                                "stream_id": "llm-stream",
+                                "task_type": "llm-type",
+                                "memory_project_key": "llm-project",
+                                "writer_policy": "llm-policy",
+                                "source_trace": "llm-trace",
+                                long_key: "long key value",
+                            },
+                            reason="llm reason",
+                        ),
+                    ),
+                    llm_used=True,
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            manager = MemoryManager.from_config(
+                config=_config(
+                    Path(tmp) / "memory",
+                    memory_evolver_writer_enabled=True,
+                    memory_project_key="stream:a",
+                ),
+                llm=FakeLLM(),
+                repo_path=repo,
+            )
+            manager.evolver_writer = ReservedOverrideWriter()  # type: ignore[assignment]
+
+            result = manager.write_experiences_from_run(
+                task="Fix focused pytest failure",
+                run_id="run-1",
+                trace_path=Path(tmp) / "trace.jsonl",
+                outcome="success",
+                source_task="manifest-task-1",
+                stream_id="stream-a",
+                task_type="manifest",
+                tool_history=[_tool_record("run_tests", ok=True)],
+            )
+
+            metadata = result.saved[0].metadata
+            self.assertEqual(metadata["source_task"], "manifest-task-1")
+            self.assertEqual(metadata["stream_id"], "stream-a")
+            self.assertEqual(metadata["task_type"], "manifest")
+            self.assertEqual(metadata["memory_project_key"], "stream:a")
+            self.assertEqual(metadata["writer_policy"], "fallback_runtime_v1")
+            self.assertEqual(metadata["source_trace"], str(Path(tmp) / "trace.jsonl"))
+            self.assertNotIn(long_key, metadata)
+            self.assertTrue(all(len(key) <= 1_000 for key in metadata))
 
     def test_write_experiences_failure_saves_tip_and_trajectory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
