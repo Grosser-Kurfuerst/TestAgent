@@ -102,6 +102,7 @@ class ExperienceWriteRequest:
     stream_id: str = ""
     task_type: str = ""
     project_key: str = ""
+    memory_mode: str = ""
 
 
 @dataclass(frozen=True)
@@ -122,6 +123,18 @@ class ExperienceWriteResult:
     llm_used: bool = False
     fallback_used: bool = False
     error: str = ""
+
+
+class MemoryWriterDatasetLogger:
+    """Append-only JSONL logger for writer training/distillation records."""
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path).expanduser()
+
+    def append(self, record: dict[str, Any]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(sanitize_json_value(record), ensure_ascii=False, sort_keys=True) + "\n")
 
 
 class ExperienceWriter:
@@ -639,6 +652,7 @@ __all__ = [
     "ExperienceWriteResult",
     "ExperienceWriteStep",
     "ExperienceWriter",
+    "MemoryWriterDatasetLogger",
     "build_write_steps_from_tool_history",
     "proposal_tier_counts",
     "runtime_outcome_from_tool_records",

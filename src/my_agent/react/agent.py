@@ -224,6 +224,7 @@ class ReActAgent(AgentBase):
                 source_task=str(writer_metadata.get("source_task") or writer_metadata.get("task_id") or ""),
                 stream_id=str(writer_metadata.get("stream_id") or ""),
                 task_type=str(writer_metadata.get("task_type") or ""),
+                memory_mode=str(writer_metadata.get("memory_mode") or ""),
             )
             self._finalize(state, writer, budget)
             return state

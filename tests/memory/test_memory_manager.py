@@ -544,6 +544,216 @@ class MemoryManagerSaveExperienceTests(unittest.TestCase):
             self.assertEqual(saved_payload["source_task"], "manifest-task-1")
             self.assertEqual(saved_payload["saved_records"][0]["tier"], "skill")
 
+    def test_write_experiences_appends_self_describing_dataset_record(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            dataset_path = Path(tmp) / "datasets" / "writer.jsonl"
+            config = _config(
+                Path(tmp) / "memory",
+                memory_evolver_mode="retrieve_select",
+                memory_evolver_writer_enabled=True,
+                memory_evolver_writer_dataset_path=dataset_path,
+                memory_project_key="stream:a",
+            )
+            manager = MemoryManager.from_config(config=config, llm=FakeLLM(), repo_path=repo)
+            manager.save_experience("pytest selected skill", tier="skill", source_task="task-skill")
+            manager.save_experience("pytest useful tip", tier="tip", source_task="task-tip")
+            manager.build_evolver_context_for_query("pytest")
+
+            result = manager.write_experiences_from_run(
+                task="Fix focused pytest failure",
+                run_id="run-1",
+                trace_path=Path(tmp) / "trace.jsonl",
+                stop_reason="finish_called",
+                outcome="success",
+                outcome_source="runtime",
+                source_task="manifest-task-1",
+                stream_id="stream-a",
+                task_type="manifest",
+                memory_mode="shared_stream",
+                tool_history=[
+                    _tool_record(
+                        "run_tests",
+                        ok=True,
+                        output="hidden_test_output should not be persisted",
+                    )
+                ],
+            )
+
+            rows = [json.loads(line) for line in dataset_path.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(len(rows), 1)
+            record = rows[0]
+            self.assertEqual(record["schema_version"], 1)
+            self.assertEqual(record["run_id"], "run-1")
+            self.assertEqual(record["trace_path"], str(Path(tmp) / "trace.jsonl"))
+            self.assertEqual(record["source_task"], "manifest-task-1")
+            self.assertEqual(record["task_id"], "manifest-task-1")
+            self.assertEqual(record["task_type"], "manifest")
+            self.assertEqual(record["stream_id"], "stream-a")
+            self.assertEqual(record["memory_project_key"], "stream:a")
+            self.assertEqual(record["memory_mode"], "shared_stream")
+            self.assertEqual(record["outcome"], "success")
+            self.assertEqual(record["selected_memory_ids"], [item.candidate.id for item in manager.last_evolver_selection.selected])
+            self.assertIn("skill", record["candidate_memory_ids_by_tier"])
+            self.assertIn("skill", record["selected_memory_ids_by_tier"])
+            self.assertEqual(record["saved_ids"], [entry.id for entry in result.saved])
+            self.assertEqual(record["saved_records"][0]["tier"], "skill")
+            self.assertTrue(record["proposals"])
+            self.assertEqual(record["steps"][0]["output"], "")
+            self.assertTrue(record["steps"][0]["output_redacted"])
+            self.assertNotIn("hidden_test_output", json.dumps(record, ensure_ascii=False))
+
+    def test_write_experiences_dataset_append_error_traces_failure_without_losing_saved_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            dataset_path = Path(tmp) / "writer-as-directory"
+            dataset_path.mkdir()
+            traces: list[tuple[str, dict[str, object]]] = []
+            manager = MemoryManager.from_config(
+                config=_config(
+                    Path(tmp) / "memory",
+                    memory_evolver_writer_enabled=True,
+                    memory_evolver_writer_dataset_path=dataset_path,
+                    memory_project_key="project?token=project-token-value",
+                ),
+                llm=FakeLLM(),
+                repo_path=repo,
+                trace_sink=lambda event, payload: traces.append((event, payload)),
+            )
+
+            result = manager.write_experiences_from_run(
+                task="Fix focused pytest failure",
+                run_id="run-1",
+                outcome="success",
+                source_task="task?api_key=plain-secret-value",
+                stream_id="stream?cookie=session-cookie-value",
+                task_type="manifest?password=plain-password-value",
+                memory_mode="mode?secret=plain-mode-secret",
+                tool_history=[_tool_record("run_tests", ok=True)],
+            )
+
+            self.assertEqual(len(result.saved), 2)
+            failed = [payload for event, payload in traces if event == "memory.evolver_writer_failed"][-1]
+            self.assertEqual(failed["phase"], "dataset")
+            self.assertIn("IsADirectoryError", failed["error"])
+            failed_text = json.dumps(failed, ensure_ascii=False)
+            traces_text = json.dumps(traces, ensure_ascii=False)
+            self.assertNotIn("plain-secret-value", failed_text)
+            self.assertNotIn("plain-password-value", failed_text)
+            self.assertNotIn("session-cookie-value", failed_text)
+            self.assertNotIn("plain-mode-secret", failed_text)
+            self.assertNotIn("project-token-value", failed_text)
+            self.assertNotIn("plain-secret-value", traces_text)
+            self.assertNotIn("plain-password-value", traces_text)
+            self.assertNotIn("session-cookie-value", traces_text)
+            self.assertNotIn("plain-mode-secret", traces_text)
+            self.assertNotIn("project-token-value", traces_text)
+            self.assertTrue(str(failed["source_task"]).startswith("redacted_"))
+
+    def test_write_experiences_dataset_redacts_rejected_and_result_errors(self) -> None:
+        class SecretRejectedWriter:
+            def propose(self, *_: object, **__: object) -> ExperienceWriteResult:
+                return ExperienceWriteResult(
+                    rejected=(
+                        {
+                            "reason": "llm_parse_failed",
+                            "error": "token=plain-token-value password=plain-password-value",
+                        },
+                    ),
+                    error="cookie=session-cookie-value",
+                    llm_used=True,
+                    fallback_used=False,
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            dataset_path = Path(tmp) / "writer.jsonl"
+            manager = MemoryManager.from_config(
+                config=_config(
+                    Path(tmp) / "memory",
+                    memory_evolver_writer_enabled=True,
+                    memory_evolver_writer_dataset_path=dataset_path,
+                ),
+                llm=FakeLLM(),
+                repo_path=repo,
+            )
+            manager.evolver_writer = SecretRejectedWriter()  # type: ignore[assignment]
+
+            manager.write_experiences_from_run(
+                task="Fix focused pytest failure",
+                run_id="run-1",
+                outcome="success",
+                tool_history=[_tool_record("run_tests", ok=True)],
+            )
+
+            record_text = dataset_path.read_text(encoding="utf-8")
+            record = json.loads(record_text)
+            self.assertNotIn("plain-token-value", record_text)
+            self.assertNotIn("plain-password-value", record_text)
+            self.assertNotIn("session-cookie-value", record_text)
+            self.assertEqual(record["rejected"][0]["error"], "")
+            self.assertTrue(record["error"].startswith("redacted_"))
+
+    def test_write_experiences_dataset_redacts_secret_arguments_and_join_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            dataset_path = Path(tmp) / "writer.jsonl"
+            manager = MemoryManager.from_config(
+                config=_config(
+                    Path(tmp) / "memory",
+                    memory_evolver_writer_enabled=True,
+                    memory_evolver_writer_dataset_path=dataset_path,
+                ),
+                llm=FakeLLM(),
+                repo_path=repo,
+            )
+
+            manager.write_experiences_from_run(
+                task="Fix focused pytest failure",
+                run_id="run-1",
+                trace_path=Path(tmp) / "trace-api_key=plain-secret-value.jsonl",
+                outcome="success",
+                source_task="task?api_key=plain-secret-value",
+                stream_id="stream-a",
+                task_type="manifest",
+                tool_history=[
+                    _tool_record(
+                        "run_tests",
+                        ok=True,
+                        arguments={
+                            "api_key": "plain-secret-value",
+                            "token": "plain-token-value",
+                            "password": "plain-password-value",
+                            "cookie": "session-cookie-value",
+                            "secret": "generic-secret-value",
+                            "access_key": "plain-access-key-value",
+                            "nested": {"private_key": "nested-secret-value"},
+                            "command": "pytest tests/test_example.py -q",
+                        },
+                    )
+                ],
+            )
+
+            record_text = dataset_path.read_text(encoding="utf-8")
+            record = json.loads(record_text)
+            self.assertNotIn("plain-secret-value", record_text)
+            self.assertNotIn("nested-secret-value", record_text)
+            self.assertNotIn("plain-token-value", record_text)
+            self.assertNotIn("plain-password-value", record_text)
+            self.assertNotIn("session-cookie-value", record_text)
+            self.assertNotIn("generic-secret-value", record_text)
+            self.assertNotIn("plain-access-key-value", record_text)
+            self.assertTrue(record["source_task"].startswith("redacted_"))
+            self.assertTrue(record["task_id"].startswith("redacted_"))
+            self.assertTrue(record["trace_path"].startswith("redacted_"))
+            self.assertEqual(record["steps"][0]["arguments"]["command"], "pytest tests/test_example.py -q")
+            self.assertTrue(any(key.startswith("redacted_") for key in record["steps"][0]["arguments"]))
+            self.assertTrue(any(key.startswith("redacted_") for key in record["steps"][0]["arguments"]["nested"]))
+
     def test_write_experiences_reserved_metadata_fields_override_proposal_metadata(self) -> None:
         long_key = "k" * 2_000
 

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import tempfile
 import unittest
+from pathlib import Path
 
 from tests._path import add_src_to_path
 
@@ -14,6 +16,7 @@ from my_agent.memory.evolver import (
     ExperienceWriteRequest,
     ExperienceWriteStep,
     ExperienceWriter,
+    MemoryWriterDatasetLogger,
     build_write_steps_from_tool_history,
     runtime_outcome_from_tool_records,
 )
@@ -344,6 +347,18 @@ class EvolverWriterTests(unittest.TestCase):
         self.assertNotEqual(step["output"], long_result)
         self.assertLessEqual(len(step["result"]), 240)
         self.assertLessEqual(len(step["output"]), 240)
+
+    def test_writer_dataset_logger_creates_parent_and_appends_jsonl(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "nested" / "writer.jsonl"
+            logger = MemoryWriterDatasetLogger(path)
+
+            logger.append({"run_id": "run-1", "schema_version": 1})
+            logger.append({"run_id": "run-2", "schema_version": 1})
+
+            rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual([row["run_id"] for row in rows], ["run-1", "run-2"])
+            self.assertEqual(rows[0]["schema_version"], 1)
 
 
 def _request(
