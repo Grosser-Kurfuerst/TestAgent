@@ -105,6 +105,15 @@ class ExperienceWriter:
         self.max_input_chars = max(0, int(max_input_chars))
         self.max_content_chars = max(0, int(max_content_chars))
 
+    def propose(self, request: ExperienceWriteRequest, *, mode: str = "fallback") -> ExperienceWriteResult:
+        raw_proposals = self._fallback_proposals(request)
+        proposals, rejected = self.validate_proposals(raw_proposals)
+        return ExperienceWriteResult(
+            proposals=proposals,
+            rejected=rejected,
+            fallback_used=True,
+        )
+
     def validate_proposals(
         self, proposals: Sequence[ExperienceWriteProposal]
     ) -> tuple[tuple[ExperienceWriteProposal, ...], tuple[dict[str, Any], ...]]:
@@ -159,6 +168,121 @@ class ExperienceWriter:
         )
         return True, "", normalized
 
+    def _fallback_proposals(self, request: ExperienceWriteRequest) -> tuple[ExperienceWriteProposal, ...]:
+        if request.outcome == "success":
+            return self._success_fallback(request)
+        if request.outcome == "failure":
+            return self._failure_fallback(request)
+        return self._unknown_fallback(request)
+
+    def _success_fallback(self, request: ExperienceWriteRequest) -> tuple[ExperienceWriteProposal, ...]:
+        proposals: list[ExperienceWriteProposal] = []
+        latest_test = _latest_step(request.steps, "run_tests")
+        if latest_test is not None and latest_test.ok:
+            proposals.append(
+                ExperienceWriteProposal(
+                    tier=ExperienceTier.SKILL,
+                    content=(
+                        "When a coding task reaches a passing focused test, preserve the narrow loop: "
+                        "inspect the failure, patch the smallest relevant path, rerun the exact test, "
+                        "then finish only after the verification result is stable."
+                    ),
+                    confidence=0.80,
+                    metadata={
+                        "category": "debugging",
+                        "technique": "Focused verification loop",
+                        "preconditions": "A focused run_tests command exposes or verifies the behavior.",
+                        "steps": [
+                            "inspect the focused failure or target behavior",
+                            "patch the smallest relevant code path",
+                            "rerun the exact focused test",
+                            "finish only after the focused verification passes",
+                        ],
+                    },
+                    reason="successful run with passing run_tests signal",
+                )
+            )
+        command = _step_command(latest_test) if latest_test is not None else ""
+        if command:
+            proposals.append(
+                ExperienceWriteProposal(
+                    tier=ExperienceTier.TOOL,
+                    content=f"Run the focused project test from the repository root: {command}",
+                    confidence=0.78,
+                    metadata={
+                        "name": "run_focused_tests",
+                        "language": "bash",
+                        "code": command,
+                        "input_description": "Run from the repository root after applying the targeted change.",
+                        "output_description": "Focused test result for the changed behavior.",
+                        "tool_name": "run_tests",
+                        "command": command,
+                    },
+                    reason="successful run_tests command is reusable",
+                )
+            )
+        return tuple(proposals)
+
+    def _failure_fallback(self, request: ExperienceWriteRequest) -> tuple[ExperienceWriteProposal, ...]:
+        latest_test = _latest_step(request.steps, "run_tests")
+        trigger = latest_test.error_code or request.stop_reason or "failed run"
+        proposals: list[ExperienceWriteProposal] = [
+            ExperienceWriteProposal(
+                tier=ExperienceTier.TIP,
+                content=(
+                    f"This run stopped with {request.stop_reason or 'failure'} after the latest "
+                    f"{'run_tests' if latest_test is not None else 'tool'} signal failed. For similar tasks, "
+                    "inspect the last failing assertion or blocked tool result before issuing another patch "
+                    "or broad test command."
+                ),
+                confidence=0.76,
+                metadata={
+                    "category": "debugging",
+                    "severity": "warning",
+                    "trigger": trigger,
+                },
+                reason="failure outcome with actionable next-step guard",
+            )
+        ]
+        if len(request.steps) >= 2:
+            proposals.append(
+                ExperienceWriteProposal(
+                    tier=ExperienceTier.TRAJECTORY,
+                    content=_trajectory_content(request),
+                    confidence=0.72,
+                    metadata={
+                        "task_description": _truncate_text(request.task, DEFAULT_TASK_CHARS),
+                        "steps": [_trajectory_step_payload(step) for step in request.steps],
+                        "outcome": request.outcome,
+                        "total_reward": 0.0,
+                        "key_learnings": ["Inspect the latest failing signal before making the next change."],
+                        "tags": ["failure", "runtime"],
+                    },
+                    reason="failure run with multiple tool steps",
+                )
+            )
+        return tuple(proposals)
+
+    def _unknown_fallback(self, request: ExperienceWriteRequest) -> tuple[ExperienceWriteProposal, ...]:
+        if not request.steps:
+            return ()
+        return (
+            ExperienceWriteProposal(
+                tier=ExperienceTier.TRAJECTORY,
+                content=_trajectory_content(request),
+                confidence=0.60,
+                metadata={
+                    "task_description": _truncate_text(request.task, DEFAULT_TASK_CHARS),
+                    "steps": [_trajectory_step_payload(step) for step in request.steps],
+                    "outcome": request.outcome,
+                    "total_reward": 0.0,
+                    "key_learnings": [],
+                    "tags": ["unknown", "runtime"],
+                },
+                reason="unknown outcome with tool trajectory only",
+            ),
+        )
+
 
 def build_write_steps_from_tool_history(
     tool_history: Sequence[Mapping[str, Any]] | None,
@@ -206,8 +330,54 @@ def runtime_outcome_from_tool_records(
     return "unknown"
 
 
+def proposal_tier_counts(proposals: Sequence[ExperienceWriteProposal]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for proposal in proposals:
+        tier = normalize_experience_tier(proposal.tier)
+        if tier is None:
+            continue
+        counts[tier.value] = counts.get(tier.value, 0) + 1
+    return counts
+
+
 def _mapping(value: Any) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
+
+
+def _latest_step(steps: Sequence[ExperienceWriteStep], tool: str) -> ExperienceWriteStep | None:
+    return next((step for step in reversed(steps) if step.tool == tool), None)
+
+
+def _step_command(step: ExperienceWriteStep | None) -> str:
+    if step is None:
+        return ""
+    command = step.arguments.get("command")
+    if isinstance(command, str) and command.strip():
+        return " ".join(command.split())
+    return ""
+
+
+def _trajectory_content(request: ExperienceWriteRequest) -> str:
+    lines = [
+        f"Task: {_truncate_text(request.task, 200)}",
+        f"Outcome: {request.outcome}",
+        "Key steps:",
+    ]
+    for step in request.steps:
+        status = "ok" if step.ok else "failed"
+        lines.append(f"{step.step_num}. {step.tool} -> {status}")
+    return "\n".join(lines)
+
+
+def _trajectory_step_payload(step: ExperienceWriteStep) -> dict[str, Any]:
+    return {
+        "step_num": step.step_num,
+        "observation": "",
+        "action": step.tool,
+        "action_params": dict(step.arguments),
+        "result": _truncate_text(step.output, 240),
+        "reward": 1.0 if step.ok else 0.0,
+    }
 
 
 def _safe_float(value: Any) -> float | None:
@@ -225,7 +395,9 @@ def _truncate_text(text: str, max_chars: int) -> str:
         return ""
     if len(text) <= max_chars:
         return text
-    return text[: max(0, max_chars - 1)].rstrip() + "..."
+    if max_chars <= 3:
+        return "." * max_chars
+    return text[: max_chars - 3].rstrip() + "..."
 
 
 def _content_fingerprint(content: str) -> str:
@@ -246,5 +418,6 @@ __all__ = [
     "ExperienceWriteStep",
     "ExperienceWriter",
     "build_write_steps_from_tool_history",
+    "proposal_tier_counts",
     "runtime_outcome_from_tool_records",
 ]

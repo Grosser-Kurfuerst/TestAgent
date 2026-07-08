@@ -9,6 +9,8 @@ add_src_to_path()
 from my_agent.memory.evolver import (
     ExperienceTier,
     ExperienceWriteProposal,
+    ExperienceWriteRequest,
+    ExperienceWriteStep,
     ExperienceWriter,
     build_write_steps_from_tool_history,
     runtime_outcome_from_tool_records,
@@ -40,7 +42,7 @@ class EvolverWriterTests(unittest.TestCase):
         self.assertEqual(steps[0].tool, "run_tests")
         self.assertEqual(steps[0].arguments["command"], "pytest tests/test_example.py -q")
         self.assertTrue(steps[0].ok)
-        self.assertEqual(steps[0].output, "xxxxxxxxx...")
+        self.assertEqual(steps[0].output, "xxxxxxx...")
 
     def test_runtime_outcome_from_tool_records_is_unknown_for_finish_without_tests(self) -> None:
         self.assertEqual(
@@ -79,7 +81,7 @@ class EvolverWriterTests(unittest.TestCase):
 
         self.assertEqual(len(accepted), 1)
         self.assertEqual(accepted[0].tier, ExperienceTier.SKILL)
-        self.assertEqual(accepted[0].content, "Reusable loop for f...")
+        self.assertEqual(accepted[0].content, "Reusable loop for...")
         self.assertEqual([item["reason"] for item in rejected], ["duplicate_proposal", "low_confidence"])
 
     def test_validate_proposals_respects_zero_max_records(self) -> None:
@@ -101,6 +103,72 @@ class EvolverWriterTests(unittest.TestCase):
 
         self.assertEqual(accepted, ())
         self.assertEqual(rejected[0]["reason"], "empty_content")
+
+    def test_fallback_success_proposes_skill_and_tool_from_passing_tests(self) -> None:
+        request = _request(
+            outcome="success",
+            steps=(
+                ExperienceWriteStep(
+                    step_num=1,
+                    tool="run_tests",
+                    arguments={"command": "pytest tests/test_example.py -q"},
+                    ok=True,
+                    output="passed",
+                ),
+            ),
+        )
+
+        result = ExperienceWriter().propose(request)
+
+        self.assertTrue(result.fallback_used)
+        self.assertEqual([proposal.tier for proposal in result.proposals], [ExperienceTier.SKILL, ExperienceTier.TOOL])
+        self.assertEqual(result.proposals[1].metadata["command"], "pytest tests/test_example.py -q")
+
+    def test_fallback_failure_proposes_tip_and_trajectory(self) -> None:
+        request = _request(
+            outcome="failure",
+            stop_reason="max_steps_reached",
+            steps=(
+                ExperienceWriteStep(step_num=1, tool="read_file", ok=True, output="code"),
+                ExperienceWriteStep(step_num=2, tool="run_tests", ok=False, output="failed", error_code="failed"),
+            ),
+        )
+
+        result = ExperienceWriter().propose(request)
+
+        self.assertEqual([proposal.tier for proposal in result.proposals], [ExperienceTier.TIP, ExperienceTier.TRAJECTORY])
+        self.assertEqual(result.proposals[1].metadata["outcome"], "failure")
+
+    def test_fallback_unknown_trajectory_is_low_confidence_by_default(self) -> None:
+        request = _request(
+            outcome="unknown",
+            steps=(ExperienceWriteStep(step_num=1, tool="read_file", ok=True, output="code"),),
+        )
+
+        result = ExperienceWriter().propose(request)
+
+        self.assertEqual(result.proposals, ())
+        self.assertEqual(result.rejected[0]["reason"], "low_confidence")
+
+def _request(
+    *,
+    outcome: str,
+    stop_reason: str = "finish_called",
+    steps: tuple[ExperienceWriteStep, ...] = (),
+) -> ExperienceWriteRequest:
+    return ExperienceWriteRequest(
+        task="Fix a failing pytest regression",
+        run_id="run-1",
+        trace_path=None,
+        stop_reason=stop_reason,
+        outcome=outcome,
+        outcome_source="runtime",
+        steps=steps,
+        source_task="task-1",
+        stream_id="stream-a",
+        task_type="manifest",
+        project_key="stream:a",
+    )
 
 
 if __name__ == "__main__":

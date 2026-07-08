@@ -104,6 +104,20 @@ def _tool_call(name: str, call_id: str, arguments: dict[str, object] | None = No
     )
 
 
+def _tool_record(
+    tool: str,
+    *,
+    ok: bool,
+    output: str = "",
+    reason: str = "",
+    arguments: dict[str, object] | None = None,
+) -> dict[str, object]:
+    return {
+        "call": {"tool": tool, "arguments": arguments or {"command": "pytest tests/test_example.py -q"}},
+        "result": {"ok": ok, "output": output or ("passed" if ok else "failed"), "reason": reason},
+    }
+
+
 def _append_turn(manager: MemoryManager, index: int, *, payload: str = "") -> None:
     suffix = f" {payload}" if payload else ""
     manager.append_user_message(f"user turn {index}{suffix}")
@@ -450,6 +464,183 @@ class MemoryManagerSaveExperienceTests(unittest.TestCase):
             self.assertEqual(entry.run_id, "run-noop")
             self.assertFalse((Path(config.memory_dir) / "long_term_memory.jsonl").exists())
             self.assertNotIn("memory.evolver_saved", [event for event, _ in traces])
+
+    def test_write_experiences_disabled_does_not_write_or_trace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            traces: list[tuple[str, dict[str, object]]] = []
+            config = _config(Path(tmp) / "memory")
+            manager = MemoryManager.from_config(
+                config=config,
+                llm=FakeLLM(),
+                repo_path=repo,
+                trace_sink=lambda event, payload: traces.append((event, payload)),
+            )
+
+            result = manager.write_experiences_from_run(
+                task="Fix focused pytest failure",
+                run_id="run-1",
+                stop_reason="finish_called",
+                outcome="success",
+                tool_history=[_tool_record("run_tests", ok=True)],
+            )
+
+            self.assertEqual(result.saved, ())
+            self.assertEqual([event for event, _ in traces if event.startswith("memory.evolver_writer")], [])
+            self.assertFalse((Path(config.memory_dir) / "long_term_memory.jsonl").exists())
+
+    def test_write_experiences_success_saves_writer_skill_and_tool_with_trace_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            traces: list[tuple[str, dict[str, object]]] = []
+            config = _config(
+                Path(tmp) / "memory",
+                memory_evolver_writer_enabled=True,
+                memory_project_key="stream:a",
+            )
+            manager = MemoryManager.from_config(
+                config=config,
+                llm=FakeLLM(),
+                repo_path=repo,
+                trace_sink=lambda event, payload: traces.append((event, payload)),
+            )
+
+            result = manager.write_experiences_from_run(
+                task="Fix focused pytest failure",
+                run_id="run-1",
+                trace_path=Path(tmp) / "trace.jsonl",
+                stop_reason="finish_called",
+                outcome="success",
+                outcome_source="runtime",
+                source_task="manifest-task-1",
+                stream_id="stream-a",
+                task_type="manifest",
+                tool_history=[_tool_record("run_tests", ok=True)],
+            )
+
+            self.assertEqual({entry.metadata["evolver_tier"] for entry in result.saved}, {"skill", "tool"})
+            entry = result.saved[0]
+            self.assertEqual(entry.metadata["created_by"], "writer")
+            self.assertEqual(entry.metadata["confidence"], 0.8)
+            self.assertEqual(entry.metadata["outcome"], "success")
+            self.assertEqual(entry.metadata["outcome_source"], "runtime")
+            self.assertEqual(entry.metadata["source_task"], "manifest-task-1")
+            self.assertEqual(entry.metadata["stream_id"], "stream-a")
+            self.assertEqual(entry.metadata["task_type"], "manifest")
+            self.assertEqual(entry.metadata["memory_project_key"], "stream:a")
+            self.assertEqual(entry.metadata["writer_policy"], "fallback_runtime_v1")
+            self.assertEqual(entry.run_id, "run-1")
+
+            events = [event for event, _ in traces]
+            self.assertIn("memory.evolver_writer_started", events)
+            self.assertIn("memory.evolver_writer_proposed", events)
+            self.assertIn("memory.evolver_writer_saved", events)
+            saved_payload = [payload for event, payload in traces if event == "memory.evolver_writer_saved"][-1]
+            self.assertEqual(saved_payload["saved_count"], 2)
+            self.assertEqual(saved_payload["memory_project_key"], "stream:a")
+            self.assertEqual(saved_payload["source_task"], "manifest-task-1")
+            self.assertEqual(saved_payload["saved_records"][0]["tier"], "skill")
+
+    def test_write_experiences_failure_saves_tip_and_trajectory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            manager = MemoryManager.from_config(
+                config=_config(Path(tmp) / "memory", memory_evolver_writer_enabled=True),
+                llm=FakeLLM(),
+                repo_path=repo,
+            )
+
+            result = manager.write_experiences_from_run(
+                task="Fix focused pytest failure",
+                run_id="run-1",
+                stop_reason="max_steps_reached",
+                outcome="failure",
+                tool_history=[
+                    _tool_record("read_file", ok=True, output="code"),
+                    _tool_record("run_tests", ok=False, output="failed", reason="failed"),
+                ],
+            )
+
+            self.assertEqual({entry.metadata["evolver_tier"] for entry in result.saved}, {"tip", "trajectory"})
+
+    def test_write_experiences_duplicate_content_is_reported_without_new_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            manager = MemoryManager.from_config(
+                config=_config(Path(tmp) / "memory", memory_evolver_writer_enabled=True),
+                llm=FakeLLM(),
+                repo_path=repo,
+            )
+            kwargs = {
+                "task": "Fix focused pytest failure",
+                "run_id": "run-1",
+                "stop_reason": "finish_called",
+                "outcome": "success",
+                "tool_history": [_tool_record("run_tests", ok=True)],
+            }
+
+            first = manager.write_experiences_from_run(**kwargs)
+            second = manager.write_experiences_from_run(**kwargs)
+
+            self.assertEqual(len(first.saved), 2)
+            self.assertEqual(second.saved, ())
+            self.assertEqual(len(second.duplicate_ids), 2)
+
+    def test_write_experiences_writer_exception_traces_failure_without_raising(self) -> None:
+        class BrokenWriter:
+            def propose(self, *_: object, **__: object) -> object:
+                raise RuntimeError("writer exploded")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            traces: list[tuple[str, dict[str, object]]] = []
+            manager = MemoryManager.from_config(
+                config=_config(Path(tmp) / "memory", memory_evolver_writer_enabled=True),
+                llm=FakeLLM(),
+                repo_path=repo,
+                trace_sink=lambda event, payload: traces.append((event, payload)),
+            )
+            manager.evolver_writer = BrokenWriter()  # type: ignore[assignment]
+
+            result = manager.write_experiences_from_run(
+                task="Fix focused pytest failure",
+                run_id="run-1",
+                outcome="success",
+                tool_history=[_tool_record("run_tests", ok=True)],
+            )
+
+            self.assertIn("writer exploded", result.error)
+            failed = [payload for event, payload in traces if event == "memory.evolver_writer_failed"][-1]
+            self.assertIn("RuntimeError", failed["error"])
+            self.assertEqual(failed["phase"], "unknown")
+
+    def test_noop_write_experiences_returns_empty_result_without_writing_or_tracing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            traces: list[tuple[str, dict[str, object]]] = []
+            config = _config(Path(tmp) / "memory", memory_evolver_writer_enabled=True)
+            manager = NoopMemoryManager(
+                config=config,
+                repo_path=repo,
+                trace_sink=lambda event, payload: traces.append((event, payload)),
+            )
+
+            result = manager.write_experiences_from_run(
+                task="Fix focused pytest failure",
+                run_id="run-1",
+                outcome="success",
+                tool_history=[_tool_record("run_tests", ok=True)],
+            )
+
+            self.assertEqual(result.saved, ())
+            self.assertEqual(traces, [])
+            self.assertFalse((Path(config.memory_dir) / "long_term_memory.jsonl").exists())
 
 
 class MemoryManagerEvolverContextTests(unittest.TestCase):

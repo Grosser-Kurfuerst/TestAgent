@@ -32,6 +32,7 @@ from my_agent.memory.evolver.writer import (
     ExperienceWriteStep,
     ExperienceWriter,
     build_write_steps_from_tool_history,
+    proposal_tier_counts,
     runtime_outcome_from_tool_records,
 )
 
@@ -59,6 +60,7 @@ __all__ = [
     "experience_tier",
     "is_experience_entry",
     "normalize_experience_tier",
+    "proposal_tier_counts",
     "render_selected_experiences",
     "runtime_outcome_from_tool_records",
     "selection_candidate_summary",

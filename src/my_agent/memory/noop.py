@@ -8,7 +8,7 @@ from uuid import uuid4
 from my_agent.config import AgentConfig
 from my_agent.context import ContextProfile
 from my_agent.llm.types import ChatResponse, MessageLike
-from my_agent.memory.evolver import ExperienceCreatedBy, ExperienceTier, build_experience_entry
+from my_agent.memory.evolver import ExperienceCreatedBy, ExperienceTier, ExperienceWriteResult, build_experience_entry
 from my_agent.memory.types import MemoryContext, MemoryEntry, MemoryScope, MemoryStatus, MemoryType
 
 
@@ -107,6 +107,9 @@ class NoopMemoryManager:
             extra_metadata=metadata,
         )
         return entry, False
+
+    def write_experiences_from_run(self, **_: Any) -> ExperienceWriteResult:
+        return ExperienceWriteResult()
 
     def append_summary(
         self,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -12,11 +13,16 @@ from my_agent.llm.types import ChatResponse, LLMToolCall, Message, MessageLike, 
 from my_agent.memory.compression import MemoryCompressor
 from my_agent.memory.evolver import (
     ExperienceCreatedBy,
+    ExperienceWriteRequest,
+    ExperienceWriteResult,
+    ExperienceWriter,
     ExperienceSelector,
     ExperienceTier,
     SelectionResult,
     build_experience_entry,
+    build_write_steps_from_tool_history,
     candidate_tier,
+    proposal_tier_counts,
     selection_candidate_summary,
     selection_tier_counts,
 )
@@ -85,6 +91,13 @@ class MemoryManager:
             tier_caps=self.config.memory_evolver_tier_caps,
             selected_max_items=self.config.memory_evolver_selected_max_items,
             min_score=self.config.memory_evolver_min_score,
+        )
+        self.evolver_writer = ExperienceWriter(
+            llm=self.llm,
+            min_confidence=self.config.memory_evolver_writer_min_confidence,
+            max_records=self.config.memory_evolver_writer_max_records,
+            max_input_chars=self.config.memory_evolver_writer_max_input_chars,
+            max_content_chars=self.config.memory_evolver_writer_max_content_chars,
         )
         self.last_evolver_selection: SelectionResult | None = None
 
@@ -625,6 +638,153 @@ class MemoryManager:
             entries = [entry for entry in entries if entry.run_id == run_id]
         return self._extract_and_store_facts(entries, reason=reason, run_id=run_id)
 
+    def write_experiences_from_run(
+        self,
+        *,
+        task: str,
+        run_id: str,
+        trace_path: str | Path | None = None,
+        stop_reason: str = "",
+        final_answer: str = "",
+        tool_history: list[dict[str, Any]] | None = None,
+        outcome: str = "unknown",
+        outcome_source: str = "runtime",
+        source_task: str = "",
+        stream_id: str = "",
+        task_type: str = "",
+    ) -> ExperienceWriteResult:
+        if not self.config.memory_evolver_writer_enabled:
+            return ExperienceWriteResult()
+
+        steps = build_write_steps_from_tool_history(
+            tool_history,
+            max_output_chars=min(1_000, max(0, self.config.memory_evolver_writer_max_input_chars)),
+        )
+        resolved_source_task = str(source_task or "").strip() or _task_ref(task)
+        selected_ids = _selection_selected_ids(self.last_evolver_selection)
+        candidate_ids = _selection_candidate_ids(self.last_evolver_selection)
+        request = ExperienceWriteRequest(
+            task=str(task or ""),
+            run_id=str(run_id or ""),
+            trace_path=Path(trace_path) if trace_path is not None else None,
+            stop_reason=str(stop_reason or ""),
+            outcome=str(outcome or "unknown"),
+            outcome_source=str(outcome_source or "runtime"),
+            final_answer=str(final_answer or ""),
+            selected_memory_ids=selected_ids,
+            candidate_memory_ids=candidate_ids,
+            steps=steps,
+            source_task=resolved_source_task,
+            stream_id=str(stream_id or ""),
+            task_type=str(task_type or ""),
+            project_key=self.project_key,
+        )
+        context_payload = _writer_context_payload(request)
+        try:
+            self._trace(
+                "memory.evolver_writer_started",
+                {
+                    **context_payload,
+                    "mode": self.config.memory_evolver_writer_mode,
+                    "task_chars": len(request.task),
+                    "tool_steps": len(request.steps),
+                    "outcome": request.outcome,
+                    "outcome_source": request.outcome_source,
+                    "selected_count": len(request.selected_memory_ids),
+                    "candidate_count": len(request.candidate_memory_ids),
+                },
+            )
+            proposed = self.evolver_writer.propose(request, mode=self.config.memory_evolver_writer_mode)
+            self._trace(
+                "memory.evolver_writer_proposed",
+                {
+                    "proposal_count": len(proposed.proposals),
+                    "tiers": proposal_tier_counts(proposed.proposals),
+                    "llm_used": proposed.llm_used,
+                    "fallback_used": proposed.fallback_used,
+                    "rejected_count": len(proposed.rejected),
+                    "rejected_reasons": _rejected_reason_counts(proposed.rejected),
+                },
+            )
+            if not proposed.proposals:
+                self._trace(
+                    "memory.evolver_writer_skipped",
+                    {
+                        **context_payload,
+                        "reason": "no_valid_proposals",
+                        "outcome": request.outcome,
+                        "tool_steps": len(request.steps),
+                    },
+                )
+                return proposed
+
+            saved: list[MemoryEntry] = []
+            duplicate_ids: list[str] = []
+            for proposal in proposed.proposals:
+                metadata = {
+                    "confidence": proposal.confidence,
+                    "outcome": request.outcome,
+                    "outcome_source": request.outcome_source,
+                    "stop_reason": request.stop_reason,
+                    "source_trace": str(request.trace_path or ""),
+                    "source_task": request.source_task,
+                    "task_type": request.task_type,
+                    "selected_memory_ids": list(request.selected_memory_ids),
+                    "candidate_memory_ids": list(request.candidate_memory_ids),
+                    "stream_id": request.stream_id,
+                    "memory_project_key": request.project_key,
+                    "writer_policy": "fallback_runtime_v1",
+                    "writer_reason": proposal.reason,
+                    **proposal.metadata,
+                }
+                entry, created = self.save_experience(
+                    proposal.content,
+                    tier=proposal.tier,
+                    source_task=request.source_task,
+                    created_by=ExperienceCreatedBy.WRITER,
+                    run_id=request.run_id,
+                    metadata=metadata,
+                )
+                if created:
+                    saved.append(entry)
+                else:
+                    duplicate_ids.append(entry.id)
+
+            result = ExperienceWriteResult(
+                proposals=proposed.proposals,
+                saved=tuple(saved),
+                duplicate_ids=tuple(duplicate_ids),
+                rejected=proposed.rejected,
+                llm_used=proposed.llm_used,
+                fallback_used=proposed.fallback_used,
+            )
+            saved_records = _saved_records(saved)
+            self._trace(
+                "memory.evolver_writer_saved",
+                {
+                    **context_payload,
+                    "saved_count": len(saved),
+                    "duplicate_count": len(duplicate_ids),
+                    "saved_ids": [entry.id for entry in saved],
+                    "saved_records": saved_records,
+                    "tiers": _saved_tier_counts(saved),
+                    "writer_policy": "fallback_runtime_v1",
+                },
+            )
+            return result
+        except Exception as exc:  # noqa: BLE001 - writer must not affect the agent loop
+            error = f"{type(exc).__name__}: {exc}"
+            self._trace(
+                "memory.evolver_writer_failed",
+                {
+                    **context_payload,
+                    "error": error,
+                    "phase": "unknown",
+                    "fallback_attempted": True,
+                },
+            )
+            return ExperienceWriteResult(error=error)
+
     def fork_for_task(self, *, session_id: str, run_id: str = "") -> "MemoryManager":
         return MemoryManager(
             config=self.config,
@@ -825,6 +985,59 @@ class MemoryManager:
             self._trace_sink(event, payload)
         except Exception:
             pass
+
+
+def _task_ref(task: str) -> str:
+    return f"task_ref_{hashlib.sha256(str(task or '').encode('utf-8')).hexdigest()[:12]}"
+
+
+def _selection_candidate_ids(selection: SelectionResult | None) -> tuple[str, ...]:
+    if selection is None:
+        return ()
+    return tuple(candidate.id for candidate in selection.candidates)
+
+
+def _selection_selected_ids(selection: SelectionResult | None) -> tuple[str, ...]:
+    if selection is None:
+        return ()
+    return tuple(item.candidate.id for item in selection.selected)
+
+
+def _writer_context_payload(request: ExperienceWriteRequest) -> dict[str, Any]:
+    return {
+        "source_task": request.source_task,
+        "stream_id": request.stream_id,
+        "task_type": request.task_type,
+        "memory_project_key": request.project_key,
+    }
+
+
+def _rejected_reason_counts(rejected: tuple[dict[str, Any], ...]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for item in rejected:
+        reason = str(item.get("reason") or "unknown")
+        counts[reason] = counts.get(reason, 0) + 1
+    return counts
+
+
+def _saved_records(entries: list[MemoryEntry]) -> list[dict[str, str]]:
+    return [
+        {
+            "id": entry.id,
+            "tier": str(entry.metadata.get("evolver_tier") or ""),
+        }
+        for entry in entries
+    ]
+
+
+def _saved_tier_counts(entries: list[MemoryEntry]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for entry in entries:
+        tier = str(entry.metadata.get("evolver_tier") or "")
+        if not tier:
+            continue
+        counts[tier] = counts.get(tier, 0) + 1
+    return counts
 
 
 def _new_id(prefix: str) -> str:
