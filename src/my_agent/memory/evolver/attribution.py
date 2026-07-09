@@ -13,6 +13,7 @@ byte-stable JSONL, with output sorted by ``memory_id``.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from math import sqrt
 from pathlib import Path
 from statistics import mean
@@ -20,9 +21,10 @@ from typing import Any, Mapping, Sequence
 import json
 import warnings
 
+from my_agent.memory.long_term import LongTermMemoryStore
 from my_agent.memory.evolver.types import experience_tier
 from my_agent.memory.evolver.usage_log import UsageLogEntry
-from my_agent.memory.types import MemoryEntry
+from my_agent.memory.types import MemoryEntry, MemoryScope
 from my_agent.text_safety import sanitize_json_value
 
 
@@ -116,6 +118,28 @@ class MemoryAttributionRecord:
         )
 
 
+@dataclass(frozen=True)
+class AttributionWriteBackSummary:
+    """Counters from writing attribution values back into long-term memory."""
+
+    attempted: int = 0
+    updated: int = 0
+    skipped_missing: int = 0
+    skipped_by_project_key: int = 0
+    skipped_tier_mismatch: int = 0
+    skipped_low_evidence: int = 0
+
+    def to_dict(self) -> dict[str, int]:
+        return {
+            "attempted": int(self.attempted),
+            "updated": int(self.updated),
+            "skipped_missing": int(self.skipped_missing),
+            "skipped_by_project_key": int(self.skipped_by_project_key),
+            "skipped_tier_mismatch": int(self.skipped_tier_mismatch),
+            "skipped_low_evidence": int(self.skipped_low_evidence),
+        }
+
+
 def _maybe_round(value: float | None) -> float | None:
     return round(value, 6) if value is not None else None
 
@@ -185,24 +209,25 @@ def score_memory(
 
     confidence = _confidence(cfg, selected_count)
 
-    # Compute per-task-type contributions only when both selected and
-    # not-selected evidence exist in that task_type and meet min counts.
-    by_task_type = _group_logs_by_task_type(pool_all)
     contributions: list[float] = []
     used_task_types: list[str] = []
-    for task_type, logs in sorted(by_task_type.items()):
-        sel = [log for log in logs if memory_id in log.all_selected_ids()]
-        nsel = [log for log in logs if memory_id not in log.all_selected_ids()]
-        if len(sel) < cfg.min_selected_count or len(nsel) < cfg.min_not_selected_count:
-            continue
-        if len(logs) == 0:
-            continue
-        pool_reward = mean([float(log.env_reward) for log in logs])
-        sel_reward = mean([float(log.env_reward) for log in sel])
-        delta = sel_reward - pool_reward
-        weight = len(sel) / len(logs)
-        contributions.append(delta * weight)
-        used_task_types.append(task_type)
+    if candidate_count >= cfg.min_candidate_count:
+        # Compute per-task-type contributions only when both selected and
+        # not-selected evidence exist in that task_type and meet min counts.
+        by_task_type = _group_logs_by_task_type(pool_all)
+        for task_type, logs in sorted(by_task_type.items()):
+            sel = [log for log in logs if memory_id in log.all_selected_ids()]
+            nsel = [log for log in logs if memory_id not in log.all_selected_ids()]
+            if len(sel) < cfg.min_selected_count or len(nsel) < cfg.min_not_selected_count:
+                continue
+            if len(logs) == 0:
+                continue
+            pool_reward = mean([float(log.env_reward) for log in logs])
+            sel_reward = mean([float(log.env_reward) for log in sel])
+            delta = sel_reward - pool_reward
+            weight = len(sel) / len(logs)
+            contributions.append(delta * weight)
+            used_task_types.append(task_type)
 
     raw_value = mean(contributions) if contributions else 0.0
     value = tier_weight * raw_value * confidence
@@ -344,12 +369,188 @@ def load_attribution_jsonl(path: str | Path) -> dict[str, MemoryAttributionRecor
     return records
 
 
+def attribution_metadata(
+    record: MemoryAttributionRecord,
+    *,
+    updated_at: str | None = None,
+    value: float | None = None,
+) -> dict[str, Any]:
+    """Metadata fragment written onto a memory entry for selector scoring."""
+    stamp = updated_at if updated_at is not None else datetime.now(timezone.utc).isoformat()
+    stored_value = float(record.value if value is None else value)
+    return {
+        "evolver_value": round(stored_value, 6),
+        "evolver_confidence": round(float(record.confidence), 6),
+        "evolver_attribution_version": 1,
+        "evolver_attribution_updated_at": str(stamp or ""),
+        "evolver_attribution_memory_project_key": str(record.memory_project_key or ""),
+        "evolver_candidate_count": int(record.candidate_count),
+        "evolver_selected_count": int(record.selected_count),
+        "evolver_not_selected_count": int(record.not_selected_count),
+        "evolver_success_when_selected": _maybe_round(record.success_when_selected),
+        "evolver_success_when_candidate_not_selected": _maybe_round(record.success_when_candidate_not_selected),
+        "evolver_reward_when_selected": _maybe_round(record.reward_when_selected),
+        "evolver_reward_when_candidate_not_selected": _maybe_round(record.reward_when_candidate_not_selected),
+        "evolver_attribution_task_types": list(record.task_types),
+        "evolver_attribution_stream_ids": list(record.stream_ids),
+    }
+
+
+def write_back_attribution(
+    *,
+    store: LongTermMemoryStore,
+    records: Sequence[MemoryAttributionRecord],
+    project_key: str | None = None,
+    all_projects: bool = False,
+    min_abs_value_to_write: float = 0.01,
+    min_candidate_count: int = 2,
+    updated_at: str | None = None,
+) -> AttributionWriteBackSummary:
+    """Write attribution metadata back through ``LongTermMemoryStore``.
+
+    The update is intentionally narrow: only metadata is changed, and the store
+    enforces rollback on persistence errors. Unless ``all_projects`` is true,
+    each record is restricted to the requested ``project_key`` or to the
+    record's own ``memory_project_key``.
+    """
+    attempted = 0
+    updated = 0
+    skipped_missing = 0
+    skipped_by_project_key = 0
+    skipped_tier_mismatch = 0
+    skipped_low_evidence = 0
+
+    all_entries = {entry.id: entry for entry in store.all(project_key=None)}
+    for record in records:
+        attempted += 1
+
+        entry = all_entries.get(record.memory_id)
+        if entry is None:
+            skipped_missing += 1
+            continue
+
+        target_project_key = _record_project_key(project_key, record)
+        if not all_projects and target_project_key is not None and not _entry_visible_to_project(entry, target_project_key):
+            skipped_by_project_key += 1
+            continue
+
+        tier = experience_tier(entry)
+        if tier is None or tier.value != record.tier:
+            skipped_tier_mismatch += 1
+            continue
+
+        value_to_write = float(record.value)
+        if record.candidate_count < int(min_candidate_count) or abs(value_to_write) < float(min_abs_value_to_write):
+            value_to_write = 0.0
+            skipped_low_evidence += 1
+
+        changed = store.update_metadata_by_id(
+            record.memory_id,
+            attribution_metadata(record, updated_at=updated_at, value=value_to_write),
+            project_key=target_project_key,
+            expected_tier=record.tier,
+            all_projects=all_projects,
+        )
+        if changed:
+            updated += 1
+            refreshed = store.all(project_key=None)
+            all_entries = {item.id: item for item in refreshed}
+        else:
+            skipped_missing += 1
+
+    return AttributionWriteBackSummary(
+        attempted=attempted,
+        updated=updated,
+        skipped_missing=skipped_missing,
+        skipped_by_project_key=skipped_by_project_key,
+        skipped_tier_mismatch=skipped_tier_mismatch,
+        skipped_low_evidence=skipped_low_evidence,
+    )
+
+
+def attribution_summary(
+    records: Sequence[MemoryAttributionRecord],
+    *,
+    output: str | Path = "",
+    top_n: int = 5,
+    write_back: AttributionWriteBackSummary | None = None,
+) -> dict[str, Any]:
+    """Build the CLI / summary.json payload for attribution scoring."""
+    ordered = sorted(records, key=lambda r: r.memory_id)
+    positives = [r for r in ordered if r.value > 0]
+    negatives = [r for r in ordered if r.value < 0]
+    zero = [r for r in ordered if r.value == 0]
+    top = sorted(ordered, key=lambda r: (-r.value, r.memory_id))[: max(0, int(top_n))]
+    bottom = sorted(ordered, key=lambda r: (r.value, r.memory_id))[: max(0, int(top_n))]
+    payload: dict[str, Any] = {
+        "output": str(output or ""),
+        "records": len(ordered),
+        "positive": len(positives),
+        "negative": len(negatives),
+        "zero": len(zero),
+        "skipped_low_evidence": sum(
+            1
+            for r in ordered
+            if r.value == 0.0 and (r.candidate_count < 2 or r.selected_count == 0 or r.not_selected_count == 0)
+        ),
+        "top": [_summary_item(r) for r in top],
+        "bottom": [_summary_item(r) for r in bottom],
+    }
+    if write_back is not None:
+        payload["write_back_updated"] = write_back.updated
+        payload["write_back"] = write_back.to_dict()
+    else:
+        payload["write_back_updated"] = 0
+    return sanitize_json_value(payload)  # type: ignore[return-value]
+
+
+def render_attribution_summary(summary: Mapping[str, Any]) -> str:
+    return (
+        f"Attribution records: {int(summary.get('records') or 0)} "
+        f"(positive={int(summary.get('positive') or 0)}, "
+        f"negative={int(summary.get('negative') or 0)}, "
+        f"zero={int(summary.get('zero') or 0)})\n"
+        f"Output: {summary.get('output') or ''}\n"
+        f"Write-back updated: {int(summary.get('write_back_updated') or 0)}"
+    )
+
+
+def _record_project_key(project_key: str | None, record: MemoryAttributionRecord) -> str | None:
+    if project_key is not None:
+        return project_key
+    if record.memory_project_key:
+        return record.memory_project_key
+    return None
+
+
+def _entry_visible_to_project(entry: MemoryEntry, project_key: str) -> bool:
+    if entry.scope == MemoryScope.GLOBAL:
+        return True
+    return bool(project_key) and entry.project_key == project_key
+
+
+def _summary_item(record: MemoryAttributionRecord) -> dict[str, Any]:
+    return {
+        "memory_id": record.memory_id,
+        "tier": record.tier,
+        "value": round(float(record.value), 6),
+        "confidence": round(float(record.confidence), 6),
+        "candidate_count": int(record.candidate_count),
+        "selected_count": int(record.selected_count),
+    }
+
+
 __all__ = [
     "AttributionConfig",
+    "AttributionWriteBackSummary",
     "DEFAULT_TIER_WEIGHTS",
     "MemoryAttributionRecord",
+    "attribution_metadata",
+    "attribution_summary",
     "load_attribution_jsonl",
+    "render_attribution_summary",
     "score_all_memories",
     "score_memory",
+    "write_back_attribution",
     "write_attribution_jsonl",
 ]

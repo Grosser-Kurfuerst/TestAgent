@@ -29,6 +29,7 @@ from my_agent.memory.evolver import (
     selection_tier_counts,
     writer_policy_for_result,
 )
+from my_agent.memory.evolver.attribution import MemoryAttributionRecord, attribution_metadata
 from my_agent.memory.long_term import LongTermMemoryStore, STORAGE_FILE
 from my_agent.memory.retrieval import MemoryRetriever
 from my_agent.memory.short_term import ShortTermMemory
@@ -338,6 +339,15 @@ class MemoryManager:
             },
         )
         return stored, created
+
+    def update_experience_attribution(self, record: MemoryAttributionRecord) -> bool:
+        """Write one attribution record onto a visible experience memory."""
+        return self.long_term.update_metadata_by_id(
+            record.memory_id,
+            attribution_metadata(record),
+            project_key=self.project_key,
+            expected_tier=record.tier,
+        )
 
     def append_summary(
         self,

@@ -211,6 +211,22 @@ class EvolverSelectorTests(unittest.TestCase):
             selection_score(normal, ExperienceTier.TIP, normal.entry.metadata, tier_weights={"tip": 1.0}),
         )
 
+    def test_evolver_confidence_zero_is_not_defaulted_to_one(self) -> None:
+        hit = _hit(
+            _experience(
+                "lowconf",
+                "pytest low confidence",
+                ExperienceTier.TIP,
+                extra={"evolver_value": 0.0, "evolver_confidence": 0.0},
+            ),
+            score=1.0,
+        )
+
+        self.assertEqual(
+            selection_score(hit, ExperienceTier.TIP, hit.entry.metadata, tier_weights={"tip": 1.0}),
+            0.5,
+        )
+
     def test_render_selected_experiences_uses_prompt_contract(self) -> None:
         hit = _hit(_experience("skill", "rerun the exact pytest file", ExperienceTier.SKILL))
         candidate = ExperienceCandidate(

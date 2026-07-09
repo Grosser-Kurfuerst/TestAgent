@@ -125,6 +125,52 @@ class LongTermMemoryStore:
         """Entries visible to ``project_key`` for retrieval scoring."""
         return self.all(project_key=project_key)
 
+    def update_metadata_by_id(
+        self,
+        memory_id: str,
+        metadata: dict[str, Any],
+        *,
+        project_key: str | None = None,
+        expected_tier: str | None = None,
+        all_projects: bool = False,
+    ) -> bool:
+        """Update only ``metadata`` for one entry, preserving identity fields.
+
+        ``project_key`` applies the same visibility boundary as retrieval unless
+        ``all_projects`` is explicit. This is used by offline attribution
+        write-back so a global usage log cannot accidentally mutate another
+        stream's project memories.
+        """
+        if not str(memory_id or ""):
+            return False
+        with self._lock:
+            self._ensure_loaded()
+            target_index: int | None = None
+            for idx, entry in enumerate(self._entries):
+                if entry.id != memory_id:
+                    continue
+                if not all_projects and project_key is not None and not _is_visible(entry, project_key):
+                    continue
+                if expected_tier is not None and str(entry.metadata.get("evolver_tier") or "") != str(expected_tier):
+                    continue
+                target_index = idx
+                break
+            if target_index is None:
+                return False
+
+            entry = self._entries[target_index]
+            next_metadata = dict(entry.metadata)
+            next_metadata.update(metadata)
+            replacement = replace(entry, metadata=sanitize_json_value(next_metadata))
+            snapshot = list(self._entries)
+            self._entries[target_index] = replacement
+            try:
+                self._persist()
+            except Exception:
+                self._entries = snapshot
+                raise
+            return True
+
     def clear(self, *, scope: MemoryScope | None = None, project_key: str | None = None) -> int:
         with self._lock:
             self._ensure_loaded()

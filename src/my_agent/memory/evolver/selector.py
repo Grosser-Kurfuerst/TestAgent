@@ -186,7 +186,11 @@ def selection_score(
         return 0.0
     tier_weight = _tier_weight(tier_weights or {}, tier)
     value = _metadata_float(metadata, "evolver_value", default=0.0) or 0.0
-    confidence = _metadata_float(metadata, "confidence", default=1.0) or 1.0
+    confidence = _metadata_float(metadata, "evolver_confidence", default=None)
+    if confidence is None:
+        confidence = _metadata_float(metadata, "confidence", default=1.0)
+    if confidence is None:
+        confidence = 1.0
     value_weight = clamp(1.0 + value, 0.50, 1.50)
     confidence_weight = clamp(confidence, 0.50, 1.20)
     return float(hit.score) * tier_weight * value_weight * confidence_weight
@@ -338,11 +342,16 @@ def _score_reason(
     metadata: Mapping[str, Any],
     tier_weights: Mapping[str, float],
 ) -> str:
+    confidence = _metadata_float(metadata, "evolver_confidence", default=None)
+    if confidence is None:
+        confidence = _metadata_float(metadata, "confidence", default=1.0)
+    if confidence is None:
+        confidence = 1.0
     return (
         f"retrieval={float(hit.score):.3f} "
         f"tier_weight={_tier_weight(tier_weights, tier):.2f} "
         f"value={_metadata_float(metadata, 'evolver_value', default=0.0) or 0.0:.2f} "
-        f"confidence={_metadata_float(metadata, 'confidence', default=1.0) or 1.0:.2f}"
+        f"confidence={confidence:.2f}"
     )
 
 
