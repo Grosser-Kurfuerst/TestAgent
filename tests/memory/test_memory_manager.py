@@ -810,10 +810,45 @@ class MemoryManagerSaveExperienceTests(unittest.TestCase):
             self.assertEqual(metadata["stream_id"], "stream-a")
             self.assertEqual(metadata["task_type"], "manifest")
             self.assertEqual(metadata["memory_project_key"], "stream:a")
-            self.assertEqual(metadata["writer_policy"], "fallback_runtime_v1")
+            self.assertEqual(metadata["writer_policy"], "llm_json_v1")
             self.assertEqual(metadata["source_trace"], str(Path(tmp) / "trace.jsonl"))
             self.assertNotIn(long_key, metadata)
             self.assertTrue(all(len(key) <= 1_000 for key in metadata))
+
+    def test_write_experiences_llm_runtime_failure_fallback_records_combined_policy(self) -> None:
+        # mode="llm" with FakeLLM: the generic assistant response is not a valid
+        # JSON array, so the writer falls back to deterministic proposals. The saved
+        # entry metadata AND the writer_saved trace event must record the combined
+        # "llm_then_fallback_runtime_v1" provenance, not the bare fallback label.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            traces: list[tuple[str, dict[str, object]]] = []
+            manager = MemoryManager.from_config(
+                config=_config(
+                    Path(tmp) / "memory",
+                    memory_evolver_writer_enabled=True,
+                    memory_evolver_writer_mode="llm",
+                ),
+                llm=FakeLLM(),
+                repo_path=repo,
+                trace_sink=lambda event, payload: traces.append((event, payload)),
+            )
+
+            result = manager.write_experiences_from_run(
+                task="Fix focused pytest failure",
+                run_id="run-1",
+                outcome="success",
+                tool_history=[_tool_record("run_tests", ok=True)],
+            )
+
+            self.assertTrue(result.llm_used)
+            self.assertTrue(result.fallback_used)
+            self.assertTrue(result.saved)
+            for entry in result.saved:
+                self.assertEqual(entry.metadata["writer_policy"], "llm_then_fallback_runtime_v1")
+            saved_payload = [payload for event, payload in traces if event == "memory.evolver_writer_saved"][-1]
+            self.assertEqual(saved_payload["writer_policy"], "llm_then_fallback_runtime_v1")
 
     def test_write_experiences_failure_saves_tip_and_trajectory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

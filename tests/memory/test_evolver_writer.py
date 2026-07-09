@@ -19,6 +19,7 @@ from my_agent.memory.evolver import (
     MemoryWriterDatasetLogger,
     build_write_steps_from_tool_history,
     runtime_outcome_from_tool_records,
+    writer_policy_for_result,
 )
 
 
@@ -359,6 +360,73 @@ class EvolverWriterTests(unittest.TestCase):
             rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
             self.assertEqual([row["run_id"] for row in rows], ["run-1", "run-2"])
             self.assertEqual(rows[0]["schema_version"], 1)
+
+    def test_writer_policy_for_result_distinguishes_llm_and_fallback_provenance(self) -> None:
+        # Pure deterministic fallback (default mode): provenance is fallback.
+        self.assertEqual(writer_policy_for_result(llm_used=False, fallback_used=True), "fallback_runtime_v1")
+        # LLM JSON accepted, no fallback needed: provenance is LLM-only.
+        self.assertEqual(writer_policy_for_result(llm_used=True, fallback_used=False), "llm_json_v1")
+        # LLM attempted but fell back to deterministic outputs: combined provenance.
+        self.assertEqual(
+            writer_policy_for_result(llm_used=True, fallback_used=True),
+            "llm_then_fallback_runtime_v1",
+        )
+
+    def test_failure_fallback_tip_attributes_to_failing_test_signal(self) -> None:
+        request = _request(
+            outcome="failure",
+            stop_reason="max_steps_reached",
+            steps=(
+                ExperienceWriteStep(step_num=1, tool="read_file", ok=True, output="code"),
+                ExperienceWriteStep(step_num=2, tool="run_tests", ok=False, output="failed", error_code="assertion_failed"),
+            ),
+        )
+
+        result = ExperienceWriter().propose(request)
+
+        tip = result.proposals[0]
+        self.assertEqual(tip.tier, ExperienceTier.TIP)
+        self.assertIn("run_tests signal failed", tip.content)
+        self.assertEqual(tip.metadata["trigger"], "assertion_failed")
+
+    def test_failure_fallback_tip_attributes_to_failing_or_blocked_tool_signal(self) -> None:
+        request = _request(
+            outcome="failure",
+            stop_reason="max_steps_reached",
+            steps=(
+                ExperienceWriteStep(step_num=1, tool="read_file", ok=True, output="code"),
+                ExperienceWriteStep(step_num=2, tool="apply_patch", ok=False, blocked=True, output="", error_code="BLOCKED"),
+            ),
+        )
+
+        result = ExperienceWriter().propose(request)
+
+        tip = result.proposals[0]
+        self.assertIn("the latest tool was blocked", tip.content)
+        # Must NOT misattribute to a run_tests signal that did not fail.
+        self.assertNotIn("run_tests signal failed", tip.content)
+        # The blocked tool's error_code is the most specific signal, so it leads the trigger.
+        self.assertEqual(tip.metadata["trigger"], "BLOCKED")
+
+    def test_failure_fallback_tip_uses_stop_reason_only_when_no_signal(self) -> None:
+        # Failure inferred purely from stop_reason (budget / max steps / timeout) with
+        # no failing test or blocked tool to attribute it to — the tip must NOT claim a
+        # tool/test signal failed.
+        request = _request(
+            outcome="failure",
+            stop_reason="context_over_budget",
+            steps=(
+                ExperienceWriteStep(step_num=1, tool="read_file", ok=True, output="code"),
+                ExperienceWriteStep(step_num=2, tool="run_tests", ok=True, output="passed"),
+            ),
+        )
+
+        result = ExperienceWriter().propose(request)
+
+        tip = result.proposals[0]
+        self.assertIn("before reaching a verified success", tip.content)
+        self.assertNotIn("signal failed", tip.content)
+        self.assertEqual(tip.metadata["trigger"], "context_over_budget")
 
 
 def _request(

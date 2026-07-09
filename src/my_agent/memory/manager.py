@@ -27,6 +27,7 @@ from my_agent.memory.evolver import (
     proposal_tier_counts,
     selection_candidate_summary,
     selection_tier_counts,
+    writer_policy_for_result,
 )
 from my_agent.memory.long_term import LongTermMemoryStore, STORAGE_FILE
 from my_agent.memory.retrieval import MemoryRetriever
@@ -755,6 +756,10 @@ class MemoryManager:
             duplicate_ids: list[str] = []
             safe_source_task = _safe_dataset_join_text(request.source_task)
             safe_source_trace = _safe_dataset_join_text(str(request.trace_path or ""))
+            writer_policy = writer_policy_for_result(
+                llm_used=proposed.llm_used,
+                fallback_used=proposed.fallback_used,
+            )
             for proposal in proposed.proposals:
                 proposal_metadata = _sanitize_writer_metadata(proposal.metadata)
                 metadata = {
@@ -770,7 +775,7 @@ class MemoryManager:
                     "candidate_memory_ids": list(request.candidate_memory_ids),
                     "stream_id": request.stream_id,
                     "memory_project_key": request.project_key,
-                    "writer_policy": "fallback_runtime_v1",
+                    "writer_policy": writer_policy,
                     "writer_reason": proposal.reason,
                 }
                 entry, created = self.save_experience(
@@ -804,7 +809,7 @@ class MemoryManager:
                     "saved_ids": [entry.id for entry in saved],
                     "saved_records": saved_records,
                     "tiers": _saved_tier_counts(saved),
-                    "writer_policy": "fallback_runtime_v1",
+                    "writer_policy": writer_policy,
                 },
             )
             self._append_writer_dataset(request, result)

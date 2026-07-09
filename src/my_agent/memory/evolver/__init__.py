@@ -35,6 +35,7 @@ from my_agent.memory.evolver.writer import (
     build_write_steps_from_tool_history,
     proposal_tier_counts,
     runtime_outcome_from_tool_records,
+    writer_policy_for_result,
 )
 
 __all__ = [
@@ -68,4 +69,5 @@ __all__ = [
     "selection_candidate_summary",
     "selection_score",
     "selection_tier_counts",
+    "writer_policy_for_result",
 ]

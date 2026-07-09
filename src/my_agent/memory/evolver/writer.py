@@ -27,6 +27,14 @@ FAILURE_STOP_MARKERS = (
     "budget",
     "timeout",
 )
+
+# writer_policy records which runtime policy produced each saved experience, so
+# downstream Phase 5/8 distillation and human audits can tell LLM-authored
+# experiences apart from deterministic fallback outputs. Mirrors the result
+# flags on ExperienceWriteResult.
+WRITER_POLICY_LLM = "llm_json_v1"
+WRITER_POLICY_LLM_THEN_FALLBACK = "llm_then_fallback_runtime_v1"
+WRITER_POLICY_FALLBACK = "fallback_runtime_v1"
 FORBIDDEN_MARKERS = (
     "hidden_test_output",
     "hidden_ok",
@@ -339,17 +347,38 @@ class ExperienceWriter:
         return tuple(proposals)
 
     def _failure_fallback(self, request: ExperienceWriteRequest) -> tuple[ExperienceWriteProposal, ...]:
-        latest_test = _latest_step(request.steps, "run_tests")
-        trigger = latest_test.error_code or request.stop_reason or "failed run"
+        failing_test = _latest_failing_test(request.steps)
+        failing_tool = _latest_failing_tool(request.steps)
+        stopped_by = request.stop_reason or "failure"
+        if failing_test is not None:
+            trigger = failing_test.error_code or stopped_by
+            tip_text = (
+                f"This run stopped with {stopped_by} after the latest run_tests signal "
+                "failed. For similar tasks, inspect the last failing assertion or blocked "
+                "tool result before issuing another patch or broad test command."
+            )
+        elif failing_tool is not None:
+            trigger = failing_tool.error_code or stopped_by
+            verb = "was blocked" if failing_tool.blocked else "failed"
+            tip_text = (
+                f"This run stopped with {stopped_by} after the latest tool {verb} or produced "
+                "an unusable result. For similar tasks, inspect the failed or blocked tool "
+                "result before retrying the same approach or broadening the command."
+            )
+        else:
+            # The failure was inferred purely from stop_reason (budget / max steps /
+            # timeout) without any failing test or tool signal to attribute it to.
+            trigger = stopped_by
+            tip_text = (
+                f"This run stopped with {stopped_by} before reaching a verified success "
+                "(no failing run_tests or blocked tool signal observed). For similar "
+                "tasks, watch the remaining budget or step budget closely and prefer a "
+                "narrow verification over a broad exploratory action."
+            )
         proposals: list[ExperienceWriteProposal] = [
             ExperienceWriteProposal(
                 tier=ExperienceTier.TIP,
-                content=(
-                    f"This run stopped with {request.stop_reason or 'failure'} after the latest "
-                    f"{'run_tests' if latest_test is not None else 'tool'} signal failed. For similar tasks, "
-                    "inspect the last failing assertion or blocked tool result before issuing another patch "
-                    "or broad test command."
-                ),
+                content=tip_text,
                 confidence=0.76,
                 metadata={
                     "category": "debugging",
@@ -455,6 +484,21 @@ def proposal_tier_counts(proposals: Sequence[ExperienceWriteProposal]) -> dict[s
     return counts
 
 
+def writer_policy_for_result(*, llm_used: bool, fallback_used: bool) -> str:
+    """Resolve the ``writer_policy`` label for a saved experience / trace event.
+
+    The label is the provenance marker persisted on every saved entry's metadata
+    and on the ``memory.evolver_writer_saved`` trace event. It distinguishes
+    LLM-authored experiences from deterministic fallback outputs so Phase 5/8
+    distillation and human audits do not mislabel LLM work as fallback.
+    """
+    if llm_used and not fallback_used:
+        return WRITER_POLICY_LLM
+    if llm_used and fallback_used:
+        return WRITER_POLICY_LLM_THEN_FALLBACK
+    return WRITER_POLICY_FALLBACK
+
+
 def _llm_prompt(request: ExperienceWriteRequest, *, max_input_chars: int) -> str:
     payload = {
         "task": _truncate_text(request.task, DEFAULT_TASK_CHARS),
@@ -518,6 +562,26 @@ def _mapping(value: Any) -> Mapping[str, Any]:
 
 def _latest_step(steps: Sequence[ExperienceWriteStep], tool: str) -> ExperienceWriteStep | None:
     return next((step for step in reversed(steps) if step.tool == tool), None)
+
+
+def _latest_failing_test(steps: Sequence[ExperienceWriteStep]) -> ExperienceWriteStep | None:
+    """Latest run_tests step that actually failed (ok=False)."""
+    return next(
+        (step for step in reversed(steps) if step.tool == "run_tests" and not step.ok),
+        None,
+    )
+
+
+def _latest_failing_tool(steps: Sequence[ExperienceWriteStep]) -> ExperienceWriteStep | None:
+    """Latest non-test tool step that failed or was blocked."""
+    return next(
+        (
+            step
+            for step in reversed(steps)
+            if step.tool != "run_tests" and (not step.ok or step.blocked)
+        ),
+        None,
+    )
 
 
 def _step_command(step: ExperienceWriteStep | None) -> str:
@@ -656,4 +720,5 @@ __all__ = [
     "build_write_steps_from_tool_history",
     "proposal_tier_counts",
     "runtime_outcome_from_tool_records",
+    "writer_policy_for_result",
 ]
