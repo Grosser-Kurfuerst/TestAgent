@@ -12,6 +12,15 @@ from my_agent.memory.evolver.selector import (
     selection_score,
     selection_tier_counts,
 )
+from my_agent.memory.evolver.attribution import (
+    AttributionConfig,
+    DEFAULT_TIER_WEIGHTS,
+    MemoryAttributionRecord,
+    load_attribution_jsonl,
+    score_all_memories,
+    score_memory,
+    write_attribution_jsonl,
+)
 from my_agent.memory.evolver.trace_join import (
     BenchmarkOutcome,
     SelectionSnapshot,
@@ -56,8 +65,10 @@ from my_agent.memory.evolver.writer import (
 )
 
 __all__ = [
+    "AttributionConfig",
     "EVOLVER_SCHEMA_VERSION",
     "BenchmarkOutcome",
+    "DEFAULT_TIER_WEIGHTS",
     "ExperienceCandidate",
     "ExperienceCreatedBy",
     "ExperienceRecord",
@@ -69,6 +80,7 @@ __all__ = [
     "ExperienceWriteResult",
     "ExperienceWriteStep",
     "ExperienceWriter",
+    "MemoryAttributionRecord",
     "MemoryWriterDatasetLogger",
     "SelectionSnapshot",
     "SelectedExperience",
@@ -87,11 +99,14 @@ __all__ = [
     "flatten_tier_ids",
     "group_ids_by_tier",
     "is_experience_entry",
+    "load_attribution_jsonl",
     "normalize_experience_tier",
     "proposal_tier_counts",
     "read_trace_events",
     "render_selected_experiences",
     "runtime_outcome_from_tool_records",
+    "score_all_memories",
+    "score_memory",
     "selection_candidate_summary",
     "selection_from_trace",
     "selection_score",
@@ -99,5 +114,6 @@ __all__ = [
     "usage_entry_from_manifest_result",
     "usage_entry_from_result_row",
     "usage_entry_from_trace",
+    "write_attribution_jsonl",
     "writer_policy_for_result",
 ]
