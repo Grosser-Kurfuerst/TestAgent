@@ -14,12 +14,24 @@ from my_agent.memory.evolver.selector import (
 )
 from my_agent.memory.evolver.attribution import (
     AttributionConfig,
+    AttributionWriteBackSummary,
     DEFAULT_TIER_WEIGHTS,
     MemoryAttributionRecord,
+    attribution_metadata,
+    attribution_summary,
     load_attribution_jsonl,
+    render_attribution_summary,
     score_all_memories,
     score_memory,
+    write_back_attribution,
     write_attribution_jsonl,
+)
+from my_agent.memory.evolver.dataset_scoring import (
+    DatasetScoringSummary,
+    SCORING_SOURCE,
+    annotate_selector_dataset_scores,
+    annotate_writer_dataset_scores,
+    write_dataset_summary_json,
 )
 from my_agent.memory.evolver.trace_join import (
     BenchmarkOutcome,
@@ -66,9 +78,11 @@ from my_agent.memory.evolver.writer import (
 
 __all__ = [
     "AttributionConfig",
+    "AttributionWriteBackSummary",
     "EVOLVER_SCHEMA_VERSION",
     "BenchmarkOutcome",
     "DEFAULT_TIER_WEIGHTS",
+    "DatasetScoringSummary",
     "ExperienceCandidate",
     "ExperienceCreatedBy",
     "ExperienceRecord",
@@ -85,8 +99,13 @@ __all__ = [
     "SelectionSnapshot",
     "SelectedExperience",
     "SelectionResult",
+    "SCORING_SOURCE",
     "UsageLogEntry",
     "UsageLogger",
+    "annotate_selector_dataset_scores",
+    "annotate_writer_dataset_scores",
+    "attribution_metadata",
+    "attribution_summary",
     "build_experience_entry",
     "build_write_steps_from_tool_history",
     "benchmark_outcome_from_trace",
@@ -104,6 +123,7 @@ __all__ = [
     "proposal_tier_counts",
     "read_trace_events",
     "render_selected_experiences",
+    "render_attribution_summary",
     "runtime_outcome_from_tool_records",
     "score_all_memories",
     "score_memory",
@@ -114,6 +134,8 @@ __all__ = [
     "usage_entry_from_manifest_result",
     "usage_entry_from_result_row",
     "usage_entry_from_trace",
+    "write_back_attribution",
     "write_attribution_jsonl",
+    "write_dataset_summary_json",
     "writer_policy_for_result",
 ]
