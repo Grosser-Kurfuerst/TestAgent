@@ -12,6 +12,17 @@ from my_agent.memory.evolver.selector import (
     selection_score,
     selection_tier_counts,
 )
+from my_agent.memory.evolver.trace_join import (
+    BenchmarkOutcome,
+    SelectionSnapshot,
+    benchmark_outcome_from_trace,
+    collect_usage_from_manifest_results,
+    read_trace_events,
+    selection_from_trace,
+    usage_entry_from_manifest_result,
+    usage_entry_from_result_row,
+    usage_entry_from_trace,
+)
 from my_agent.memory.evolver.types import (
     EVOLVER_SCHEMA_VERSION,
     ExperienceCreatedBy,
@@ -24,6 +35,12 @@ from my_agent.memory.evolver.types import (
     experience_tier,
     is_experience_entry,
     normalize_experience_tier,
+)
+from my_agent.memory.evolver.usage_log import (
+    UsageLogEntry,
+    UsageLogger,
+    flatten_tier_ids,
+    group_ids_by_tier,
 )
 from my_agent.memory.evolver.writer import (
     ExperienceWriteProposal,
@@ -40,6 +57,7 @@ from my_agent.memory.evolver.writer import (
 
 __all__ = [
     "EVOLVER_SCHEMA_VERSION",
+    "BenchmarkOutcome",
     "ExperienceCandidate",
     "ExperienceCreatedBy",
     "ExperienceRecord",
@@ -52,22 +70,34 @@ __all__ = [
     "ExperienceWriteStep",
     "ExperienceWriter",
     "MemoryWriterDatasetLogger",
+    "SelectionSnapshot",
     "SelectedExperience",
     "SelectionResult",
+    "UsageLogEntry",
+    "UsageLogger",
     "build_experience_entry",
     "build_write_steps_from_tool_history",
+    "benchmark_outcome_from_trace",
     "candidate_tier",
     "candidate_value",
+    "collect_usage_from_manifest_results",
     "experience_metadata",
     "experience_record_from_entry",
     "experience_tier",
+    "flatten_tier_ids",
+    "group_ids_by_tier",
     "is_experience_entry",
     "normalize_experience_tier",
     "proposal_tier_counts",
+    "read_trace_events",
     "render_selected_experiences",
     "runtime_outcome_from_tool_records",
     "selection_candidate_summary",
+    "selection_from_trace",
     "selection_score",
     "selection_tier_counts",
+    "usage_entry_from_manifest_result",
+    "usage_entry_from_result_row",
+    "usage_entry_from_trace",
     "writer_policy_for_result",
 ]
