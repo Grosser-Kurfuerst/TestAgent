@@ -8,14 +8,17 @@ stable schema shared by planning, review, audit, and future dataset export.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field, fields
+from datetime import datetime, timezone
 from enum import Enum
+from hashlib import sha256
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Collection, Mapping, Sequence
 import json
 
 from my_agent.memory.evolver.attribution import MemoryAttributionRecord
 from my_agent.memory.evolver.types import ExperienceTier, experience_tier
-from my_agent.memory.types import MemoryEntry, MemoryScope
+from my_agent.memory.retrieval import tokenize
+from my_agent.memory.types import MemoryEntry, MemoryScope, normalize_content
 from my_agent.text_safety import sanitize_json_value
 
 
@@ -153,6 +156,14 @@ class MaintenanceEvidence:
             writer_confidence=_as_float(data.get("writer_confidence")),
             has_attribution=bool(data.get("has_attribution", False)),
         )
+
+
+@dataclass(frozen=True)
+class MaintenanceLookupHit:
+    entry: MemoryEntry
+    tier: str
+    score: float
+    matched_terms: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -492,6 +503,155 @@ def maintenance_evidence_for_entry(
     )
 
 
+def lookup_experiences(
+    entries: Sequence[MemoryEntry],
+    query: str,
+    *,
+    project_key: str,
+    tiers: Collection[str] | None = None,
+    limit: int = 20,
+) -> list[MaintenanceLookupHit]:
+    """Return deterministic lexical lookup hits without mutating usage state."""
+    if not project_key:
+        raise ValueError("project_key must not be empty")
+    if limit < 0:
+        raise ValueError("limit must be non-negative")
+    requested_tiers: set[str] | None = None
+    if tiers is not None:
+        requested_tiers = set()
+        for value in tiers:
+            tier = _valid_tier(str(value))
+            if tier is None:
+                raise ValueError(f"invalid experience tier: {value!r}")
+            requested_tiers.add(tier.value)
+
+    normalized_query = normalize_content(query)
+    query_terms = set(tokenize(query))
+    if not normalized_query and not query_terms:
+        return []
+
+    hits: list[MaintenanceLookupHit] = []
+    for entry in entries:
+        tier = experience_tier(entry)
+        if tier is None or not _entry_visible_to_project(entry, project_key):
+            continue
+        if requested_tiers is not None and tier.value not in requested_tiers:
+            continue
+        content_terms = set(tokenize(entry.content))
+        matched = tuple(sorted(query_terms.intersection(content_terms)))
+        coverage = len(matched) / len(query_terms) if query_terms else 0.0
+        substring_bonus = (
+            0.25
+            if normalized_query and normalized_query in normalize_content(entry.content)
+            else 0.0
+        )
+        score = min(1.0, coverage + substring_bonus)
+        if score <= 0:
+            continue
+        hits.append(
+            MaintenanceLookupHit(
+                entry=entry,
+                tier=tier.value,
+                score=round(score, 6),
+                matched_terms=matched,
+            )
+        )
+    hits.sort(key=lambda item: (-item.score, item.tier, item.entry.id))
+    return hits[:limit] if limit else []
+
+
+def redundancy_score(left: MemoryEntry, right: MemoryEntry) -> float:
+    """Return deterministic lexical redundancy for a merge-safe pair."""
+    left_tier = experience_tier(left)
+    right_tier = experience_tier(right)
+    if left_tier is None or right_tier is None or left_tier != right_tier:
+        return 0.0
+    if left.scope != right.scope:
+        return 0.0
+    if left.scope != MemoryScope.GLOBAL and left.project_key != right.project_key:
+        return 0.0
+
+    left_normalized = normalize_content(left.content)
+    right_normalized = normalize_content(right.content)
+    if not left_normalized or not right_normalized:
+        return 0.0
+    if left_normalized == right_normalized:
+        return 1.0
+
+    token_score = _jaccard(set(tokenize(left.content)), set(tokenize(right.content)))
+    trigram_score = _jaccard(_char_trigrams(left_normalized), _char_trigrams(right_normalized))
+    return round(min(1.0, max(0.0, token_score, trigram_score)), 6)
+
+
+def build_maintenance_plan(
+    *,
+    entries: Sequence[MemoryEntry],
+    attribution: Mapping[AttributionKey, MemoryAttributionRecord],
+    repository_revision: str,
+    project_key: str,
+    as_of: datetime,
+    config: MaintenanceConfig | None = None,
+) -> MaintenancePlan:
+    """Build a deterministic single-project keep/delete maintenance plan."""
+    if not project_key:
+        raise ValueError("project_key must not be empty")
+    if not repository_revision:
+        raise ValueError("repository_revision must not be empty")
+    as_of_utc = _require_aware_datetime(as_of, "as_of").astimezone(timezone.utc)
+    cfg = config or MaintenanceConfig()
+
+    considered: list[tuple[MemoryEntry, MaintenanceEvidence]] = []
+    for entry in entries:
+        if experience_tier(entry) is None or not _entry_visible_to_project(entry, project_key):
+            continue
+        considered.append((
+            entry,
+            maintenance_evidence_for_entry(
+                entry,
+                attribution=attribution,
+                project_key=project_key,
+            ),
+        ))
+    considered.sort(key=lambda item: (item[1].tier, item[0].id))
+
+    operations = [
+        _retention_operation(entry, evidence, as_of=as_of_utc, config=cfg)
+        for entry, evidence in considered
+    ]
+    operations.sort(key=_operation_sort_key)
+    operation_tuple = tuple(operations)
+    summary = _operation_summary(operation_tuple)
+    input_summary = {
+        "entries_total": len(entries),
+        "experiences_considered": len(considered),
+        "missing_attribution": sum(1 for _, evidence in considered if not evidence.has_attribution),
+    }
+    as_of_text = as_of_utc.isoformat()
+    config_payload = cfg.to_dict()
+    plan_id = _plan_id(
+        repository_revision=repository_revision,
+        project_key=project_key,
+        as_of=as_of_text,
+        config=config_payload,
+        input_summary=input_summary,
+        operations=operation_tuple,
+        summary=summary,
+    )
+    return MaintenancePlan(
+        schema_version=MAINTENANCE_SCHEMA_VERSION,
+        policy=MAINTENANCE_POLICY,
+        plan_id=plan_id,
+        repository_revision=repository_revision,
+        scope_mode=MAINTENANCE_SCOPE_MODE,
+        memory_project_key=project_key,
+        as_of=as_of_text,
+        config=config_payload,
+        input_summary=input_summary,
+        operations=operation_tuple,
+        summary=summary,
+    )
+
+
 def maintenance_plan_json(plan: MaintenancePlan) -> str:
     """Return canonical, byte-stable pretty JSON for a maintenance plan."""
     return json.dumps(
@@ -518,6 +678,230 @@ def load_maintenance_plan(path: str | Path) -> MaintenancePlan:
     if not isinstance(payload, dict):
         raise MaintenancePlanError("maintenance plan must be a JSON object")
     return MaintenancePlan.from_dict(payload)
+
+
+def _retention_operation(
+    entry: MemoryEntry,
+    evidence: MaintenanceEvidence,
+    *,
+    as_of: datetime,
+    config: MaintenanceConfig,
+) -> MaintenanceOperation:
+    metadata = entry.metadata
+    action = MaintenanceAction.KEEP
+    reason = "no_maintenance_rule"
+
+    if metadata.get("maintenance_protected") is True:
+        reason = "protected_metadata"
+    elif entry.scope == MemoryScope.GLOBAL:
+        reason = "protected_global"
+    elif config.protect_manual and evidence.created_by == "manual":
+        reason = "protected_manual"
+    elif metadata.get("maintenance_invalidated") is True:
+        action = MaintenanceAction.DELETE
+        reason = "explicitly_invalidated"
+    elif _negative_delete_eligible(evidence, config):
+        action = MaintenanceAction.DELETE
+        reason = "negative_attribution_with_control"
+    elif _stale_delete_eligible(evidence, as_of=as_of, config=config):
+        action = MaintenanceAction.DELETE
+        reason = "stale_retrieved_never_selected"
+    elif evidence.has_attribution and evidence.value > 0:
+        reason = "high_value"
+    elif not _has_sufficient_retention_evidence(evidence, config):
+        reason = "insufficient_attribution_evidence"
+
+    precondition = _source_precondition(entry, evidence.tier)
+    evidence_payload = (evidence.to_dict(),)
+    remove_ids = (entry.id,) if action == MaintenanceAction.DELETE else ()
+    operation_id = _operation_id(
+        action=action,
+        source_ids=(entry.id,),
+        target_ids=(),
+        replacements=(),
+        additions=(),
+    )
+    return MaintenanceOperation(
+        operation_id=operation_id,
+        action=action,
+        source_ids=(entry.id,),
+        source_tiers=(evidence.tier,),
+        source_preconditions={entry.id: precondition},
+        reason_codes=(reason,),
+        evidence=evidence_payload,
+        remove_ids=remove_ids,
+    )
+
+
+def _negative_delete_eligible(
+    evidence: MaintenanceEvidence,
+    config: MaintenanceConfig,
+) -> bool:
+    return bool(
+        evidence.has_attribution
+        and evidence.value <= config.delete_value_threshold
+        and evidence.confidence >= config.delete_min_confidence
+        and evidence.candidate_count >= config.delete_min_candidate_count
+        and evidence.selected_count >= config.delete_min_selected_count
+        and evidence.not_selected_count >= config.delete_min_not_selected_count
+    )
+
+
+def _stale_delete_eligible(
+    evidence: MaintenanceEvidence,
+    *,
+    as_of: datetime,
+    config: MaintenanceConfig,
+) -> bool:
+    if (
+        evidence.candidate_count < config.stale_min_candidate_count
+        or evidence.selected_count != 0
+        or evidence.value > 0
+    ):
+        return False
+    last_seen = _parse_datetime(evidence.last_used) or _parse_datetime(evidence.created_at)
+    if last_seen is None:
+        return False
+    age_days = max(0.0, (as_of - last_seen.astimezone(timezone.utc)).total_seconds() / 86_400)
+    return age_days >= config.stale_after_days
+
+
+def _has_sufficient_retention_evidence(
+    evidence: MaintenanceEvidence,
+    config: MaintenanceConfig,
+) -> bool:
+    return bool(
+        evidence.has_attribution
+        and evidence.confidence >= config.delete_min_confidence
+        and evidence.candidate_count >= config.delete_min_candidate_count
+    )
+
+
+def _source_precondition(entry: MemoryEntry, tier: str) -> dict[str, str]:
+    return {
+        "fingerprint": entry.fingerprint,
+        "tier": tier,
+        "scope": entry.scope.value,
+        "project_key": entry.project_key,
+    }
+
+
+def _operation_id(
+    *,
+    action: MaintenanceAction,
+    source_ids: Sequence[str],
+    target_ids: Sequence[str],
+    replacements: Sequence[Mapping[str, Any]],
+    additions: Sequence[Mapping[str, Any]],
+) -> str:
+    payload = {
+        "policy": MAINTENANCE_POLICY,
+        "action": action.value,
+        "source_ids": sorted(str(item) for item in source_ids),
+        "target_ids": sorted(str(item) for item in target_ids),
+        "replacement_fingerprints": sorted(
+            str(item.get("fingerprint") or "") for item in replacements
+        ),
+        "addition_fingerprints": sorted(
+            str(item.get("fingerprint") or "") for item in additions
+        ),
+    }
+    return f"op-{_stable_digest(payload)[:24]}"
+
+
+def _plan_id(
+    *,
+    repository_revision: str,
+    project_key: str,
+    as_of: str,
+    config: Mapping[str, Any],
+    input_summary: Mapping[str, Any],
+    operations: Sequence[MaintenanceOperation],
+    summary: Mapping[str, Any],
+) -> str:
+    payload = {
+        "schema_version": MAINTENANCE_SCHEMA_VERSION,
+        "policy": MAINTENANCE_POLICY,
+        "repository_revision": repository_revision,
+        "scope_mode": MAINTENANCE_SCOPE_MODE,
+        "memory_project_key": project_key,
+        "as_of": as_of,
+        "config": dict(config),
+        "input_summary": dict(input_summary),
+        "operations": [item.to_dict() for item in operations],
+        "summary": dict(summary),
+    }
+    return f"maint-{_stable_digest(payload)[:24]}"
+
+
+def _operation_summary(operations: Sequence[MaintenanceOperation]) -> dict[str, int]:
+    counts = {action.value: 0 for action in MaintenanceAction}
+    for operation in operations:
+        counts[operation.action.value] += 1
+    return {
+        **counts,
+        "source_entries_removed": sum(len(item.remove_ids) for item in operations),
+        "entries_added": sum(len(item.additions) for item in operations),
+    }
+
+
+def _operation_sort_key(operation: MaintenanceOperation) -> tuple[int, tuple[str, ...], str]:
+    order = {
+        MaintenanceAction.DELETE: 0,
+        MaintenanceAction.MERGE: 1,
+        MaintenanceAction.PROMOTE: 2,
+        MaintenanceAction.KEEP: 3,
+    }
+    return (order[operation.action], operation.source_ids, operation.operation_id)
+
+
+def _entry_visible_to_project(entry: MemoryEntry, project_key: str) -> bool:
+    return entry.scope == MemoryScope.GLOBAL or (
+        entry.scope == MemoryScope.PROJECT and entry.project_key == project_key
+    )
+
+
+def _jaccard(left: set[str], right: set[str]) -> float:
+    if not left or not right:
+        return 0.0
+    return len(left.intersection(right)) / len(left.union(right))
+
+
+def _char_trigrams(value: str) -> set[str]:
+    compact = "".join(value.split())
+    if not compact:
+        return set()
+    if len(compact) < 3:
+        return {compact}
+    return {compact[index:index + 3] for index in range(len(compact) - 2)}
+
+
+def _stable_digest(payload: Mapping[str, Any]) -> str:
+    canonical = json.dumps(
+        sanitize_json_value(dict(payload)),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _require_aware_datetime(value: datetime, name: str) -> datetime:
+    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError(f"{name} must be a timezone-aware datetime")
+    return value
+
+
+def _parse_datetime(value: str) -> datetime | None:
+    if not str(value or ""):
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed
 
 
 def _validate_range(name: str, value: Any, minimum: float, maximum: float) -> None:
@@ -597,12 +981,16 @@ __all__ = [
     "MaintenanceConfig",
     "MaintenanceError",
     "MaintenanceEvidence",
+    "MaintenanceLookupHit",
     "MaintenanceOperation",
     "MaintenancePlan",
     "MaintenancePlanError",
     "load_maintenance_plan",
     "load_project_attribution",
+    "lookup_experiences",
+    "build_maintenance_plan",
     "maintenance_evidence_for_entry",
     "maintenance_plan_json",
+    "redundancy_score",
     "write_maintenance_plan",
 ]

@@ -14,6 +14,7 @@ from my_agent.memory.evolver import (
     MAINTENANCE_POLICY,
     MAINTENANCE_SCHEMA_VERSION,
     MAINTENANCE_SCOPE_MODE,
+    ExperienceCreatedBy,
     MaintenanceAction,
     MaintenanceAttributionError,
     MaintenanceConfig,
@@ -21,13 +22,17 @@ from my_agent.memory.evolver import (
     MaintenancePlan,
     MemoryAttributionRecord,
     build_experience_entry,
+    build_maintenance_plan,
     load_maintenance_plan,
     load_project_attribution,
     maintenance_evidence_for_entry,
     maintenance_plan_json,
+    lookup_experiences,
+    redundancy_score,
     write_maintenance_plan,
 )
-from my_agent.memory.types import MemoryScope
+from my_agent.memory.token import estimate_tokens
+from my_agent.memory.types import MemoryEntry, MemoryScope, MemoryType
 
 
 PROJECT_KEY = "manifest:demo:memory:shared_stream:stream:python"
@@ -41,14 +46,18 @@ def _entry(
     project_key: str = PROJECT_KEY,
     scope: MemoryScope = MemoryScope.PROJECT,
     metadata: dict | None = None,
+    content: str | None = None,
+    created_by: ExperienceCreatedBy = ExperienceCreatedBy.MANUAL,
+    created_at: datetime = NOW,
 ):
     return build_experience_entry(
         id=memory_id,
-        content=f"experience {memory_id}",
+        content=content or f"experience {memory_id}",
         tier=tier,
         project_key=project_key,
         scope=scope,
-        created_at=NOW,
+        created_at=created_at,
+        created_by=created_by,
         source_task="task-1",
         extra_metadata=metadata,
     )
@@ -59,17 +68,23 @@ def _record(
     *,
     tier: str = "skill",
     project_key: str = PROJECT_KEY,
+    value: float = 0.25,
+    confidence: float = 0.75,
+    candidate_count: int = 8,
+    selected_count: int = 4,
+    not_selected_count: int = 4,
+    last_used: str = "2026-07-09T00:00:00+00:00",
 ) -> MemoryAttributionRecord:
     return MemoryAttributionRecord(
         memory_id=memory_id,
         tier=tier,
         memory_project_key=project_key,
-        candidate_count=8,
-        selected_count=4,
-        not_selected_count=4,
-        value=0.25,
-        confidence=0.75,
-        last_used="2026-07-09T00:00:00+00:00",
+        candidate_count=candidate_count,
+        selected_count=selected_count,
+        not_selected_count=not_selected_count,
+        value=value,
+        confidence=confidence,
+        last_used=last_used,
     )
 
 
@@ -212,6 +227,267 @@ class MaintenanceEvidenceTests(unittest.TestCase):
 
         self.assertFalse(evidence.has_attribution)
         self.assertEqual(evidence.value, 0.0)
+
+
+class LookupAndRedundancyTests(unittest.TestCase):
+    def test_lookup_filters_project_tier_and_non_experience_entries(self) -> None:
+        project_skill = _entry(
+            "project-skill",
+            content="Parse the project manifest before editing task metadata",
+            tier="skill",
+        )
+        project_tip = _entry(
+            "project-tip",
+            content="Manifest parser errors should be reproduced first",
+            tier="tip",
+        )
+        other_project = _entry(
+            "other-project",
+            content="Parse the project manifest",
+            project_key="other-project",
+        )
+        global_skill = _entry(
+            "global-skill",
+            content="Use a parser for manifest input",
+            project_key="",
+            scope=MemoryScope.GLOBAL,
+        )
+        plain = MemoryEntry.build(
+            id="plain",
+            content="Parse the project manifest",
+            type=MemoryType.FACT,
+            scope=MemoryScope.PROJECT,
+            source="manual",
+            token_count=estimate_tokens("Parse the project manifest"),
+            project_key=PROJECT_KEY,
+            created_at=NOW,
+        )
+
+        hits = lookup_experiences(
+            [other_project, plain, project_tip, global_skill, project_skill],
+            "project manifest",
+            project_key=PROJECT_KEY,
+            tiers=("skill",),
+        )
+
+        self.assertEqual([hit.entry.id for hit in hits], ["project-skill", "global-skill"])
+        self.assertTrue(all(hit.tier == "skill" for hit in hits))
+        self.assertGreaterEqual(hits[0].score, hits[1].score)
+
+    def test_lookup_rejects_invalid_scope_inputs(self) -> None:
+        with self.assertRaises(ValueError):
+            lookup_experiences([], "query", project_key="")
+        with self.assertRaises(ValueError):
+            lookup_experiences([], "query", project_key=PROJECT_KEY, tiers=("future",))
+        with self.assertRaises(ValueError):
+            lookup_experiences([], "query", project_key=PROJECT_KEY, limit=-1)
+
+    def test_redundancy_is_exact_for_normalized_match_and_supports_cjk(self) -> None:
+        left = _entry("left", tier="tip", content="Run  tests before editing")
+        exact = _entry("exact", tier="tip", content="run tests before editing")
+        cjk_left = _entry("cjk-left", tier="skill", content="先运行测试再修改解析器")
+        cjk_right = _entry("cjk-right", tier="skill", content="先运行测试再修改配置器")
+
+        self.assertEqual(redundancy_score(left, exact), 1.0)
+        self.assertGreater(redundancy_score(cjk_left, cjk_right), 0.0)
+
+    def test_redundancy_refuses_cross_tier_scope_or_project_pairs(self) -> None:
+        tip = _entry("tip", tier="tip", content="same content")
+        skill = _entry("skill", tier="skill", content="same content")
+        other_project = _entry(
+            "other",
+            tier="tip",
+            content="same content",
+            project_key="other-project",
+        )
+        global_tip = _entry(
+            "global",
+            tier="tip",
+            content="same content",
+            project_key="",
+            scope=MemoryScope.GLOBAL,
+        )
+
+        self.assertEqual(redundancy_score(tip, skill), 0.0)
+        self.assertEqual(redundancy_score(tip, other_project), 0.0)
+        self.assertEqual(redundancy_score(tip, global_tip), 0.0)
+
+
+class RetentionPlannerTests(unittest.TestCase):
+    def _keyed(self, *records: MemoryAttributionRecord):
+        return {
+            (record.memory_id, record.tier, record.memory_project_key): record
+            for record in records
+        }
+
+    def test_planner_applies_boundaries_and_delete_rules(self) -> None:
+        writer = ExperienceCreatedBy.WRITER
+        manual = _entry("manual", created_by=ExperienceCreatedBy.MANUAL)
+        global_entry = _entry(
+            "global",
+            project_key="",
+            scope=MemoryScope.GLOBAL,
+            created_by=writer,
+        )
+        protected = _entry(
+            "protected",
+            created_by=writer,
+            metadata={"maintenance_protected": True, "maintenance_invalidated": True},
+        )
+        negative = _entry("negative", tier="tip", created_by=writer)
+        stale = _entry(
+            "stale",
+            created_by=writer,
+            created_at=datetime(2025, 1, 1, tzinfo=timezone.utc),
+        )
+        low_confidence = _entry("low-confidence", created_by=writer)
+        other_project = _entry("other-project", project_key="other-project", created_by=writer)
+        plain = MemoryEntry.build(
+            id="plain",
+            content="ordinary fact",
+            type=MemoryType.FACT,
+            scope=MemoryScope.PROJECT,
+            source="manual",
+            token_count=2,
+            project_key=PROJECT_KEY,
+            created_at=NOW,
+        )
+        attribution = self._keyed(
+            _record(
+                "negative",
+                tier="tip",
+                value=-0.2,
+                confidence=0.8,
+                candidate_count=8,
+                selected_count=2,
+                not_selected_count=6,
+            ),
+            _record(
+                "stale",
+                value=0.0,
+                confidence=0.0,
+                candidate_count=7,
+                selected_count=0,
+                not_selected_count=7,
+                last_used="2025-01-01T00:00:00+00:00",
+            ),
+            _record(
+                "low-confidence",
+                value=-0.4,
+                confidence=0.1,
+                candidate_count=10,
+                selected_count=2,
+                not_selected_count=8,
+            ),
+        )
+
+        plan = build_maintenance_plan(
+            entries=[
+                other_project,
+                plain,
+                low_confidence,
+                stale,
+                negative,
+                protected,
+                global_entry,
+                manual,
+            ],
+            attribution=attribution,
+            repository_revision="sha256:iteration-2",
+            project_key=PROJECT_KEY,
+            as_of=NOW,
+        )
+
+        by_source = {operation.source_ids[0]: operation for operation in plan.operations}
+        self.assertEqual(set(by_source), {
+            "manual", "global", "protected", "negative", "stale", "low-confidence"
+        })
+        self.assertEqual(by_source["negative"].action, MaintenanceAction.DELETE)
+        self.assertEqual(by_source["negative"].reason_codes, ("negative_attribution_with_control",))
+        self.assertEqual(by_source["negative"].remove_ids, ("negative",))
+        self.assertEqual(by_source["stale"].action, MaintenanceAction.DELETE)
+        self.assertEqual(by_source["stale"].reason_codes, ("stale_retrieved_never_selected",))
+        self.assertEqual(by_source["manual"].reason_codes, ("protected_manual",))
+        self.assertEqual(by_source["global"].reason_codes, ("protected_global",))
+        self.assertEqual(by_source["protected"].reason_codes, ("protected_metadata",))
+        self.assertEqual(
+            by_source["low-confidence"].reason_codes,
+            ("insufficient_attribution_evidence",),
+        )
+        self.assertEqual(plan.summary["delete"], 2)
+        self.assertEqual(plan.summary["keep"], 4)
+        self.assertEqual(plan.summary["source_entries_removed"], 2)
+        self.assertEqual(plan.input_summary["experiences_considered"], 6)
+        self.assertEqual(len({item.source_ids[0] for item in plan.operations}), len(plan.operations))
+
+    def test_explicit_invalidation_deletes_unprotected_writer_entry(self) -> None:
+        invalid = _entry(
+            "invalid",
+            created_by=ExperienceCreatedBy.WRITER,
+            metadata={"maintenance_invalidated": True},
+        )
+
+        plan = build_maintenance_plan(
+            entries=[invalid],
+            attribution={},
+            repository_revision="sha256:invalid",
+            project_key=PROJECT_KEY,
+            as_of=NOW,
+        )
+
+        self.assertEqual(plan.operations[0].action, MaintenanceAction.DELETE)
+        self.assertEqual(plan.operations[0].reason_codes, ("explicitly_invalidated",))
+
+    def test_plan_is_stable_for_reordered_inputs(self) -> None:
+        entries = [
+            _entry("keep", created_by=ExperienceCreatedBy.WRITER),
+            _entry("delete", created_by=ExperienceCreatedBy.WRITER),
+        ]
+        record = _record(
+            "delete",
+            value=-0.2,
+            confidence=0.8,
+            candidate_count=8,
+            selected_count=2,
+            not_selected_count=6,
+        )
+        attribution = self._keyed(record)
+
+        first = build_maintenance_plan(
+            entries=entries,
+            attribution=attribution,
+            repository_revision="sha256:stable",
+            project_key=PROJECT_KEY,
+            as_of=NOW,
+        )
+        second = build_maintenance_plan(
+            entries=list(reversed(entries)),
+            attribution=dict(reversed(list(attribution.items()))),
+            repository_revision="sha256:stable",
+            project_key=PROJECT_KEY,
+            as_of=NOW,
+        )
+
+        self.assertEqual(first, second)
+        self.assertEqual(maintenance_plan_json(first), maintenance_plan_json(second))
+
+    def test_planner_requires_single_project_and_aware_as_of(self) -> None:
+        with self.assertRaises(ValueError):
+            build_maintenance_plan(
+                entries=[],
+                attribution={},
+                repository_revision="sha256:x",
+                project_key="",
+                as_of=NOW,
+            )
+        with self.assertRaises(ValueError):
+            build_maintenance_plan(
+                entries=[],
+                attribution={},
+                repository_revision="sha256:x",
+                project_key=PROJECT_KEY,
+                as_of=datetime(2026, 7, 10),
+            )
 
 
 class MaintenancePlanContractTests(unittest.TestCase):
