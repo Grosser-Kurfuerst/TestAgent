@@ -14,8 +14,10 @@ from my_agent.memory.evolver import (
     DEFAULT_TIER_WEIGHTS,
     MemoryAttributionRecord,
     UsageLogEntry,
+    attribution_summary,
     build_experience_entry,
     load_attribution_jsonl,
+    render_attribution_summary,
     score_all_memories,
     score_memory,
     write_attribution_jsonl,
@@ -187,6 +189,16 @@ class ScoreAllMemoriesTests(unittest.TestCase):
         self.assertEqual([r.memory_id for r in records], ["mem-1"])
         self.assertNotIn("mem-other", [r.memory_id for r in records])
 
+    def test_selected_only_memory_is_not_scored_without_candidate_evidence(self) -> None:
+        entries = [_entry("mem-1", "skill")]
+        logs = [
+            _log(task_id="A", candidates=[], selected=["mem-1"], reward=1.0),
+        ]
+
+        records = score_all_memories(entries=entries, usage_logs=logs, project_key="proj-A")
+
+        self.assertEqual(records, [])
+
     def test_non_experience_entries_excluded(self) -> None:
         plain = _plain_entry("plain-1")
         logs = [_log(task_id="A", candidates=["plain-1", "mem-2"], selected=["plain-1"], reward=1.0)]
@@ -276,6 +288,29 @@ class JsonlIoTests(unittest.TestCase):
             )
             loaded = load_attribution_jsonl(path)
             self.assertEqual(list(loaded.keys()), ["mem-1"])
+
+
+class AttributionSummaryTests(unittest.TestCase):
+    def test_summary_uses_configured_evidence_thresholds_and_renders_skips(self) -> None:
+        record = MemoryAttributionRecord(
+            memory_id="mem-1",
+            tier="skill",
+            candidate_count=3,
+            selected_count=1,
+            not_selected_count=2,
+            value=0.0,
+        )
+
+        summary = attribution_summary(
+            [record],
+            config=AttributionConfig(min_candidate_count=4),
+        )
+
+        self.assertEqual(summary["skipped_low_evidence"], 1)
+        self.assertEqual(summary["skipped_by_project_key"], 0)
+        rendered = render_attribution_summary(summary)
+        self.assertIn("Skipped by project key: 0", rendered)
+        self.assertIn("Skipped low evidence: 1", rendered)
 
 
 if __name__ == "__main__":

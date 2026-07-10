@@ -66,9 +66,10 @@ class WriterDatasetScoringTests(unittest.TestCase):
 
             row = _read_jsonl(output)[0]
             self.assertEqual(row["other"], "kept")
-            self.assertEqual(row["created_memory_scores"][0]["value"], 0.2)
-            self.assertEqual(row["created_memory_scores"][1]["value"], 0.0)
-            self.assertTrue(row["created_memory_scores"][1]["missing_attribution"])
+            self.assertEqual(row["created_memory_scores"], {
+                "skill": {"mem-good": 0.2},
+                "tip": {"mem-missing": 0.0},
+            })
             self.assertEqual(row["mean_created_memory_score"], 0.1)
             self.assertEqual(row["score"], 0.1)
             self.assertEqual(row["scoring_source"], "memory_attribution_v1")
@@ -133,6 +134,13 @@ class SelectorDatasetScoringTests(unittest.TestCase):
             )
 
             row = _read_jsonl(output)[0]
+            self.assertEqual(row["candidate_memory_scores"], {
+                "skill": {"mem-good": 0.2},
+                "unknown": {"mem-missing": 0.0},
+            })
+            self.assertEqual(row["selected_memory_scores"], {
+                "skill": {"mem-good": 0.2},
+            })
             self.assertEqual(row["mean_selected_memory_score"], 0.2)
             self.assertEqual(row["score"], 0.8400000000000001)
             self.assertEqual(row["scoring_source"], "memory_attribution_v1")
@@ -160,6 +168,12 @@ class SelectorDatasetScoringTests(unittest.TestCase):
             )
 
             row = _read_jsonl(output)[0]
+            self.assertEqual(row["candidate_memory_scores"], {
+                "skill": {"mem-bad": -0.1},
+            })
+            self.assertEqual(row["selected_memory_scores"], {
+                "skill": {"mem-bad": -0.1},
+            })
             self.assertEqual(row["mean_selected_memory_score"], -0.1)
             self.assertEqual(row["score"], 0.0)
 

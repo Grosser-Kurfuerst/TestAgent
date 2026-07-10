@@ -26,10 +26,17 @@ from my_agent.memory.evolver import (
 )
 
 
-def _candidate_event(summaries: list[dict], *, timestamp: str = "") -> dict:
+def _candidate_event(
+    summaries: list[dict],
+    *,
+    timestamp: str = "",
+    event_time: str = "2026-01-01T00:00:00",
+    run_id: str = "",
+) -> dict:
     return {
         "event": "memory.evolver_candidates",
-        "time": "2026-01-01T00:00:00",
+        "time": event_time,
+        "run_id": run_id,
         "payload": {
             "candidate_count": len(summaries),
             "candidate_summaries": summaries,
@@ -41,10 +48,17 @@ def _candidate_event(summaries: list[dict], *, timestamp: str = "") -> dict:
     }
 
 
-def _selected_event(ids: list[str], *, timestamp: str = "") -> dict:
+def _selected_event(
+    ids: list[str],
+    *,
+    timestamp: str = "",
+    event_time: str = "2026-01-01T00:00:01",
+    run_id: str = "",
+) -> dict:
     return {
         "event": "memory.evolver_selected",
-        "time": "2026-01-01T00:00:01",
+        "time": event_time,
+        "run_id": run_id,
         "payload": {
             "selected_count": len(ids),
             "selected_ids": ids,
@@ -55,10 +69,16 @@ def _selected_event(ids: list[str], *, timestamp: str = "") -> dict:
     }
 
 
-def _benchmark_result_event(*, resolved: bool, task_id: str = "humaneval-1") -> dict:
+def _benchmark_result_event(
+    *,
+    resolved: bool,
+    task_id: str = "humaneval-1",
+    run_id: str = "",
+) -> dict:
     return {
         "event": "benchmark_result",
         "time": "2026-01-01T00:05:00",
+        "run_id": run_id,
         "payload": {
             "task_id": task_id,
             "resolved": resolved,
@@ -188,6 +208,33 @@ class UsageLoggerTests(unittest.TestCase):
             self.assertTrue(by_proj["proj-A"].success)
             self.assertFalse(by_proj["proj-B"].success)
 
+    def test_same_task_and_project_are_isolated_by_run_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            logger = UsageLogger(Path(tmp) / "usage_logs.jsonl")
+            logger.append(UsageLogEntry(
+                task_id="t1",
+                task_type="humaneval",
+                run_id="run-1",
+                memory_project_key="proj-A",
+                retrieved_candidates={"skill": ["mem-1"]},
+                success=True,
+                status="complete",
+            ))
+            logger.append(UsageLogEntry(
+                task_id="t1",
+                task_type="humaneval",
+                run_id="run-2",
+                memory_project_key="proj-A",
+                retrieved_candidates={"skill": ["mem-1"]},
+                success=False,
+                status="complete",
+            ))
+
+            entries = logger.load_all()
+
+            self.assertEqual([entry.run_id for entry in entries], ["run-1", "run-2"])
+            self.assertEqual([entry.success for entry in entries], [True, False])
+
     def test_overwrite_replaces_contents(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "usage_logs.jsonl"
@@ -252,6 +299,40 @@ class TraceJoinTests(unittest.TestCase):
         self.assertEqual(snapshot.selected_memory_ids, {"skill": ["mem-1"]})
         self.assertEqual(snapshot.selection_policy, "default_v1")
         self.assertEqual(snapshot.timestamp, "2026-01-01T00:00:31")
+        self.assertEqual(snapshot.selection_events_seen, 2)
+        self.assertEqual(snapshot.selection_events_used, 1)
+
+    def test_selection_filters_by_run_and_uses_top_level_event_time(self) -> None:
+        events = [
+            _candidate_event(
+                [{"id": "mem-1", "tier": "skill"}],
+                event_time="2026-01-01T00:01:00",
+                run_id="run-1",
+            ),
+            _selected_event(
+                ["mem-1"],
+                event_time="2026-01-01T00:01:01",
+                run_id="run-1",
+            ),
+            _candidate_event(
+                [{"id": "mem-2", "tier": "tip"}],
+                event_time="2026-01-01T00:02:00",
+                run_id="run-2",
+            ),
+            _selected_event(
+                ["mem-2"],
+                event_time="2026-01-01T00:02:01",
+                run_id="run-2",
+            ),
+        ]
+
+        snapshot = selection_from_trace(events, run_id="run-1")
+
+        self.assertEqual(snapshot.retrieved_candidates, {"skill": ["mem-1"]})
+        self.assertEqual(snapshot.selected_memory_ids, {"skill": ["mem-1"]})
+        self.assertEqual(snapshot.run_id, "run-1")
+        self.assertEqual(snapshot.timestamp, "2026-01-01T00:01:01")
+        self.assertEqual(snapshot.selection_events_seen, 1)
 
     def test_selection_from_trace_candidates_only_empty_selected(self) -> None:
         events = [_candidate_event([{"id": "mem-1", "tier": "skill"}]), _selected_event([])]
@@ -296,6 +377,31 @@ class TraceJoinTests(unittest.TestCase):
         self.assertEqual(entry.memory_project_key, "manifest:abc:memory:shared_stream:stream:python")
         self.assertEqual(entry.tags, ("smoke",))
         self.assertTrue(entry.is_complete)
+
+    def test_usage_entry_preserves_trace_run_id_and_selection_time(self) -> None:
+        events = [
+            _candidate_event(
+                [{"id": "mem-1", "tier": "skill"}],
+                event_time="2026-01-01T00:01:00",
+                run_id="run-1",
+            ),
+            _selected_event(
+                ["mem-1"],
+                event_time="2026-01-01T00:01:01",
+                run_id="run-1",
+            ),
+            _benchmark_result_event(resolved=True, run_id="run-1"),
+        ]
+
+        entry = usage_entry_from_result_row(
+            {"task_id": "humaneval-1", "resolved": True},
+            trace_events=events,
+        )
+
+        self.assertIsNotNone(entry)
+        assert entry is not None
+        self.assertEqual(entry.run_id, "run-1")
+        self.assertEqual(entry.timestamp, "2026-01-01T00:01:01")
 
     def test_usage_entry_outcome_falls_back_to_trace_benchmark_result(self) -> None:
         events = [

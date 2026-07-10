@@ -9,7 +9,6 @@ from typing import Any, Iterable, Mapping
 import json
 
 from my_agent.memory.evolver.attribution import MemoryAttributionRecord
-from my_agent.memory.evolver.usage_log import flatten_tier_ids
 from my_agent.text_safety import sanitize_json_value
 
 
@@ -65,14 +64,14 @@ def annotate_writer_dataset_scores(
 
         saved = _writer_saved_records(next_row)
         score_items, row_missing = _score_items(saved, attribution)
-        values = [item["value"] for item in score_items]
+        values = _score_values(score_items)
         mean_score = mean(values) if values else None
         next_row["created_memory_scores"] = score_items
         next_row["mean_created_memory_score"] = mean_score
         next_row["score"] = mean_score
         next_row["scoring_source"] = SCORING_SOURCE
         rows_scored += 1
-        missing += row_missing
+        missing += len(row_missing)
         output_rows.append(next_row)
 
     _write_jsonl(output_path, output_rows)
@@ -113,17 +112,15 @@ def annotate_selector_dataset_scores(
             output_rows.append(next_row)
             continue
 
-        candidate_ids = _selector_candidate_ids(next_row)
-        selected_ids = _selector_selected_ids(next_row)
         candidate_items, candidate_missing = _score_items(
-            [{"id": mid, "tier": ""} for mid in candidate_ids],
+            _selector_candidate_records(next_row),
             attribution,
         )
         selected_items, selected_missing = _score_items(
-            [{"id": mid, "tier": ""} for mid in selected_ids],
+            _selector_selected_records(next_row),
             attribution,
         )
-        selected_values = [item["value"] for item in selected_items]
+        selected_values = _score_values(selected_items)
         mean_selected = mean(selected_values) if selected_values else None
         success = _row_success(next_row)
         if score_mode == "binary":
@@ -137,7 +134,7 @@ def annotate_selector_dataset_scores(
         next_row["score"] = score
         next_row["scoring_source"] = SCORING_SOURCE
         rows_scored += 1
-        missing += candidate_missing + selected_missing
+        missing += len(candidate_missing | selected_missing)
         output_rows.append(next_row)
 
     _write_jsonl(output_path, output_rows)
@@ -197,76 +194,83 @@ def _writer_saved_records(row: Mapping[str, Any]) -> list[dict[str, str]]:
     return [{"id": str(mid), "tier": ""} for mid in (row.get("saved_ids") or []) if mid]
 
 
-def _selector_candidate_ids(row: Mapping[str, Any]) -> list[str]:
+def _selector_candidate_records(row: Mapping[str, Any]) -> list[dict[str, str]]:
     nested = row.get("retrieve")
     if isinstance(nested, Mapping):
-        ids = _ids_from_candidate_payload(nested.get("candidates"))
-        if ids:
-            return ids
-    return _ids_from_tier_or_flat(row.get("candidate_memory_ids_by_tier") or row.get("candidate_memory_ids"))
+        records = _records_from_tier_or_flat(nested.get("candidates"))
+        if records:
+            return records
+    return _records_from_tier_or_flat(
+        row.get("candidate_memory_ids_by_tier") or row.get("candidate_memory_ids")
+    )
 
 
-def _selector_selected_ids(row: Mapping[str, Any]) -> list[str]:
+def _selector_selected_records(row: Mapping[str, Any]) -> list[dict[str, str]]:
     select = row.get("select")
     if isinstance(select, Mapping):
-        ids = _ids_from_tier_or_flat(select.get("selected_memory_ids") or select.get("selected_ids"))
-        if ids:
-            return ids
-    return _ids_from_tier_or_flat(row.get("selected_memory_ids_by_tier") or row.get("selected_memory_ids"))
+        records = _records_from_tier_or_flat(
+            select.get("selected_memory_ids") or select.get("selected_ids")
+        )
+        if records:
+            return records
+    return _records_from_tier_or_flat(
+        row.get("selected_memory_ids_by_tier") or row.get("selected_memory_ids")
+    )
 
 
-def _ids_from_candidate_payload(value: Any) -> list[str]:
+def _records_from_tier_or_flat(value: Any) -> list[dict[str, str]]:
+    records: list[dict[str, str]] = []
     if isinstance(value, Mapping):
-        return _ids_from_tier_or_flat(value)
-    if isinstance(value, list):
-        ids: list[str] = []
+        if value.get("id"):
+            records.append({"id": str(value.get("id")), "tier": str(value.get("tier") or "")})
+        else:
+            for tier, raw_items in value.items():
+                if not isinstance(raw_items, (list, tuple)):
+                    continue
+                for item in raw_items:
+                    if isinstance(item, Mapping):
+                        memory_id = str(item.get("id") or "")
+                        item_tier = str(item.get("tier") or tier or "")
+                    else:
+                        memory_id = str(item or "")
+                        item_tier = str(tier or "")
+                    if memory_id:
+                        records.append({"id": memory_id, "tier": item_tier})
+    elif isinstance(value, (list, tuple)):
         for item in value:
-            if isinstance(item, Mapping) and item.get("id"):
-                ids.append(str(item.get("id")))
-            elif item:
-                ids.append(str(item))
-        return _dedupe(ids)
-    return []
-
-
-def _ids_from_tier_or_flat(value: Any) -> list[str]:
-    if isinstance(value, Mapping):
-        return flatten_tier_ids({str(k): [str(i) for i in (v or [])] for k, v in value.items()})
-    if isinstance(value, list):
-        return _dedupe(str(i) for i in value if i)
-    if isinstance(value, tuple):
-        return _dedupe(str(i) for i in value if i)
-    return []
+            if isinstance(item, Mapping):
+                memory_id = str(item.get("id") or "")
+                tier = str(item.get("tier") or "")
+            else:
+                memory_id = str(item or "")
+                tier = ""
+            if memory_id:
+                records.append({"id": memory_id, "tier": tier})
+    return _dedupe_records(records)
 
 
 def _score_items(
     items: Iterable[Mapping[str, Any]],
     attribution: Mapping[str, MemoryAttributionRecord],
-) -> tuple[list[dict[str, Any]], int]:
-    scored: list[dict[str, Any]] = []
-    missing = 0
+) -> tuple[dict[str, dict[str, float]], set[str]]:
+    scored: dict[str, dict[str, float]] = {}
+    missing: set[str] = set()
     for item in items:
         memory_id = str(item.get("id") or "")
         if not memory_id:
             continue
         record = attribution.get(memory_id)
+        tier = str(item.get("tier") or (record.tier if record is not None else "") or "unknown")
         if record is None:
-            missing += 1
-            scored.append({
-                "id": memory_id,
-                "tier": str(item.get("tier") or ""),
-                "value": 0.0,
-                "missing_attribution": True,
-            })
-            continue
-        scored.append({
-            "id": memory_id,
-            "tier": str(item.get("tier") or record.tier),
-            "value": round(float(record.value), 6),
-            "confidence": round(float(record.confidence), 6),
-            "missing_attribution": False,
-        })
+            missing.add(memory_id)
+        scored.setdefault(tier, {})[memory_id] = (
+            0.0 if record is None else round(float(record.value), 6)
+        )
     return scored, missing
+
+
+def _score_values(scores: Mapping[str, Mapping[str, float]]) -> list[float]:
+    return [float(value) for tier_scores in scores.values() for value in tier_scores.values()]
 
 
 def _row_success(row: Mapping[str, Any]) -> bool:
@@ -289,13 +293,20 @@ def _has_numeric_score(row: Mapping[str, Any]) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
-def _dedupe(values: Iterable[str]) -> list[str]:
-    seen: set[str] = set()
-    result: list[str] = []
-    for value in values:
-        if value and value not in seen:
-            seen.add(value)
-            result.append(value)
+def _dedupe_records(records: Iterable[Mapping[str, str]]) -> list[dict[str, str]]:
+    result: list[dict[str, str]] = []
+    positions: dict[str, int] = {}
+    for record in records:
+        memory_id = str(record.get("id") or "")
+        tier = str(record.get("tier") or "")
+        if not memory_id:
+            continue
+        position = positions.get(memory_id)
+        if position is None:
+            positions[memory_id] = len(result)
+            result.append({"id": memory_id, "tier": tier})
+        elif not result[position]["tier"] and tier:
+            result[position]["tier"] = tier
     return result
 
 

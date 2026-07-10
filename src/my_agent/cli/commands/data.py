@@ -246,6 +246,8 @@ def _build_memory_usage_log(args: argparse.Namespace) -> _RenderedResult:
         "missing_outcome": 0,
         "missing_memory_project_key": 0,
         "bad_trace": 0,
+        "selection_events_seen": 0,
+        "selection_events_used": 0,
     }
     for row in rows:
         trace_path = _resolve_trace_path(row, results_path.parent, Path(args.trace_dir) if args.trace_dir else None)
@@ -254,22 +256,29 @@ def _build_memory_usage_log(args: argparse.Namespace) -> _RenderedResult:
             _raise_if_strict(args.strict, f"missing trace for task_id={row.get('task_id', '')}")
             continue
         try:
-            trace_events = _read_trace_events_for_cli(trace_path, strict=args.strict)
+            trace_events, bad_lines = _read_trace_events_for_cli(trace_path, strict=args.strict)
         except ValueError:
             summary["bad_trace"] += 1
             if args.strict:
                 raise
             continue
+        if bad_lines:
+            summary["bad_trace"] += 1
 
-        selection = selection_from_trace(trace_events)
+        row_with_trace = dict(row)
+        row_with_trace["trace_path"] = str(trace_path)
+        entry = usage_entry_from_result_row(row_with_trace, trace_events=trace_events)
+        selection = selection_from_trace(
+            trace_events,
+            run_id=entry.run_id if entry is not None else str(row.get("run_id") or ""),
+        )
+        summary["selection_events_seen"] += selection.selection_events_seen
+        summary["selection_events_used"] += selection.selection_events_used
         if selection.is_empty:
             summary["missing_selection"] += 1
             _raise_if_strict(args.strict, f"missing selection for task_id={row.get('task_id', '')}")
             continue
 
-        row_with_trace = dict(row)
-        row_with_trace["trace_path"] = str(trace_path)
-        entry = usage_entry_from_result_row(row_with_trace, trace_events=trace_events)
         if entry is None:
             summary["missing_outcome"] += 1
             _raise_if_strict(args.strict, f"missing outcome for task_id={row.get('task_id', '')}")
@@ -317,8 +326,15 @@ def _score_memory_attribution(args: argparse.Namespace) -> _RenderedResult:
             project_key=str(args.memory_project_key or "") if args.memory_project_key else None,
             all_projects=bool(args.all_projects),
             min_abs_value_to_write=float(args.min_abs_value_to_write),
+            min_candidate_count=int(args.min_candidate_count),
         )
-    summary = attribution_summary(records, output=output, top_n=args.top_n, write_back=write_back_summary)
+    summary = attribution_summary(
+        records,
+        output=output,
+        top_n=args.top_n,
+        write_back=write_back_summary,
+        config=config,
+    )
     _write_summary_json(summary, output)
     return _RenderedResult(render_attribution_summary(summary))
 
@@ -409,8 +425,13 @@ def _resolve_trace_path(row: dict[str, object], results_dir: Path, trace_dir: Pa
     return None
 
 
-def _read_trace_events_for_cli(path: Path, *, strict: bool) -> list[dict[str, object]]:
+def _read_trace_events_for_cli(
+    path: Path,
+    *,
+    strict: bool,
+) -> tuple[list[dict[str, object]], int]:
     events: list[dict[str, object]] = []
+    bad_lines = 0
     with path.open("r", encoding="utf-8") as fh:
         for lineno, raw in enumerate(fh, 1):
             raw = raw.strip()
@@ -421,10 +442,11 @@ def _read_trace_events_for_cli(path: Path, *, strict: bool) -> list[dict[str, ob
             except json.JSONDecodeError as exc:
                 if strict:
                     raise ValueError(f"invalid trace JSONL in {path} line {lineno}: {exc}") from exc
+                bad_lines += 1
                 continue
             if isinstance(data, dict):
                 events.append(data)
-    return events
+    return events, bad_lines
 
 
 def _trace_identifiers(row: dict[str, object]) -> list[str]:
@@ -484,6 +506,9 @@ def _render_usage_summary(summary: dict[str, object]) -> str:
         f"Missing selection: {int(summary.get('missing_selection') or 0)}\n"
         f"Missing outcome: {int(summary.get('missing_outcome') or 0)}\n"
         f"Missing memory project key: {int(summary.get('missing_memory_project_key') or 0)}\n"
+        f"Bad trace: {int(summary.get('bad_trace') or 0)}\n"
+        f"Selection events: {int(summary.get('selection_events_used') or 0)}/"
+        f"{int(summary.get('selection_events_seen') or 0)} used\n"
         f"Output: {summary.get('output') or ''}"
     )
 

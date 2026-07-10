@@ -305,7 +305,6 @@ def score_all_memories(
             continue
         scoped_logs.append(log)
         candidate_ids.update(log.all_candidate_ids())
-        candidate_ids.update(log.all_selected_ids())
 
     # Project-visible experience entries.
     visible_entries: list[MemoryEntry] = []
@@ -474,6 +473,7 @@ def attribution_summary(
     output: str | Path = "",
     top_n: int = 5,
     write_back: AttributionWriteBackSummary | None = None,
+    config: AttributionConfig | None = None,
 ) -> dict[str, Any]:
     """Build the CLI / summary.json payload for attribution scoring."""
     ordered = sorted(records, key=lambda r: r.memory_id)
@@ -482,23 +482,30 @@ def attribution_summary(
     zero = [r for r in ordered if r.value == 0]
     top = sorted(ordered, key=lambda r: (-r.value, r.memory_id))[: max(0, int(top_n))]
     bottom = sorted(ordered, key=lambda r: (r.value, r.memory_id))[: max(0, int(top_n))]
+    cfg = config or AttributionConfig()
+    low_evidence = sum(
+        1
+        for record in ordered
+        if record.candidate_count < cfg.min_candidate_count
+        or record.selected_count < cfg.min_selected_count
+        or record.not_selected_count < cfg.min_not_selected_count
+    )
     payload: dict[str, Any] = {
         "output": str(output or ""),
         "records": len(ordered),
         "positive": len(positives),
         "negative": len(negatives),
         "zero": len(zero),
-        "skipped_low_evidence": sum(
-            1
-            for r in ordered
-            if r.value == 0.0 and (r.candidate_count < 2 or r.selected_count == 0 or r.not_selected_count == 0)
-        ),
+        "skipped_by_project_key": 0,
+        "skipped_low_evidence": low_evidence,
         "top": [_summary_item(r) for r in top],
         "bottom": [_summary_item(r) for r in bottom],
     }
     if write_back is not None:
         payload["write_back_updated"] = write_back.updated
         payload["write_back"] = write_back.to_dict()
+        payload["skipped_by_project_key"] = write_back.skipped_by_project_key
+        payload["skipped_low_evidence"] = write_back.skipped_low_evidence
     else:
         payload["write_back_updated"] = 0
     return sanitize_json_value(payload)  # type: ignore[return-value]
@@ -511,7 +518,9 @@ def render_attribution_summary(summary: Mapping[str, Any]) -> str:
         f"negative={int(summary.get('negative') or 0)}, "
         f"zero={int(summary.get('zero') or 0)})\n"
         f"Output: {summary.get('output') or ''}\n"
-        f"Write-back updated: {int(summary.get('write_back_updated') or 0)}"
+        f"Write-back updated: {int(summary.get('write_back_updated') or 0)}\n"
+        f"Skipped by project key: {int(summary.get('skipped_by_project_key') or 0)}\n"
+        f"Skipped low evidence: {int(summary.get('skipped_low_evidence') or 0)}"
     )
 
 

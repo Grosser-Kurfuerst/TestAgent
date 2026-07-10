@@ -20,10 +20,11 @@ from my_agent.memory.types import MemoryScope
 PROJECT_KEY = "manifest:demo:memory:shared_stream:stream:python"
 
 
-def _candidate_event(memory_id: str, *, timestamp: str) -> dict:
+def _candidate_event(memory_id: str, *, timestamp: str, run_id: str = "") -> dict:
     return {
         "event": "memory.evolver_candidates",
         "time": timestamp,
+        "run_id": run_id,
         "payload": {
             "candidate_count": 1,
             "candidate_summaries": [{"id": memory_id, "tier": "skill", "score": 1.0, "tokens": 4}],
@@ -35,10 +36,11 @@ def _candidate_event(memory_id: str, *, timestamp: str) -> dict:
     }
 
 
-def _selected_event(ids: list[str], *, timestamp: str) -> dict:
+def _selected_event(ids: list[str], *, timestamp: str, run_id: str = "") -> dict:
     return {
         "event": "memory.evolver_selected",
         "time": timestamp,
+        "run_id": run_id,
         "payload": {
             "selected_count": len(ids),
             "selected_ids": ids,
@@ -49,10 +51,11 @@ def _selected_event(ids: list[str], *, timestamp: str) -> dict:
     }
 
 
-def _benchmark_event(task_id: str, *, resolved: bool, timestamp: str) -> dict:
+def _benchmark_event(task_id: str, *, resolved: bool, timestamp: str, run_id: str = "") -> dict:
     return {
         "event": "benchmark_result",
         "time": timestamp,
+        "run_id": run_id,
         "payload": {
             "task_id": task_id,
             "resolved": resolved,
@@ -68,10 +71,24 @@ def _benchmark_event(task_id: str, *, resolved: bool, timestamp: str) -> dict:
 
 
 def _write_trace(path: Path, task_id: str, memory_id: str, *, selected: bool, resolved: bool) -> None:
+    run_id = f"run-{task_id}"
     events = [
-        _candidate_event(memory_id, timestamp=f"2026-01-01T00:00:{task_id[-1]}0+00:00"),
-        _selected_event([memory_id] if selected else [], timestamp=f"2026-01-01T00:00:{task_id[-1]}1+00:00"),
-        _benchmark_event(task_id, resolved=resolved, timestamp=f"2026-01-01T00:01:{task_id[-1]}0+00:00"),
+        _candidate_event(
+            memory_id,
+            timestamp=f"2026-01-01T00:00:{task_id[-1]}0+00:00",
+            run_id=run_id,
+        ),
+        _selected_event(
+            [memory_id] if selected else [],
+            timestamp=f"2026-01-01T00:00:{task_id[-1]}1+00:00",
+            run_id=run_id,
+        ),
+        _benchmark_event(
+            task_id,
+            resolved=resolved,
+            timestamp=f"2026-01-01T00:01:{task_id[-1]}0+00:00",
+            run_id=run_id,
+        ),
     ]
     path.write_text("\n".join(json.dumps(event, ensure_ascii=False) for event in events) + "\n", encoding="utf-8")
 
@@ -140,6 +157,10 @@ class EvolverAttributionCliTests(unittest.TestCase):
             self.assertEqual(len(usage_log.read_text(encoding="utf-8").splitlines()), 4)
             usage_summary = json.loads(Path(str(usage_log) + ".summary.json").read_text(encoding="utf-8"))
             self.assertEqual(usage_summary["usage_logs"], 4)
+            self.assertEqual(usage_summary["selection_events_seen"], 4)
+            self.assertEqual(usage_summary["selection_events_used"], 4)
+            usage_rows = [json.loads(line) for line in usage_log.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual({row["run_id"] for row in usage_rows}, {f"run-{task_id}" for task_id, *_ in tasks})
 
             attribution = base / "memory_attribution.jsonl"
             stdout = io.StringIO()
@@ -186,6 +207,9 @@ class EvolverAttributionCliTests(unittest.TestCase):
             self.assertEqual(exit_code, 0)
             writer_row = json.loads(writer_output.read_text(encoding="utf-8").strip())
             self.assertGreater(writer_row["score"], 0.0)
+            self.assertEqual(writer_row["created_memory_scores"], {
+                "skill": {"mem-good": by_id["mem-good"]["value"]},
+            })
             self.assertTrue(Path(str(writer_output) + ".summary.json").exists())
 
     def test_build_usage_log_strict_fails_on_bad_trace(self) -> None:
@@ -216,6 +240,36 @@ class EvolverAttributionCliTests(unittest.TestCase):
 
             self.assertNotEqual(exit_code, 0)
             self.assertIn("invalid trace JSONL", stderr.getvalue())
+
+    def test_build_usage_log_non_strict_counts_bad_trace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            trace = base / "bad.jsonl"
+            trace.write_text("{bad}\n", encoding="utf-8")
+            results = base / "results.jsonl"
+            results.write_text(
+                json.dumps({
+                    "task_id": "bad-task",
+                    "resolved": True,
+                    "memory_project_key": PROJECT_KEY,
+                    "trace_path": str(trace),
+                }) + "\n",
+                encoding="utf-8",
+            )
+            output = base / "usage_logs.jsonl"
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                exit_code = main([
+                    "data",
+                    "build-memory-usage-log",
+                    "--results", str(results),
+                    "--output", str(output),
+                ])
+
+            self.assertEqual(exit_code, 0)
+            summary = json.loads(Path(str(output) + ".summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["bad_trace"], 1)
+            self.assertEqual(summary["missing_selection"], 1)
 
     def test_build_usage_log_resolves_missing_trace_path_from_trace_dir(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
