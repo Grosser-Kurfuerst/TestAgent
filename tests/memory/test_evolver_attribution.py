@@ -14,6 +14,7 @@ from my_agent.memory.evolver import (
     DEFAULT_TIER_WEIGHTS,
     MemoryAttributionRecord,
     UsageLogEntry,
+    attribution_metadata,
     attribution_summary,
     build_experience_entry,
     load_attribution_jsonl,
@@ -59,10 +60,12 @@ def _log(
     project_key: str = "proj-A",
     stream_id: str = "python",
     success: bool | None = None,
+    timestamp: str = "",
 ) -> UsageLogEntry:
     return UsageLogEntry(
         task_id=task_id,
         task_type=task_type,
+        timestamp=timestamp,
         stream_id=stream_id,
         memory_project_key=project_key,
         retrieved_candidates={"skill": candidates},
@@ -175,6 +178,49 @@ class ScoreMemoryTests(unittest.TestCase):
         complete = _log(task_id="B", candidates=["mem-1", "mem-2"], selected=[], reward=0.0)
         record = score_memory(memory_id="mem-1", tier="skill", usage_logs=[started, complete])
         self.assertEqual(record.candidate_count, 1)
+
+    def test_last_used_is_latest_stable_selected_timestamp(self) -> None:
+        logs = [
+            _log(
+                task_id="A",
+                candidates=["mem-1"],
+                selected=["mem-1"],
+                reward=1.0,
+                timestamp="2026-07-01T00:00:00+00:00",
+            ),
+            _log(
+                task_id="B",
+                candidates=["mem-1"],
+                selected=["mem-1"],
+                reward=1.0,
+                timestamp="2026-07-03T00:00:00+00:00",
+            ),
+            _log(
+                task_id="C",
+                candidates=["mem-1"],
+                selected=[],
+                reward=0.0,
+                timestamp="2026-07-05T00:00:00+00:00",
+            ),
+        ]
+
+        record = score_memory(memory_id="mem-1", tier="skill", usage_logs=logs)
+
+        self.assertEqual(record.last_used, "2026-07-03T00:00:00+00:00")
+        metadata = attribution_metadata(record, updated_at="2026-07-06T00:00:00+00:00")
+        self.assertEqual(metadata["evolver_last_used"], record.last_used)
+
+    def test_last_used_remains_empty_without_selected_timestamp(self) -> None:
+        record = score_memory(
+            memory_id="mem-1",
+            tier="skill",
+            usage_logs=[
+                _log(task_id="A", candidates=["mem-1"], selected=["mem-1"], reward=1.0),
+                _log(task_id="B", candidates=["mem-1"], selected=[], reward=0.0),
+            ],
+        )
+
+        self.assertEqual(record.last_used, "")
 
 
 class ScoreAllMemoriesTests(unittest.TestCase):

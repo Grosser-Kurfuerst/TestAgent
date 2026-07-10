@@ -149,6 +149,17 @@ class EvolverMetadataTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             build_experience_entry(id="empty", content="  ", tier=ExperienceTier.SKILL, project_key="/repo")
 
+    def test_build_experience_entry_preserves_explicit_created_at(self) -> None:
+        entry = build_experience_entry(
+            id="fixed-time",
+            content="Deterministic promoted skill",
+            tier=ExperienceTier.SKILL,
+            project_key="/repo",
+            created_at=NOW,
+        )
+
+        self.assertEqual(entry.created_at, NOW)
+
     def test_experience_trajectory_step_renders_json_safe_dict(self) -> None:
         step = ExperienceTrajectoryStep(
             step_num=1,
@@ -343,6 +354,73 @@ class EvolverLongTermStoreTests(unittest.TestCase):
             visible_b = {entry.id for entry in store.all(project_key="/repo-b")}
             self.assertEqual(visible_a, {"exp_a", "exp_global"})
             self.assertEqual(visible_b, {"exp_b", "exp_global"})
+
+    def test_same_content_can_coexist_across_experience_tiers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(Path(tmp))
+            store.load()
+            tip = build_experience_entry(
+                id="tip",
+                content="Use the project parser before editing manifests.",
+                tier=ExperienceTier.TIP,
+                project_key="/repo",
+            )
+            skill = build_experience_entry(
+                id="skill",
+                content=tip.content,
+                tier=ExperienceTier.SKILL,
+                project_key="/repo",
+            )
+            duplicate_skill = build_experience_entry(
+                id="skill-duplicate",
+                content=tip.content,
+                tier=ExperienceTier.SKILL,
+                project_key="/repo",
+            )
+
+            _, tip_created = store.add(tip)
+            _, skill_created = store.add(skill)
+            stored_duplicate, duplicate_created = store.add(duplicate_skill)
+
+            self.assertTrue(tip_created)
+            self.assertTrue(skill_created)
+            self.assertFalse(duplicate_created)
+            self.assertEqual(stored_duplicate.id, "skill")
+            self.assertEqual({entry.id for entry in store.all()}, {"tip", "skill"})
+
+    def test_global_experiences_dedupe_by_tier_but_not_project(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(Path(tmp))
+            store.load()
+            first = build_experience_entry(
+                id="global-tip-a",
+                content="Global guidance",
+                tier=ExperienceTier.TIP,
+                project_key="/repo-a",
+                scope=MemoryScope.GLOBAL,
+            )
+            duplicate = build_experience_entry(
+                id="global-tip-b",
+                content=first.content,
+                tier=ExperienceTier.TIP,
+                project_key="/repo-b",
+                scope=MemoryScope.GLOBAL,
+            )
+            skill = build_experience_entry(
+                id="global-skill",
+                content=first.content,
+                tier=ExperienceTier.SKILL,
+                project_key="/repo-b",
+                scope=MemoryScope.GLOBAL,
+            )
+
+            store.add(first)
+            duplicate_entry, duplicate_created = store.add(duplicate)
+            _, skill_created = store.add(skill)
+
+            self.assertFalse(duplicate_created)
+            self.assertEqual(duplicate_entry.id, "global-tip-a")
+            self.assertTrue(skill_created)
 
 
 if __name__ == "__main__":

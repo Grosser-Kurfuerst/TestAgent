@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
 from typing import Any
 
@@ -111,6 +112,7 @@ def build_experience_entry(
     source_task: str = "",
     created_by: ExperienceCreatedBy | str = ExperienceCreatedBy.MANUAL,
     extra_metadata: dict[str, Any] | None = None,
+    created_at: datetime | None = None,
 ) -> MemoryEntry:
     if not str(content).strip():
         raise ValueError("experience content must not be empty")
@@ -128,6 +130,7 @@ def build_experience_entry(
         scope=scope,
         source=source or f"evolver:{resolved_tier.value}",
         token_count=estimate_tokens(content),
+        created_at=created_at,
         project_key=project_key,
         run_id=run_id,
         metadata=metadata,

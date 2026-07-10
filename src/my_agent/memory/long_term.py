@@ -22,9 +22,11 @@ class LongTermMemoryStore:
     Semantics (see plan §6):
 
     * Loaded fully at startup; malformed lines are skipped and traced.
-    * ``add()`` deduplicates by ``scope`` + ``project_key`` + ``fingerprint``
-      (global scope ignores ``project_key``). Duplicate writes return the
-      original entry and ``False`` so the caller can report "already exists".
+    * ``add()`` deduplicates ordinary memories by ``scope`` + ``project_key`` +
+      ``fingerprint`` and experience memories by the same key plus
+      ``evolver_tier`` (global scope ignores ``project_key``). Duplicate writes
+      return the original entry and ``False`` so the caller can report
+      "already exists".
     * The original ``created_at`` is always preserved on a hit, so time-decay
       retrieval is not polluted by repeated saves.
     * Persistence uses an atomic temp-file + ``Path.replace``.
@@ -77,7 +79,7 @@ class LongTermMemoryStore:
                 })
 
     def add(self, entry: MemoryEntry) -> tuple[MemoryEntry, bool]:
-        """Add an entry, deduplicating by scope/project/fingerprint.
+        """Add an entry, deduplicating by scope/project/tier/fingerprint.
 
         Returns ``(stored_entry, created)``. On a duplicate the original entry
         (with its original ``created_at``) is returned and ``created`` is
@@ -225,10 +227,10 @@ class LongTermMemoryStore:
         duplicate actually replaces the earlier, newer one in the output list
         — not just in the bookkeeping dict.
         """
-        seen: dict[tuple[str, str, str], int] = {}
+        seen: dict[tuple[str, str, str, str], int] = {}
         unique: list[MemoryEntry] = []
         for entry in self._entries:
-            key = _dedup_key(entry)
+            key = memory_dedup_key(entry)
             if key not in seen:
                 seen[key] = len(unique)
                 unique.append(entry)
@@ -309,19 +311,22 @@ def _is_visible(entry: MemoryEntry, project_key: str) -> bool:
 
 
 def _is_duplicate(existing: MemoryEntry, candidate: MemoryEntry) -> bool:
-    if existing.scope != candidate.scope:
-        return False
-    if existing.scope == MemoryScope.GLOBAL:
-        return existing.fingerprint == candidate.fingerprint
-    if existing.project_key != candidate.project_key:
-        return False
-    return existing.fingerprint == candidate.fingerprint
+    return memory_dedup_key(existing) == memory_dedup_key(candidate)
 
 
-def _dedup_key(entry: MemoryEntry) -> tuple[str, str, str]:
-    if entry.scope == MemoryScope.GLOBAL:
-        return (entry.scope.value, "", entry.fingerprint)
-    return (entry.scope.value, entry.project_key, entry.fingerprint)
+def memory_dedup_key(entry: MemoryEntry) -> tuple[str, str, str, str]:
+    """Return the repository-wide dedup identity for ``entry``.
+
+    Experience tiers are separate repositories in OPD-Evolver semantics, so a
+    promoted skill may coexist with its source tip/trajectory even when their
+    normalized contents (and fingerprints) are identical. Ordinary memories
+    retain the original scope/project/fingerprint behavior via an empty tier
+    component.
+    """
+    project_key = "" if entry.scope == MemoryScope.GLOBAL else entry.project_key
+    raw_tier = str(entry.metadata.get("evolver_tier") or "")
+    tier = raw_tier if raw_tier in {"trajectory", "tip", "skill", "tool"} else ""
+    return (entry.scope.value, project_key, tier, entry.fingerprint)
 
 
 def _matches_filter(entry: MemoryEntry, *, scope: MemoryScope | None, project_key: str | None) -> bool:
@@ -332,4 +337,4 @@ def _matches_filter(entry: MemoryEntry, *, scope: MemoryScope | None, project_ke
     return True
 
 
-__all__ = ["LongTermMemoryStore", "STORAGE_FILE"]
+__all__ = ["LongTermMemoryStore", "STORAGE_FILE", "memory_dedup_key"]

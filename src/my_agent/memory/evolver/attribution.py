@@ -238,6 +238,10 @@ def score_memory(
     groups = stream_ids  # group identity aligns with stream in AgentCli
     selected_task_ids = tuple(sorted({log.task_id for log in selected_logs if log.task_id}))
     not_selected_task_ids = tuple(sorted({log.task_id for log in not_selected_logs if log.task_id}))
+    last_used = max(
+        (str(log.timestamp) for log in selected_logs if str(log.timestamp or "")),
+        default="",
+    )
 
     return MemoryAttributionRecord(
         memory_id=memory_id,
@@ -257,7 +261,7 @@ def score_memory(
         stream_ids=stream_ids,
         selected_task_ids=selected_task_ids,
         not_selected_task_ids=not_selected_task_ids,
-        last_used="",
+        last_used=last_used,
     )
 
 
@@ -392,6 +396,7 @@ def attribution_metadata(
         "evolver_reward_when_candidate_not_selected": _maybe_round(record.reward_when_candidate_not_selected),
         "evolver_attribution_task_types": list(record.task_types),
         "evolver_attribution_stream_ids": list(record.stream_ids),
+        "evolver_last_used": str(record.last_used or ""),
     }
 
 
