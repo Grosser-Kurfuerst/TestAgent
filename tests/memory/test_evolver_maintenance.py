@@ -974,10 +974,20 @@ class MaintenancePlanContractTests(unittest.TestCase):
 
     def test_partial_config_is_normalized_before_round_trip(self) -> None:
         plan = self._plan()
+        normalized_config = MaintenanceConfig(delete_value_threshold=-0.2).to_dict()
+        plan_id = maintenance_module._plan_id(
+            repository_revision=plan.repository_revision,
+            project_key=plan.memory_project_key,
+            as_of=plan.as_of,
+            config=normalized_config,
+            input_summary=plan.input_summary,
+            operations=plan.operations,
+            summary=plan.summary,
+        )
         partial = MaintenancePlan(
             schema_version=plan.schema_version,
             policy=plan.policy,
-            plan_id=plan.plan_id,
+            plan_id=plan_id,
             repository_revision=plan.repository_revision,
             scope_mode=plan.scope_mode,
             memory_project_key=plan.memory_project_key,

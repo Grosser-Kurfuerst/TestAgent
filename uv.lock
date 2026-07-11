@@ -833,6 +833,7 @@ name = "my-agent"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "filelock" },
     { name = "python-dotenv" },
 ]
 
@@ -847,6 +848,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "datasets", marker = "extra == 'data'", specifier = ">=5.0.0" },
+    { name = "filelock", specifier = ">=3.18,<4" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0.0" },
     { name = "python-dotenv", specifier = ">=1.0.0" },
 ]

@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "A lightweight coding-agent skeleton with typed state and CLI scaffolding."
 requires-python = ">=3.10"
 dependencies = [
+  "filelock>=3.18,<4",
   "python-dotenv>=1.0.0",
 ]
 

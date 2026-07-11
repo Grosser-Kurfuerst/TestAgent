@@ -3,9 +3,13 @@ from __future__ import annotations
 import json
 import os
 import threading
-from dataclasses import replace
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
+from hashlib import sha256
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator, Sequence
+
+from filelock import FileLock, Timeout as FileLockTimeout
 
 from my_agent.memory.types import MemoryEntry, MemoryScope, content_fingerprint
 from my_agent.text_safety import sanitize_json_value
@@ -14,6 +18,34 @@ from my_agent.text_safety import sanitize_json_value
 TraceSink = Callable[[str, dict[str, Any]], None]
 
 STORAGE_FILE = "long_term_memory.jsonl"
+LOCK_FILE = ".long_term_memory.lock"
+
+
+class MemoryStoreLockTimeout(RuntimeError):
+    """Raised when the directory-scoped process lock cannot be acquired."""
+
+
+class MemoryStoreLoadError(ValueError):
+    """Raised when a strict repository snapshot is malformed or ambiguous."""
+
+
+class MemoryStoreRevisionConflict(RuntimeError):
+    """Raised when an atomic replace was planned against a stale revision."""
+
+
+class MemoryStorePostCommitError(RuntimeError):
+    """Raised when replacement occurred but write verification did not finish."""
+
+    def __init__(self, message: str, *, expected_revision: str) -> None:
+        super().__init__(message)
+        self.expected_revision = expected_revision
+
+
+@dataclass(frozen=True)
+class MemoryStoreSnapshot:
+    entries: tuple[MemoryEntry, ...]
+    raw_bytes: bytes
+    revision: str
 
 
 class LongTermMemoryStore:
@@ -32,17 +64,38 @@ class LongTermMemoryStore:
     * Persistence uses an atomic temp-file + ``Path.replace``.
     """
 
-    def __init__(self, path: Path, *, trace_sink: TraceSink | None = None) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        trace_sink: TraceSink | None = None,
+        lock_timeout_seconds: float = 30.0,
+    ) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        if lock_timeout_seconds < 0:
+            raise ValueError("lock_timeout_seconds must be non-negative")
         self._trace_sink = trace_sink
         self._entries: list[MemoryEntry] = []
         self._loaded = False
         self._lock = threading.RLock()
+        self._lock_timeout_seconds = float(lock_timeout_seconds)
+        self.lock_path = self.path.parent / LOCK_FILE
+        self._process_lock = FileLock(self.lock_path)
 
     @classmethod
-    def from_dir(cls, directory: str | Path, *, trace_sink: TraceSink | None = None) -> "LongTermMemoryStore":
-        return cls(Path(directory) / STORAGE_FILE, trace_sink=trace_sink)
+    def from_dir(
+        cls,
+        directory: str | Path,
+        *,
+        trace_sink: TraceSink | None = None,
+        lock_timeout_seconds: float = 30.0,
+    ) -> "LongTermMemoryStore":
+        return cls(
+            Path(directory) / STORAGE_FILE,
+            trace_sink=trace_sink,
+            lock_timeout_seconds=lock_timeout_seconds,
+        )
 
     def load(self) -> None:
         """Load entries from disk. Safe to call once at startup."""
@@ -78,6 +131,72 @@ class LongTermMemoryStore:
                     "loaded": len(self._entries),
                 })
 
+    @contextmanager
+    def exclusive_process_lock(
+        self,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> Iterator[None]:
+        """Hold the directory-scoped lock shared by every store mutation."""
+        timeout = self._lock_timeout_seconds if timeout_seconds is None else float(timeout_seconds)
+        if timeout < 0:
+            raise ValueError("timeout_seconds must be non-negative")
+        try:
+            with self._process_lock.acquire(timeout=timeout):
+                yield
+        except FileLockTimeout as exc:
+            raise MemoryStoreLockTimeout(
+                f"timed out acquiring memory store lock after {timeout:g}s"
+            ) from exc
+
+    def load_strict_snapshot(self) -> MemoryStoreSnapshot:
+        """Load a fail-closed snapshot suitable for planning or mutation."""
+        with self.exclusive_process_lock():
+            with self._lock:
+                return self._load_strict_snapshot_locked()
+
+    def revision(self) -> str:
+        return self.load_strict_snapshot().revision
+
+    def replace_all_atomically(
+        self,
+        entries: Sequence[MemoryEntry],
+        *,
+        expected_revision: str,
+    ) -> str:
+        """Replace the full repository once after a strict revision check."""
+        replacement_entries = tuple(entries)
+        _validate_strict_entries(replacement_entries)
+        expected_next_revision = memory_entries_revision(replacement_entries)
+        with self.exclusive_process_lock():
+            with self._lock:
+                current = self._load_strict_snapshot_locked()
+                if current.revision != expected_revision:
+                    raise MemoryStoreRevisionConflict(
+                        f"memory revision changed: expected {expected_revision}, got {current.revision}"
+                    )
+                previous_entries = list(self._entries)
+                self._entries = list(replacement_entries)
+                self._loaded = True
+                try:
+                    self._persist()
+                except Exception:
+                    self._entries = previous_entries
+                    self._loaded = True
+                    raise
+                try:
+                    written = self._load_strict_snapshot_locked()
+                    if written.revision != expected_next_revision:
+                        raise MemoryStoreLoadError("written memory revision mismatch")
+                except Exception as exc:
+                    self._entries = list(replacement_entries)
+                    self._loaded = True
+                    raise MemoryStorePostCommitError(
+                        "memory replaced but post-commit verification failed",
+                        expected_revision=expected_next_revision,
+                    ) from exc
+                return written.revision
+
     def add(self, entry: MemoryEntry) -> tuple[MemoryEntry, bool]:
         """Add an entry, deduplicating by scope/project/tier/fingerprint.
 
@@ -91,30 +210,33 @@ class LongTermMemoryStore:
         cannot collide. ``MemoryEntry.build()`` already fills a matching
         fingerprint, so well-formed entries pass through unchanged.
         """
-        with self._lock:
-            self._ensure_loaded()
-            entry = _normalize_fingerprint(entry)
-            existing = self._find_duplicate(entry)
-            if existing is not None:
-                upgraded = _manual_upgrade(existing, entry)
-                if upgraded is not None:
-                    snapshot = list(self._entries)
-                    self._replace_entry(existing, upgraded)
-                    try:
-                        self._persist()
-                    except Exception:
-                        self._entries = snapshot
-                        raise
-                    return upgraded, False
-                return existing, False
-            snapshot = list(self._entries)
-            self._entries.append(entry)
-            try:
-                self._persist()
-            except Exception:
-                self._entries = snapshot
-                raise
-            return entry, True
+        with self.exclusive_process_lock():
+            with self._lock:
+                self._load_strict_snapshot_locked()
+                entry = _normalize_fingerprint(entry)
+                existing = self._find_duplicate(entry)
+                if existing is not None:
+                    upgraded = _manual_upgrade(existing, entry)
+                    if upgraded is not None:
+                        snapshot = list(self._entries)
+                        self._replace_entry(existing, upgraded)
+                        try:
+                            _validate_strict_entries(self._entries)
+                            self._persist()
+                        except Exception:
+                            self._entries = snapshot
+                            raise
+                        return upgraded, False
+                    return existing, False
+                snapshot = list(self._entries)
+                self._entries.append(entry)
+                try:
+                    _validate_strict_entries(self._entries)
+                    self._persist()
+                except Exception:
+                    self._entries = snapshot
+                    raise
+                return entry, True
 
     def all(self, *, project_key: str | None = None) -> list[MemoryEntry]:
         with self._lock:
@@ -145,54 +267,106 @@ class LongTermMemoryStore:
         """
         if not str(memory_id or ""):
             return False
-        with self._lock:
-            self._ensure_loaded()
-            target_index: int | None = None
-            for idx, entry in enumerate(self._entries):
-                if entry.id != memory_id:
-                    continue
-                if not all_projects and project_key is not None and not _is_visible(entry, project_key):
-                    continue
-                if expected_tier is not None and str(entry.metadata.get("evolver_tier") or "") != str(expected_tier):
-                    continue
-                target_index = idx
-                break
-            if target_index is None:
-                return False
+        with self.exclusive_process_lock():
+            with self._lock:
+                self._load_strict_snapshot_locked()
+                target_index: int | None = None
+                for idx, entry in enumerate(self._entries):
+                    if entry.id != memory_id:
+                        continue
+                    if not all_projects and project_key is not None and not _is_visible(entry, project_key):
+                        continue
+                    if expected_tier is not None and str(entry.metadata.get("evolver_tier") or "") != str(expected_tier):
+                        continue
+                    target_index = idx
+                    break
+                if target_index is None:
+                    return False
 
-            entry = self._entries[target_index]
-            next_metadata = dict(entry.metadata)
-            next_metadata.update(metadata)
-            replacement = replace(entry, metadata=sanitize_json_value(next_metadata))
-            snapshot = list(self._entries)
-            self._entries[target_index] = replacement
-            try:
-                self._persist()
-            except Exception:
-                self._entries = snapshot
-                raise
-            return True
+                entry = self._entries[target_index]
+                next_metadata = dict(entry.metadata)
+                next_metadata.update(metadata)
+                replacement = replace(entry, metadata=sanitize_json_value(next_metadata))
+                snapshot = list(self._entries)
+                self._entries[target_index] = replacement
+                try:
+                    _validate_strict_entries(self._entries)
+                    self._persist()
+                except Exception:
+                    self._entries = snapshot
+                    raise
+                return True
 
     def clear(self, *, scope: MemoryScope | None = None, project_key: str | None = None) -> int:
-        with self._lock:
-            self._ensure_loaded()
-            before = len(self._entries)
-            if scope is None and project_key is None:
-                self._entries = []
-            else:
-                self._entries = [
-                    entry for entry in self._entries
-                    if not _matches_filter(entry, scope=scope, project_key=project_key)
-                ]
-            removed = before - len(self._entries)
-            if removed:
-                self._persist()
-            return removed
+        with self.exclusive_process_lock():
+            with self._lock:
+                self._load_strict_snapshot_locked()
+                snapshot = list(self._entries)
+                before = len(self._entries)
+                if scope is None and project_key is None:
+                    self._entries = []
+                else:
+                    self._entries = [
+                        entry for entry in self._entries
+                        if not _matches_filter(entry, scope=scope, project_key=project_key)
+                    ]
+                removed = before - len(self._entries)
+                if removed:
+                    try:
+                        _validate_strict_entries(self._entries)
+                        self._persist()
+                    except Exception:
+                        self._entries = snapshot
+                        raise
+                return removed
 
     def __len__(self) -> int:
         with self._lock:
             self._ensure_loaded()
             return len(self._entries)
+
+    def _load_strict_snapshot_locked(self) -> MemoryStoreSnapshot:
+        raw_bytes = self.path.read_bytes() if self.path.exists() else b""
+        try:
+            text = raw_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise MemoryStoreLoadError("invalid memory JSONL: UnicodeDecodeError") from exc
+
+        entries: list[MemoryEntry] = []
+        for line_no, raw_line in enumerate(text.splitlines(), start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+                if not isinstance(payload, dict):
+                    raise TypeError("expected object")
+                content = str(payload.get("content") or "")
+                declared_fingerprint = str(payload.get("fingerprint") or "")
+                expected_fingerprint = content_fingerprint(content)
+                if declared_fingerprint and declared_fingerprint != expected_fingerprint:
+                    raise ValueError("fingerprint mismatch")
+                entry = _entry_from_payload(payload)
+            except (ValueError, json.JSONDecodeError, KeyError, TypeError) as exc:
+                raise MemoryStoreLoadError(
+                    f"invalid memory JSONL at line {line_no}: {type(exc).__name__}"
+                ) from exc
+            entries.append(entry)
+
+        try:
+            _validate_strict_entries(entries)
+        except MemoryStoreLoadError:
+            raise
+        except ValueError as exc:
+            raise MemoryStoreLoadError(f"invalid memory repository: {type(exc).__name__}") from exc
+        snapshot = MemoryStoreSnapshot(
+            entries=tuple(entries),
+            raw_bytes=raw_bytes,
+            revision=memory_entries_revision(entries),
+        )
+        self._entries = list(entries)
+        self._loaded = True
+        return snapshot
 
     def _ensure_loaded(self) -> None:
         """Lazily load disk state before the first read or mutation.
@@ -242,13 +416,20 @@ class LongTermMemoryStore:
 
     def _persist(self) -> None:
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-        with tmp.open("w", encoding="utf-8") as file:
-            for entry in self._entries:
-                payload = sanitize_json_value(entry.to_dict())
-                file.write(json.dumps(payload, ensure_ascii=False) + "\n")
-            file.flush()
-            os.fsync(file.fileno())
-        tmp.replace(self.path)
+        try:
+            with tmp.open("w", encoding="utf-8") as file:
+                for entry in self._entries:
+                    payload = sanitize_json_value(entry.to_dict())
+                    file.write(json.dumps(payload, ensure_ascii=False) + "\n")
+                file.flush()
+                os.fsync(file.fileno())
+            tmp.replace(self.path)
+        finally:
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
 
     def _trace(self, event: str, payload: dict[str, Any]) -> None:
         if self._trace_sink is not None:
@@ -329,6 +510,38 @@ def memory_dedup_key(entry: MemoryEntry) -> tuple[str, str, str, str]:
     return (entry.scope.value, project_key, tier, entry.fingerprint)
 
 
+def memory_entries_revision(entries: Sequence[MemoryEntry]) -> str:
+    payload = [entry.to_dict() for entry in sorted(entries, key=lambda item: item.id)]
+    canonical = json.dumps(
+        sanitize_json_value(payload),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return f"sha256:{sha256(canonical.encode('utf-8')).hexdigest()}"
+
+
+def _validate_strict_entries(entries: Sequence[MemoryEntry]) -> None:
+    ids: set[str] = set()
+    dedup_keys: dict[tuple[str, str, str, str], str] = {}
+    for entry in entries:
+        if not entry.id:
+            raise MemoryStoreLoadError("memory entry id must not be empty")
+        if entry.id in ids:
+            raise MemoryStoreLoadError(f"duplicate memory id: {entry.id}")
+        ids.add(entry.id)
+        expected_fingerprint = content_fingerprint(entry.content)
+        if entry.fingerprint != expected_fingerprint:
+            raise MemoryStoreLoadError(f"fingerprint mismatch for memory id: {entry.id}")
+        key = memory_dedup_key(entry)
+        previous = dedup_keys.get(key)
+        if previous is not None:
+            raise MemoryStoreLoadError(
+                f"duplicate memory dedup identity: {previous}, {entry.id}"
+            )
+        dedup_keys[key] = entry.id
+
+
 def _matches_filter(entry: MemoryEntry, *, scope: MemoryScope | None, project_key: str | None) -> bool:
     if scope is not None and entry.scope != scope:
         return False
@@ -337,4 +550,15 @@ def _matches_filter(entry: MemoryEntry, *, scope: MemoryScope | None, project_ke
     return True
 
 
-__all__ = ["LongTermMemoryStore", "STORAGE_FILE", "memory_dedup_key"]
+__all__ = [
+    "LOCK_FILE",
+    "STORAGE_FILE",
+    "LongTermMemoryStore",
+    "MemoryStoreLoadError",
+    "MemoryStoreLockTimeout",
+    "MemoryStorePostCommitError",
+    "MemoryStoreRevisionConflict",
+    "MemoryStoreSnapshot",
+    "memory_dedup_key",
+    "memory_entries_revision",
+]
