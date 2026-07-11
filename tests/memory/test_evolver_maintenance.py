@@ -5,15 +5,14 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from tests._path import add_src_to_path
 
 add_src_to_path()
 
+import my_agent.memory.evolver.maintenance as maintenance_module
 from my_agent.memory.evolver import (
-    MAINTENANCE_POLICY,
-    MAINTENANCE_SCHEMA_VERSION,
-    MAINTENANCE_SCOPE_MODE,
     ExperienceCreatedBy,
     MaintenanceAction,
     MaintenanceAttributionError,
@@ -49,6 +48,7 @@ def _entry(
     content: str | None = None,
     created_by: ExperienceCreatedBy = ExperienceCreatedBy.MANUAL,
     created_at: datetime = NOW,
+    run_id: str = "",
 ):
     return build_experience_entry(
         id=memory_id,
@@ -58,6 +58,7 @@ def _entry(
         scope=scope,
         created_at=created_at,
         created_by=created_by,
+        run_id=run_id,
         source_task="task-1",
         extra_metadata=metadata,
     )
@@ -490,36 +491,471 @@ class RetentionPlannerTests(unittest.TestCase):
             )
 
 
+class MergePlannerTests(unittest.TestCase):
+    def _keyed(self, *records: MemoryAttributionRecord):
+        return {
+            (record.memory_id, record.tier, record.memory_project_key): record
+            for record in records
+        }
+
+    def test_merge_guards_reject_cross_boundary_trajectory_and_tool_payloads(self) -> None:
+        writer = ExperienceCreatedBy.WRITER
+        entries = [
+            _entry("tip", tier="tip", content="Inspect parser failures first", created_by=writer),
+            _entry("skill", tier="skill", content="Inspect parser failures first", created_by=writer),
+            _entry(
+                "global-tip",
+                tier="tip",
+                content="Inspect parser failure first",
+                project_key="",
+                scope=MemoryScope.GLOBAL,
+                created_by=writer,
+            ),
+            _entry(
+                "other-project",
+                tier="tip",
+                content="Inspect parser failure first",
+                project_key="other-project",
+                created_by=writer,
+            ),
+            _entry("trajectory-a", tier="trajectory", content="Parser repair trace A", created_by=writer),
+            _entry("trajectory-b", tier="trajectory", content="Parser repair trace B", created_by=writer),
+            _entry(
+                "tool-a",
+                tier="tool",
+                content="Run the focused parser test command",
+                metadata={"language": "bash", "command": "pytest tests/test_parser.py -q"},
+                created_by=writer,
+            ),
+            _entry(
+                "tool-b",
+                tier="tool",
+                content="Run focused parser tests with this command",
+                metadata={"language": "bash", "command": "pytest tests/test_other.py -q"},
+                created_by=writer,
+            ),
+        ]
+
+        plan = build_maintenance_plan(
+            entries=entries,
+            attribution={},
+            repository_revision="sha256:merge-guards",
+            project_key=PROJECT_KEY,
+            as_of=NOW,
+            config=MaintenanceConfig(
+                merge_threshold_tip=0.1,
+                merge_threshold_skill=0.1,
+                merge_threshold_tool=0.1,
+                max_promotions=0,
+            ),
+        )
+
+        self.assertFalse(any(item.action == MaintenanceAction.MERGE for item in plan.operations))
+        by_source = {item.source_ids[0]: item for item in plan.operations}
+        self.assertEqual(by_source["global-tip"].reason_codes, ("protected_global",))
+        self.assertNotIn("other-project", by_source)
+        self.assertIn("trajectory-a", by_source)
+        self.assertIn("trajectory-b", by_source)
+
+    def test_complete_link_does_not_transitively_merge_three_entries(self) -> None:
+        writer = ExperienceCreatedBy.WRITER
+        entries = [
+            _entry("a", content="alpha parser workflow", created_by=writer),
+            _entry("b", content="beta parser workflow", created_by=writer),
+            _entry("c", content="gamma parser workflow", created_by=writer),
+        ]
+        scores = {
+            frozenset(("a", "b")): 0.91,
+            frozenset(("b", "c")): 0.92,
+            frozenset(("a", "c")): 0.70,
+        }
+
+        with patch(
+            "my_agent.memory.evolver.maintenance.redundancy_score",
+            side_effect=lambda left, right: scores[frozenset((left.id, right.id))],
+        ):
+            plan = build_maintenance_plan(
+                entries=entries,
+                attribution={},
+                repository_revision="sha256:complete-link",
+                project_key=PROJECT_KEY,
+                as_of=NOW,
+                config=MaintenanceConfig(merge_threshold_skill=0.8, max_promotions=0),
+            )
+
+        merges = [item for item in plan.operations if item.action == MaintenanceAction.MERGE]
+        self.assertEqual(len(merges), 1)
+        self.assertEqual(merges[0].source_ids, ("a", "b"))
+        self.assertEqual(merges[0].redundancy_score, 0.91)
+        self.assertTrue(any(item.source_ids == ("c",) for item in plan.operations))
+
+    def test_tool_payload_guard_preserves_command_case_and_code_indentation(self) -> None:
+        writer = ExperienceCreatedBy.WRITER
+        cases = [
+            (
+                "command-case",
+                {"language": "bash", "command": "python Build.py"},
+                {"language": "BASH", "command": "python build.py"},
+            ),
+            (
+                "code-indentation",
+                {"language": "python", "code": "if ready:\n    run()"},
+                {"language": "PYTHON", "code": "if ready:\nrun()"},
+            ),
+        ]
+        for name, left_metadata, right_metadata in cases:
+            with self.subTest(name=name):
+                entries = [
+                    _entry(
+                        f"{name}-left",
+                        tier="tool",
+                        content=f"Reusable tool description left {name}",
+                        metadata=left_metadata,
+                        created_by=writer,
+                    ),
+                    _entry(
+                        f"{name}-right",
+                        tier="tool",
+                        content=f"Reusable tool description right {name}",
+                        metadata=right_metadata,
+                        created_by=writer,
+                    ),
+                ]
+                with patch(
+                    "my_agent.memory.evolver.maintenance.redundancy_score",
+                    return_value=1.0,
+                ):
+                    plan = build_maintenance_plan(
+                        entries=entries,
+                        attribution={},
+                        repository_revision=f"sha256:{name}",
+                        project_key=PROJECT_KEY,
+                        as_of=NOW,
+                        config=MaintenanceConfig(max_promotions=0),
+                    )
+                self.assertFalse(
+                    any(item.action == MaintenanceAction.MERGE for item in plan.operations)
+                )
+
+    def test_anchor_priority_uses_value_confidence_selected_created_and_id(self) -> None:
+        writer = ExperienceCreatedBy.WRITER
+        earlier = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        later = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        cases = [
+            ("value", _record("left", value=0.3, confidence=0.1, selected_count=1),
+             _record("right", value=0.2, confidence=0.9, selected_count=9), later, earlier, "left"),
+            ("confidence", _record("left", value=0.3, confidence=0.9, selected_count=1),
+             _record("right", value=0.3, confidence=0.8, selected_count=9), later, earlier, "left"),
+            ("selected", _record("left", value=0.3, confidence=0.9, selected_count=5),
+             _record("right", value=0.3, confidence=0.9, selected_count=4), later, earlier, "left"),
+            ("created", _record("left", value=0.3, confidence=0.9, selected_count=5),
+             _record("right", value=0.3, confidence=0.9, selected_count=5), earlier, later, "left"),
+            ("id", _record("a", value=0.3, confidence=0.9, selected_count=5),
+             _record("b", value=0.3, confidence=0.9, selected_count=5), earlier, earlier, "a"),
+        ]
+        for name, left_record, right_record, left_created, right_created, expected in cases:
+            with self.subTest(name=name):
+                left_id = left_record.memory_id
+                right_id = right_record.memory_id
+                entries = [
+                    _entry(
+                        left_id,
+                        content=f"left content {name}",
+                        created_by=writer,
+                        created_at=left_created,
+                    ),
+                    _entry(
+                        right_id,
+                        content=f"right content {name}",
+                        created_by=writer,
+                        created_at=right_created,
+                    ),
+                ]
+                with patch(
+                    "my_agent.memory.evolver.maintenance.redundancy_score",
+                    return_value=1.0,
+                ):
+                    plan = build_maintenance_plan(
+                        entries=entries,
+                        attribution=self._keyed(left_record, right_record),
+                        repository_revision=f"sha256:anchor-{name}",
+                        project_key=PROJECT_KEY,
+                        as_of=NOW,
+                        config=MaintenanceConfig(max_promotions=0),
+                    )
+                merge = next(item for item in plan.operations if item.action == MaintenanceAction.MERGE)
+                self.assertEqual(merge.source_ids[0], expected)
+                self.assertEqual(merge.target_ids, (expected,))
+
+    def test_merge_preserves_anchor_identity_and_records_complete_lineage(self) -> None:
+        writer = ExperienceCreatedBy.WRITER
+        anchor = _entry(
+            "anchor",
+            content="Run parser tests before editing",
+            created_by=writer,
+            created_at=datetime(2025, 1, 1, tzinfo=timezone.utc),
+            run_id="run-anchor",
+            metadata={
+                "steps": ["run focused tests"],
+                "tags": ["parser"],
+                "evolver_value": 0.4,
+                "evolver_candidate_count": 8,
+            },
+        )
+        source = _entry(
+            "source",
+            content="Run parser test before edits",
+            created_by=writer,
+            metadata={
+                "steps": ["run focused tests", "run full suite"],
+                "tags": ["pytest", "parser"],
+                "evolver_value": 0.2,
+                "evolver_candidate_count": 20,
+            },
+        )
+        records = self._keyed(
+            _record("anchor", value=0.4, confidence=0.9, selected_count=5),
+            _record("source", value=0.2, confidence=0.8, selected_count=4),
+        )
+
+        with patch("my_agent.memory.evolver.maintenance.redundancy_score", return_value=0.95):
+            plan = build_maintenance_plan(
+                entries=[source, anchor],
+                attribution=records,
+                repository_revision="sha256:lineage",
+                project_key=PROJECT_KEY,
+                as_of=NOW,
+                config=MaintenanceConfig(max_promotions=0),
+            )
+
+        operation = next(item for item in plan.operations if item.action == MaintenanceAction.MERGE)
+        replacement = MemoryEntry.from_dict(operation.replacements[0])
+        self.assertEqual(replacement.id, anchor.id)
+        self.assertEqual(replacement.content, anchor.content)
+        self.assertEqual(replacement.created_at, anchor.created_at)
+        self.assertEqual(replacement.project_key, anchor.project_key)
+        self.assertEqual(replacement.run_id, "run-anchor")
+        self.assertEqual(replacement.metadata["steps"], ["run focused tests", "run full suite"])
+        self.assertEqual(replacement.metadata["tags"], ["parser", "pytest"])
+        self.assertEqual(replacement.metadata["evolver_value"], 0.4)
+        self.assertEqual(replacement.metadata["evolver_candidate_count"], 8)
+        self.assertEqual(replacement.metadata["maintenance_source_ids"], ["anchor", "source"])
+        self.assertEqual(
+            set(replacement.metadata["maintenance_source_fingerprints"]),
+            {"anchor", "source"},
+        )
+        self.assertEqual(
+            set(replacement.metadata["maintenance_source_evidence"]),
+            {"anchor", "source"},
+        )
+        self.assertEqual(operation.remove_ids, ("source",))
+
+
+class PromotionPlannerTests(unittest.TestCase):
+    def _keyed(self, *records: MemoryAttributionRecord):
+        return {
+            (record.memory_id, record.tier, record.memory_project_key): record
+            for record in records
+        }
+
+    def test_tip_and_trajectory_promotions_are_stable_neutral_and_timestamped(self) -> None:
+        writer = ExperienceCreatedBy.WRITER
+        tip = _entry(
+            "tip-source",
+            tier="tip",
+            content="Inspect the focused parser failure before broad edits.",
+            created_by=writer,
+            run_id="run-tip",
+            metadata={"category": "debugging", "trigger": "parser test fails", "confidence": 0.82},
+        )
+        trajectory = _entry(
+            "trajectory-source",
+            tier="trajectory",
+            content="Successful parser repair trajectory",
+            created_by=writer,
+            metadata={
+                "task_description": "Repair parser handling for comments",
+                "outcome": "success",
+                "key_learnings": ["Strip comments first", "Preserve strings", "Run focused tests", "Ignore fourth"],
+                "tags": ["parser", "testing"],
+                "steps": [
+                    {"action": "inspect", "result": "located parser", "status": "passed"},
+                    {"action": "bad attempt", "result": "failed", "status": "failed"},
+                    {"action": "run_tests", "result": "focused tests passed", "success": True},
+                ],
+                "confidence": 0.74,
+            },
+        )
+        attribution = self._keyed(
+            _record("tip-source", tier="tip", value=0.3, confidence=0.9, selected_count=5),
+            _record(
+                "trajectory-source",
+                tier="trajectory",
+                value=0.2,
+                confidence=0.8,
+                selected_count=4,
+            ),
+        )
+        kwargs = {
+            "attribution": attribution,
+            "repository_revision": "sha256:promotion",
+            "project_key": PROJECT_KEY,
+            "as_of": NOW,
+        }
+
+        first = build_maintenance_plan(entries=[tip, trajectory], **kwargs)
+        second = build_maintenance_plan(entries=[trajectory, tip], **kwargs)
+
+        self.assertEqual(first, second)
+        promotions = {
+            item.source_ids[0]: item
+            for item in first.operations
+            if item.action == MaintenanceAction.PROMOTE
+        }
+        self.assertEqual(set(promotions), {"tip-source", "trajectory-source"})
+
+        tip_operation = promotions["tip-source"]
+        promoted_tip = MemoryEntry.from_dict(tip_operation.additions[0])
+        updated_tip = MemoryEntry.from_dict(tip_operation.replacements[0])
+        self.assertTrue(promoted_tip.id.startswith("exp_maint_"))
+        self.assertEqual(promoted_tip.created_at, NOW)
+        self.assertEqual(promoted_tip.content, tip.content)
+        self.assertEqual(promoted_tip.fingerprint, tip.fingerprint)
+        self.assertEqual(promoted_tip.run_id, "run-tip")
+        self.assertEqual(promoted_tip.metadata["created_by"], "maintenance")
+        self.assertEqual(promoted_tip.metadata["confidence"], 0.82)
+        for key in (
+            "evolver_value",
+            "evolver_confidence",
+            "evolver_candidate_count",
+            "evolver_selected_count",
+            "evolver_not_selected_count",
+        ):
+            self.assertNotIn(key, promoted_tip.metadata)
+        self.assertEqual(updated_tip.metadata["maintenance_promoted_to"], promoted_tip.id)
+        self.assertEqual(updated_tip.metadata["maintenance_promoted_at"], NOW.isoformat())
+
+        trajectory_operation = promotions["trajectory-source"]
+        promoted_trajectory = MemoryEntry.from_dict(trajectory_operation.additions[0])
+        self.assertEqual(
+            promoted_trajectory.content,
+            "Strip comments first\nPreserve strings\nRun focused tests",
+        )
+        self.assertEqual(
+            promoted_trajectory.metadata["steps"],
+            ["inspect: located parser", "run_tests: focused tests passed"],
+        )
+        self.assertEqual(promoted_trajectory.created_at, NOW)
+
+    def test_existing_skill_link_uses_skill_tier_and_repeat_is_not_promoted(self) -> None:
+        writer = ExperienceCreatedBy.WRITER
+        tip = _entry(
+            "tip-source",
+            tier="tip",
+            content="Reuse the focused parser verification loop.",
+            created_by=writer,
+        )
+        existing_skill = _entry(
+            "existing-skill",
+            tier="skill",
+            content=tip.content,
+            created_by=writer,
+        )
+        already_promoted = _entry(
+            "already-promoted",
+            tier="tip",
+            content="Inspect import boundaries before edits.",
+            created_by=writer,
+            metadata={"maintenance_promoted_to": "skill-old"},
+        )
+        attribution = self._keyed(
+            _record("tip-source", tier="tip", value=0.3, confidence=0.9, selected_count=5),
+            _record("already-promoted", tier="tip", value=0.4, confidence=0.9, selected_count=6),
+        )
+
+        plan = build_maintenance_plan(
+            entries=[tip, existing_skill, already_promoted],
+            attribution=attribution,
+            repository_revision="sha256:existing-skill",
+            project_key=PROJECT_KEY,
+            as_of=NOW,
+            config=MaintenanceConfig(merge_threshold_tip=1.0),
+        )
+
+        promotions = [item for item in plan.operations if item.action == MaintenanceAction.PROMOTE]
+        self.assertEqual(len(promotions), 1)
+        self.assertEqual(promotions[0].source_ids, ("tip-source",))
+        self.assertEqual(promotions[0].target_ids, ("existing-skill",))
+        self.assertEqual(promotions[0].reason_codes, ("promotion_linked_existing_skill",))
+        self.assertEqual(promotions[0].additions, ())
+        self.assertTrue(any(item.source_ids == ("already-promoted",) for item in plan.operations))
+
+    def test_promotion_cap_uses_value_confidence_selected_and_id_order(self) -> None:
+        writer = ExperienceCreatedBy.WRITER
+        entries = [
+            _entry("tip-low", tier="tip", content="Low value parser guidance", created_by=writer),
+            _entry("tip-high", tier="tip", content="High value test guidance", created_by=writer),
+            _entry("tip-mid", tier="tip", content="Medium value import guidance", created_by=writer),
+        ]
+        attribution = self._keyed(
+            _record("tip-low", tier="tip", value=0.2, confidence=0.9, selected_count=8),
+            _record("tip-high", tier="tip", value=0.5, confidence=0.8, selected_count=3),
+            _record("tip-mid", tier="tip", value=0.3, confidence=0.9, selected_count=5),
+        )
+
+        plan = build_maintenance_plan(
+            entries=entries,
+            attribution=attribution,
+            repository_revision="sha256:promotion-cap",
+            project_key=PROJECT_KEY,
+            as_of=NOW,
+            config=MaintenanceConfig(merge_threshold_tip=1.0, max_promotions=2),
+        )
+
+        promoted = {
+            item.source_ids[0]
+            for item in plan.operations
+            if item.action == MaintenanceAction.PROMOTE
+        }
+        self.assertEqual(promoted, {"tip-high", "tip-mid"})
+        self.assertEqual(plan.summary["promote"], 2)
+
+
 class MaintenancePlanContractTests(unittest.TestCase):
     def _plan(self) -> MaintenancePlan:
-        operation = MaintenanceOperation(
-            operation_id="op-keep-1",
-            action=MaintenanceAction.KEEP,
-            source_ids=("mem-1",),
-            source_tiers=("skill",),
-            source_preconditions={
-                "mem-1": {
-                    "fingerprint": "fp-1",
-                    "tier": "skill",
-                    "scope": "project",
-                    "project_key": PROJECT_KEY,
-                }
-            },
-            reason_codes=("no_maintenance_rule",),
-        )
-        return MaintenancePlan(
-            schema_version=MAINTENANCE_SCHEMA_VERSION,
-            policy=MAINTENANCE_POLICY,
-            plan_id="maint-contract-1",
+        return build_maintenance_plan(
+            entries=[_entry("mem-1", created_by=ExperienceCreatedBy.WRITER)],
+            attribution={},
             repository_revision="sha256:repository",
-            scope_mode=MAINTENANCE_SCOPE_MODE,
-            memory_project_key=PROJECT_KEY,
-            as_of=NOW.isoformat(),
-            config=MaintenanceConfig().to_dict(),
-            input_summary={"entries_total": 1},
-            operations=(operation,),
-            summary={"keep": 1, "delete": 0, "merge": 0, "promote": 0},
+            project_key=PROJECT_KEY,
+            as_of=NOW,
         )
+
+    def _promotion_fixture(self):
+        source = _entry(
+            "promotion-source",
+            tier="tip",
+            content="Preserve parser command case during verification.",
+            created_by=ExperienceCreatedBy.WRITER,
+        )
+        record = _record(
+            source.id,
+            tier="tip",
+            value=0.3,
+            confidence=0.9,
+            selected_count=5,
+        )
+        plan = build_maintenance_plan(
+            entries=[source],
+            attribution={(source.id, "tip", PROJECT_KEY): record},
+            repository_revision="sha256:promotion-contract",
+            project_key=PROJECT_KEY,
+            as_of=NOW,
+        )
+        operation = next(
+            item for item in plan.operations if item.action == MaintenanceAction.PROMOTE
+        )
+        return source, plan, operation
 
     def test_plan_round_trip_and_file_output_are_byte_stable(self) -> None:
         plan = self._plan()
@@ -578,6 +1014,192 @@ class MaintenancePlanContractTests(unittest.TestCase):
         payload["operations"][0]["source_preconditions"]["mem-1"]["tier"] = "tip"
         with self.assertRaises(ValueError):
             MaintenancePlan.from_dict(payload)
+
+    def test_plan_rejects_multiple_primary_operations_for_one_source(self) -> None:
+        plan = self._plan()
+
+        with self.assertRaises(ValueError):
+            MaintenancePlan(
+                schema_version=plan.schema_version,
+                policy=plan.policy,
+                plan_id="maint-conflict",
+                repository_revision=plan.repository_revision,
+                scope_mode=plan.scope_mode,
+                memory_project_key=plan.memory_project_key,
+                as_of=plan.as_of,
+                config=plan.config,
+                input_summary=plan.input_summary,
+                operations=(plan.operations[0], plan.operations[0]),
+                summary=plan.summary,
+            )
+
+    def test_operation_and_mutation_metadata_ids_are_tamper_evident(self) -> None:
+        _, plan, _ = self._promotion_fixture()
+        operation_id_tampered = plan.to_dict()
+        operation_id_tampered["operations"][0]["operation_id"] = "op-tampered"
+        with self.assertRaises(ValueError):
+            MaintenancePlan.from_dict(operation_id_tampered)
+
+        metadata_id_tampered = plan.to_dict()
+        metadata_id_tampered["operations"][0]["replacements"][0]["metadata"][
+            "maintenance_operation_id"
+        ] = "op-tampered"
+        with self.assertRaises(ValueError):
+            MaintenancePlan.from_dict(metadata_id_tampered)
+
+    def test_mutation_payload_rejects_forged_fingerprint(self) -> None:
+        _, plan, _ = self._promotion_fixture()
+        payload = plan.to_dict()
+        payload["operations"][0]["additions"][0]["fingerprint"] = "f" * 64
+
+        with self.assertRaises(ValueError):
+            MaintenancePlan.from_dict(payload)
+
+    def test_existing_promotion_target_must_exist_and_match_skill_identity(self) -> None:
+        source, _, valid_operation = self._promotion_fixture()
+        wrong_tier = _entry(
+            "wrong-tier",
+            tier="tool",
+            content=source.content,
+            created_by=ExperienceCreatedBy.WRITER,
+        )
+        wrong_fingerprint = _entry(
+            "wrong-fingerprint",
+            tier="skill",
+            content="Different skill content",
+            created_by=ExperienceCreatedBy.WRITER,
+        )
+        cases = [
+            ("ghost-skill", [source]),
+            (wrong_tier.id, [source, wrong_tier]),
+            (wrong_fingerprint.id, [source, wrong_fingerprint]),
+        ]
+        for target_id, repository in cases:
+            with self.subTest(target_id=target_id):
+                payload = valid_operation.to_dict()
+                payload["target_ids"] = [target_id]
+                payload["additions"] = []
+                payload["replacements"][0]["metadata"]["maintenance_promoted_to"] = target_id
+                operation_id = maintenance_module._operation_id(
+                    action=MaintenanceAction.PROMOTE,
+                    source_ids=payload["source_ids"],
+                    target_ids=payload["target_ids"],
+                    replacements=payload["replacements"],
+                    additions=payload["additions"],
+                )
+                payload["operation_id"] = operation_id
+                payload["replacements"][0]["metadata"][
+                    "maintenance_operation_id"
+                ] = operation_id
+                malformed = MaintenanceOperation.from_dict(payload)
+
+                with self.assertRaises(ValueError):
+                    maintenance_module._validate_operation_conflicts(
+                        (malformed,),
+                        repository_entries=repository,
+                    )
+
+    def test_merge_contract_rejects_cross_tier_truth_and_tier_spoofing(self) -> None:
+        writer = ExperienceCreatedBy.WRITER
+        tip = _entry(
+            "merge-tip",
+            tier="tip",
+            content="Inspect parser failure before editing.",
+            created_by=writer,
+        )
+        skill = _entry(
+            "merge-skill",
+            tier="skill",
+            content="Run parser verification before editing.",
+            created_by=writer,
+        )
+
+        def operation_payload(*, declared_tiers: tuple[str, str], anchor: MemoryEntry):
+            source_ids = (tip.id, skill.id)
+            preconditions = {
+                tip.id: {
+                    "fingerprint": tip.fingerprint,
+                    "tier": declared_tiers[0],
+                    "scope": tip.scope.value,
+                    "project_key": tip.project_key,
+                },
+                skill.id: {
+                    "fingerprint": skill.fingerprint,
+                    "tier": declared_tiers[1],
+                    "scope": skill.scope.value,
+                    "project_key": skill.project_key,
+                },
+            }
+            replacement = anchor.to_dict()
+            replacement["metadata"]["maintenance_action"] = "merge"
+            operation_id = maintenance_module._operation_id(
+                action=MaintenanceAction.MERGE,
+                source_ids=source_ids,
+                target_ids=(anchor.id,),
+                replacements=(replacement,),
+                additions=(),
+            )
+            replacement["metadata"]["maintenance_operation_id"] = operation_id
+            return {
+                "operation_id": operation_id,
+                "action": "merge",
+                "source_ids": list(source_ids),
+                "source_tiers": list(declared_tiers),
+                "source_preconditions": preconditions,
+                "target_ids": [anchor.id],
+                "reason_codes": ["near_duplicate_complete_link"],
+                "redundancy_score": 0.95,
+                "evidence": [],
+                "remove_ids": [item for item in source_ids if item != anchor.id],
+                "replacements": [replacement],
+                "additions": [],
+            }
+
+        truthful = operation_payload(declared_tiers=("tip", "skill"), anchor=tip)
+        with self.assertRaises(ValueError):
+            MaintenanceOperation.from_dict(truthful)
+
+        spoofed = MaintenanceOperation.from_dict(
+            operation_payload(declared_tiers=("skill", "skill"), anchor=skill)
+        )
+        with self.assertRaises(ValueError):
+            maintenance_module._validate_operation_conflicts(
+                (spoofed,),
+                repository_entries=[tip, skill],
+            )
+
+    def test_merge_replacement_must_preserve_anchor_repository_identity(self) -> None:
+        writer = ExperienceCreatedBy.WRITER
+        anchor = _entry(
+            "anchor",
+            content="Run parser tests before editing.",
+            created_by=writer,
+            run_id="run-anchor",
+        )
+        source = _entry(
+            "source",
+            content="Run parser test before edits.",
+            created_by=writer,
+        )
+        with patch("my_agent.memory.evolver.maintenance.redundancy_score", return_value=0.95):
+            plan = build_maintenance_plan(
+                entries=[anchor, source],
+                attribution={},
+                repository_revision="sha256:anchor-contract",
+                project_key=PROJECT_KEY,
+                as_of=NOW,
+                config=MaintenanceConfig(max_promotions=0),
+            )
+        merge = next(item for item in plan.operations if item.action == MaintenanceAction.MERGE)
+        payload = merge.to_dict()
+        payload["replacements"][0]["project_key"] = "other-project"
+        malformed = MaintenanceOperation.from_dict(payload)
+
+        with self.assertRaises(ValueError):
+            maintenance_module._validate_operation_conflicts(
+                (malformed,),
+                repository_entries=[anchor, source],
+            )
 
 
 if __name__ == "__main__":

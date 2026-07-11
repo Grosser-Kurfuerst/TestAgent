@@ -16,9 +16,20 @@ from typing import Any, Collection, Mapping, Sequence
 import json
 
 from my_agent.memory.evolver.attribution import MemoryAttributionRecord
-from my_agent.memory.evolver.types import ExperienceTier, experience_tier
+from my_agent.memory.evolver.types import (
+    ExperienceCreatedBy,
+    ExperienceTier,
+    build_experience_entry,
+    experience_tier,
+)
+from my_agent.memory.long_term import memory_dedup_key
 from my_agent.memory.retrieval import tokenize
-from my_agent.memory.types import MemoryEntry, MemoryScope, normalize_content
+from my_agent.memory.types import (
+    MemoryEntry,
+    MemoryScope,
+    content_fingerprint,
+    normalize_content,
+)
 from my_agent.text_safety import sanitize_json_value
 
 
@@ -218,6 +229,7 @@ class MaintenanceOperation:
                 raise MaintenancePlanError(
                     f"project source precondition for {source_id} requires project_key"
                 )
+        _validate_operation_shape(self)
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -304,6 +316,7 @@ class MaintenancePlan:
         operation_ids = [item.operation_id for item in self.operations]
         if len(operation_ids) != len(set(operation_ids)):
             raise MaintenancePlanError("operation_id values must be unique within a plan")
+        _validate_operation_conflicts(self.operations)
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -592,7 +605,7 @@ def build_maintenance_plan(
     as_of: datetime,
     config: MaintenanceConfig | None = None,
 ) -> MaintenancePlan:
-    """Build a deterministic single-project keep/delete maintenance plan."""
+    """Build a deterministic single-project maintenance plan."""
     if not project_key:
         raise ValueError("project_key must not be empty")
     if not repository_revision:
@@ -614,17 +627,70 @@ def build_maintenance_plan(
         ))
     considered.sort(key=lambda item: (item[1].tier, item[0].id))
 
-    operations = [
-        _retention_operation(entry, evidence, as_of=as_of_utc, config=cfg)
-        for entry, evidence in considered
-    ]
+    operations: list[MaintenanceOperation] = []
+    remaining: list[tuple[MemoryEntry, MaintenanceEvidence]] = []
+    retention_reasons: dict[str, str] = {}
+    protected_reasons = {"protected_metadata", "protected_global", "protected_manual"}
+    for entry, evidence in considered:
+        action, reason = _retention_decision(entry, evidence, as_of=as_of_utc, config=cfg)
+        retention_reasons[entry.id] = reason
+        if action == MaintenanceAction.DELETE or reason in protected_reasons:
+            operations.append(_retention_operation(
+                entry,
+                evidence,
+                as_of=as_of_utc,
+                config=cfg,
+            ))
+        else:
+            remaining.append((entry, evidence))
+
+    merge_operations, merged_source_ids = _plan_merge_operations(
+        remaining,
+        as_of=as_of_utc,
+        config=cfg,
+    )
+    operations.extend(merge_operations)
+    remaining = [item for item in remaining if item[0].id not in merged_source_ids]
+
+    removed_before_promotion = {
+        memory_id
+        for operation in operations
+        for memory_id in operation.remove_ids
+    }
+    repository_after_merge = _repository_after_operations(entries, operations)
+    promotion_operations, promoted_source_ids = _plan_promotion_operations(
+        remaining,
+        repository_entries=repository_after_merge,
+        as_of=as_of_utc,
+        config=cfg,
+    )
+    operations.extend(promotion_operations)
+    remaining = [item for item in remaining if item[0].id not in promoted_source_ids]
+
+    for entry, evidence in remaining:
+        reason = retention_reasons[entry.id]
+        tier = experience_tier(entry)
+        if reason == "no_maintenance_rule" and tier in {
+            ExperienceTier.TIP,
+            ExperienceTier.TRAJECTORY,
+        }:
+            reason = "promotion_not_ready"
+        elif reason == "no_maintenance_rule" and tier in {
+            ExperienceTier.SKILL,
+            ExperienceTier.TOOL,
+        }:
+            reason = "merge_not_safe"
+        operations.append(_keep_operation(entry, evidence, reason=reason))
+
     operations.sort(key=_operation_sort_key)
     operation_tuple = tuple(operations)
+    _validate_operation_conflicts(operation_tuple, repository_entries=entries)
     summary = _operation_summary(operation_tuple)
     input_summary = {
         "entries_total": len(entries),
         "experiences_considered": len(considered),
         "missing_attribution": sum(1 for _, evidence in considered if not evidence.has_attribution),
+        "sources_removed_before_promotion": len(removed_before_promotion),
     }
     as_of_text = as_of_utc.isoformat()
     config_payload = cfg.to_dict()
@@ -687,6 +753,36 @@ def _retention_operation(
     as_of: datetime,
     config: MaintenanceConfig,
 ) -> MaintenanceOperation:
+    action, reason = _retention_decision(entry, evidence, as_of=as_of, config=config)
+    if action == MaintenanceAction.KEEP:
+        return _keep_operation(entry, evidence, reason=reason)
+
+    operation_id = _operation_id(
+        action=action,
+        source_ids=(entry.id,),
+        target_ids=(),
+        replacements=(),
+        additions=(),
+    )
+    return MaintenanceOperation(
+        operation_id=operation_id,
+        action=action,
+        source_ids=(entry.id,),
+        source_tiers=(evidence.tier,),
+        source_preconditions={entry.id: _source_precondition(entry, evidence.tier)},
+        reason_codes=(reason,),
+        evidence=(evidence.to_dict(),),
+        remove_ids=(entry.id,),
+    )
+
+
+def _retention_decision(
+    entry: MemoryEntry,
+    evidence: MaintenanceEvidence,
+    *,
+    as_of: datetime,
+    config: MaintenanceConfig,
+) -> tuple[MaintenanceAction, str]:
     metadata = entry.metadata
     action = MaintenanceAction.KEEP
     reason = "no_maintenance_rule"
@@ -711,11 +807,17 @@ def _retention_operation(
     elif not _has_sufficient_retention_evidence(evidence, config):
         reason = "insufficient_attribution_evidence"
 
-    precondition = _source_precondition(entry, evidence.tier)
-    evidence_payload = (evidence.to_dict(),)
-    remove_ids = (entry.id,) if action == MaintenanceAction.DELETE else ()
+    return action, reason
+
+
+def _keep_operation(
+    entry: MemoryEntry,
+    evidence: MaintenanceEvidence,
+    *,
+    reason: str,
+) -> MaintenanceOperation:
     operation_id = _operation_id(
-        action=action,
+        action=MaintenanceAction.KEEP,
         source_ids=(entry.id,),
         target_ids=(),
         replacements=(),
@@ -723,14 +825,425 @@ def _retention_operation(
     )
     return MaintenanceOperation(
         operation_id=operation_id,
-        action=action,
+        action=MaintenanceAction.KEEP,
         source_ids=(entry.id,),
         source_tiers=(evidence.tier,),
-        source_preconditions={entry.id: precondition},
+        source_preconditions={entry.id: _source_precondition(entry, evidence.tier)},
         reason_codes=(reason,),
-        evidence=evidence_payload,
-        remove_ids=remove_ids,
+        evidence=(evidence.to_dict(),),
     )
+
+
+def _plan_merge_operations(
+    candidates: Sequence[tuple[MemoryEntry, MaintenanceEvidence]],
+    *,
+    as_of: datetime,
+    config: MaintenanceConfig,
+) -> tuple[list[MaintenanceOperation], set[str]]:
+    groups: dict[tuple[str, str, str], list[tuple[MemoryEntry, MaintenanceEvidence]]] = {}
+    for entry, evidence in candidates:
+        tier = experience_tier(entry)
+        if (
+            tier not in {ExperienceTier.TIP, ExperienceTier.SKILL, ExperienceTier.TOOL}
+            or evidence.created_by not in {
+                ExperienceCreatedBy.WRITER.value,
+                ExperienceCreatedBy.MAINTENANCE.value,
+            }
+        ):
+            continue
+        group_key = (tier.value, entry.scope.value, entry.project_key)
+        groups.setdefault(group_key, []).append((entry, evidence))
+
+    operations: list[MaintenanceOperation] = []
+    consumed: set[str] = set()
+    for group_key in sorted(groups):
+        tier = ExperienceTier(group_key[0])
+        threshold = _merge_threshold(tier, config)
+        unassigned = sorted(groups[group_key], key=_anchor_priority)
+        while unassigned:
+            anchor = unassigned.pop(0)
+            cluster = [anchor]
+            accepted_ids: set[str] = set()
+            for candidate in unassigned:
+                if len(cluster) >= config.merge_max_cluster_size:
+                    break
+                if all(
+                    _merge_pair_score(candidate[0], member[0]) >= threshold
+                    for member in cluster
+                ):
+                    cluster.append(candidate)
+                    accepted_ids.add(candidate[0].id)
+            if accepted_ids:
+                unassigned = [item for item in unassigned if item[0].id not in accepted_ids]
+            if len(cluster) < 2:
+                continue
+            operation = _merge_operation(cluster, as_of=as_of)
+            operations.append(operation)
+            consumed.update(operation.source_ids)
+    return operations, consumed
+
+
+def _merge_operation(
+    cluster: Sequence[tuple[MemoryEntry, MaintenanceEvidence]],
+    *,
+    as_of: datetime,
+) -> MaintenanceOperation:
+    ordered = sorted(cluster, key=_anchor_priority)
+    anchor_entry, _ = ordered[0]
+    source_ids = tuple(item[0].id for item in ordered)
+    source_tiers = tuple(item[1].tier for item in ordered)
+    source_preconditions = {
+        entry.id: _source_precondition(entry, evidence.tier)
+        for entry, evidence in ordered
+    }
+    source_fingerprints = {entry.id: entry.fingerprint for entry, _ in ordered}
+    source_evidence = {entry.id: evidence.to_dict() for entry, evidence in ordered}
+    pair_scores = [
+        _merge_pair_score(ordered[left][0], ordered[right][0])
+        for left in range(len(ordered))
+        for right in range(left + 1, len(ordered))
+    ]
+    minimum_score = round(min(pair_scores), 6)
+
+    metadata = dict(anchor_entry.metadata)
+    for key in ("steps", "tags"):
+        merged_values = _ordered_metadata_union(ordered, key)
+        if merged_values:
+            metadata[key] = merged_values
+    metadata.update({
+        "created_by": ExperienceCreatedBy.MAINTENANCE.value,
+        "maintenance_action": MaintenanceAction.MERGE.value,
+        "maintenance_policy": MAINTENANCE_POLICY,
+        "maintenance_as_of": as_of.isoformat(),
+        "maintenance_source_ids": list(source_ids),
+        "maintenance_source_fingerprints": source_fingerprints,
+        "maintenance_redundancy_min": minimum_score,
+        "maintenance_source_evidence": source_evidence,
+    })
+    provisional_replacement = _entry_payload_with_metadata(anchor_entry, metadata)
+    operation_id = _operation_id(
+        action=MaintenanceAction.MERGE,
+        source_ids=source_ids,
+        target_ids=(anchor_entry.id,),
+        replacements=(provisional_replacement,),
+        additions=(),
+    )
+    metadata["maintenance_operation_id"] = operation_id
+    replacement = _entry_payload_with_metadata(anchor_entry, metadata)
+    return MaintenanceOperation(
+        operation_id=operation_id,
+        action=MaintenanceAction.MERGE,
+        source_ids=source_ids,
+        source_tiers=source_tiers,
+        source_preconditions=source_preconditions,
+        target_ids=(anchor_entry.id,),
+        reason_codes=("near_duplicate_complete_link",),
+        redundancy_score=minimum_score,
+        evidence=tuple(evidence.to_dict() for _, evidence in ordered),
+        remove_ids=tuple(sorted(source_ids[1:])),
+        replacements=(replacement,),
+    )
+
+
+def _plan_promotion_operations(
+    candidates: Sequence[tuple[MemoryEntry, MaintenanceEvidence]],
+    *,
+    repository_entries: Sequence[MemoryEntry],
+    as_of: datetime,
+    config: MaintenanceConfig,
+) -> tuple[list[MaintenanceOperation], set[str]]:
+    eligible = [item for item in candidates if _promotion_eligible(*item, config=config)]
+    eligible.sort(key=_promotion_priority)
+    eligible = eligible[:config.max_promotions]
+
+    available_repository = list(repository_entries)
+    operations: list[MaintenanceOperation] = []
+    promoted_sources: set[str] = set()
+    for entry, evidence in eligible:
+        operation, target = _promotion_operation(
+            entry,
+            evidence,
+            repository_entries=available_repository,
+            as_of=as_of,
+        )
+        operations.append(operation)
+        promoted_sources.add(entry.id)
+        available_repository = [
+            item for item in available_repository if item.id != entry.id
+        ]
+        available_repository.append(MemoryEntry.from_dict(operation.replacements[0]))
+        if operation.additions:
+            available_repository.append(target)
+    return operations, promoted_sources
+
+
+def _promotion_eligible(
+    entry: MemoryEntry,
+    evidence: MaintenanceEvidence,
+    *,
+    config: MaintenanceConfig,
+) -> bool:
+    tier = experience_tier(entry)
+    if tier not in {ExperienceTier.TIP, ExperienceTier.TRAJECTORY}:
+        return False
+    if evidence.created_by == ExperienceCreatedBy.MANUAL.value:
+        return False
+    if entry.metadata.get("maintenance_promoted_to"):
+        return False
+    if not (
+        evidence.has_attribution
+        and evidence.value >= config.promote_value_threshold
+        and evidence.confidence >= config.promote_min_confidence
+        and evidence.selected_count >= config.promote_min_selected_count
+    ):
+        return False
+    if tier == ExperienceTier.TRAJECTORY:
+        learnings = _non_empty_strings(entry.metadata.get("key_learnings"))
+        return str(entry.metadata.get("outcome") or "").casefold() == "success" and bool(learnings)
+    return True
+
+
+def _promotion_operation(
+    entry: MemoryEntry,
+    evidence: MaintenanceEvidence,
+    *,
+    repository_entries: Sequence[MemoryEntry],
+    as_of: datetime,
+) -> tuple[MaintenanceOperation, MemoryEntry]:
+    content, skill_metadata = _promoted_skill_fields(entry)
+    target_id = _promoted_skill_id(entry.id, content)
+    lineage = {
+        "maintenance_action": MaintenanceAction.PROMOTE.value,
+        "maintenance_policy": MAINTENANCE_POLICY,
+        "maintenance_as_of": as_of.isoformat(),
+        "maintenance_source_ids": [entry.id],
+        "maintenance_source_fingerprints": {entry.id: entry.fingerprint},
+        "maintenance_source_evidence": {entry.id: evidence.to_dict()},
+        "maintenance_parent_id": entry.id,
+        "maintenance_parent_tier": evidence.tier,
+        "maintenance_parent_value": evidence.value,
+        "maintenance_parent_confidence": evidence.confidence,
+    }
+    skill_metadata.update(lineage)
+    skill_metadata["confidence"] = round(max(0.0, min(1.0, evidence.writer_confidence)), 6)
+    provisional_target = build_experience_entry(
+        id=target_id,
+        content=content,
+        tier=ExperienceTier.SKILL,
+        project_key=entry.project_key,
+        scope=entry.scope,
+        source="evolver:maintenance",
+        run_id=entry.run_id,
+        source_task=str(entry.metadata.get("source_task") or entry.metadata.get("task_id") or ""),
+        created_by=ExperienceCreatedBy.MAINTENANCE,
+        extra_metadata=skill_metadata,
+        created_at=as_of,
+    )
+    existing_target = _find_existing_skill(repository_entries, provisional_target)
+    target = existing_target or provisional_target
+    additions = () if existing_target is not None else (provisional_target.to_dict(),)
+    reason = (
+        "promotion_linked_existing_skill"
+        if existing_target is not None
+        else "promoted_to_skill"
+    )
+
+    source_metadata = dict(entry.metadata)
+    source_metadata.update({
+        "maintenance_promoted_to": target.id,
+        "maintenance_promoted_at": as_of.isoformat(),
+    })
+    provisional_source = _entry_payload_with_metadata(entry, source_metadata)
+    operation_id = _operation_id(
+        action=MaintenanceAction.PROMOTE,
+        source_ids=(entry.id,),
+        target_ids=(target.id,),
+        replacements=(provisional_source,),
+        additions=additions,
+    )
+    source_metadata["maintenance_operation_id"] = operation_id
+    source_replacement = _entry_payload_with_metadata(entry, source_metadata)
+    if existing_target is None:
+        target_metadata = dict(provisional_target.metadata)
+        target_metadata["maintenance_operation_id"] = operation_id
+        target = MemoryEntry.from_dict(_entry_payload_with_metadata(provisional_target, target_metadata))
+        additions = (target.to_dict(),)
+
+    operation = MaintenanceOperation(
+        operation_id=operation_id,
+        action=MaintenanceAction.PROMOTE,
+        source_ids=(entry.id,),
+        source_tiers=(evidence.tier,),
+        source_preconditions={entry.id: _source_precondition(entry, evidence.tier)},
+        target_ids=(target.id,),
+        reason_codes=(reason,),
+        evidence=(evidence.to_dict(),),
+        replacements=(source_replacement,),
+        additions=additions,
+    )
+    return operation, target
+
+
+def _promoted_skill_fields(entry: MemoryEntry) -> tuple[str, dict[str, Any]]:
+    tier = experience_tier(entry)
+    metadata = entry.metadata
+    if tier == ExperienceTier.TIP:
+        category = str(metadata.get("category") or "promoted_tip")
+        return entry.content, {
+            "category": category,
+            "technique": _stable_title(entry.content, fallback=category),
+            "preconditions": str(metadata.get("trigger") or ""),
+            "steps": [entry.content],
+        }
+    if tier == ExperienceTier.TRAJECTORY:
+        learnings = _non_empty_strings(metadata.get("key_learnings"))[:3]
+        content = "\n".join(learnings)
+        task_description = str(metadata.get("task_description") or "")
+        tags = _non_empty_strings(metadata.get("tags"))
+        return content, {
+            "category": "trajectory_distillation",
+            "technique": _stable_title(task_description, fallback="Trajectory distillation"),
+            "preconditions": task_description or ", ".join(tags),
+            "steps": _successful_step_summaries(metadata.get("steps"))[:6],
+        }
+    raise MaintenancePlanError(f"unsupported promotion source tier: {tier!r}")
+
+
+def _promoted_skill_id(source_id: str, content: str) -> str:
+    digest = sha256(f"{source_id}{ExperienceTier.SKILL.value}{content}".encode("utf-8")).hexdigest()
+    return f"exp_maint_{digest[:16]}"
+
+
+def _find_existing_skill(
+    repository_entries: Sequence[MemoryEntry],
+    target: MemoryEntry,
+) -> MemoryEntry | None:
+    target_key = memory_dedup_key(target)
+    matches = [
+        entry
+        for entry in repository_entries
+        if experience_tier(entry) == ExperienceTier.SKILL
+        and memory_dedup_key(entry) == target_key
+    ]
+    return min(matches, key=lambda entry: entry.id) if matches else None
+
+
+def _merge_threshold(tier: ExperienceTier, config: MaintenanceConfig) -> float:
+    if tier == ExperienceTier.TIP:
+        return config.merge_threshold_tip
+    if tier == ExperienceTier.SKILL:
+        return config.merge_threshold_skill
+    if tier == ExperienceTier.TOOL:
+        return config.merge_threshold_tool
+    raise MaintenancePlanError(f"tier does not support merge: {tier.value}")
+
+
+def _merge_pair_score(left: MemoryEntry, right: MemoryEntry) -> float:
+    if experience_tier(left) == ExperienceTier.TOOL and not _tool_payload_matches(left, right):
+        return 0.0
+    return redundancy_score(left, right)
+
+
+def _tool_payload_matches(left: MemoryEntry, right: MemoryEntry) -> bool:
+    def payload(entry: MemoryEntry) -> tuple[str, tuple[str, ...]]:
+        language = normalize_content(str(entry.metadata.get("language") or ""))
+        executable = tuple(
+            _normalize_executable_payload(entry.metadata.get(key))
+            for key in ("code", "command", "template")
+        )
+        return language, executable
+
+    left_language, left_executable = payload(left)
+    right_language, right_executable = payload(right)
+    return bool(
+        any(left_executable)
+        and left_language == right_language
+        and left_executable == right_executable
+    )
+
+
+def _normalize_executable_payload(value: Any) -> str:
+    return str(value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
+def _anchor_priority(
+    item: tuple[MemoryEntry, MaintenanceEvidence],
+) -> tuple[float, float, int, str, str]:
+    entry, evidence = item
+    created_at = entry.created_at.astimezone(timezone.utc).isoformat()
+    return (-evidence.value, -evidence.confidence, -evidence.selected_count, created_at, entry.id)
+
+
+def _promotion_priority(
+    item: tuple[MemoryEntry, MaintenanceEvidence],
+) -> tuple[float, float, int, str]:
+    entry, evidence = item
+    return (-evidence.value, -evidence.confidence, -evidence.selected_count, entry.id)
+
+
+def _ordered_metadata_union(
+    sources: Sequence[tuple[MemoryEntry, MaintenanceEvidence]],
+    key: str,
+) -> list[Any]:
+    result: list[Any] = []
+    seen: set[str] = set()
+    for entry, _ in sources:
+        value = entry.metadata.get(key)
+        if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+            continue
+        for item in value:
+            normalized = json.dumps(
+                sanitize_json_value(item),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            result.append(sanitize_json_value(item))
+    return result
+
+
+def _successful_step_summaries(value: Any) -> list[str]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        return []
+    summaries: list[str] = []
+    for raw in value:
+        if isinstance(raw, str):
+            summary = " ".join(raw.split())
+        elif isinstance(raw, Mapping):
+            status = str(raw.get("status") or raw.get("outcome") or "").casefold()
+            if raw.get("success") is False or status in {"failed", "failure", "error"}:
+                continue
+            action = " ".join(str(raw.get("action") or "").split())
+            result = " ".join(str(raw.get("result") or "").split())
+            summary = ": ".join(item for item in (action, result) if item)
+        else:
+            continue
+        if summary:
+            summaries.append(summary)
+    return summaries
+
+
+def _non_empty_strings(value: Any) -> list[str]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        return []
+    return [" ".join(str(item).split()) for item in value if str(item).strip()]
+
+
+def _stable_title(value: str, *, fallback: str, max_chars: int = 120) -> str:
+    title = next((" ".join(line.split()) for line in str(value).splitlines() if line.strip()), "")
+    return (title or fallback)[:max_chars].rstrip()
+
+
+def _entry_payload_with_metadata(
+    entry: MemoryEntry,
+    metadata: Mapping[str, Any],
+) -> dict[str, Any]:
+    payload = entry.to_dict()
+    payload["metadata"] = sanitize_json_value(dict(metadata))
+    return payload
 
 
 def _negative_delete_eligible(
@@ -775,6 +1288,283 @@ def _has_sufficient_retention_evidence(
         and evidence.confidence >= config.delete_min_confidence
         and evidence.candidate_count >= config.delete_min_candidate_count
     )
+
+
+def _validate_operation_shape(operation: MaintenanceOperation) -> None:
+    target_ids = operation.target_ids
+    remove_ids = operation.remove_ids
+    replacement_ids = _payload_ids(operation.replacements, "replacement")
+    addition_ids = _payload_ids(operation.additions, "addition")
+    replacement_entries = tuple(
+        _validated_payload_entry(payload, "replacement")
+        for payload in operation.replacements
+    )
+    addition_entries = tuple(
+        _validated_payload_entry(payload, "addition")
+        for payload in operation.additions
+    )
+    if len(set(target_ids)) != len(target_ids):
+        raise MaintenancePlanError("target_ids must be unique within an operation")
+    if len(set(remove_ids)) != len(remove_ids):
+        raise MaintenancePlanError("remove_ids must be unique within an operation")
+    if len(set(replacement_ids)) != len(replacement_ids):
+        raise MaintenancePlanError("replacement ids must be unique within an operation")
+    if len(set(addition_ids)) != len(addition_ids):
+        raise MaintenancePlanError("addition ids must be unique within an operation")
+    expected_operation_id = _operation_id(
+        action=operation.action,
+        source_ids=operation.source_ids,
+        target_ids=target_ids,
+        replacements=operation.replacements,
+        additions=operation.additions,
+    )
+    if operation.operation_id != expected_operation_id:
+        raise MaintenancePlanError("operation_id does not match its deterministic payload")
+
+    mutation_entries: tuple[MemoryEntry, ...] = ()
+    if operation.action == MaintenanceAction.MERGE:
+        mutation_entries = replacement_entries
+    elif operation.action == MaintenanceAction.PROMOTE:
+        mutation_entries = replacement_entries + addition_entries
+    for entry in mutation_entries:
+        if str(entry.metadata.get("maintenance_operation_id") or "") != operation.operation_id:
+            raise MaintenancePlanError(
+                f"mutation payload operation id mismatch: {entry.id}"
+            )
+
+    if operation.action == MaintenanceAction.KEEP:
+        if target_ids or remove_ids or replacement_ids or addition_ids:
+            raise MaintenancePlanError("keep operation cannot contain mutation payloads")
+        return
+    if operation.action == MaintenanceAction.DELETE:
+        if target_ids or replacement_ids or addition_ids or set(remove_ids) != set(operation.source_ids):
+            raise MaintenancePlanError("delete operation must remove every source and nothing else")
+        return
+    if operation.action == MaintenanceAction.MERGE:
+        if len(operation.source_ids) < 2:
+            raise MaintenancePlanError("merge operation requires at least two sources")
+        if len(set(operation.source_tiers)) != 1:
+            raise MaintenancePlanError("merge operation sources must have one tier")
+        if operation.source_tiers[0] == ExperienceTier.TRAJECTORY.value:
+            raise MaintenancePlanError("trajectory entries cannot be merged")
+        if len(target_ids) != 1 or target_ids[0] not in operation.source_ids:
+            raise MaintenancePlanError("merge target must be exactly one source anchor")
+        if replacement_ids != target_ids:
+            raise MaintenancePlanError("merge must replace exactly its anchor target")
+        if set(remove_ids) != set(operation.source_ids) - set(target_ids) or addition_ids:
+            raise MaintenancePlanError("merge must remove every non-anchor source")
+        return
+    if operation.action == MaintenanceAction.PROMOTE:
+        if len(operation.source_ids) != 1 or len(target_ids) != 1:
+            raise MaintenancePlanError("promote operation requires one source and one target")
+        if remove_ids or replacement_ids != operation.source_ids:
+            raise MaintenancePlanError("promote must replace its source without removing it")
+        if len(addition_ids) > 1 or (addition_ids and addition_ids != target_ids):
+            raise MaintenancePlanError("promote addition must be its target")
+
+
+def _validate_operation_conflicts(
+    operations: Sequence[MaintenanceOperation],
+    *,
+    repository_entries: Sequence[MemoryEntry] | None = None,
+) -> None:
+    source_owners: dict[str, str] = {}
+    remove_owners: dict[str, str] = {}
+    replacement_owners: dict[str, str] = {}
+    addition_owners: dict[str, str] = {}
+    for operation in operations:
+        for source_id in operation.source_ids:
+            _claim_operation_id(source_owners, source_id, operation.operation_id, "source")
+        for memory_id in operation.remove_ids:
+            _claim_operation_id(remove_owners, memory_id, operation.operation_id, "remove")
+        for memory_id in _payload_ids(operation.replacements, "replacement"):
+            _claim_operation_id(replacement_owners, memory_id, operation.operation_id, "replacement")
+        for memory_id in _payload_ids(operation.additions, "addition"):
+            _claim_operation_id(addition_owners, memory_id, operation.operation_id, "addition")
+
+    remove_ids = set(remove_owners)
+    replacement_ids = set(replacement_owners)
+    addition_ids = set(addition_owners)
+    if remove_ids.intersection(replacement_ids | addition_ids):
+        raise MaintenancePlanError("remove ids conflict with replacement/addition ids")
+    if replacement_ids.intersection(addition_ids):
+        raise MaintenancePlanError("replacement ids conflict with addition ids")
+    if repository_entries is None:
+        return
+
+    repository_by_id: dict[str, MemoryEntry] = {}
+    for entry in repository_entries:
+        if entry.id in repository_by_id:
+            raise MaintenancePlanError(f"duplicate repository id: {entry.id}")
+        expected_fingerprint = content_fingerprint(entry.content)
+        if entry.fingerprint and entry.fingerprint != expected_fingerprint:
+            raise MaintenancePlanError(f"repository fingerprint mismatch: {entry.id}")
+        repository_by_id[entry.id] = entry
+    existing_ids = set(repository_by_id)
+    if addition_ids.intersection(existing_ids):
+        conflict = min(addition_ids.intersection(existing_ids))
+        raise MaintenancePlanError(f"addition id already exists in repository: {conflict}")
+
+    for operation in operations:
+        for source_id, tier in zip(operation.source_ids, operation.source_tiers):
+            entry = repository_by_id.get(source_id)
+            if entry is None:
+                raise MaintenancePlanError(f"source id is absent from repository: {source_id}")
+            actual_tier = experience_tier(entry)
+            if actual_tier is None or actual_tier.value != tier:
+                raise MaintenancePlanError(f"source tier does not match repository: {source_id}")
+            expected = _source_precondition(entry, tier)
+            if operation.source_preconditions[source_id] != expected:
+                raise MaintenancePlanError(f"source precondition mismatch: {source_id}")
+
+    final_entries = _repository_after_operations(repository_entries, operations, validate=False)
+    final_by_id = {entry.id: entry for entry in final_entries}
+    for operation in operations:
+        if operation.action == MaintenanceAction.MERGE:
+            _validate_merge_repository_contract(
+                operation,
+                repository_by_id=repository_by_id,
+                final_by_id=final_by_id,
+            )
+        if operation.action != MaintenanceAction.PROMOTE:
+            continue
+        source = repository_by_id[operation.source_ids[0]]
+        target = final_by_id.get(operation.target_ids[0])
+        if target is None:
+            raise MaintenancePlanError(
+                f"promotion target is absent after planning: {operation.target_ids[0]}"
+            )
+        _validate_promotion_target(operation, source=source, target=target, final_by_id=final_by_id)
+
+    seen_dedup_keys: dict[tuple[str, str, str, str], str] = {}
+    for entry in final_entries:
+        key = memory_dedup_key(entry)
+        previous = seen_dedup_keys.get(key)
+        if previous is not None:
+            raise MaintenancePlanError(
+                f"duplicate repository dedup identity after planning: {previous}, {entry.id}"
+            )
+        seen_dedup_keys[key] = entry.id
+
+
+def _validate_merge_repository_contract(
+    operation: MaintenanceOperation,
+    *,
+    repository_by_id: Mapping[str, MemoryEntry],
+    final_by_id: Mapping[str, MemoryEntry],
+) -> None:
+    sources = [repository_by_id[source_id] for source_id in operation.source_ids]
+    tiers = {experience_tier(entry) for entry in sources}
+    scopes = {entry.scope for entry in sources}
+    projects = {
+        "" if entry.scope == MemoryScope.GLOBAL else entry.project_key
+        for entry in sources
+    }
+    if len(tiers) != 1 or ExperienceTier.TRAJECTORY in tiers:
+        raise MaintenancePlanError("merge repository sources must have one non-trajectory tier")
+    if len(scopes) != 1 or len(projects) != 1:
+        raise MaintenancePlanError("merge repository sources must share scope and project")
+
+    anchor = repository_by_id[operation.target_ids[0]]
+    replacement = final_by_id.get(anchor.id)
+    if replacement is None:
+        raise MaintenancePlanError(f"merge anchor replacement is absent: {anchor.id}")
+    preserved_fields = (
+        replacement.id == anchor.id,
+        replacement.content == anchor.content,
+        replacement.fingerprint == anchor.fingerprint,
+        replacement.created_at == anchor.created_at,
+        replacement.scope == anchor.scope,
+        replacement.project_key == anchor.project_key,
+        replacement.run_id == anchor.run_id,
+        experience_tier(replacement) == experience_tier(anchor),
+    )
+    if not all(preserved_fields):
+        raise MaintenancePlanError(f"merge replacement does not preserve anchor identity: {anchor.id}")
+
+
+def _repository_after_operations(
+    entries: Sequence[MemoryEntry],
+    operations: Sequence[MaintenanceOperation],
+    *,
+    validate: bool = True,
+) -> list[MemoryEntry]:
+    if validate:
+        _validate_operation_conflicts(operations, repository_entries=entries)
+    by_id = {entry.id: entry for entry in entries}
+    for operation in operations:
+        for memory_id in operation.remove_ids:
+            by_id.pop(memory_id, None)
+        for payload in operation.replacements:
+            replacement = _validated_payload_entry(payload, "replacement")
+            by_id[replacement.id] = replacement
+        for payload in operation.additions:
+            addition = _validated_payload_entry(payload, "addition")
+            by_id[addition.id] = addition
+    return sorted(by_id.values(), key=lambda entry: entry.id)
+
+
+def _validate_promotion_target(
+    operation: MaintenanceOperation,
+    *,
+    source: MemoryEntry,
+    target: MemoryEntry,
+    final_by_id: Mapping[str, MemoryEntry],
+) -> None:
+    if experience_tier(source) not in {ExperienceTier.TIP, ExperienceTier.TRAJECTORY}:
+        raise MaintenancePlanError(f"invalid promotion source tier: {source.id}")
+    if experience_tier(target) != ExperienceTier.SKILL:
+        raise MaintenancePlanError(f"promotion target is not a skill: {target.id}")
+    expected_content, _ = _promoted_skill_fields(source)
+    expected_fingerprint = content_fingerprint(expected_content)
+    if target.fingerprint != expected_fingerprint:
+        raise MaintenancePlanError(f"promotion target fingerprint mismatch: {target.id}")
+    if target.scope != source.scope:
+        raise MaintenancePlanError(f"promotion target scope mismatch: {target.id}")
+    if target.scope != MemoryScope.GLOBAL and target.project_key != source.project_key:
+        raise MaintenancePlanError(f"promotion target project mismatch: {target.id}")
+
+    updated_source = final_by_id.get(source.id)
+    if updated_source is None:
+        raise MaintenancePlanError(f"promotion source is absent after planning: {source.id}")
+    if str(updated_source.metadata.get("maintenance_promoted_to") or "") != target.id:
+        raise MaintenancePlanError(f"promotion source target metadata mismatch: {source.id}")
+    if str(updated_source.metadata.get("maintenance_operation_id") or "") != operation.operation_id:
+        raise MaintenancePlanError(f"promotion source operation metadata mismatch: {source.id}")
+
+
+def _validated_payload_entry(payload: Mapping[str, Any], kind: str) -> MemoryEntry:
+    content = str(payload.get("content") or "")
+    declared_fingerprint = str(payload.get("fingerprint") or "")
+    expected_fingerprint = content_fingerprint(content)
+    if declared_fingerprint and declared_fingerprint != expected_fingerprint:
+        memory_id = str(payload.get("id") or "")
+        raise MaintenancePlanError(f"{kind} fingerprint mismatch: {memory_id}")
+    return MemoryEntry.from_dict(dict(payload))
+
+
+def _payload_ids(payloads: Sequence[Mapping[str, Any]], kind: str) -> tuple[str, ...]:
+    result: list[str] = []
+    for payload in payloads:
+        memory_id = str(payload.get("id") or "")
+        if not memory_id:
+            raise MaintenancePlanError(f"{kind} payload requires a non-empty id")
+        result.append(memory_id)
+    return tuple(result)
+
+
+def _claim_operation_id(
+    owners: dict[str, str],
+    memory_id: str,
+    operation_id: str,
+    kind: str,
+) -> None:
+    previous = owners.get(memory_id)
+    if previous is not None:
+        raise MaintenancePlanError(
+            f"{kind} id {memory_id} is claimed by both {previous} and {operation_id}"
+        )
+    owners[memory_id] = operation_id
 
 
 def _source_precondition(entry: MemoryEntry, tier: str) -> dict[str, str]:
