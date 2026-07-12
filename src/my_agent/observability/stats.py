@@ -32,6 +32,16 @@ class TraceStats:
     evolver_writer_saved_total: int = 0
     evolver_writer_saved_by_tier: dict[str, int] = field(default_factory=dict)
     evolver_writer_failed_events: int = 0
+    maintenance_runs: int = 0
+    maintenance_applied_runs: int = 0
+    maintenance_keep: int = 0
+    maintenance_delete: int = 0
+    maintenance_merge: int = 0
+    maintenance_promote: int = 0
+    maintenance_removed_entries: int = 0
+    maintenance_added_entries: int = 0
+    maintenance_failures: int = 0
+    maintenance_committed_with_audit_error: int = 0
 
     @property
     def tool_success_rate(self) -> float:
@@ -65,6 +75,18 @@ class TraceStats:
             "evolver_writer_saved_total": self.evolver_writer_saved_total,
             "evolver_writer_saved_by_tier": self.evolver_writer_saved_by_tier,
             "evolver_writer_failed_events": self.evolver_writer_failed_events,
+            "maintenance_runs": self.maintenance_runs,
+            "maintenance_applied_runs": self.maintenance_applied_runs,
+            "maintenance_keep": self.maintenance_keep,
+            "maintenance_delete": self.maintenance_delete,
+            "maintenance_merge": self.maintenance_merge,
+            "maintenance_promote": self.maintenance_promote,
+            "maintenance_removed_entries": self.maintenance_removed_entries,
+            "maintenance_added_entries": self.maintenance_added_entries,
+            "maintenance_failures": self.maintenance_failures,
+            "maintenance_committed_with_audit_error": (
+                self.maintenance_committed_with_audit_error
+            ),
         }
 
 
@@ -89,6 +111,16 @@ def collect_trace_stats(path: str | Path) -> TraceStats:
     evolver_writer_saved_total = 0
     evolver_writer_saved_by_tier: Counter[str] = Counter()
     evolver_writer_failed_events = 0
+    maintenance_runs = 0
+    maintenance_applied_runs = 0
+    maintenance_keep = 0
+    maintenance_delete = 0
+    maintenance_merge = 0
+    maintenance_promote = 0
+    maintenance_removed_entries = 0
+    maintenance_added_entries = 0
+    maintenance_failures = 0
+    maintenance_committed_with_audit_error = 0
 
     for trace_file in trace_files:
         for event in _read_trace_file(trace_file):
@@ -137,6 +169,30 @@ def collect_trace_stats(path: str | Path) -> TraceStats:
                 evolver_writer_failed_events += 1
                 continue
 
+            if event_name == "memory.maintenance_started":
+                maintenance_runs += 1
+                continue
+            if event_name == "memory.maintenance_proposed":
+                maintenance_keep += _nonnegative_int(payload.get("keep"))
+                maintenance_delete += _nonnegative_int(payload.get("delete"))
+                maintenance_merge += _nonnegative_int(payload.get("merge"))
+                maintenance_promote += _nonnegative_int(payload.get("promote"))
+                maintenance_removed_entries += _nonnegative_int(
+                    payload.get("source_entries_removed")
+                )
+                maintenance_added_entries += _nonnegative_int(
+                    payload.get("entries_added")
+                )
+                continue
+            if event_name == "memory.maintenance_completed":
+                maintenance_applied_runs += 1
+                if payload.get("status") == "committed_with_audit_error":
+                    maintenance_committed_with_audit_error += 1
+                continue
+            if event_name == "memory.maintenance_failed":
+                maintenance_failures += 1
+                continue
+
             if event_name != "tool.completed":
                 continue
 
@@ -180,6 +236,16 @@ def collect_trace_stats(path: str | Path) -> TraceStats:
         evolver_writer_saved_total=evolver_writer_saved_total,
         evolver_writer_saved_by_tier=dict(sorted(evolver_writer_saved_by_tier.items())),
         evolver_writer_failed_events=evolver_writer_failed_events,
+        maintenance_runs=maintenance_runs,
+        maintenance_applied_runs=maintenance_applied_runs,
+        maintenance_keep=maintenance_keep,
+        maintenance_delete=maintenance_delete,
+        maintenance_merge=maintenance_merge,
+        maintenance_promote=maintenance_promote,
+        maintenance_removed_entries=maintenance_removed_entries,
+        maintenance_added_entries=maintenance_added_entries,
+        maintenance_failures=maintenance_failures,
+        maintenance_committed_with_audit_error=maintenance_committed_with_audit_error,
     )
 
 
@@ -208,6 +274,23 @@ def format_trace_stats(stats: TraceStats) -> str:
             f"saved_events={stats.evolver_writer_saved_events}, "
             f"saved={stats.evolver_writer_saved_total}, "
             f"failed_events={stats.evolver_writer_failed_events}"
+        ),
+        (
+            "Memory maintenance: "
+            f"runs={stats.maintenance_runs}, "
+            f"applied={stats.maintenance_applied_runs}, "
+            f"failures={stats.maintenance_failures}, "
+            "committed_with_audit_error="
+            f"{stats.maintenance_committed_with_audit_error}"
+        ),
+        (
+            "Maintenance actions: "
+            f"keep={stats.maintenance_keep}, "
+            f"delete={stats.maintenance_delete}, "
+            f"merge={stats.maintenance_merge}, "
+            f"promote={stats.maintenance_promote}, "
+            f"removed={stats.maintenance_removed_entries}, "
+            f"added={stats.maintenance_added_entries}"
         ),
         "Tool distribution:",
     ]
@@ -267,6 +350,14 @@ def _payload_count(payload: dict[str, Any], *, count_key: str, fallback_keys: tu
         values = payload.get(key)
         if isinstance(values, list):
             return len(values)
+    return 0
+
+
+def _nonnegative_int(value: object) -> int:
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int) and value >= 0:
+        return value
     return 0
 
 

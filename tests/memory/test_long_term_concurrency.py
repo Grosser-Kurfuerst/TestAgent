@@ -207,6 +207,19 @@ class StrictSnapshotTests(unittest.TestCase):
 
 
 class ProcessLockTests(unittest.TestCase):
+    def test_process_lock_timeout_must_be_finite(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "long_term_memory.jsonl"
+            for value in (float("nan"), float("inf"), float("-inf")):
+                with self.subTest(constructor_timeout=value), self.assertRaises(ValueError):
+                    LongTermMemoryStore(path, lock_timeout_seconds=value)
+
+            store = LongTermMemoryStore(path)
+            for value in (float("nan"), float("inf"), float("-inf")):
+                with self.subTest(lock_timeout=value), self.assertRaises(ValueError):
+                    with store.exclusive_process_lock(timeout_seconds=value):
+                        self.fail("non-finite timeout acquired the process lock")
+
     def test_two_processes_add_without_lost_update(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = str(Path(tmp) / "long_term_memory.jsonl")

@@ -14,6 +14,7 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any, Collection, Mapping, Sequence
 import json
+import math
 import os
 import re
 
@@ -785,8 +786,8 @@ def apply_maintenance_plan(
     lock_timeout_seconds: float = 30.0,
 ) -> MaintenanceApplyResult:
     """Apply a reviewed plan under one process lock and one store persist."""
-    if lock_timeout_seconds < 0:
-        raise ValueError("lock_timeout_seconds must be non-negative")
+    if not math.isfinite(lock_timeout_seconds) or lock_timeout_seconds < 0:
+        raise ValueError("lock_timeout_seconds must be finite and non-negative")
 
     before_revision = plan.repository_revision
     after_revision = plan.repository_revision

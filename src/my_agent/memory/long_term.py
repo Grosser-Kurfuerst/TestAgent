@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import threading
 from contextlib import contextmanager
@@ -73,8 +74,8 @@ class LongTermMemoryStore:
     ) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        if lock_timeout_seconds < 0:
-            raise ValueError("lock_timeout_seconds must be non-negative")
+        if not math.isfinite(lock_timeout_seconds) or lock_timeout_seconds < 0:
+            raise ValueError("lock_timeout_seconds must be finite and non-negative")
         self._trace_sink = trace_sink
         self._entries: list[MemoryEntry] = []
         self._loaded = False
@@ -139,8 +140,8 @@ class LongTermMemoryStore:
     ) -> Iterator[None]:
         """Hold the directory-scoped lock shared by every store mutation."""
         timeout = self._lock_timeout_seconds if timeout_seconds is None else float(timeout_seconds)
-        if timeout < 0:
-            raise ValueError("timeout_seconds must be non-negative")
+        if not math.isfinite(timeout) or timeout < 0:
+            raise ValueError("timeout_seconds must be finite and non-negative")
         try:
             with self._process_lock.acquire(timeout=timeout):
                 yield

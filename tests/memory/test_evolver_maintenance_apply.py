@@ -664,6 +664,29 @@ class MaintenanceApplyTests(unittest.TestCase):
             self.assertTrue(results[0].should_retry)
             self.assertEqual(holder.path.read_bytes(), before)
 
+    def test_apply_lock_timeout_must_be_finite(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self._store(root)
+            store.add(_experience(
+                "delete-tip",
+                tier="tip",
+                content="Invalidated tip",
+                metadata={"maintenance_invalidated": True},
+            ))
+            plan = self._plan(store)
+            backup_dir, history_path = self._paths(root)
+
+            for value in (float("nan"), float("inf"), float("-inf")):
+                with self.subTest(lock_timeout=value), self.assertRaises(ValueError):
+                    apply_maintenance_plan(
+                        store=store,
+                        plan=plan,
+                        backup_dir=backup_dir,
+                        history_path=history_path,
+                        lock_timeout_seconds=value,
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()

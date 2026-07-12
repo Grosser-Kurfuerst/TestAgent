@@ -123,6 +123,10 @@ class TraceMetricsEvolverTests(unittest.TestCase):
         self.assertEqual(metrics.evolver_writer_saved_total, 0)
         self.assertEqual(metrics.evolver_writer_saved_by_tier, {})
         self.assertEqual(metrics.evolver_writer_failed_events, 0)
+        self.assertEqual(metrics.maintenance_runs, 0)
+        self.assertEqual(metrics.maintenance_applied_runs, 0)
+        self.assertEqual(metrics.maintenance_failures, 0)
+        self.assertEqual(metrics.maintenance_committed_with_audit_error, 0)
 
     def test_collects_evolver_writer_saved_total_and_tiers(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -244,6 +248,70 @@ class TraceMetricsEvolverTests(unittest.TestCase):
 
         self.assertEqual(metrics.evolver_writer_saved_total, 2)
         self.assertEqual(metrics.evolver_writer_saved_by_tier, {"skill": 1, "tip": 1})
+
+    def test_collects_memory_maintenance_metrics_from_trace_events(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trace = Path(tmp) / "maintenance_trace.jsonl"
+            events = [
+                {
+                    "run_id": "maintenance-1",
+                    "event": "memory.maintenance_started",
+                    "payload": {"mode": "apply"},
+                },
+                {
+                    "run_id": "maintenance-1",
+                    "event": "memory.maintenance_proposed",
+                    "payload": {
+                        "keep": 4,
+                        "delete": 1,
+                        "merge": 2,
+                        "promote": 1,
+                        "source_entries_removed": 3,
+                        "entries_added": 2,
+                    },
+                },
+                {
+                    "run_id": "maintenance-1",
+                    "event": "memory.maintenance_completed",
+                    "payload": {
+                        "status": "committed_with_audit_error",
+                        "mutation_committed": True,
+                    },
+                },
+                {
+                    "run_id": "maintenance-2",
+                    "event": "memory.maintenance_started",
+                    "payload": {"mode": "apply"},
+                },
+                {
+                    "run_id": "maintenance-2",
+                    "event": "memory.maintenance_failed",
+                    "payload": {
+                        "status": "pre_commit_failed",
+                        "stage": "validation",
+                    },
+                },
+            ]
+            trace.write_text(
+                "\n".join(json.dumps(event) for event in events),
+                encoding="utf-8",
+            )
+
+            metrics = collect_trace_metrics(trace, recursive=False)
+
+        self.assertEqual(metrics.maintenance_runs, 2)
+        self.assertEqual(metrics.maintenance_applied_runs, 1)
+        self.assertEqual(metrics.maintenance_keep, 4)
+        self.assertEqual(metrics.maintenance_delete, 1)
+        self.assertEqual(metrics.maintenance_merge, 2)
+        self.assertEqual(metrics.maintenance_promote, 1)
+        self.assertEqual(metrics.maintenance_removed_entries, 3)
+        self.assertEqual(metrics.maintenance_added_entries, 2)
+        self.assertEqual(metrics.maintenance_failures, 1)
+        self.assertEqual(metrics.maintenance_committed_with_audit_error, 1)
+        self.assertEqual(metrics.to_dict()["maintenance_removed_entries"], 3)
+        self.assertIn("Memory maintenance: runs=2", format_trace_metrics(metrics))
+        self.assertIn("Maintenance actions: keep=4", format_trace_metrics(metrics))
 
 
 if __name__ == "__main__":

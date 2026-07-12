@@ -4,7 +4,19 @@ import argparse
 from collections.abc import Callable, Sequence
 from typing import Any
 
-from my_agent.cli.commands import chat, config, data, eval as eval_manifest, mcp, repo, run, stats, task, tools
+from my_agent.cli.commands import (
+    chat,
+    config,
+    data,
+    eval as eval_manifest,
+    mcp,
+    memory,
+    repo,
+    run,
+    stats,
+    task,
+    tools,
+)
 from my_agent.cli.common import CliContext
 
 CommandHandler = Callable[[argparse.Namespace, CliContext], int]
@@ -19,6 +31,7 @@ COMMAND_MODULES = (
     config,
     tools,
     mcp,
+    memory,
     data,
 )
 

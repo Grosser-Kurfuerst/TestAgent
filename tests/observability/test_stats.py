@@ -45,6 +45,10 @@ class TraceStatsTests(unittest.TestCase):
         self.assertEqual(stats.evolver_writer_saved_total, 0)
         self.assertEqual(stats.evolver_writer_saved_by_tier, {})
         self.assertEqual(stats.evolver_writer_failed_events, 0)
+        self.assertEqual(stats.maintenance_runs, 0)
+        self.assertEqual(stats.maintenance_applied_runs, 0)
+        self.assertEqual(stats.maintenance_failures, 0)
+        self.assertEqual(stats.maintenance_committed_with_audit_error, 0)
 
     def test_collects_evolver_selection_for_nonrecursive_stats(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -114,6 +118,59 @@ class TraceStatsTests(unittest.TestCase):
         self.assertEqual(stats.to_dict()["evolver_writer_saved_total"], 2)
         self.assertIn("Evolver writer: started_events=1", format_trace_stats(stats))
         self.assertIn("- skill: 1", format_trace_stats(stats))
+
+    def test_collects_memory_maintenance_stats_for_nonrecursive_trace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trace = Path(tmp) / "maintenance_trace.jsonl"
+            events = [
+                {
+                    "run_id": "maintenance-1",
+                    "event": "memory.maintenance_started",
+                    "payload": {"mode": "apply"},
+                },
+                {
+                    "run_id": "maintenance-1",
+                    "event": "memory.maintenance_proposed",
+                    "payload": {
+                        "keep": 5,
+                        "delete": 1,
+                        "merge": 1,
+                        "promote": 2,
+                        "source_entries_removed": 2,
+                        "entries_added": 3,
+                    },
+                },
+                {
+                    "run_id": "maintenance-1",
+                    "event": "memory.maintenance_completed",
+                    "payload": {"status": "committed"},
+                },
+                {
+                    "run_id": "maintenance-2",
+                    "event": "memory.maintenance_failed",
+                    "payload": {"status": "pre_commit_failed"},
+                },
+            ]
+            trace.write_text(
+                "\n".join(json.dumps(event) for event in events),
+                encoding="utf-8",
+            )
+
+            stats = collect_trace_stats(trace)
+
+        self.assertEqual(stats.maintenance_runs, 1)
+        self.assertEqual(stats.maintenance_applied_runs, 1)
+        self.assertEqual(stats.maintenance_keep, 5)
+        self.assertEqual(stats.maintenance_delete, 1)
+        self.assertEqual(stats.maintenance_merge, 1)
+        self.assertEqual(stats.maintenance_promote, 2)
+        self.assertEqual(stats.maintenance_removed_entries, 2)
+        self.assertEqual(stats.maintenance_added_entries, 3)
+        self.assertEqual(stats.maintenance_failures, 1)
+        self.assertEqual(stats.maintenance_committed_with_audit_error, 0)
+        self.assertEqual(stats.to_dict()["maintenance_added_entries"], 3)
+        self.assertIn("Memory maintenance: runs=1", format_trace_stats(stats))
+        self.assertIn("Maintenance actions: keep=5", format_trace_stats(stats))
 
     def test_recursive_metrics_follow_child_traces_and_tokens_by_phase(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
