@@ -82,11 +82,69 @@ def load_project_attribution(
                 raise MaintenanceAttributionError(f"invalid tier at line {line_no}")
             if record.memory_project_key != memory_project_key:
                 raise MaintenanceAttributionError(f"memory_project_key mismatch at line {line_no}")
+            _validate_attribution_record(payload, record, line_no=line_no)
             key = (record.memory_id, tier.value, memory_project_key)
             if key in records:
                 raise MaintenanceAttributionError(f"duplicate attribution record at line {line_no}")
             records[key] = record
     return records
+
+
+def _validate_attribution_record(
+    payload: Mapping[str, Any],
+    record: MemoryAttributionRecord,
+    *,
+    line_no: int,
+) -> None:
+    for name in ("candidate_count", "selected_count", "not_selected_count"):
+        raw = payload.get(name, 0)
+        if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+            raise MaintenanceAttributionError(
+                f"{name} must be a non-negative integer at line {line_no}"
+            )
+    if record.candidate_count != record.selected_count + record.not_selected_count:
+        raise MaintenanceAttributionError(
+            f"candidate counts are inconsistent at line {line_no}"
+        )
+
+    finite_values = {
+        "value": record.value,
+        "confidence": record.confidence,
+        "success_when_selected": record.success_when_selected,
+        "success_when_candidate_not_selected": (
+            record.success_when_candidate_not_selected
+        ),
+        "reward_when_selected": record.reward_when_selected,
+        "reward_when_candidate_not_selected": (
+            record.reward_when_candidate_not_selected
+        ),
+    }
+    for name, value in finite_values.items():
+        if value is not None and not math.isfinite(float(value)):
+            raise MaintenanceAttributionError(
+                f"{name} must be finite at line {line_no}"
+            )
+    if not -1.0 <= record.value <= 1.0:
+        raise MaintenanceAttributionError(f"value is out of range at line {line_no}")
+    if not 0.0 <= record.confidence <= 1.0:
+        raise MaintenanceAttributionError(
+            f"confidence is out of range at line {line_no}"
+        )
+    for name, value in (
+        ("success_when_selected", record.success_when_selected),
+        (
+            "success_when_candidate_not_selected",
+            record.success_when_candidate_not_selected,
+        ),
+    ):
+        if value is not None and not 0.0 <= value <= 1.0:
+            raise MaintenanceAttributionError(
+                f"{name} is out of range at line {line_no}"
+            )
+    if record.last_used and _parse_datetime(record.last_used) is None:
+        raise MaintenanceAttributionError(
+            f"last_used must be a timezone-aware timestamp at line {line_no}"
+        )
 
 
 def maintenance_evidence_for_entry(
@@ -295,7 +353,12 @@ def build_maintenance_plan(
     operations: list[MaintenanceOperation] = []
     remaining: list[tuple[MemoryEntry, MaintenanceEvidence]] = []
     retention_reasons: dict[str, str] = {}
-    protected_reasons = {"protected_metadata", "protected_global", "protected_manual"}
+    protected_reasons = {
+        "protected_metadata",
+        "protected_global",
+        "protected_manual",
+        "protected_unknown_provenance",
+    }
     for entry, evidence in considered:
         action, reason = _retention_decision(entry, evidence, as_of=as_of_utc, config=cfg)
         retention_reasons[entry.id] = reason
@@ -430,8 +493,12 @@ def _retention_decision(
         reason = "protected_metadata"
     elif entry.scope == MemoryScope.GLOBAL:
         reason = "protected_global"
-    elif config.protect_manual and evidence.created_by == "manual":
-        reason = "protected_manual"
+    elif not _automatic_maintenance_provenance(evidence.created_by):
+        reason = (
+            "protected_manual"
+            if evidence.created_by == ExperienceCreatedBy.MANUAL.value
+            else "protected_unknown_provenance"
+        )
     elif metadata.get("maintenance_invalidated") is True:
         action = MaintenanceAction.DELETE
         reason = "explicitly_invalidated"
@@ -649,7 +716,7 @@ def _promotion_eligible(
     tier = experience_tier(entry)
     if tier not in {ExperienceTier.TIP, ExperienceTier.TRAJECTORY}:
         return False
-    if evidence.created_by == ExperienceCreatedBy.MANUAL.value:
+    if not _automatic_maintenance_provenance(evidence.created_by):
         return False
     if entry.metadata.get("maintenance_promoted_to"):
         return False
@@ -664,6 +731,13 @@ def _promotion_eligible(
         learnings = _non_empty_strings(entry.metadata.get("key_learnings"))
         return str(entry.metadata.get("outcome") or "").casefold() == "success" and bool(learnings)
     return True
+
+
+def _automatic_maintenance_provenance(created_by: str) -> bool:
+    return created_by in {
+        ExperienceCreatedBy.WRITER.value,
+        ExperienceCreatedBy.MAINTENANCE.value,
+    }
 
 
 def _promotion_operation(

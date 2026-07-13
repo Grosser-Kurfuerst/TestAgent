@@ -97,8 +97,8 @@ class MaintenanceConfig:
         _validate_positive_int("merge_max_cluster_size", self.merge_max_cluster_size)
         if self.merge_max_cluster_size < 2:
             raise ValueError("merge_max_cluster_size must be at least 2")
-        if not isinstance(self.protect_manual, bool):
-            raise ValueError("protect_manual must be a bool")
+        if self.protect_manual is not True:
+            raise ValueError("protect_manual must remain true in the single-project policy")
 
     def to_dict(self) -> dict[str, Any]:
         return sanitize_json_value(asdict(self))  # type: ignore[return-value]

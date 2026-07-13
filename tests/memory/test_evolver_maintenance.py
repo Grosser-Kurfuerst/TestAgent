@@ -126,6 +126,8 @@ class MaintenanceConfigTests(unittest.TestCase):
             MaintenanceConfig.from_dict({"unknown": 1})
         with self.assertRaises(ValueError):
             MaintenanceConfig.from_dict({"max_merged_content_chars": 1_600})
+        with self.assertRaises(ValueError):
+            MaintenanceConfig(protect_manual=False)
 
 
 class MaintenanceModuleBoundaryTests(unittest.TestCase):
@@ -178,6 +180,29 @@ class ProjectAttributionLoaderTests(unittest.TestCase):
             self._write(path, [_record().to_dict(), _record().to_dict()])
             with self.assertRaises(MaintenanceAttributionError):
                 load_project_attribution(path, memory_project_key=PROJECT_KEY)
+
+    def test_invalid_numeric_and_timestamp_semantics_fail_closed(self) -> None:
+        invalid_cases = {
+            "non_finite_value": {"value": float("nan")},
+            "confidence_out_of_range": {"confidence": 2.0},
+            "success_rate_out_of_range": {"success_when_selected": -0.1},
+            "negative_count": {"selected_count": -1},
+            "inconsistent_counts": {
+                "candidate_count": 8,
+                "selected_count": 3,
+                "not_selected_count": 4,
+            },
+            "invalid_last_used": {"last_used": "not-a-timestamp"},
+        }
+        for case, updates in invalid_cases.items():
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "attribution.jsonl"
+                payload = _record().to_dict()
+                payload.update(updates)
+                self._write(path, [payload])
+
+                with self.assertRaises(MaintenanceAttributionError):
+                    load_project_attribution(path, memory_project_key=PROJECT_KEY)
 
 
 class MaintenanceEvidenceTests(unittest.TestCase):
@@ -475,6 +500,43 @@ class RetentionPlannerTests(unittest.TestCase):
 
         self.assertEqual(plan.operations[0].action, MaintenanceAction.DELETE)
         self.assertEqual(plan.operations[0].reason_codes, ("explicitly_invalidated",))
+
+    def test_missing_or_unknown_provenance_is_never_a_destructive_candidate(self) -> None:
+        for created_by in (None, "legacy-import"):
+            with self.subTest(created_by=created_by):
+                payload = _entry(
+                    "legacy-tip",
+                    tier="tip",
+                    created_by=ExperienceCreatedBy.WRITER,
+                ).to_dict()
+                if created_by is None:
+                    payload["metadata"].pop("created_by", None)
+                else:
+                    payload["metadata"]["created_by"] = created_by
+                entry = MemoryEntry.from_dict(payload)
+                record = _record(
+                    "legacy-tip",
+                    tier="tip",
+                    value=-0.4,
+                    confidence=0.9,
+                    candidate_count=10,
+                    selected_count=2,
+                    not_selected_count=8,
+                )
+
+                plan = build_maintenance_plan(
+                    entries=[entry],
+                    attribution={(entry.id, "tip", PROJECT_KEY): record},
+                    repository_revision=f"sha256:legacy:{created_by}",
+                    project_key=PROJECT_KEY,
+                    as_of=NOW,
+                )
+
+                self.assertEqual(plan.operations[0].action, MaintenanceAction.KEEP)
+                self.assertEqual(
+                    plan.operations[0].reason_codes,
+                    ("protected_unknown_provenance",),
+                )
 
     def test_plan_is_stable_for_reordered_inputs(self) -> None:
         entries = [
