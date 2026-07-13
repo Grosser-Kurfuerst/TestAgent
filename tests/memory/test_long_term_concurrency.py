@@ -9,6 +9,7 @@ import unittest
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from tests._path import add_src_to_path
 
@@ -21,7 +22,13 @@ from my_agent.memory.long_term import (
     MemoryStoreRevisionConflict,
     memory_entries_revision,
 )
-from my_agent.memory.evolver import ExperienceCreatedBy, build_experience_entry
+from my_agent.memory.evolver import (
+    ExperienceCreatedBy,
+    MaintenanceApplyStatus,
+    apply_maintenance_plan,
+    build_experience_entry,
+    build_maintenance_plan,
+)
 from my_agent.memory.types import (
     MemoryEntry,
     MemoryScope,
@@ -54,6 +61,32 @@ def _process_add(path: str, memory_id: str, start, results) -> None:
         results.put((memory_id, ""))
     except BaseException as exc:
         results.put((memory_id, f"{type(exc).__name__}: {exc}"))
+
+
+def _process_add_runtime_experience(
+    path: str,
+    start,
+    attempting,
+    acquired,
+    results,
+) -> None:
+    try:
+        start.wait(10)
+        store = LongTermMemoryStore(Path(path), lock_timeout_seconds=10)
+        attempting.set()
+        with store.exclusive_process_lock():
+            acquired.set()
+            _, created = store.add(build_experience_entry(
+                id="runtime-writer-tip",
+                content="Runtime writer preserves this concurrent experience.",
+                tier="tip",
+                project_key="/repo",
+                created_at=NOW,
+                created_by=ExperienceCreatedBy.WRITER,
+            ))
+        results.put((created, ""))
+    except BaseException as exc:
+        results.put((False, f"{type(exc).__name__}: {exc}"))
 
 
 class StrictSnapshotTests(unittest.TestCase):
@@ -268,6 +301,78 @@ class ProcessLockTests(unittest.TestCase):
 
             self.assertTrue(done.is_set())
             self.assertEqual({entry.id for entry in writer.all()}, {"writer"})
+
+    def test_runtime_writer_and_maintenance_do_not_lose_updates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = LongTermMemoryStore.from_dir(root)
+            store.add(build_experience_entry(
+                id="invalidated-tip",
+                content="This invalidated experience should be removed.",
+                tier="tip",
+                project_key="/repo",
+                created_at=NOW,
+                created_by=ExperienceCreatedBy.WRITER,
+                extra_metadata={"maintenance_invalidated": True},
+            ))
+            snapshot = store.load_strict_snapshot()
+            plan = build_maintenance_plan(
+                entries=snapshot.entries,
+                attribution={},
+                repository_revision=snapshot.revision,
+                project_key="/repo",
+                as_of=NOW,
+            )
+            context = multiprocessing.get_context("spawn")
+            start = context.Event()
+            attempting = context.Event()
+            acquired = context.Event()
+            results = context.Queue()
+            writer = context.Process(
+                target=_process_add_runtime_experience,
+                args=(str(store.path), start, attempting, acquired, results),
+            )
+            original_load = store.load_strict_snapshot
+            writer_started = False
+
+            def load_while_writer_waits():
+                nonlocal writer_started
+                current = original_load()
+                if not writer_started:
+                    writer_started = True
+                    writer.start()
+                    start.set()
+                    self.assertTrue(attempting.wait(10))
+                    self.assertFalse(acquired.wait(0.1))
+                return current
+
+            with patch.object(
+                store,
+                "load_strict_snapshot",
+                side_effect=load_while_writer_waits,
+            ):
+                apply_result = apply_maintenance_plan(
+                    store=store,
+                    plan=plan,
+                    backup_dir=root / "maintenance_backups",
+                    history_path=root / "maintenance_history.jsonl",
+                )
+                self.assertEqual(
+                    apply_result.status,
+                    MaintenanceApplyStatus.COMMITTED,
+                )
+
+            writer.join(15)
+            self.assertEqual(writer.exitcode, 0)
+            self.assertTrue(acquired.is_set())
+            created, error = results.get(timeout=2)
+            self.assertTrue(created)
+            self.assertEqual(error, "")
+            final_ids = {
+                entry.id for entry in store.load_strict_snapshot().entries
+            }
+            self.assertNotIn("invalidated-tip", final_ids)
+            self.assertIn("runtime-writer-tip", final_ids)
 
     def test_writer_lock_timeout_fails_without_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
