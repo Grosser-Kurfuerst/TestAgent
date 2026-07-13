@@ -14,7 +14,9 @@ add_src_to_path()
 import my_agent.memory.evolver.maintenance as maintenance_module
 import my_agent.memory.evolver.contracts as maintenance_contracts
 import my_agent.memory.evolver.planner as maintenance_planner
+import my_agent.memory.evolver.service as maintenance_service
 import my_agent.memory.evolver.transaction as maintenance_transaction
+import my_agent.memory.evolver.validation as maintenance_validation
 from my_agent.memory.evolver import (
     ExperienceCreatedBy,
     MaintenanceAction,
@@ -135,7 +137,7 @@ class MaintenanceModuleBoundaryTests(unittest.TestCase):
         self.assertIs(maintenance_module.MaintenancePlan, maintenance_contracts.MaintenancePlan)
         self.assertIs(
             maintenance_module.build_maintenance_plan,
-            maintenance_planner.build_maintenance_plan,
+            maintenance_service.build_maintenance_plan,
         )
         self.assertIs(
             maintenance_module.apply_maintenance_plan,
@@ -143,6 +145,8 @@ class MaintenanceModuleBoundaryTests(unittest.TestCase):
         )
         self.assertFalse(hasattr(maintenance_contracts, "LongTermMemoryStore"))
         self.assertFalse(hasattr(maintenance_planner, "LongTermMemoryStore"))
+        self.assertFalse(hasattr(maintenance_contracts, "validate_plan_semantics"))
+        self.assertFalse(hasattr(maintenance_planner, "validate_plan_semantics"))
 
 
 class ProjectAttributionLoaderTests(unittest.TestCase):
@@ -1187,7 +1191,7 @@ class MaintenancePlanContractTests(unittest.TestCase):
                     target[path] = value
                 _refresh_plan_id(payload)
                 with self.assertRaisesRegex(ValueError, "deterministic semantics"):
-                    MaintenancePlan.from_dict(payload)
+                    maintenance_validation.parse_maintenance_plan(payload)
 
     def test_rehashed_promotion_target_id_must_be_deterministic(self) -> None:
         _, plan, _ = self._promotion_fixture()
@@ -1210,7 +1214,7 @@ class MaintenancePlanContractTests(unittest.TestCase):
         _refresh_plan_id(payload)
 
         with self.assertRaisesRegex(ValueError, "target id is not deterministic"):
-            MaintenancePlan.from_dict(payload)
+            maintenance_validation.parse_maintenance_plan(payload)
 
     def test_rehashed_merge_lineage_must_cover_exact_sources(self) -> None:
         writer = ExperienceCreatedBy.WRITER
@@ -1239,7 +1243,7 @@ class MaintenancePlanContractTests(unittest.TestCase):
         _refresh_plan_id(payload)
 
         with self.assertRaisesRegex(ValueError, "merge replacement lineage mismatch"):
-            MaintenancePlan.from_dict(payload)
+            maintenance_validation.parse_maintenance_plan(payload)
 
     def test_mutation_payload_rejects_forged_fingerprint(self) -> None:
         _, plan, _ = self._promotion_fixture()

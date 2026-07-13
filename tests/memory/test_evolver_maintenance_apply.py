@@ -13,9 +13,13 @@ from tests._path import add_src_to_path
 add_src_to_path()
 
 import my_agent.memory.evolver.maintenance as maintenance_module
+import my_agent.memory.evolver.contracts as maintenance_contracts
+import my_agent.memory.evolver.planner as maintenance_planner
 import my_agent.memory.evolver.transaction as maintenance_transaction
+import my_agent.memory.evolver.validation as maintenance_validation
 from my_agent.memory.evolver import (
     ExperienceCreatedBy,
+    MaintenanceAction,
     MaintenanceApplyStatus,
     MaintenanceConfig,
     MemoryAttributionRecord,
@@ -125,6 +129,13 @@ class MaintenanceApplyTests(unittest.TestCase):
             as_of=NOW,
             config=config,
         )
+
+    def _replace_plan_operations(self, plan, operations):
+        payload = plan.to_dict()
+        payload["operations"] = [operation.to_dict() for operation in operations]
+        payload["summary"] = maintenance_contracts._operation_summary(operations)
+        _refresh_plan_id(payload)
+        return maintenance_module.MaintenancePlan.from_dict(payload)
 
     def test_noop_plan_does_not_rewrite_memory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -650,6 +661,132 @@ class MaintenanceApplyTests(unittest.TestCase):
                 self.assertEqual(store.path.read_bytes(), before)
                 self.assertFalse(backup_dir.exists())
                 self.assertFalse(history_path.exists())
+
+    def test_rehashed_delete_cannot_bypass_snapshot_protection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self._store(root)
+            protected = _experience(
+                "protected-tip",
+                tier="tip",
+                content="A protected writer-authored tip",
+                metadata={"maintenance_protected": True},
+            )
+            store.add(protected)
+            reviewed = self._plan(store)
+            keep = reviewed.operations[0]
+            delete_id = maintenance_module._operation_id(
+                action=MaintenanceAction.DELETE,
+                source_ids=keep.source_ids,
+                target_ids=(),
+                replacements=(),
+                additions=(),
+            )
+            delete = maintenance_module.MaintenanceOperation(
+                operation_id=delete_id,
+                action=MaintenanceAction.DELETE,
+                source_ids=keep.source_ids,
+                source_tiers=keep.source_tiers,
+                source_preconditions=keep.source_preconditions,
+                reason_codes=("explicitly_invalidated",),
+                evidence=keep.evidence,
+                remove_ids=keep.source_ids,
+            )
+            forged = self._replace_plan_operations(reviewed, (delete,))
+            before = store.path.read_bytes()
+            backup_dir, history_path = self._paths(root)
+
+            result = apply_maintenance_plan(
+                store=store,
+                plan=forged,
+                backup_dir=backup_dir,
+                history_path=history_path,
+            )
+
+            self.assertEqual(result.status, MaintenanceApplyStatus.PRE_COMMIT_FAILED)
+            self.assertEqual(result.audit_error_stage, "validation")
+            self.assertEqual(store.path.read_bytes(), before)
+            self.assertIn("protected-tip", {entry.id for entry in store.all()})
+            self.assertFalse(backup_dir.exists())
+            self.assertFalse(history_path.exists())
+
+    def test_rehashed_merge_recomputes_complete_link_from_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self._store(root)
+            left = _experience(
+                "unrelated-a",
+                content="Always validate database migrations in a staging environment.",
+            )
+            right = _experience(
+                "unrelated-b",
+                content="Use a lexer when parsing nested programming language syntax.",
+            )
+            store.add(left)
+            store.add(right)
+            reviewed = self._plan(store)
+            evidence = {
+                entry.id: maintenance_module.maintenance_evidence_for_entry(
+                    entry,
+                    attribution={},
+                    project_key=PROJECT_KEY,
+                )
+                for entry in (left, right)
+            }
+            merge = maintenance_planner._merge_operation(
+                [(left, evidence[left.id]), (right, evidence[right.id])],
+                as_of=NOW,
+            )
+            payload = merge.to_dict()
+            payload["redundancy_score"] = 1.0
+            payload["replacements"][0]["metadata"]["maintenance_redundancy_min"] = 1.0
+            forged_merge = maintenance_module.MaintenanceOperation.from_dict(payload)
+            forged = self._replace_plan_operations(reviewed, (forged_merge,))
+            before = store.path.read_bytes()
+            backup_dir, history_path = self._paths(root)
+
+            # Without source content the parser can only verify the claimed
+            # threshold; the lock-held apply must recompute actual redundancy.
+            maintenance_validation.parse_maintenance_plan(forged.to_dict())
+            result = apply_maintenance_plan(
+                store=store,
+                plan=forged,
+                backup_dir=backup_dir,
+                history_path=history_path,
+            )
+
+            self.assertEqual(result.status, MaintenanceApplyStatus.PRE_COMMIT_FAILED)
+            self.assertEqual(result.audit_error_stage, "validation")
+            self.assertEqual(store.path.read_bytes(), before)
+            self.assertFalse(backup_dir.exists())
+            self.assertFalse(history_path.exists())
+
+    def test_parser_rejects_promotion_that_does_not_meet_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self._store(root)
+            tip = _experience(
+                "low-evidence-tip",
+                tier="tip",
+                content="Inspect parser errors before editing.",
+            )
+            store.add(tip)
+            reviewed = self._plan(store)
+            evidence = maintenance_module.maintenance_evidence_for_entry(
+                tip,
+                attribution={},
+                project_key=PROJECT_KEY,
+            )
+            promotion, _ = maintenance_planner._promotion_operation(
+                tip,
+                evidence,
+                repository_entries=[tip],
+                as_of=NOW,
+            )
+            forged = self._replace_plan_operations(reviewed, (promotion,))
+
+            with self.assertRaisesRegex(ValueError, "not eligible"):
+                maintenance_validation.parse_maintenance_plan(forged.to_dict())
 
     def test_apply_lock_timeout_returns_pre_commit_failed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

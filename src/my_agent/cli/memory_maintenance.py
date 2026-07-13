@@ -90,14 +90,17 @@ def _run_maintenance(args: argparse.Namespace, state: _CommandState) -> int:
         lock_timeout_seconds=float(args.lock_timeout_seconds),
     )
     if args.plan:
+        state.stage = "strict_load"
+        snapshot = store.load_strict_snapshot()
         state.stage = "plan_load"
-        plan = load_maintenance_plan(args.plan)
+        plan = load_maintenance_plan(
+            args.plan,
+            repository_entries=snapshot.entries,
+        )
         state.plan = plan
         state.stage = "validation"
         if plan.memory_project_key != state.project_key:
             raise ValueError("reviewed plan memory_project_key does not match CLI value")
-        state.stage = "strict_load"
-        snapshot = store.load_strict_snapshot()
     else:
         state.stage = "strict_load"
         snapshot = store.load_strict_snapshot()

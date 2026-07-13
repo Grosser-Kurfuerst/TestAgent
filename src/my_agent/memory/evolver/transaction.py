@@ -25,6 +25,9 @@ from my_agent.memory.evolver.contracts import (
 )
 from my_agent.memory.evolver.planner import (
     _repository_after_operations,
+)
+from my_agent.memory.evolver.validation import (
+    parse_maintenance_plan,
     validate_plan_semantics,
 )
 from my_agent.memory.long_term import (
@@ -327,7 +330,7 @@ def _validated_plan_copy(plan: MaintenancePlan) -> MaintenancePlan:
     payload = json.loads(maintenance_plan_json(plan))
     if not isinstance(payload, dict):
         raise MaintenancePlanError("maintenance plan must be a JSON object")
-    return MaintenancePlan.from_dict(payload)
+    return parse_maintenance_plan(payload)
 
 
 def _validate_apply_project_boundaries(

@@ -305,9 +305,8 @@ class MaintenancePlan:
         if len(operation_ids) != len(set(operation_ids)):
             raise MaintenancePlanError("operation_id values must be unique within a plan")
 
-        from my_agent.memory.evolver.planner import validate_plan_semantics
-
-        validate_plan_semantics(self)
+        if self.summary != _operation_summary(self.operations):
+            raise MaintenancePlanError("plan summary does not match its operations")
         expected_plan_id = _plan_id(
             repository_revision=self.repository_revision,
             project_key=self.memory_project_key,
@@ -403,17 +402,6 @@ def write_maintenance_plan(plan: MaintenancePlan, path: str | Path) -> Path:
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(maintenance_plan_json(plan), encoding="utf-8")
     return output
-
-
-def load_maintenance_plan(path: str | Path) -> MaintenancePlan:
-    source = Path(path)
-    try:
-        payload = json.loads(source.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise MaintenancePlanError(f"invalid maintenance plan JSON: {exc.msg}") from exc
-    if not isinstance(payload, dict):
-        raise MaintenancePlanError("maintenance plan must be a JSON object")
-    return MaintenancePlan.from_dict(payload)
 
 
 def _validate_operation_shape(operation: MaintenanceOperation) -> None:
@@ -684,7 +672,6 @@ __all__ = [
     "MaintenanceOperation",
     "MaintenancePlan",
     "MaintenancePlanError",
-    "load_maintenance_plan",
     "maintenance_plan_json",
     "write_maintenance_plan",
 ]

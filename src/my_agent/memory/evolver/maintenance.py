@@ -20,24 +20,24 @@ from my_agent.memory.evolver.contracts import (
     MaintenancePlanError,
     _operation_id,
     _plan_id,
-    load_maintenance_plan,
     maintenance_plan_json,
     write_maintenance_plan,
 )
 from my_agent.memory.evolver.planner import (
     _validate_operation_conflicts,
-    build_maintenance_plan,
     load_project_attribution,
     lookup_experiences,
     maintenance_evidence_for_entry,
     redundancy_score,
 )
+from my_agent.memory.evolver.service import build_maintenance_plan
 from my_agent.memory.evolver.transaction import (
     _maintenance_backup_path,
     _write_backup_atomic,
     append_maintenance_history,
     apply_maintenance_plan,
 )
+from my_agent.memory.evolver.validation import load_maintenance_plan
 
 __all__ = [
     "AttributionKey",
