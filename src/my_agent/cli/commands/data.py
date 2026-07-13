@@ -144,7 +144,12 @@ def _add_memory_attribution_parsers(subparsers: argparse._SubParsersAction[argpa
         help="Score experience memories from usage logs.",
     )
     attribution_parser.add_argument("--memory-dir", required=True, help="Directory containing long_term_memory.jsonl.")
-    attribution_parser.add_argument("--memory-project-key", default="", help="Project/stream key to score.")
+    attribution_parser.add_argument(
+        "--memory-project-key",
+        required=True,
+        type=_nonempty_text,
+        help="Exact project/stream key to score.",
+    )
     attribution_parser.add_argument("--usage-log", help="Usage log JSONL path (default: <memory-dir>/usage_logs.jsonl).")
     attribution_parser.add_argument("--output", help="Attribution JSONL path (default: <memory-dir>/memory_attribution.jsonl).")
     attribution_parser.add_argument("--min-candidate-count", type=int, default=2)
@@ -374,6 +379,13 @@ def _score_memory_datasets(args: argparse.Namespace) -> _RenderedResult:
         write_dataset_summary_json(selector_summary)
         rendered.append("Selector dataset\n" + selector_summary.render())
     return _RenderedResult("\n\n".join(rendered))
+
+
+def _nonempty_text(value: str) -> str:
+    normalized = str(value).strip()
+    if not normalized:
+        raise argparse.ArgumentTypeError("value must not be empty")
+    return normalized
 
 
 def _read_jsonl(path: Path) -> list[dict[str, object]]:

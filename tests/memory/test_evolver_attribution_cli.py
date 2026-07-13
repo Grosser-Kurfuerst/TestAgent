@@ -106,6 +106,23 @@ def _add_memory(store: LongTermMemoryStore, memory_id: str) -> None:
 
 
 class EvolverAttributionCliTests(unittest.TestCase):
+    def test_score_memory_attribution_requires_nonempty_project_key(self) -> None:
+        cases = (
+            [],
+            ["--memory-project-key", " "],
+        )
+        for extra_args in cases:
+            with self.subTest(extra_args=extra_args):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit):
+                        main([
+                            "data",
+                            "score-memory-attribution",
+                            "--memory-dir",
+                            "/tmp/memory",
+                            *extra_args,
+                        ])
+
     def test_cli_end_to_end_usage_attribution_dataset_and_writeback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)

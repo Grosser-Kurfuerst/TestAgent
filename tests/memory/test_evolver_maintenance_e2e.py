@@ -18,9 +18,13 @@ add_src_to_path()
 from my_agent.cli import main
 from my_agent.memory.evolver import (
     DEFAULT_TIER_WEIGHTS,
+    ExperienceCreatedBy,
     ExperienceSelector,
     ExperienceTier,
     MaintenanceAction,
+    UsageLogEntry,
+    UsageLogger,
+    build_experience_entry,
     experience_tier,
     load_maintenance_plan,
 )
@@ -359,6 +363,95 @@ class MaintenanceEndToEndTests(unittest.TestCase):
             self.assertNotIn(
                 source_tip.id,
                 {candidate.id for candidate in promotion_selection.candidates},
+            )
+
+    def test_phase5_cli_attribution_is_consumed_by_phase6_maintenance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            memory_dir = root / "memory"
+            store = LongTermMemoryStore.from_dir(memory_dir)
+            store.add(build_experience_entry(
+                id="phase5-negative-tip",
+                content="Delete diagnostics before understanding the failing assertion.",
+                tier="tip",
+                project_key=PROJECT_KEY,
+                created_at=datetime(2026, 6, 1, tzinfo=timezone.utc),
+                created_by=ExperienceCreatedBy.WRITER,
+            ))
+            usage_path = root / "usage_logs.jsonl"
+            usage_rows = []
+            for index in range(8):
+                selected = index < 2
+                usage_rows.append(UsageLogEntry(
+                    task_id=f"phase5-task-{index}",
+                    task_type="phase5_to_phase6",
+                    timestamp=f"2026-07-01T00:00:0{index}+00:00",
+                    run_id=f"phase5-run-{index}",
+                    stream_id="python",
+                    memory_project_key=PROJECT_KEY,
+                    memory_mode="shared_stream",
+                    retrieved_candidates={"tip": ["phase5-negative-tip"]},
+                    selected_memory_ids=(
+                        {"tip": ["phase5-negative-tip"]}
+                        if selected
+                        else {"tip": []}
+                    ),
+                    env_reward=0.0 if selected else 1.0,
+                    success=not selected,
+                    status="complete",
+                ))
+            UsageLogger(usage_path).overwrite(usage_rows)
+            attribution_path = root / "memory_attribution.jsonl"
+
+            score_result = self._invoke([
+                "data",
+                "score-memory-attribution",
+                "--memory-dir",
+                str(memory_dir),
+                "--memory-project-key",
+                PROJECT_KEY,
+                "--usage-log",
+                str(usage_path),
+                "--output",
+                str(attribution_path),
+            ])
+
+            self.assertEqual(score_result[0], 0, score_result[2])
+            attribution = _read_jsonl(attribution_path)
+            self.assertEqual(len(attribution), 1)
+            self.assertEqual(attribution[0]["memory_project_key"], PROJECT_KEY)
+            self.assertLessEqual(attribution[0]["value"], -0.05)
+            plan_path = root / "maintenance_plan.json"
+
+            maintain_result = self._invoke([
+                "memory",
+                "maintain",
+                "--memory-dir",
+                str(memory_dir),
+                "--memory-project-key",
+                PROJECT_KEY,
+                "--attribution",
+                str(attribution_path),
+                "--as-of",
+                AS_OF_TEXT,
+                "--output",
+                str(plan_path),
+                "--trace-output",
+                str(root / "maintenance_trace.jsonl"),
+                "--history-output",
+                str(root / "maintenance_history.jsonl"),
+                "--backup-dir",
+                str(root / "maintenance_backups"),
+                "--apply",
+            ])
+
+            self.assertEqual(maintain_result[0], 0, maintain_result[2])
+            plan = load_maintenance_plan(plan_path)
+            self.assertEqual(plan.memory_project_key, PROJECT_KEY)
+            self.assertEqual(plan.summary["delete"], 1)
+            self.assertNotIn(
+                "phase5-negative-tip",
+                {entry.id for entry in store.search_candidates(project_key=PROJECT_KEY)},
             )
 
     def _assert_phase5_attribution_record(self, row: dict) -> None:

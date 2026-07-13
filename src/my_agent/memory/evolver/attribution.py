@@ -291,9 +291,10 @@ def score_all_memories(
 
     Filtering rules (see plan -> "Attribution Formula"):
     - Only entries with an experience tier are considered.
-    - ``project_key`` filters usage logs by ``log.memory_project_key == project_key``
-      (empty log keys are per-task/global and always included). When non-empty it
-      also restricts candidate entries to those visible to ``project_key``.
+    - A non-empty ``project_key`` requires an exact
+      ``log.memory_project_key == project_key`` match and restricts candidate
+      entries to that project. An explicitly empty API key is the
+      per-task/global fallback and scores all complete logs.
     """
     cfg = config or AttributionConfig()
     # Pre-filter usage logs to the target project scope:
