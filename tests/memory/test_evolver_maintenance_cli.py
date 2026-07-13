@@ -16,7 +16,7 @@ from tests._path import add_src_to_path
 add_src_to_path()
 
 from my_agent.cli import build_parser, main
-from my_agent.cli.commands import memory as maintenance_cli
+from my_agent.cli import memory_maintenance as maintenance_cli
 from my_agent.memory.evolver import (
     ExperienceCreatedBy,
     MaintenanceApplyResult,

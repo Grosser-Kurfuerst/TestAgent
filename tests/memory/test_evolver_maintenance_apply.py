@@ -13,6 +13,7 @@ from tests._path import add_src_to_path
 add_src_to_path()
 
 import my_agent.memory.evolver.maintenance as maintenance_module
+import my_agent.memory.evolver.transaction as maintenance_transaction
 from my_agent.memory.evolver import (
     ExperienceCreatedBy,
     MaintenanceApplyStatus,
@@ -175,7 +176,7 @@ class MaintenanceApplyTests(unittest.TestCase):
             backup_dir, history_path = self._paths(root)
 
             with patch.object(
-                maintenance_module,
+                maintenance_transaction,
                 "append_maintenance_history",
                 side_effect=OSError("history unavailable"),
             ):
@@ -343,13 +344,13 @@ class MaintenanceApplyTests(unittest.TestCase):
 
                 if stage == "backup":
                     context = patch.object(
-                        maintenance_module,
+                        maintenance_transaction,
                         "_write_backup_atomic",
                         side_effect=OSError("backup failed"),
                     )
                 elif stage == "audit_intent":
                     context = patch.object(
-                        maintenance_module,
+                        maintenance_transaction,
                         "append_maintenance_history",
                         side_effect=OSError("history failed"),
                     )
@@ -383,7 +384,7 @@ class MaintenanceApplyTests(unittest.TestCase):
             ))
             plan = self._plan(store)
             backup_dir, history_path = self._paths(root)
-            original_append = maintenance_module.append_maintenance_history
+            original_append = maintenance_transaction.append_maintenance_history
 
             def fail_completion(path, record):
                 if record.get("record_type") == "completion":
@@ -391,7 +392,7 @@ class MaintenanceApplyTests(unittest.TestCase):
                 return original_append(path, record)
 
             with patch.object(
-                maintenance_module,
+                maintenance_transaction,
                 "append_maintenance_history",
                 side_effect=fail_completion,
             ):

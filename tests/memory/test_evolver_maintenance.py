@@ -12,6 +12,9 @@ from tests._path import add_src_to_path
 add_src_to_path()
 
 import my_agent.memory.evolver.maintenance as maintenance_module
+import my_agent.memory.evolver.contracts as maintenance_contracts
+import my_agent.memory.evolver.planner as maintenance_planner
+import my_agent.memory.evolver.transaction as maintenance_transaction
 from my_agent.memory.evolver import (
     ExperienceCreatedBy,
     MaintenanceAction,
@@ -123,6 +126,21 @@ class MaintenanceConfigTests(unittest.TestCase):
             MaintenanceConfig.from_dict({"unknown": 1})
         with self.assertRaises(ValueError):
             MaintenanceConfig.from_dict({"max_merged_content_chars": 1_600})
+
+
+class MaintenanceModuleBoundaryTests(unittest.TestCase):
+    def test_facade_reexports_layer_owners_without_duplicating_implementations(self) -> None:
+        self.assertIs(maintenance_module.MaintenancePlan, maintenance_contracts.MaintenancePlan)
+        self.assertIs(
+            maintenance_module.build_maintenance_plan,
+            maintenance_planner.build_maintenance_plan,
+        )
+        self.assertIs(
+            maintenance_module.apply_maintenance_plan,
+            maintenance_transaction.apply_maintenance_plan,
+        )
+        self.assertFalse(hasattr(maintenance_contracts, "LongTermMemoryStore"))
+        self.assertFalse(hasattr(maintenance_planner, "LongTermMemoryStore"))
 
 
 class ProjectAttributionLoaderTests(unittest.TestCase):
@@ -590,7 +608,7 @@ class MergePlannerTests(unittest.TestCase):
         }
 
         with patch(
-            "my_agent.memory.evolver.maintenance.redundancy_score",
+            "my_agent.memory.evolver.planner.redundancy_score",
             side_effect=lambda left, right: scores[frozenset((left.id, right.id))],
         ):
             plan = build_maintenance_plan(
@@ -641,7 +659,7 @@ class MergePlannerTests(unittest.TestCase):
                     ),
                 ]
                 with patch(
-                    "my_agent.memory.evolver.maintenance.redundancy_score",
+                    "my_agent.memory.evolver.planner.redundancy_score",
                     return_value=1.0,
                 ):
                     plan = build_maintenance_plan(
@@ -691,7 +709,7 @@ class MergePlannerTests(unittest.TestCase):
                     ),
                 ]
                 with patch(
-                    "my_agent.memory.evolver.maintenance.redundancy_score",
+                    "my_agent.memory.evolver.planner.redundancy_score",
                     return_value=1.0,
                 ):
                     plan = build_maintenance_plan(
@@ -737,7 +755,7 @@ class MergePlannerTests(unittest.TestCase):
             _record("source", value=0.2, confidence=0.8, selected_count=4),
         )
 
-        with patch("my_agent.memory.evolver.maintenance.redundancy_score", return_value=0.95):
+        with patch.object(maintenance_planner, "redundancy_score", return_value=0.95):
             plan = build_maintenance_plan(
                 entries=[source, anchor],
                 attribution=records,
@@ -1144,7 +1162,7 @@ class MaintenancePlanContractTests(unittest.TestCase):
             content="Run parser test before edits.",
             created_by=writer,
         )
-        with patch("my_agent.memory.evolver.maintenance.redundancy_score", return_value=0.95):
+        with patch.object(maintenance_planner, "redundancy_score", return_value=0.95):
             plan = build_maintenance_plan(
                 entries=[anchor, source],
                 attribution={},
@@ -1295,7 +1313,7 @@ class MaintenancePlanContractTests(unittest.TestCase):
             content="Run parser test before edits.",
             created_by=writer,
         )
-        with patch("my_agent.memory.evolver.maintenance.redundancy_score", return_value=0.95):
+        with patch.object(maintenance_planner, "redundancy_score", return_value=0.95):
             plan = build_maintenance_plan(
                 entries=[anchor, source],
                 attribution={},

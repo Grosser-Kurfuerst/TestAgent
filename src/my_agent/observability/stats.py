@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from my_agent.observability.maintenance_events import MaintenanceEventCounters
+
 
 EDIT_TOOLS = {"replace_in_file", "write_file"}
 
@@ -111,16 +113,7 @@ def collect_trace_stats(path: str | Path) -> TraceStats:
     evolver_writer_saved_total = 0
     evolver_writer_saved_by_tier: Counter[str] = Counter()
     evolver_writer_failed_events = 0
-    maintenance_runs = 0
-    maintenance_applied_runs = 0
-    maintenance_keep = 0
-    maintenance_delete = 0
-    maintenance_merge = 0
-    maintenance_promote = 0
-    maintenance_removed_entries = 0
-    maintenance_added_entries = 0
-    maintenance_failures = 0
-    maintenance_committed_with_audit_error = 0
+    maintenance = MaintenanceEventCounters()
 
     for trace_file in trace_files:
         for event in _read_trace_file(trace_file):
@@ -169,28 +162,7 @@ def collect_trace_stats(path: str | Path) -> TraceStats:
                 evolver_writer_failed_events += 1
                 continue
 
-            if event_name == "memory.maintenance_started":
-                maintenance_runs += 1
-                continue
-            if event_name == "memory.maintenance_proposed":
-                maintenance_keep += _nonnegative_int(payload.get("keep"))
-                maintenance_delete += _nonnegative_int(payload.get("delete"))
-                maintenance_merge += _nonnegative_int(payload.get("merge"))
-                maintenance_promote += _nonnegative_int(payload.get("promote"))
-                maintenance_removed_entries += _nonnegative_int(
-                    payload.get("source_entries_removed")
-                )
-                maintenance_added_entries += _nonnegative_int(
-                    payload.get("entries_added")
-                )
-                continue
-            if event_name == "memory.maintenance_completed":
-                maintenance_applied_runs += 1
-                if payload.get("status") == "committed_with_audit_error":
-                    maintenance_committed_with_audit_error += 1
-                continue
-            if event_name == "memory.maintenance_failed":
-                maintenance_failures += 1
+            if maintenance.observe(event_name, payload):
                 continue
 
             if event_name != "tool.completed":
@@ -236,16 +208,16 @@ def collect_trace_stats(path: str | Path) -> TraceStats:
         evolver_writer_saved_total=evolver_writer_saved_total,
         evolver_writer_saved_by_tier=dict(sorted(evolver_writer_saved_by_tier.items())),
         evolver_writer_failed_events=evolver_writer_failed_events,
-        maintenance_runs=maintenance_runs,
-        maintenance_applied_runs=maintenance_applied_runs,
-        maintenance_keep=maintenance_keep,
-        maintenance_delete=maintenance_delete,
-        maintenance_merge=maintenance_merge,
-        maintenance_promote=maintenance_promote,
-        maintenance_removed_entries=maintenance_removed_entries,
-        maintenance_added_entries=maintenance_added_entries,
-        maintenance_failures=maintenance_failures,
-        maintenance_committed_with_audit_error=maintenance_committed_with_audit_error,
+        maintenance_runs=maintenance.runs,
+        maintenance_applied_runs=maintenance.applied_runs,
+        maintenance_keep=maintenance.keep,
+        maintenance_delete=maintenance.delete,
+        maintenance_merge=maintenance.merge,
+        maintenance_promote=maintenance.promote,
+        maintenance_removed_entries=maintenance.removed_entries,
+        maintenance_added_entries=maintenance.added_entries,
+        maintenance_failures=maintenance.failures,
+        maintenance_committed_with_audit_error=maintenance.committed_with_audit_error,
     )
 
 
@@ -350,14 +322,6 @@ def _payload_count(payload: dict[str, Any], *, count_key: str, fallback_keys: tu
         values = payload.get(key)
         if isinstance(values, list):
             return len(values)
-    return 0
-
-
-def _nonnegative_int(value: object) -> int:
-    if isinstance(value, bool):
-        return 0
-    if isinstance(value, int) and value >= 0:
-        return value
     return 0
 
 
