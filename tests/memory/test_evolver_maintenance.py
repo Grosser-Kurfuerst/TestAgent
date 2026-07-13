@@ -89,6 +89,23 @@ def _record(
     )
 
 
+def _refresh_plan_id(payload: dict) -> None:
+    operations = tuple(
+        maintenance_module.MaintenanceOperation.from_dict(item)
+        for item in payload["operations"]
+    )
+    config = MaintenanceConfig.from_dict(payload["config"]).to_dict()
+    payload["plan_id"] = maintenance_module._plan_id(
+        repository_revision=payload["repository_revision"],
+        project_key=payload["memory_project_key"],
+        as_of=payload["as_of"],
+        config=config,
+        input_summary=payload["input_summary"],
+        operations=operations,
+        summary=payload["summary"],
+    )
+
+
 class MaintenanceConfigTests(unittest.TestCase):
     def test_defaults_round_trip(self) -> None:
         config = MaintenanceConfig()
@@ -104,6 +121,8 @@ class MaintenanceConfigTests(unittest.TestCase):
             MaintenanceConfig(merge_max_cluster_size=1)
         with self.assertRaises(ValueError):
             MaintenanceConfig.from_dict({"unknown": 1})
+        with self.assertRaises(ValueError):
+            MaintenanceConfig.from_dict({"max_merged_content_chars": 1_600})
 
 
 class ProjectAttributionLoaderTests(unittest.TestCase):
@@ -1056,6 +1075,91 @@ class MaintenancePlanContractTests(unittest.TestCase):
         ] = "op-tampered"
         with self.assertRaises(ValueError):
             MaintenancePlan.from_dict(metadata_id_tampered)
+
+    def test_plan_rejects_noncanonical_as_of_and_rehashed_summary(self) -> None:
+        payload = self._plan().to_dict()
+        payload["as_of"] = "2026-07-10T08:00:00+08:00"
+        with self.assertRaisesRegex(ValueError, "canonical timezone-aware UTC"):
+            MaintenancePlan.from_dict(payload)
+
+        payload = self._plan().to_dict()
+        payload["summary"]["keep"] += 1
+        _refresh_plan_id(payload)
+        with self.assertRaisesRegex(ValueError, "summary does not match"):
+            MaintenancePlan.from_dict(payload)
+
+    def test_rehashed_promotion_target_must_match_semantic_contract(self) -> None:
+        _, plan, _ = self._promotion_fixture()
+        cases = (
+            ("created_at", "1999-01-01T00:00:00+00:00"),
+            ("source", "manual"),
+            ("metadata.created_by", "writer"),
+            ("metadata.source_task", "forged-task"),
+            ("metadata.maintenance_parent_id", "forged-parent"),
+        )
+        for path, value in cases:
+            with self.subTest(path=path):
+                payload = plan.to_dict()
+                target = payload["operations"][0]["additions"][0]
+                if path.startswith("metadata."):
+                    target["metadata"][path.removeprefix("metadata.")] = value
+                else:
+                    target[path] = value
+                _refresh_plan_id(payload)
+                with self.assertRaisesRegex(ValueError, "deterministic semantics"):
+                    MaintenancePlan.from_dict(payload)
+
+    def test_rehashed_promotion_target_id_must_be_deterministic(self) -> None:
+        _, plan, _ = self._promotion_fixture()
+        payload = plan.to_dict()
+        operation = payload["operations"][0]
+        forged_id = "exp_maint_0000000000000000"
+        operation["target_ids"] = [forged_id]
+        operation["additions"][0]["id"] = forged_id
+        operation["replacements"][0]["metadata"]["maintenance_promoted_to"] = forged_id
+        operation_id = maintenance_module._operation_id(
+            action=MaintenanceAction.PROMOTE,
+            source_ids=operation["source_ids"],
+            target_ids=operation["target_ids"],
+            replacements=operation["replacements"],
+            additions=operation["additions"],
+        )
+        operation["operation_id"] = operation_id
+        operation["replacements"][0]["metadata"]["maintenance_operation_id"] = operation_id
+        operation["additions"][0]["metadata"]["maintenance_operation_id"] = operation_id
+        _refresh_plan_id(payload)
+
+        with self.assertRaisesRegex(ValueError, "target id is not deterministic"):
+            MaintenancePlan.from_dict(payload)
+
+    def test_rehashed_merge_lineage_must_cover_exact_sources(self) -> None:
+        writer = ExperienceCreatedBy.WRITER
+        anchor = _entry(
+            "merge-a",
+            content="Run parser tests before editing.",
+            created_by=writer,
+        )
+        source = _entry(
+            "merge-b",
+            content="Run parser test before edits.",
+            created_by=writer,
+        )
+        with patch("my_agent.memory.evolver.maintenance.redundancy_score", return_value=0.95):
+            plan = build_maintenance_plan(
+                entries=[anchor, source],
+                attribution={},
+                repository_revision="sha256:merge-lineage",
+                project_key=PROJECT_KEY,
+                as_of=NOW,
+                config=MaintenanceConfig(max_promotions=0),
+            )
+        payload = plan.to_dict()
+        operation = next(item for item in payload["operations"] if item["action"] == "merge")
+        operation["replacements"][0]["metadata"]["maintenance_source_ids"] = ["merge-a"]
+        _refresh_plan_id(payload)
+
+        with self.assertRaisesRegex(ValueError, "merge replacement lineage mismatch"):
+            MaintenancePlan.from_dict(payload)
 
     def test_mutation_payload_rejects_forged_fingerprint(self) -> None:
         _, plan, _ = self._promotion_fixture()

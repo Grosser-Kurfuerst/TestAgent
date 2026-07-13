@@ -306,8 +306,8 @@ class MaintenanceApplyTests(unittest.TestCase):
             original = self._plan(store)
             payload = original.to_dict()
             payload["operations"][0]["source_preconditions"]["delete-tip"][
-                "project_key"
-            ] = "other-project"
+                "fingerprint"
+            ] = "f" * 64
             _refresh_plan_id(payload)
             plan = maintenance_module.MaintenancePlan.from_dict(payload)
             before = store.path.read_bytes()
@@ -559,7 +559,17 @@ class MaintenanceApplyTests(unittest.TestCase):
                 )
 
     def test_apply_revalidates_mutable_plan_payloads(self) -> None:
-        tamper_cases = ("source_precondition", "replacement", "addition")
+        tamper_cases = (
+            "source_precondition",
+            "replacement",
+            "addition",
+            "promotion_created_at",
+            "promotion_source",
+            "promotion_created_by",
+            "promotion_source_task",
+            "promotion_lineage",
+            "summary",
+        )
         for tamper_case in tamper_cases:
             with self.subTest(tamper_case=tamper_case), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
@@ -604,15 +614,27 @@ class MaintenanceApplyTests(unittest.TestCase):
                         if operation.action.value == "merge"
                     )
                     merge.replacements[0]["content"] = "unreviewed replacement"
+                elif tamper_case == "summary":
+                    plan.summary["promote"] += 1
                 else:
                     promotion = next(
                         operation
                         for operation in plan.operations
                         if operation.action.value == "promote"
                     )
-                    promotion.additions[0]["metadata"][
-                        "maintenance_operation_id"
-                    ] = "op-" + "0" * 24
+                    target = promotion.additions[0]
+                    if tamper_case == "addition":
+                        target["metadata"]["maintenance_operation_id"] = "op-" + "0" * 24
+                    elif tamper_case == "promotion_created_at":
+                        target["created_at"] = "1999-01-01T00:00:00+00:00"
+                    elif tamper_case == "promotion_source":
+                        target["source"] = "manual"
+                    elif tamper_case == "promotion_created_by":
+                        target["metadata"]["created_by"] = "writer"
+                    elif tamper_case == "promotion_source_task":
+                        target["metadata"]["source_task"] = "forged-task"
+                    else:
+                        target["metadata"]["maintenance_parent_id"] = "forged-parent"
 
                 result = apply_maintenance_plan(
                     store=store,

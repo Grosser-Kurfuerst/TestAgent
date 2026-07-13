@@ -92,7 +92,6 @@ class MaintenanceConfig:
     merge_threshold_skill: float = 0.86
     merge_threshold_tool: float = 0.94
     merge_max_cluster_size: int = 5
-    max_merged_content_chars: int = 1_600
 
     promote_value_threshold: float = 0.10
     promote_min_confidence: float = 0.70
@@ -119,7 +118,6 @@ class MaintenanceConfig:
             "max_promotions",
         ):
             _validate_non_negative_int(name, getattr(self, name))
-        _validate_positive_int("max_merged_content_chars", self.max_merged_content_chars)
         _validate_positive_int("merge_max_cluster_size", self.merge_max_cluster_size)
         if self.merge_max_cluster_size < 2:
             raise ValueError("merge_max_cluster_size must be at least 2")
@@ -322,14 +320,15 @@ class MaintenancePlan:
             raise MaintenancePlanError("plan_id must use the deterministic maintenance format")
         if not self.repository_revision:
             raise MaintenancePlanError("repository_revision must not be empty")
-        if not self.as_of:
-            raise MaintenancePlanError("as_of must not be empty")
+        as_of = _parse_datetime(self.as_of)
+        if as_of is None or as_of.astimezone(timezone.utc).isoformat() != self.as_of:
+            raise MaintenancePlanError("as_of must be a canonical timezone-aware UTC datetime")
         normalized_config = MaintenanceConfig.from_dict(self.config).to_dict()
         object.__setattr__(self, "config", normalized_config)
         operation_ids = [item.operation_id for item in self.operations]
         if len(operation_ids) != len(set(operation_ids)):
             raise MaintenancePlanError("operation_id values must be unique within a plan")
-        _validate_operation_conflicts(self.operations)
+        _validate_plan_semantics(self)
         expected_plan_id = _plan_id(
             repository_revision=self.repository_revision,
             project_key=self.memory_project_key,
@@ -734,7 +733,7 @@ def build_maintenance_plan(
         operations=operation_tuple,
         summary=summary,
     )
-    return MaintenancePlan(
+    plan = MaintenancePlan(
         schema_version=MAINTENANCE_SCHEMA_VERSION,
         policy=MAINTENANCE_POLICY,
         plan_id=plan_id,
@@ -747,6 +746,8 @@ def build_maintenance_plan(
         operations=operation_tuple,
         summary=summary,
     )
+    _validate_plan_semantics(plan, repository_entries=entries)
+    return plan
 
 
 def maintenance_plan_json(plan: MaintenancePlan) -> str:
@@ -857,10 +858,7 @@ def apply_maintenance_plan(
                         "reviewed plan repository revision no longer matches"
                     )
 
-                _validate_operation_conflicts(
-                    plan.operations,
-                    repository_entries=snapshot.entries,
-                )
+                _validate_plan_semantics(plan, repository_entries=snapshot.entries)
                 _validate_apply_project_boundaries(plan, snapshot.entries)
                 next_entries = _repository_after_operations(snapshot.entries, plan.operations)
                 after_count = len(next_entries)
@@ -1635,8 +1633,6 @@ def _merge_operation(
         entry.id: _source_precondition(entry, evidence.tier)
         for entry, evidence in ordered
     }
-    source_fingerprints = {entry.id: entry.fingerprint for entry, _ in ordered}
-    source_evidence = {entry.id: evidence.to_dict() for entry, evidence in ordered}
     pair_scores = [
         _merge_pair_score(ordered[left][0], ordered[right][0])
         for left in range(len(ordered))
@@ -1644,22 +1640,11 @@ def _merge_operation(
     ]
     minimum_score = round(min(pair_scores), 6)
 
-    metadata = dict(anchor_entry.metadata)
-    for key in ("steps", "tags"):
-        merged_values = _ordered_metadata_union(ordered, key)
-        if merged_values:
-            metadata[key] = merged_values
-    metadata.update({
-        "created_by": ExperienceCreatedBy.MAINTENANCE.value,
-        "maintenance_action": MaintenanceAction.MERGE.value,
-        "maintenance_policy": MAINTENANCE_POLICY,
-        "maintenance_as_of": as_of.isoformat(),
-        "maintenance_source_ids": list(source_ids),
-        "maintenance_source_fingerprints": source_fingerprints,
-        "maintenance_redundancy_min": minimum_score,
-        "maintenance_source_evidence": source_evidence,
-    })
-    provisional_replacement = _entry_payload_with_metadata(anchor_entry, metadata)
+    provisional_replacement = _merge_replacement_payload(
+        ordered,
+        as_of=as_of,
+        minimum_score=minimum_score,
+    )
     operation_id = _operation_id(
         action=MaintenanceAction.MERGE,
         source_ids=source_ids,
@@ -1667,8 +1652,12 @@ def _merge_operation(
         replacements=(provisional_replacement,),
         additions=(),
     )
-    metadata["maintenance_operation_id"] = operation_id
-    replacement = _entry_payload_with_metadata(anchor_entry, metadata)
+    replacement = _merge_replacement_payload(
+        ordered,
+        as_of=as_of,
+        minimum_score=minimum_score,
+        operation_id=operation_id,
+    )
     return MaintenanceOperation(
         operation_id=operation_id,
         action=MaintenanceAction.MERGE,
@@ -1682,6 +1671,39 @@ def _merge_operation(
         remove_ids=tuple(sorted(source_ids[1:])),
         replacements=(replacement,),
     )
+
+
+def _merge_replacement_payload(
+    ordered: Sequence[tuple[MemoryEntry, MaintenanceEvidence]],
+    *,
+    as_of: datetime,
+    minimum_score: float,
+    operation_id: str = "",
+) -> dict[str, Any]:
+    anchor_entry = ordered[0][0]
+    source_ids = tuple(entry.id for entry, _ in ordered)
+    metadata = dict(anchor_entry.metadata)
+    for key in ("steps", "tags"):
+        merged_values = _ordered_metadata_union(ordered, key)
+        if merged_values:
+            metadata[key] = merged_values
+    metadata.update({
+        "created_by": ExperienceCreatedBy.MAINTENANCE.value,
+        "maintenance_action": MaintenanceAction.MERGE.value,
+        "maintenance_policy": MAINTENANCE_POLICY,
+        "maintenance_as_of": as_of.isoformat(),
+        "maintenance_source_ids": list(source_ids),
+        "maintenance_source_fingerprints": {
+            entry.id: entry.fingerprint for entry, _ in ordered
+        },
+        "maintenance_redundancy_min": minimum_score,
+        "maintenance_source_evidence": {
+            entry.id: evidence.to_dict() for entry, evidence in ordered
+        },
+    })
+    if operation_id:
+        metadata["maintenance_operation_id"] = operation_id
+    return _entry_payload_with_metadata(anchor_entry, metadata)
 
 
 def _plan_promotion_operations(
@@ -1749,34 +1771,12 @@ def _promotion_operation(
     repository_entries: Sequence[MemoryEntry],
     as_of: datetime,
 ) -> tuple[MaintenanceOperation, MemoryEntry]:
-    content, skill_metadata = _promoted_skill_fields(entry)
+    content, _ = _promoted_skill_fields(entry)
     target_id = _promoted_skill_id(entry.id, content)
-    lineage = {
-        "maintenance_action": MaintenanceAction.PROMOTE.value,
-        "maintenance_policy": MAINTENANCE_POLICY,
-        "maintenance_as_of": as_of.isoformat(),
-        "maintenance_source_ids": [entry.id],
-        "maintenance_source_fingerprints": {entry.id: entry.fingerprint},
-        "maintenance_source_evidence": {entry.id: evidence.to_dict()},
-        "maintenance_parent_id": entry.id,
-        "maintenance_parent_tier": evidence.tier,
-        "maintenance_parent_value": evidence.value,
-        "maintenance_parent_confidence": evidence.confidence,
-    }
-    skill_metadata.update(lineage)
-    skill_metadata["confidence"] = round(max(0.0, min(1.0, evidence.writer_confidence)), 6)
-    provisional_target = build_experience_entry(
-        id=target_id,
-        content=content,
-        tier=ExperienceTier.SKILL,
-        project_key=entry.project_key,
-        scope=entry.scope,
-        source="evolver:maintenance",
-        run_id=entry.run_id,
-        source_task=str(entry.metadata.get("source_task") or entry.metadata.get("task_id") or ""),
-        created_by=ExperienceCreatedBy.MAINTENANCE,
-        extra_metadata=skill_metadata,
-        created_at=as_of,
+    provisional_target = _promoted_target_entry(
+        entry,
+        evidence,
+        as_of=as_of,
     )
     existing_target = _find_existing_skill(repository_entries, provisional_target)
     target = existing_target or provisional_target
@@ -1803,9 +1803,12 @@ def _promotion_operation(
     source_metadata["maintenance_operation_id"] = operation_id
     source_replacement = _entry_payload_with_metadata(entry, source_metadata)
     if existing_target is None:
-        target_metadata = dict(provisional_target.metadata)
-        target_metadata["maintenance_operation_id"] = operation_id
-        target = MemoryEntry.from_dict(_entry_payload_with_metadata(provisional_target, target_metadata))
+        target = _promoted_target_entry(
+            entry,
+            evidence,
+            as_of=as_of,
+            operation_id=operation_id,
+        )
         additions = (target.to_dict(),)
 
     operation = MaintenanceOperation(
@@ -1821,6 +1824,44 @@ def _promotion_operation(
         additions=additions,
     )
     return operation, target
+
+
+def _promoted_target_entry(
+    source: MemoryEntry,
+    evidence: MaintenanceEvidence,
+    *,
+    as_of: datetime,
+    operation_id: str = "",
+) -> MemoryEntry:
+    content, skill_metadata = _promoted_skill_fields(source)
+    skill_metadata.update({
+        "maintenance_action": MaintenanceAction.PROMOTE.value,
+        "maintenance_policy": MAINTENANCE_POLICY,
+        "maintenance_as_of": as_of.isoformat(),
+        "maintenance_source_ids": [source.id],
+        "maintenance_source_fingerprints": {source.id: source.fingerprint},
+        "maintenance_source_evidence": {source.id: evidence.to_dict()},
+        "maintenance_parent_id": source.id,
+        "maintenance_parent_tier": evidence.tier,
+        "maintenance_parent_value": evidence.value,
+        "maintenance_parent_confidence": evidence.confidence,
+        "confidence": round(max(0.0, min(1.0, evidence.writer_confidence)), 6),
+    })
+    if operation_id:
+        skill_metadata["maintenance_operation_id"] = operation_id
+    return build_experience_entry(
+        id=_promoted_skill_id(source.id, content),
+        content=content,
+        tier=ExperienceTier.SKILL,
+        project_key=source.project_key,
+        scope=source.scope,
+        source="evolver:maintenance",
+        run_id=source.run_id,
+        source_task=str(source.metadata.get("source_task") or source.metadata.get("task_id") or ""),
+        created_by=ExperienceCreatedBy.MAINTENANCE,
+        extra_metadata=skill_metadata,
+        created_at=as_of,
+    )
 
 
 def _promoted_skill_fields(entry: MemoryEntry) -> tuple[str, dict[str, Any]]:
@@ -2100,6 +2141,200 @@ def _validate_operation_shape(operation: MaintenanceOperation) -> None:
             raise MaintenancePlanError("promote must replace its source without removing it")
         if len(addition_ids) > 1 or (addition_ids and addition_ids != target_ids):
             raise MaintenancePlanError("promote addition must be its target")
+
+
+def _validate_plan_semantics(
+    plan: MaintenancePlan,
+    *,
+    repository_entries: Sequence[MemoryEntry] | None = None,
+) -> None:
+    """Validate action meaning independently from plan and operation digests."""
+    as_of = _parse_datetime(plan.as_of)
+    if as_of is None or as_of.astimezone(timezone.utc).isoformat() != plan.as_of:
+        raise MaintenancePlanError("as_of must be a canonical timezone-aware UTC datetime")
+    expected_summary = _operation_summary(plan.operations)
+    if plan.summary != expected_summary:
+        raise MaintenancePlanError("plan summary does not match its operations")
+
+    for operation in plan.operations:
+        for source_id in operation.source_ids:
+            precondition = operation.source_preconditions[source_id]
+            scope = MemoryScope(precondition["scope"])
+            if scope == MemoryScope.GLOBAL:
+                if operation.action != MaintenanceAction.KEEP:
+                    raise MaintenancePlanError("global experience may only be kept")
+            elif precondition["project_key"] != plan.memory_project_key:
+                raise MaintenancePlanError("operation crosses memory project boundary")
+        for payload in operation.replacements + operation.additions:
+            entry = _validated_payload_entry(payload, "mutation")
+            if entry.scope == MemoryScope.GLOBAL:
+                raise MaintenancePlanError("maintenance cannot mutate global experience")
+            if entry.project_key != plan.memory_project_key:
+                raise MaintenancePlanError("mutation payload crosses memory project boundary")
+
+    _validate_operation_conflicts(
+        plan.operations,
+        repository_entries=repository_entries,
+    )
+    repository_by_id = (
+        {entry.id: entry for entry in repository_entries}
+        if repository_entries is not None
+        else None
+    )
+    for operation in plan.operations:
+        evidence_by_id = _validated_operation_evidence(operation)
+        if operation.action == MaintenanceAction.MERGE:
+            _validate_merge_action_semantics(
+                operation,
+                evidence_by_id=evidence_by_id,
+                as_of=as_of,
+                repository_by_id=repository_by_id,
+            )
+        elif operation.action == MaintenanceAction.PROMOTE:
+            _validate_promotion_action_semantics(
+                operation,
+                evidence_by_id=evidence_by_id,
+                as_of=as_of,
+                repository_by_id=repository_by_id,
+            )
+
+
+def _validated_operation_evidence(
+    operation: MaintenanceOperation,
+) -> dict[str, MaintenanceEvidence]:
+    if len(operation.evidence) != len(operation.source_ids):
+        raise MaintenancePlanError("operation evidence must cover every source exactly")
+    result: dict[str, MaintenanceEvidence] = {}
+    for source_id, source_tier, raw in zip(
+        operation.source_ids,
+        operation.source_tiers,
+        operation.evidence,
+    ):
+        evidence = MaintenanceEvidence.from_dict(raw)
+        if raw != evidence.to_dict():
+            raise MaintenancePlanError(f"operation evidence is not canonical: {source_id}")
+        precondition = operation.source_preconditions[source_id]
+        if evidence.memory_id != source_id or evidence.tier != source_tier:
+            raise MaintenancePlanError(f"operation evidence identity mismatch: {source_id}")
+        if evidence.scope != precondition["scope"]:
+            raise MaintenancePlanError(f"operation evidence scope mismatch: {source_id}")
+        if evidence.project_key != precondition["project_key"]:
+            raise MaintenancePlanError(f"operation evidence project mismatch: {source_id}")
+        result[source_id] = evidence
+    return result
+
+
+def _validate_merge_action_semantics(
+    operation: MaintenanceOperation,
+    *,
+    evidence_by_id: Mapping[str, MaintenanceEvidence],
+    as_of: datetime,
+    repository_by_id: Mapping[str, MemoryEntry] | None,
+) -> None:
+    if operation.reason_codes != ("near_duplicate_complete_link",):
+        raise MaintenancePlanError("merge operation has invalid reason codes")
+    if (
+        operation.redundancy_score is None
+        or not math.isfinite(operation.redundancy_score)
+        or not 0.0 <= operation.redundancy_score <= 1.0
+    ):
+        raise MaintenancePlanError("merge redundancy score must be finite and between 0 and 1")
+
+    replacement = _validated_payload_entry(operation.replacements[0], "merge replacement")
+    metadata = replacement.metadata
+    expected_lineage = {
+        "created_by": ExperienceCreatedBy.MAINTENANCE.value,
+        "maintenance_action": MaintenanceAction.MERGE.value,
+        "maintenance_policy": MAINTENANCE_POLICY,
+        "maintenance_operation_id": operation.operation_id,
+        "maintenance_as_of": as_of.isoformat(),
+        "maintenance_source_ids": list(operation.source_ids),
+        "maintenance_source_fingerprints": {
+            source_id: operation.source_preconditions[source_id]["fingerprint"]
+            for source_id in operation.source_ids
+        },
+        "maintenance_redundancy_min": operation.redundancy_score,
+        "maintenance_source_evidence": {
+            source_id: evidence_by_id[source_id].to_dict()
+            for source_id in operation.source_ids
+        },
+    }
+    for key, expected in expected_lineage.items():
+        if metadata.get(key) != expected:
+            raise MaintenancePlanError(
+                f"merge replacement lineage mismatch for {key}: {replacement.id}"
+            )
+
+    if repository_by_id is None:
+        return
+    ordered = [
+        (repository_by_id[source_id], evidence_by_id[source_id])
+        for source_id in operation.source_ids
+    ]
+    expected_replacement = _merge_replacement_payload(
+        ordered,
+        as_of=as_of,
+        minimum_score=operation.redundancy_score,
+        operation_id=operation.operation_id,
+    )
+    if operation.replacements[0] != expected_replacement:
+        raise MaintenancePlanError("merge replacement does not match deterministic semantics")
+
+
+def _validate_promotion_action_semantics(
+    operation: MaintenanceOperation,
+    *,
+    evidence_by_id: Mapping[str, MaintenanceEvidence],
+    as_of: datetime,
+    repository_by_id: Mapping[str, MemoryEntry] | None,
+) -> None:
+    source_id = operation.source_ids[0]
+    evidence = evidence_by_id[source_id]
+    replacement = _validated_payload_entry(operation.replacements[0], "promotion source")
+    replacement_metadata = replacement.metadata
+    expected_source_lineage = {
+        "maintenance_promoted_to": operation.target_ids[0],
+        "maintenance_promoted_at": as_of.isoformat(),
+        "maintenance_operation_id": operation.operation_id,
+    }
+    for key, expected in expected_source_lineage.items():
+        if replacement_metadata.get(key) != expected:
+            raise MaintenancePlanError(
+                f"promotion source lineage mismatch for {key}: {source_id}"
+            )
+
+    if repository_by_id is not None:
+        source = repository_by_id[source_id]
+        expected_source_metadata = dict(source.metadata)
+        expected_source_metadata.update(expected_source_lineage)
+        expected_replacement = _entry_payload_with_metadata(source, expected_source_metadata)
+        if operation.replacements[0] != expected_replacement:
+            raise MaintenancePlanError("promotion source replacement changes non-lineage fields")
+    else:
+        source_payload = replacement.to_dict()
+        source_metadata = dict(replacement_metadata)
+        for key in expected_source_lineage:
+            source_metadata.pop(key, None)
+        source_payload["metadata"] = source_metadata
+        source = MemoryEntry.from_dict(source_payload)
+
+    if experience_tier(source) not in {ExperienceTier.TIP, ExperienceTier.TRAJECTORY}:
+        raise MaintenancePlanError(f"invalid promotion source tier: {source_id}")
+    if operation.additions:
+        if operation.reason_codes != ("promoted_to_skill",):
+            raise MaintenancePlanError("new promotion target has invalid reason codes")
+        expected_target = _promoted_target_entry(
+            source,
+            evidence,
+            as_of=as_of,
+            operation_id=operation.operation_id,
+        )
+        if operation.target_ids != (expected_target.id,):
+            raise MaintenancePlanError("promotion target id is not deterministic")
+        if operation.additions[0] != expected_target.to_dict():
+            raise MaintenancePlanError("promotion target does not match deterministic semantics")
+    elif operation.reason_codes != ("promotion_linked_existing_skill",):
+        raise MaintenancePlanError("existing promotion target has invalid reason codes")
 
 
 def _validate_operation_conflicts(
