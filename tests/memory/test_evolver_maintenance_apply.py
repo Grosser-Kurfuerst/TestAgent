@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import threading
 import unittest
@@ -382,6 +383,59 @@ class MaintenanceApplyTests(unittest.TestCase):
                 self.assertEqual(result.audit_error_stage, stage)
                 self.assertEqual(store.path.read_bytes(), before)
                 self.assertEqual([entry.to_dict() for entry in store.all()], before_entries)
+
+    def test_transaction_rejects_store_lock_history_and_backup_aliases(self) -> None:
+        cases = (
+            "history_store",
+            "history_lock",
+            "history_backup",
+            "backup_hardlink_store",
+        )
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                store = self._store(root)
+                store.add(_experience(
+                    "delete-tip",
+                    tier="tip",
+                    content="Invalidated tip",
+                    metadata={"maintenance_invalidated": True},
+                ))
+                plan = self._plan(store)
+                before = store.path.read_bytes()
+                backup_dir, default_history = self._paths(root)
+                backup_path = maintenance_transaction._maintenance_backup_path(
+                    backup_dir,
+                    plan.plan_id,
+                )
+                history_path = default_history
+                if case == "history_store":
+                    history_path = store.path
+                elif case == "history_lock":
+                    history_path = store.lock_path
+                elif case == "history_backup":
+                    history_path = backup_path
+                else:
+                    backup_dir.mkdir(parents=True)
+                    os.link(store.path, backup_path)
+
+                result = apply_maintenance_plan(
+                    store=store,
+                    plan=plan,
+                    backup_dir=backup_dir,
+                    history_path=history_path,
+                )
+
+                self.assertEqual(result.status, MaintenanceApplyStatus.PRE_COMMIT_FAILED)
+                self.assertEqual(result.audit_error_stage, "artifact_validation")
+                self.assertFalse(result.mutation_committed)
+                self.assertFalse(result.should_retry)
+                self.assertEqual(store.path.read_bytes(), before)
+                self.assertIn("delete-tip", {entry.id for entry in store.all()})
+                if case == "history_backup":
+                    self.assertFalse(backup_path.exists())
+                if case != "backup_hardlink_store":
+                    self.assertFalse(default_history.exists())
 
     def test_completion_failure_reports_committed_without_retry(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

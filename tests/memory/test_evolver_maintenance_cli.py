@@ -290,6 +290,49 @@ class MaintenanceCliTests(unittest.TestCase):
             self.assertIn("maintenance paths must be distinct", stderr)
             self.assertFalse(dangerous_path.exists())
 
+    def test_apply_rejects_history_aliasing_concrete_backup_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            memory_dir = Path(tmp) / "memory"
+            store = self._add_invalidated_tip(memory_dir)
+            before = store.path.read_bytes()
+            plan_path = memory_dir / "reviewed_plan.json"
+            self.assertEqual(
+                self._invoke(
+                    self._base_args(memory_dir) + ["--output", str(plan_path)]
+                )[0],
+                0,
+            )
+            plan = load_maintenance_plan(plan_path)
+            backup_dir = memory_dir / "backups"
+            concrete_backup = (
+                backup_dir / f"{plan.plan_id}.long_term_memory.jsonl"
+            )
+
+            exit_code, _, stderr = self._invoke(
+                self._base_args(memory_dir)
+                + [
+                    "--plan",
+                    str(plan_path),
+                    "--output",
+                    str(plan_path),
+                    "--backup-dir",
+                    str(backup_dir),
+                    "--history-output",
+                    str(concrete_backup),
+                    "--apply",
+                ]
+            )
+
+            self.assertEqual(exit_code, 1)
+            self.assertIn("status=pre_commit_failed", stderr)
+            self.assertEqual(store.path.read_bytes(), before)
+            self.assertIn("delete-tip", {entry.id for entry in store.all()})
+            self.assertFalse(concrete_backup.exists())
+            summary = json.loads(
+                Path(str(plan_path) + ".summary.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(summary["audit_error_stage"], "artifact_validation")
+
     def test_reviewed_plan_alias_is_reused_without_rewrite(self) -> None:
         for alias_kind in ("direct", "symlink", "hardlink"):
             with self.subTest(alias_kind=alias_kind), tempfile.TemporaryDirectory() as tmp:

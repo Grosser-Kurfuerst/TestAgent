@@ -68,9 +68,29 @@ def apply_maintenance_plan(
     intent_written = False
     reuse_intent = False
     mutation_committed = False
+    backup: Path | None = None
 
     try:
         plan = _validated_plan_copy(plan)
+    except Exception as exc:
+        return _pre_commit_failure_result(
+            plan=plan,
+            stage=stage,
+            error=exc,
+            before_revision=before_revision,
+            before_count=before_count,
+            backup_path=backup_path,
+            should_retry=False,
+        )
+
+    stage = "artifact_validation"
+    try:
+        backup = _maintenance_backup_path(backup_dir, plan.plan_id)
+        _validate_transaction_artifact_paths(
+            store=store,
+            history_path=history_path,
+            backup_path=backup,
+        )
     except Exception as exc:
         return _pre_commit_failure_result(
             plan=plan,
@@ -164,7 +184,7 @@ def apply_maintenance_plan(
                     return result
 
                 stage = "backup"
-                backup = _maintenance_backup_path(backup_dir, plan.plan_id)
+                assert backup is not None
                 _write_backup_atomic(backup, snapshot.raw_bytes)
                 backup_path = str(backup)
 
@@ -384,6 +404,40 @@ def _maintenance_backup_path(backup_dir: str | Path, plan_id: str) -> Path:
     if candidate.parent != root:
         raise MaintenancePlanError("maintenance backup path escapes backup directory")
     return candidate
+
+
+def _validate_transaction_artifact_paths(
+    *,
+    store: LongTermMemoryStore,
+    history_path: str | Path,
+    backup_path: Path,
+) -> None:
+    candidates = (
+        ("memory_store", store.path),
+        ("memory_lock", store.lock_path),
+        ("history", Path(history_path)),
+        ("backup", backup_path),
+    )
+    for index, (left_label, left_path) in enumerate(candidates):
+        for right_label, right_path in candidates[index + 1:]:
+            if _artifact_paths_alias(left_path, right_path):
+                raise MaintenancePlanError(
+                    "maintenance transaction paths must be distinct: "
+                    f"{left_label} conflicts with {right_label}"
+                )
+
+
+def _artifact_paths_alias(left: Path, right: Path) -> bool:
+    try:
+        if left.resolve(strict=False) == right.resolve(strict=False):
+            return True
+        if left.exists() and right.exists() and left.samefile(right):
+            return True
+    except (OSError, RuntimeError) as exc:
+        raise MaintenancePlanError(
+            "maintenance transaction path cannot be resolved safely"
+        ) from exc
+    return False
 
 
 def _load_maintenance_history_state(
