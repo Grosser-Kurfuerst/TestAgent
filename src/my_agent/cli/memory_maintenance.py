@@ -19,6 +19,7 @@ from my_agent.memory.evolver import (
     build_maintenance_plan,
     load_maintenance_plan,
     load_project_attribution,
+    record_post_commit_audit_error,
     write_maintenance_plan,
 )
 from my_agent.memory.long_term import (
@@ -528,15 +529,31 @@ def _finalize_apply_success(
     except Exception as exc:
         if not result.mutation_committed:
             raise
+        result = _record_post_commit_failure(
+            state,
+            result,
+            stage="summary",
+            error=exc,
+        )
         summary = _post_commit_audit_error(summary, stage="summary", error=exc)
         state.stage = "render"
         rendered = _render_summary(summary)
         state.stage = "trace"
-        _append_trace_best_effort(
-            writer,
-            _completed_event(result, summary=summary, run_id=run_id),
-            summary,
-        )
+        try:
+            writer.append(_completed_event(result, summary=summary, run_id=run_id))
+        except Exception as trace_exc:
+            result = _record_post_commit_failure(
+                state,
+                result,
+                stage="trace",
+                error=trace_exc,
+            )
+            summary = _post_commit_audit_error(
+                summary,
+                stage="trace",
+                error=trace_exc,
+            )
+            rendered = _render_summary(summary)
         _print_stdout_best_effort(rendered)
         _print_do_not_retry_warning("summary")
         if summary.get("trace_complete") is False:
@@ -551,6 +568,12 @@ def _finalize_apply_success(
     except Exception as exc:
         if not result.mutation_committed:
             raise
+        result = _record_post_commit_failure(
+            state,
+            result,
+            stage="trace",
+            error=exc,
+        )
         summary = _post_commit_audit_error(summary, stage="trace", error=exc)
         _write_summary_best_effort(state.paths.summary, summary)
         state.stage = "render"
@@ -621,16 +644,53 @@ def _post_commit_audit_error(
     return updated
 
 
+def _record_post_commit_failure(
+    state: _CommandState,
+    result: MaintenanceApplyResult,
+    *,
+    stage: str,
+    error: Exception,
+) -> MaintenanceApplyResult:
+    plan = state.plan
+    if plan is None:
+        return result
+    updated = record_post_commit_audit_error(
+        history_path=state.paths.history,
+        plan=plan,
+        result=result,
+        stage=stage,
+        error=error,
+    )
+    state.apply_result = updated
+    return updated
+
+
 def _handle_post_commit_exception(state: _CommandState, exc: Exception) -> int:
     result = state.apply_result
     plan = state.plan
+    if result is not None and plan is not None:
+        result = _record_post_commit_failure(
+            state,
+            result,
+            stage=state.stage or "post_commit",
+            error=exc,
+        )
     summary = _emergency_post_commit_summary(state, result, plan, exc)
     if state.paths_validated and result is not None and plan is not None:
         try:
             _write_summary(state.paths.summary, summary)
         except Exception as summary_exc:
-            summary["summary_complete"] = False
-            summary["summary_error"] = type(summary_exc).__name__
+            result = _record_post_commit_failure(
+                state,
+                result,
+                stage="summary",
+                error=summary_exc,
+            )
+            summary = _post_commit_audit_error(
+                summary,
+                stage="summary",
+                error=summary_exc,
+            )
         try:
             payload = {
                 "mode": "apply",
@@ -660,8 +720,17 @@ def _handle_post_commit_exception(state: _CommandState, exc: Exception) -> int:
                 )
             )
         except Exception as trace_exc:
-            summary["trace_complete"] = False
-            summary["trace_error"] = type(trace_exc).__name__
+            result = _record_post_commit_failure(
+                state,
+                result,
+                stage="trace",
+                error=trace_exc,
+            )
+            summary = _post_commit_audit_error(
+                summary,
+                stage="trace",
+                error=trace_exc,
+            )
             try:
                 _write_summary(state.paths.summary, summary)
             except Exception:

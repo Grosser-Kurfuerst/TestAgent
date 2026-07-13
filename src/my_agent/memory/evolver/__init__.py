@@ -57,6 +57,7 @@ from my_agent.memory.evolver.maintenance import (
     build_maintenance_plan,
     maintenance_evidence_for_entry,
     maintenance_plan_json,
+    record_post_commit_audit_error,
     redundancy_score,
     write_maintenance_plan,
 )
@@ -169,6 +170,7 @@ __all__ = [
     "lookup_experiences",
     "maintenance_evidence_for_entry",
     "maintenance_plan_json",
+    "record_post_commit_audit_error",
     "normalize_experience_tier",
     "proposal_tier_counts",
     "read_trace_events",

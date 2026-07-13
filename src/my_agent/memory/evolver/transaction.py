@@ -345,6 +345,34 @@ def append_maintenance_history(
     return output
 
 
+def record_post_commit_audit_error(
+    *,
+    history_path: str | Path,
+    plan: MaintenancePlan,
+    result: MaintenanceApplyResult,
+    stage: str,
+    error: Exception,
+) -> MaintenanceApplyResult:
+    """Record a post-commit sink failure without making mutation retryable."""
+    if not result.mutation_committed:
+        raise ValueError("post-commit audit errors require a committed mutation")
+    if not str(stage or ""):
+        raise ValueError("post-commit audit error stage must not be empty")
+    updated = replace(
+        result,
+        status=MaintenanceApplyStatus.COMMITTED_WITH_AUDIT_ERROR,
+        audit_complete=False,
+        should_retry=False,
+        audit_error_stage=str(stage),
+        audit_error=_safe_error(error),
+    )
+    _best_effort_history(
+        history_path,
+        _audit_error_history_record(plan, updated),
+    )
+    return updated
+
+
 def _validated_plan_copy(plan: MaintenancePlan) -> MaintenancePlan:
     """Rebuild a plan so mutable payload aliases cannot bypass identity checks."""
     payload = json.loads(maintenance_plan_json(plan))
@@ -809,4 +837,5 @@ def _is_retryable_pre_commit_failure(stage: str, error: Exception) -> bool:
 __all__ = [
     "append_maintenance_history",
     "apply_maintenance_plan",
+    "record_post_commit_audit_error",
 ]

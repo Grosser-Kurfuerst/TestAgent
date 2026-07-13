@@ -36,6 +36,7 @@ from my_agent.memory.evolver.transaction import (
     _write_backup_atomic,
     append_maintenance_history,
     apply_maintenance_plan,
+    record_post_commit_audit_error,
 )
 from my_agent.memory.evolver.validation import load_maintenance_plan
 
@@ -64,5 +65,6 @@ __all__ = [
     "maintenance_evidence_for_entry",
     "maintenance_plan_json",
     "redundancy_score",
+    "record_post_commit_audit_error",
     "write_maintenance_plan",
 ]

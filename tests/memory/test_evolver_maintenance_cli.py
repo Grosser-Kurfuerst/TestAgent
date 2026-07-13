@@ -787,6 +787,13 @@ class MaintenanceCliTests(unittest.TestCase):
             self.assertEqual(summary["audit_error_stage"], "trace")
             self.assertFalse(summary["trace_complete"])
             self.assertFalse(summary["should_retry"])
+            history = _read_jsonl(memory_dir / "maintenance_history.jsonl")
+            self.assertEqual(
+                [record["record_type"] for record in history],
+                ["intent", "completion", "audit_error"],
+            )
+            self.assertEqual(history[-1]["status"], "committed_with_audit_error")
+            self.assertEqual(history[-1]["audit_error_stage"], "trace")
 
     def test_summary_failure_after_commit_emits_audit_error_completion(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -833,6 +840,13 @@ class MaintenanceCliTests(unittest.TestCase):
             self.assertFalse(completed["audit_complete"])
             self.assertFalse(completed["should_retry"])
             self.assertEqual(completed["audit_error_stage"], "summary")
+            history = _read_jsonl(memory_dir / "maintenance_history.jsonl")
+            self.assertEqual(
+                [record["record_type"] for record in history],
+                ["intent", "completion", "audit_error"],
+            )
+            self.assertEqual(history[-1]["status"], "committed_with_audit_error")
+            self.assertEqual(history[-1]["audit_error_stage"], "summary")
 
     def test_unexpected_post_commit_helpers_use_independent_emergency_finalizer(self) -> None:
         for helper_name in ("_summary_for_apply", "_render_summary"):
