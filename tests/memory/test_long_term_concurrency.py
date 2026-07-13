@@ -90,6 +90,43 @@ def _process_add_runtime_experience(
 
 
 class StrictSnapshotTests(unittest.TestCase):
+    def test_resident_reader_refreshes_after_another_store_replaces_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            writer = LongTermMemoryStore.from_dir(tmp)
+            writer.add(_fact("stale", "stale resident fact"))
+            reader = LongTermMemoryStore.from_dir(tmp)
+            self.assertEqual([entry.id for entry in reader.all()], ["stale"])
+
+            writer.clear()
+
+            self.assertEqual(writer.all(), [])
+            self.assertEqual(reader.all(), [])
+            self.assertEqual(len(reader), 0)
+
+    def test_resident_reader_fails_closed_after_corrupt_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            writer = LongTermMemoryStore.from_dir(tmp)
+            writer.add(_fact("resident", "resident fact"))
+            reader = LongTermMemoryStore.from_dir(tmp)
+            self.assertEqual([entry.id for entry in reader.all()], ["resident"])
+            corrupt = writer.path.with_suffix(".replacement")
+            corrupt.write_bytes(b"{bad}\n")
+            corrupt.replace(writer.path)
+
+            with self.assertRaises(MemoryStoreLoadError):
+                reader.all()
+            with self.assertRaises(MemoryStoreLoadError):
+                reader.all()
+
+            recovered = writer.path.with_suffix(".recovered")
+            recovered.write_text(
+                json.dumps(_fact("recovered", "recovered fact").to_dict()) + "\n",
+                encoding="utf-8",
+            )
+            recovered.replace(writer.path)
+
+            self.assertEqual([entry.id for entry in reader.all()], ["recovered"])
+
     def test_add_rejects_duplicate_id_before_persist(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = LongTermMemoryStore.from_dir(tmp)

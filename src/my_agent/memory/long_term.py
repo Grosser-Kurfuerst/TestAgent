@@ -17,6 +17,7 @@ from my_agent.text_safety import sanitize_json_value
 
 
 TraceSink = Callable[[str, dict[str, Any]], None]
+FileGeneration = tuple[int, int, int]
 
 STORAGE_FILE = "long_term_memory.jsonl"
 LOCK_FILE = ".long_term_memory.lock"
@@ -79,6 +80,7 @@ class LongTermMemoryStore:
         self._trace_sink = trace_sink
         self._entries: list[MemoryEntry] = []
         self._loaded = False
+        self._loaded_generation: FileGeneration | None = None
         self._lock = threading.RLock()
         self._lock_timeout_seconds = float(lock_timeout_seconds)
         self.lock_path = self.path.parent / LOCK_FILE
@@ -99,38 +101,10 @@ class LongTermMemoryStore:
         )
 
     def load(self) -> None:
-        """Load entries from disk. Safe to call once at startup."""
-        with self._lock:
-            self._entries = []
-            skipped = 0
-            if self.path.exists():
-                with self.path.open("r", encoding="utf-8") as file:
-                    for line_no, raw in enumerate(file, start=1):
-                        line = raw.strip()
-                        if not line:
-                            continue
-                        try:
-                            payload = json.loads(line)
-                            if not isinstance(payload, dict):
-                                raise ValueError("not an object")
-                            entry = _entry_from_payload(payload)
-                        except (ValueError, json.JSONDecodeError, KeyError, TypeError) as exc:
-                            skipped += 1
-                            self._trace("memory.load_skipped", {
-                                "file": str(self.path),
-                                "line": line_no,
-                                "error": f"{type(exc).__name__}: {exc}",
-                            })
-                            continue
-                        self._entries.append(entry)
-            self._dedupe_in_place()
-            self._loaded = True
-            if skipped:
-                self._trace("memory.load_skipped_summary", {
-                    "file": str(self.path),
-                    "skipped": skipped,
-                    "loaded": len(self._entries),
-                })
+        """Load entries from disk with the startup-compatible permissive parser."""
+        with self.exclusive_process_lock():
+            with self._lock:
+                self._load_permissive_locked()
 
     @contextmanager
     def exclusive_process_lock(
@@ -240,8 +214,8 @@ class LongTermMemoryStore:
                 return entry, True
 
     def all(self, *, project_key: str | None = None) -> list[MemoryEntry]:
+        self._refresh_for_read()
         with self._lock:
-            self._ensure_loaded()
             if project_key is None:
                 return list(self._entries)
             return [entry for entry in self._entries if _is_visible(entry, project_key)]
@@ -322,9 +296,42 @@ class LongTermMemoryStore:
                 return removed
 
     def __len__(self) -> int:
+        self._refresh_for_read()
         with self._lock:
-            self._ensure_loaded()
             return len(self._entries)
+
+    def _load_permissive_locked(self) -> None:
+        self._entries = []
+        skipped = 0
+        if self.path.exists():
+            with self.path.open("r", encoding="utf-8") as file:
+                for line_no, raw in enumerate(file, start=1):
+                    line = raw.strip()
+                    if not line:
+                        continue
+                    try:
+                        payload = json.loads(line)
+                        if not isinstance(payload, dict):
+                            raise ValueError("not an object")
+                        entry = _entry_from_payload(payload)
+                    except (ValueError, json.JSONDecodeError, KeyError, TypeError) as exc:
+                        skipped += 1
+                        self._trace("memory.load_skipped", {
+                            "file": str(self.path),
+                            "line": line_no,
+                            "error": f"{type(exc).__name__}: {exc}",
+                        })
+                        continue
+                    self._entries.append(entry)
+        self._dedupe_in_place()
+        self._loaded = True
+        self._loaded_generation = self._file_generation()
+        if skipped:
+            self._trace("memory.load_skipped_summary", {
+                "file": str(self.path),
+                "skipped": skipped,
+                "loaded": len(self._entries),
+            })
 
     def _load_strict_snapshot_locked(self) -> MemoryStoreSnapshot:
         raw_bytes = self.path.read_bytes() if self.path.exists() else b""
@@ -367,19 +374,41 @@ class LongTermMemoryStore:
         )
         self._entries = list(entries)
         self._loaded = True
+        self._loaded_generation = self._file_generation()
         return snapshot
 
-    def _ensure_loaded(self) -> None:
-        """Lazily load disk state before the first read or mutation.
+    def _refresh_for_read(self) -> None:
+        """Reload a resident cache after another process replaces the store."""
+        generation = self._file_generation()
+        with self._lock:
+            if self._loaded and self._loaded_generation == generation:
+                return
+            if self._loaded and generation is None and not self.path.parent.exists():
+                # A loaded store remains usable after an owning temporary
+                # workspace is torn down. Deleting only the storage file while
+                # its directory remains is still treated as a real generation
+                # change and reloads to an empty repository.
+                return
 
-        Without this, ``add()`` on a fresh store (``load()`` not called) would
-        ``_persist()`` an in-memory list containing only the new entry and
-        silently overwrite the existing file — a data-loss risk. Loading here
-        guarantees the on-disk entries are in memory before any write, so
-        ``_persist()`` rewrites the file with the full set.
-        """
-        if not self._loaded:
-            self.load()
+        # Mutations use the same process -> thread lock order. Recheck after
+        # acquiring both locks so a writer cannot replace the file between the
+        # generation comparison and the reload.
+        with self.exclusive_process_lock():
+            with self._lock:
+                generation = self._file_generation()
+                if self._loaded and self._loaded_generation == generation:
+                    return
+                if self._loaded:
+                    self._load_strict_snapshot_locked()
+                else:
+                    self._load_permissive_locked()
+
+    def _file_generation(self) -> FileGeneration | None:
+        try:
+            stat = self.path.stat()
+        except FileNotFoundError:
+            return None
+        return (int(stat.st_ino), int(stat.st_mtime_ns), int(stat.st_size))
 
     def _find_duplicate(self, entry: MemoryEntry) -> MemoryEntry | None:
         for existing in self._entries:
@@ -425,6 +454,7 @@ class LongTermMemoryStore:
                 file.flush()
                 os.fsync(file.fileno())
             tmp.replace(self.path)
+            self._loaded_generation = self._file_generation()
         finally:
             if tmp.exists():
                 try:

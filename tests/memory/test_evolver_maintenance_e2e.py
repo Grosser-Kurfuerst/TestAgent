@@ -75,6 +75,11 @@ class MaintenanceEndToEndTests(unittest.TestCase):
             before_snapshot = store.load_strict_snapshot()
             before_bytes = before_snapshot.raw_bytes
             before = {entry.id: entry.to_dict() for entry in before_snapshot.entries}
+            resident_reader = LongTermMemoryStore.from_dir(memory_dir)
+            self.assertIn(
+                "mem-negative-tip",
+                {entry.id for entry in resident_reader.search_candidates(project_key=PROJECT_KEY)},
+            )
             attribution = {
                 row["memory_id"]: row
                 for row in _read_jsonl(attribution_path)
@@ -299,7 +304,7 @@ class MaintenanceEndToEndTests(unittest.TestCase):
             negative_hits = retriever.retrieve(
                 before["mem-negative-tip"]["content"],
                 short_term=None,
-                long_term=store,
+                long_term=resident_reader,
                 project_key=PROJECT_KEY,
                 limit=20,
             )
@@ -317,7 +322,7 @@ class MaintenanceEndToEndTests(unittest.TestCase):
             merge_hits = retriever.retrieve(
                 before[merged_source_id]["content"],
                 short_term=None,
-                long_term=store,
+                long_term=resident_reader,
                 project_key=PROJECT_KEY,
                 limit=20,
             )
@@ -336,7 +341,7 @@ class MaintenanceEndToEndTests(unittest.TestCase):
             promotion_hits = retriever.retrieve(
                 source_tip.content,
                 short_term=None,
-                long_term=store,
+                long_term=resident_reader,
                 project_key=PROJECT_KEY,
                 limit=20,
             )
