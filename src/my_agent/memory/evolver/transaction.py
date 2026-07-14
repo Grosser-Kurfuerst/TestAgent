@@ -10,7 +10,7 @@ import json
 import math
 import os
 
-from filelock import FileLock
+from filelock import FileLock, Timeout as FileLockTimeout
 
 from my_agent.memory.evolver.artifacts import (
     MaintenanceArtifactGraph,
@@ -53,6 +53,10 @@ from my_agent.text_safety import sanitize_json_value
 
 
 _HISTORY_LOCK_TIMEOUT_SECONDS = 30.0
+
+
+class MaintenanceHistoryLockTimeout(RuntimeError):
+    """Raised when maintenance history cannot acquire its process lock."""
 
 
 @dataclass(frozen=True)
@@ -151,8 +155,17 @@ def apply_maintenance_plan(
                 before_count = len(snapshot.entries)
                 after_count = before_count
 
+                stage = "history_load"
+                try:
+                    history_state = _load_maintenance_history_state(
+                        history_path,
+                        plan.plan_id,
+                        lock_timeout_seconds=lock_timeout_seconds,
+                    )
+                except MaintenanceHistoryLockTimeout:
+                    stage = "history_lock"
+                    raise
                 stage = "validation"
-                history_state = _load_maintenance_history_state(history_path, plan.plan_id)
                 terminal = _terminal_history_result(
                     plan,
                     history_state,
@@ -199,6 +212,7 @@ def apply_maintenance_plan(
                         append_maintenance_history(
                             history_path,
                             _completion_history_record(plan, result),
+                            lock_timeout_seconds=lock_timeout_seconds,
                         )
                     except Exception as exc:
                         return replace(
@@ -225,20 +239,25 @@ def apply_maintenance_plan(
                         )
                 else:
                     stage = "audit_intent"
-                    append_maintenance_history(
-                        history_path,
-                        _intent_history_record(
-                            plan,
-                            before_revision=before_revision,
-                            expected_after_revision=expected_after_revision,
-                            before_count=before_count,
-                            after_count=after_count,
-                            removed_ids=removed_ids,
-                            updated_ids=updated_ids,
-                            added_ids=added_ids,
-                            backup_path=backup_path,
-                        ),
-                    )
+                    try:
+                        append_maintenance_history(
+                            history_path,
+                            _intent_history_record(
+                                plan,
+                                before_revision=before_revision,
+                                expected_after_revision=expected_after_revision,
+                                before_count=before_count,
+                                after_count=after_count,
+                                removed_ids=removed_ids,
+                                updated_ids=updated_ids,
+                                added_ids=added_ids,
+                                backup_path=backup_path,
+                            ),
+                            lock_timeout_seconds=lock_timeout_seconds,
+                        )
+                    except MaintenanceHistoryLockTimeout:
+                        stage = "history_lock"
+                        raise
                     intent_written = True
 
                 stage = "persist"
@@ -284,6 +303,7 @@ def apply_maintenance_plan(
                     append_maintenance_history(
                         history_path,
                         _completion_history_record(plan, committed),
+                        lock_timeout_seconds=lock_timeout_seconds,
                     )
                 except Exception as exc:
                     failed = replace(
@@ -296,6 +316,7 @@ def apply_maintenance_plan(
                     _best_effort_history(
                         history_path,
                         _audit_error_history_record(plan, failed),
+                        lock_timeout_seconds=lock_timeout_seconds,
                     )
                     return failed
                 return committed
@@ -321,6 +342,7 @@ def apply_maintenance_plan(
                     _best_effort_history(
                         history_path,
                         _audit_error_history_record(plan, failed),
+                        lock_timeout_seconds=lock_timeout_seconds,
                     )
                     return failed
                 retryable = _is_retryable_pre_commit_failure(stage, exc)
@@ -335,6 +357,7 @@ def apply_maintenance_plan(
                             error=_safe_error(exc),
                             should_retry=False,
                         ),
+                        lock_timeout_seconds=lock_timeout_seconds,
                     )
                 return _pre_commit_failure_result(
                     plan=plan,
@@ -360,19 +383,27 @@ def apply_maintenance_plan(
 def append_maintenance_history(
     path: str | Path,
     record: Mapping[str, Any],
+    *,
+    lock_timeout_seconds: float = _HISTORY_LOCK_TIMEOUT_SECONDS,
 ) -> Path:
+    _validate_history_lock_timeout(lock_timeout_seconds)
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
     payload = sanitize_json_value(dict(record))
     lock = FileLock(
         str(_history_lock_path(output)),
-        timeout=_HISTORY_LOCK_TIMEOUT_SECONDS,
+        timeout=lock_timeout_seconds,
     )
-    with lock:
-        with output.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
+    try:
+        with lock:
+            with output.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+    except FileLockTimeout as exc:
+        raise MaintenanceHistoryLockTimeout(
+            "maintenance history lock acquisition timed out"
+        ) from exc
     return output
 
 
@@ -474,7 +505,10 @@ def _validate_supplied_artifact_graph(
 def _load_maintenance_history_state(
     path: str | Path,
     plan_id: str,
+    *,
+    lock_timeout_seconds: float = _HISTORY_LOCK_TIMEOUT_SECONDS,
 ) -> _MaintenanceHistoryState:
+    _validate_history_lock_timeout(lock_timeout_seconds)
     source = Path(path)
     if not source.exists():
         return _MaintenanceHistoryState()
@@ -483,38 +517,43 @@ def _load_maintenance_history_state(
     audit_error: dict[str, Any] | None = None
     lock = FileLock(
         str(_history_lock_path(source)),
-        timeout=_HISTORY_LOCK_TIMEOUT_SECONDS,
+        timeout=lock_timeout_seconds,
     )
-    with lock:
-        if not source.exists():
-            return _MaintenanceHistoryState()
-        with source.open("r", encoding="utf-8") as handle:
-            for line_no, raw in enumerate(handle, start=1):
-                line = raw.strip()
-                if not line:
-                    continue
-                try:
-                    payload = json.loads(line)
-                    if not isinstance(payload, dict):
-                        raise TypeError("expected object")
-                except (TypeError, json.JSONDecodeError) as exc:
-                    raise MaintenancePlanError(
-                        f"invalid maintenance history at line {line_no}: "
-                        f"{type(exc).__name__}"
-                    ) from exc
-                if str(payload.get("plan_id") or "") != plan_id:
-                    continue
-                record_type = str(payload.get("record_type") or "")
-                if record_type == "intent":
-                    if intent is not None:
-                        raise MaintenancePlanError("duplicate maintenance intent record")
-                    intent = payload
-                elif record_type == "completion":
-                    if completion is not None:
-                        raise MaintenancePlanError("duplicate maintenance completion record")
-                    completion = payload
-                elif record_type == "audit_error":
-                    audit_error = payload
+    try:
+        with lock:
+            if not source.exists():
+                return _MaintenanceHistoryState()
+            with source.open("r", encoding="utf-8") as handle:
+                for line_no, raw in enumerate(handle, start=1):
+                    line = raw.strip()
+                    if not line:
+                        continue
+                    try:
+                        payload = json.loads(line)
+                        if not isinstance(payload, dict):
+                            raise TypeError("expected object")
+                    except (TypeError, json.JSONDecodeError) as exc:
+                        raise MaintenancePlanError(
+                            f"invalid maintenance history at line {line_no}: "
+                            f"{type(exc).__name__}"
+                        ) from exc
+                    if str(payload.get("plan_id") or "") != plan_id:
+                        continue
+                    record_type = str(payload.get("record_type") or "")
+                    if record_type == "intent":
+                        if intent is not None:
+                            raise MaintenancePlanError("duplicate maintenance intent record")
+                        intent = payload
+                    elif record_type == "completion":
+                        if completion is not None:
+                            raise MaintenancePlanError("duplicate maintenance completion record")
+                        completion = payload
+                    elif record_type == "audit_error":
+                        audit_error = payload
+    except FileLockTimeout as exc:
+        raise MaintenanceHistoryLockTimeout(
+            "maintenance history lock acquisition timed out"
+        ) from exc
     return _MaintenanceHistoryState(
         intent=intent,
         completion=completion,
@@ -676,9 +715,18 @@ def _audit_error_history_record(
     }
 
 
-def _best_effort_history(path: str | Path, record: Mapping[str, Any]) -> None:
+def _best_effort_history(
+    path: str | Path,
+    record: Mapping[str, Any],
+    *,
+    lock_timeout_seconds: float = _HISTORY_LOCK_TIMEOUT_SECONDS,
+) -> None:
     try:
-        append_maintenance_history(path, record)
+        append_maintenance_history(
+            path,
+            record,
+            lock_timeout_seconds=lock_timeout_seconds,
+        )
     except Exception:
         pass
 
@@ -831,8 +879,13 @@ def _safe_error(error: Exception) -> str:
     return type(error).__name__[:120]
 
 
+def _validate_history_lock_timeout(value: float) -> None:
+    if not math.isfinite(value) or value < 0:
+        raise ValueError("history lock timeout must be finite and non-negative")
+
+
 def _is_retryable_pre_commit_failure(stage: str, error: Exception) -> bool:
-    if isinstance(error, MemoryStoreLockTimeout):
+    if isinstance(error, (MaintenanceHistoryLockTimeout, MemoryStoreLockTimeout)):
         return True
     return stage in {"backup", "audit_intent", "persist"} and isinstance(
         error,
@@ -841,6 +894,7 @@ def _is_retryable_pre_commit_failure(stage: str, error: Exception) -> bool:
 
 
 __all__ = [
+    "MaintenanceHistoryLockTimeout",
     "append_maintenance_history",
     "apply_maintenance_plan",
     "record_post_commit_audit_error",

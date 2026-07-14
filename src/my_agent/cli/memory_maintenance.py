@@ -857,6 +857,8 @@ def _failure_phase(stage: str) -> str:
         return "strict_load"
     if stage == "artifact_validation":
         return "artifact_validation"
+    if stage in {"history_load", "history_lock"}:
+        return stage
     if stage in {"backup", "audit_intent", "persist", "verify"}:
         return stage
     return "validation"

@@ -36,6 +36,7 @@ from my_agent.memory.evolver.planner import (
 )
 from my_agent.memory.evolver.service import build_maintenance_plan
 from my_agent.memory.evolver.transaction import (
+    MaintenanceHistoryLockTimeout,
     _maintenance_backup_path,
     _write_backup_atomic,
     append_maintenance_history,
@@ -57,6 +58,7 @@ __all__ = [
     "MaintenanceConfig",
     "MaintenanceError",
     "MaintenanceEvidence",
+    "MaintenanceHistoryLockTimeout",
     "MaintenanceLookupHit",
     "MaintenanceOperation",
     "MaintenancePlan",

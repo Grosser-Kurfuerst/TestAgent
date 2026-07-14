@@ -11,6 +11,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from filelock import FileLock
+
 from tests._path import add_src_to_path
 
 add_src_to_path()
@@ -765,6 +767,46 @@ class MaintenanceCliTests(unittest.TestCase):
             event = _read_jsonl(trace_path)[0]
             self.assertEqual(event["event"], "memory.maintenance_failed")
             self.assertEqual(event["payload"]["stage"], "lock")
+
+    def test_history_lock_timeout_is_reported_retryable_by_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            memory_dir = Path(tmp) / "memory"
+            store = self._add_invalidated_tip(memory_dir)
+            before = store.path.read_bytes()
+            history_path = memory_dir / "maintenance_history.jsonl"
+            history_path.write_text("", encoding="utf-8")
+            history_lock_path = history_path.with_name(f".{history_path.name}.lock")
+            trace_path = memory_dir / "history_lock_trace.jsonl"
+
+            with FileLock(str(history_lock_path)):
+                exit_code, _, stderr = self._invoke(
+                    self._base_args(memory_dir)
+                    + [
+                        "--trace-output",
+                        str(trace_path),
+                        "--lock-timeout-seconds",
+                        "0.05",
+                        "--apply",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 1)
+            self.assertIn("stage=history_lock", stderr)
+            self.assertEqual(store.path.read_bytes(), before)
+            summary = json.loads(
+                (memory_dir / "maintenance_plan.json.summary.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(summary["status"], "pre_commit_failed")
+            self.assertEqual(summary["audit_error_stage"], "history_lock")
+            self.assertEqual(summary["audit_error"], "MaintenanceHistoryLockTimeout")
+            self.assertTrue(summary["should_retry"])
+            self.assertFalse(summary["mutation_committed"])
+            event = _read_jsonl(trace_path)[-1]
+            self.assertEqual(event["event"], "memory.maintenance_failed")
+            self.assertEqual(event["payload"]["stage"], "history_lock")
+            self.assertTrue(event["payload"]["should_retry"])
 
     def test_committed_with_audit_error_returns_zero_and_warns_not_to_retry(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

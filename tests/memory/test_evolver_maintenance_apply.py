@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
+from filelock import FileLock
+
 from tests._path import add_src_to_path
 
 add_src_to_path()
@@ -505,10 +507,14 @@ class MaintenanceApplyTests(unittest.TestCase):
             backup_dir, history_path = self._paths(root)
             original_append = maintenance_transaction.append_maintenance_history
 
-            def fail_completion(path, record):
+            def fail_completion(path, record, *, lock_timeout_seconds=30.0):
                 if record.get("record_type") == "completion":
                     raise OSError("completion unavailable")
-                return original_append(path, record)
+                return original_append(
+                    path,
+                    record,
+                    lock_timeout_seconds=lock_timeout_seconds,
+                )
 
             with patch.object(
                 maintenance_transaction,
@@ -1041,6 +1047,74 @@ class MaintenanceApplyTests(unittest.TestCase):
             self.assertEqual(results[0].audit_error_stage, "lock")
             self.assertTrue(results[0].should_retry)
             self.assertEqual(holder.path.read_bytes(), before)
+
+    def test_history_lock_timeout_is_retryable_and_pre_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self._store(root)
+            store.add(_experience(
+                "delete-tip",
+                tier="tip",
+                content="Invalidated tip",
+                metadata={"maintenance_invalidated": True},
+            ))
+            plan = self._plan(store)
+            before = store.path.read_bytes()
+            backup_dir, history_path = self._paths(root)
+            history_path.write_text("", encoding="utf-8")
+            history_lock = FileLock(
+                str(maintenance_transaction._history_lock_path(history_path))
+            )
+
+            with history_lock:
+                result = apply_maintenance_plan(
+                    store=store,
+                    plan=plan,
+                    backup_dir=backup_dir,
+                    history_path=history_path,
+                    lock_timeout_seconds=0.05,
+                )
+
+            self.assertEqual(result.status, MaintenanceApplyStatus.PRE_COMMIT_FAILED)
+            self.assertEqual(result.audit_error_stage, "history_lock")
+            self.assertEqual(result.audit_error, "MaintenanceHistoryLockTimeout")
+            self.assertTrue(result.should_retry)
+            self.assertFalse(result.mutation_committed)
+            self.assertEqual(store.path.read_bytes(), before)
+            self.assertIn("delete-tip", {entry.id for entry in store.all()})
+            self.assertFalse(backup_dir.exists())
+            self.assertEqual(history_path.read_bytes(), b"")
+
+    def test_invalid_history_is_nonretryable_history_load_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self._store(root)
+            store.add(_experience(
+                "delete-tip",
+                tier="tip",
+                content="Invalidated tip",
+                metadata={"maintenance_invalidated": True},
+            ))
+            plan = self._plan(store)
+            before = store.path.read_bytes()
+            backup_dir, history_path = self._paths(root)
+            history_path.write_text("{bad json}\n", encoding="utf-8")
+
+            result = apply_maintenance_plan(
+                store=store,
+                plan=plan,
+                backup_dir=backup_dir,
+                history_path=history_path,
+                lock_timeout_seconds=0.05,
+            )
+
+            self.assertEqual(result.status, MaintenanceApplyStatus.PRE_COMMIT_FAILED)
+            self.assertEqual(result.audit_error_stage, "history_load")
+            self.assertEqual(result.audit_error, "MaintenancePlanError")
+            self.assertFalse(result.should_retry)
+            self.assertFalse(result.mutation_committed)
+            self.assertEqual(store.path.read_bytes(), before)
+            self.assertFalse(backup_dir.exists())
 
     def test_apply_lock_timeout_must_be_finite(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
