@@ -10,6 +10,8 @@ import json
 import math
 import os
 
+from filelock import FileLock
+
 from my_agent.memory.evolver.contracts import (
     MAINTENANCE_SCHEMA_VERSION,
     MaintenanceAction,
@@ -39,6 +41,10 @@ from my_agent.memory.long_term import (
 )
 from my_agent.memory.types import MemoryEntry, MemoryScope
 from my_agent.text_safety import sanitize_json_value
+
+
+_HISTORY_LOCK_TIMEOUT_SECONDS = 30.0
+
 
 @dataclass(frozen=True)
 class _MaintenanceHistoryState:
@@ -338,10 +344,15 @@ def append_maintenance_history(
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
     payload = sanitize_json_value(dict(record))
-    with output.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
-        handle.flush()
-        os.fsync(handle.fileno())
+    lock = FileLock(
+        str(_history_lock_path(output)),
+        timeout=_HISTORY_LOCK_TIMEOUT_SECONDS,
+    )
+    with lock:
+        with output.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
     return output
 
 
@@ -444,6 +455,7 @@ def _validate_transaction_artifact_paths(
         ("memory_store", store.path),
         ("memory_lock", store.lock_path),
         ("history", Path(history_path)),
+        ("history_lock", _history_lock_path(history_path)),
         ("backup", backup_path),
     )
     for index, (left_label, left_path) in enumerate(candidates):
@@ -468,6 +480,11 @@ def _artifact_paths_alias(left: Path, right: Path) -> bool:
     return False
 
 
+def _history_lock_path(path: str | Path) -> Path:
+    source = Path(path)
+    return source.with_name(f".{source.name}.lock")
+
+
 def _load_maintenance_history_state(
     path: str | Path,
     plan_id: str,
@@ -478,37 +495,40 @@ def _load_maintenance_history_state(
     intent: dict[str, Any] | None = None
     completion: dict[str, Any] | None = None
     audit_error: dict[str, Any] | None = None
-    audit_stages: set[str] = set()
-    with source.open("r", encoding="utf-8") as handle:
-        for line_no, raw in enumerate(handle, start=1):
-            line = raw.strip()
-            if not line:
-                continue
-            try:
-                payload = json.loads(line)
-                if not isinstance(payload, dict):
-                    raise TypeError("expected object")
-            except (TypeError, json.JSONDecodeError) as exc:
-                raise MaintenancePlanError(
-                    f"invalid maintenance history at line {line_no}: {type(exc).__name__}"
-                ) from exc
-            if str(payload.get("plan_id") or "") != plan_id:
-                continue
-            record_type = str(payload.get("record_type") or "")
-            if record_type == "intent":
-                if intent is not None:
-                    raise MaintenancePlanError("duplicate maintenance intent record")
-                intent = payload
-            elif record_type == "completion":
-                if completion is not None:
-                    raise MaintenancePlanError("duplicate maintenance completion record")
-                completion = payload
-            elif record_type == "audit_error":
-                stage = str(payload.get("audit_error_stage") or "")
-                if stage in audit_stages:
-                    raise MaintenancePlanError("duplicate maintenance audit error record")
-                audit_stages.add(stage)
-                audit_error = payload
+    lock = FileLock(
+        str(_history_lock_path(source)),
+        timeout=_HISTORY_LOCK_TIMEOUT_SECONDS,
+    )
+    with lock:
+        if not source.exists():
+            return _MaintenanceHistoryState()
+        with source.open("r", encoding="utf-8") as handle:
+            for line_no, raw in enumerate(handle, start=1):
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                    if not isinstance(payload, dict):
+                        raise TypeError("expected object")
+                except (TypeError, json.JSONDecodeError) as exc:
+                    raise MaintenancePlanError(
+                        f"invalid maintenance history at line {line_no}: "
+                        f"{type(exc).__name__}"
+                    ) from exc
+                if str(payload.get("plan_id") or "") != plan_id:
+                    continue
+                record_type = str(payload.get("record_type") or "")
+                if record_type == "intent":
+                    if intent is not None:
+                        raise MaintenancePlanError("duplicate maintenance intent record")
+                    intent = payload
+                elif record_type == "completion":
+                    if completion is not None:
+                        raise MaintenancePlanError("duplicate maintenance completion record")
+                    completion = payload
+                elif record_type == "audit_error":
+                    audit_error = payload
     return _MaintenanceHistoryState(
         intent=intent,
         completion=completion,

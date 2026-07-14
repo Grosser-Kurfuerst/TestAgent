@@ -388,6 +388,7 @@ class MaintenanceApplyTests(unittest.TestCase):
         cases = (
             "history_store",
             "history_lock",
+            "history_derived_lock",
             "history_backup",
             "backup_hardlink_store",
         )
@@ -413,6 +414,8 @@ class MaintenanceApplyTests(unittest.TestCase):
                     history_path = store.path
                 elif case == "history_lock":
                     history_path = store.lock_path
+                elif case == "history_derived_lock":
+                    history_path = root / "long_term_memory"
                 elif case == "history_backup":
                     history_path = backup_path
                 else:
@@ -556,6 +559,116 @@ class MaintenanceApplyTests(unittest.TestCase):
             self.assertIn("later", {entry.id for entry in store.all()})
             history = [json.loads(line) for line in history_path.read_text().splitlines()]
             self.assertEqual([item["record_type"] for item in history], ["intent", "completion"])
+
+    def test_repeated_audit_error_stage_uses_latest_append_only_event(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self._store(root)
+            store.add(_experience(
+                "delete-tip",
+                tier="tip",
+                content="Invalidated tip",
+                metadata={"maintenance_invalidated": True},
+            ))
+            plan = self._plan(store)
+            backup_dir, history_path = self._paths(root)
+            committed = apply_maintenance_plan(
+                store=store,
+                plan=plan,
+                backup_dir=backup_dir,
+                history_path=history_path,
+            )
+
+            first = maintenance_transaction.record_post_commit_audit_error(
+                history_path=history_path,
+                plan=plan,
+                result=committed,
+                stage="summary",
+                error=OSError("first summary failure"),
+            )
+            maintenance_transaction.record_post_commit_audit_error(
+                history_path=history_path,
+                plan=plan,
+                result=first,
+                stage="summary",
+                error=RuntimeError("second summary failure"),
+            )
+            repeated = apply_maintenance_plan(
+                store=store,
+                plan=plan,
+                backup_dir=backup_dir,
+                history_path=history_path,
+            )
+
+            self.assertEqual(
+                repeated.status,
+                MaintenanceApplyStatus.COMMITTED_WITH_AUDIT_ERROR,
+            )
+            self.assertEqual(repeated.audit_error_stage, "summary")
+            self.assertEqual(repeated.audit_error, "RuntimeError")
+            history = [json.loads(line) for line in history_path.read_text().splitlines()]
+            self.assertEqual(
+                [item["record_type"] for item in history],
+                ["intent", "completion", "audit_error", "audit_error"],
+            )
+
+    def test_concurrent_audit_finalizers_append_complete_events(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self._store(root)
+            store.add(_experience(
+                "delete-tip",
+                tier="tip",
+                content="Invalidated tip",
+                metadata={"maintenance_invalidated": True},
+            ))
+            plan = self._plan(store)
+            backup_dir, history_path = self._paths(root)
+            committed = apply_maintenance_plan(
+                store=store,
+                plan=plan,
+                backup_dir=backup_dir,
+                history_path=history_path,
+            )
+            barrier = threading.Barrier(3)
+            results = []
+
+            def finalize(index: int) -> None:
+                barrier.wait()
+                results.append(
+                    maintenance_transaction.record_post_commit_audit_error(
+                        history_path=history_path,
+                        plan=plan,
+                        result=committed,
+                        stage="trace",
+                        error=OSError(f"trace failure {index}"),
+                    )
+                )
+
+            threads = [threading.Thread(target=finalize, args=(index,)) for index in range(2)]
+            for thread in threads:
+                thread.start()
+            barrier.wait()
+            for thread in threads:
+                thread.join(2)
+
+            self.assertEqual(len(results), 2)
+            history = [json.loads(line) for line in history_path.read_text().splitlines()]
+            self.assertEqual(
+                [item["record_type"] for item in history],
+                ["intent", "completion", "audit_error", "audit_error"],
+            )
+            repeated = apply_maintenance_plan(
+                store=store,
+                plan=plan,
+                backup_dir=backup_dir,
+                history_path=history_path,
+            )
+            self.assertEqual(
+                repeated.status,
+                MaintenanceApplyStatus.COMMITTED_WITH_AUDIT_ERROR,
+            )
+            self.assertEqual(repeated.audit_error_stage, "trace")
 
     def test_post_replace_verification_failure_is_never_reported_pre_commit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
