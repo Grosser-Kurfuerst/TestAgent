@@ -26,22 +26,6 @@ class _MaintenanceArtifactGraph:
         return self._path("backup")
 
     @property
-    def backup_tmp_path(self) -> Path | None:
-        return self._path("backup_tmp")
-
-    @property
-    def history_lock_path(self) -> Path:
-        path = self._path("history_lock")
-        assert path is not None
-        return path
-
-    @property
-    def store_tmp_path(self) -> Path:
-        path = self._path("memory_store_tmp")
-        assert path is not None
-        return path
-
-    @property
     def reuse_plan_artifact(self) -> bool:
         return self._path("plan_artifact") is not None
 

@@ -99,7 +99,7 @@ def _refresh_plan_id(payload: dict) -> None:
         for item in payload["operations"]
     )
     config = MaintenanceConfig.from_dict(payload["config"]).to_dict()
-    payload["plan_id"] = maintenance_module._plan_id(
+    payload["plan_id"] = maintenance_contracts._plan_id(
         repository_revision=payload["repository_revision"],
         project_key=payload["memory_project_key"],
         as_of=payload["as_of"],
@@ -192,7 +192,7 @@ class MaintenanceApplyTests(unittest.TestCase):
 
             with patch.object(
                 maintenance_transaction,
-                "append_maintenance_history",
+                "_append_maintenance_history",
                 side_effect=OSError("history unavailable"),
             ):
                 result = apply_maintenance_plan(
@@ -366,7 +366,7 @@ class MaintenanceApplyTests(unittest.TestCase):
                 elif stage == "audit_intent":
                     context = patch.object(
                         maintenance_transaction,
-                        "append_maintenance_history",
+                        "_append_maintenance_history",
                         side_effect=OSError("history failed"),
                     )
                 else:
@@ -506,7 +506,7 @@ class MaintenanceApplyTests(unittest.TestCase):
             ))
             plan = self._plan(store)
             backup_dir, history_path = self._paths(root)
-            original_append = maintenance_transaction.append_maintenance_history
+            original_append = maintenance_transaction._append_maintenance_history
 
             def fail_completion(path, record, *, lock_timeout_seconds=30.0):
                 if record.get("record_type") == "completion":
@@ -519,7 +519,7 @@ class MaintenanceApplyTests(unittest.TestCase):
 
             with patch.object(
                 maintenance_transaction,
-                "append_maintenance_history",
+                "_append_maintenance_history",
                 side_effect=fail_completion,
             ):
                 result = apply_maintenance_plan(
@@ -832,7 +832,7 @@ class MaintenanceApplyTests(unittest.TestCase):
                         maintenance_module.MaintenancePlan.from_dict(payload)
 
             with self.assertRaises(ValueError):
-                maintenance_module._maintenance_backup_path(
+                maintenance_transaction._maintenance_backup_path(
                     root / "backups",
                     "../escaped",
                 )
@@ -942,7 +942,7 @@ class MaintenanceApplyTests(unittest.TestCase):
             store.add(protected)
             reviewed = self._plan(store)
             keep = reviewed.operations[0]
-            delete_id = maintenance_module._operation_id(
+            delete_id = maintenance_contracts._operation_id(
                 action=MaintenanceAction.DELETE,
                 source_ids=keep.source_ids,
                 target_ids=(),

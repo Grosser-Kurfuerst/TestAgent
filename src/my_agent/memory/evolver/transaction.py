@@ -228,7 +228,7 @@ def _apply_maintenance_plan(
                     )
                     stage = "history_completion"
                     try:
-                        append_maintenance_history(
+                        _append_maintenance_history(
                             history_path,
                             _completion_history_record(plan, result),
                             lock_timeout_seconds=lock_timeout_seconds,
@@ -258,7 +258,7 @@ def _apply_maintenance_plan(
                 else:
                     stage = "audit_intent"
                     try:
-                        append_maintenance_history(
+                        _append_maintenance_history(
                             history_path,
                             _intent_history_record(
                                 plan,
@@ -318,7 +318,7 @@ def _apply_maintenance_plan(
                 )
                 stage = "history_completion"
                 try:
-                    append_maintenance_history(
+                    _append_maintenance_history(
                         history_path,
                         _completion_history_record(plan, committed),
                         lock_timeout_seconds=lock_timeout_seconds,
@@ -398,7 +398,7 @@ def _apply_maintenance_plan(
         )
 
 
-def append_maintenance_history(
+def _append_maintenance_history(
     path: str | Path,
     record: Mapping[str, Any],
     *,
@@ -1272,7 +1272,7 @@ def _best_effort_history(
     lock_timeout_seconds: float = _HISTORY_LOCK_TIMEOUT_SECONDS,
 ) -> None:
     try:
-        append_maintenance_history(
+        _append_maintenance_history(
             path,
             record,
             lock_timeout_seconds=lock_timeout_seconds,
@@ -1437,7 +1437,6 @@ def _is_retryable_pre_commit_failure(stage: str, error: Exception) -> bool:
 
 __all__ = [
     "MaintenanceHistoryLockTimeout",
-    "append_maintenance_history",
     "apply_maintenance_plan",
     "record_post_commit_audit_error",
 ]

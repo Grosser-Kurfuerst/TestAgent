@@ -13,6 +13,7 @@ from tests._path import add_src_to_path
 add_src_to_path()
 
 import my_agent.memory.evolver as evolver_module
+import my_agent.memory.evolver.artifacts as maintenance_artifacts
 import my_agent.memory.evolver.maintenance as maintenance_module
 import my_agent.memory.evolver.contracts as maintenance_contracts
 import my_agent.memory.evolver.planner as maintenance_planner
@@ -107,7 +108,7 @@ def _refresh_plan_id(payload: dict) -> None:
         for item in payload["operations"]
     )
     config = MaintenanceConfig.from_dict(payload["config"]).to_dict()
-    payload["plan_id"] = maintenance_module._plan_id(
+    payload["plan_id"] = maintenance_contracts._plan_id(
         repository_revision=payload["repository_revision"],
         project_key=payload["memory_project_key"],
         as_of=payload["as_of"],
@@ -156,11 +157,30 @@ class MaintenanceModuleBoundaryTests(unittest.TestCase):
         self.assertFalse(hasattr(maintenance_planner, "LongTermMemoryStore"))
         self.assertFalse(hasattr(maintenance_contracts, "validate_plan_semantics"))
         self.assertFalse(hasattr(maintenance_planner, "validate_plan_semantics"))
+        for name in (
+            "_operation_id",
+            "_plan_id",
+            "_validate_operation_conflicts",
+            "_maintenance_backup_path",
+            "_write_backup_atomic",
+        ):
+            with self.subTest(private_helper=name):
+                self.assertFalse(hasattr(maintenance_module, name))
+        for module in (maintenance_module, evolver_module):
+            with self.subTest(history_api=module.__name__):
+                self.assertFalse(hasattr(module, "append_maintenance_history"))
+        self.assertFalse(hasattr(maintenance_transaction, "append_maintenance_history"))
 
     def test_planner_all_only_names_existing_exports(self) -> None:
         for name in maintenance_planner.__all__:
             with self.subTest(name=name):
                 self.assertTrue(hasattr(maintenance_planner, name))
+
+    def test_public_module_exports_only_name_existing_attributes(self) -> None:
+        for module in (maintenance_module, evolver_module):
+            for name in module.__all__:
+                with self.subTest(module=module.__name__, name=name):
+                    self.assertTrue(hasattr(module, name))
 
     def test_artifact_graph_remains_internal_infrastructure(self) -> None:
         for module in (maintenance_module, evolver_module):
@@ -176,6 +196,15 @@ class MaintenanceModuleBoundaryTests(unittest.TestCase):
             ).parameters,
         )
         self.assertFalse(hasattr(long_term_module, "atomic_write_tmp_path"))
+        for name in (
+            "backup_tmp_path",
+            "history_lock_path",
+            "store_tmp_path",
+        ):
+            with self.subTest(unused_graph_property=name):
+                self.assertFalse(
+                    hasattr(maintenance_artifacts._MaintenanceArtifactGraph, name)
+                )
 
 
 class ProjectAttributionLoaderTests(unittest.TestCase):
@@ -1216,7 +1245,7 @@ class MaintenancePlanContractTests(unittest.TestCase):
     def test_partial_config_is_normalized_before_round_trip(self) -> None:
         plan = self._plan()
         normalized_config = MaintenanceConfig(delete_value_threshold=-0.2).to_dict()
-        plan_id = maintenance_module._plan_id(
+        plan_id = maintenance_contracts._plan_id(
             repository_revision=plan.repository_revision,
             project_key=plan.memory_project_key,
             as_of=plan.as_of,
@@ -1347,7 +1376,7 @@ class MaintenancePlanContractTests(unittest.TestCase):
         operation["target_ids"] = [forged_id]
         operation["additions"][0]["id"] = forged_id
         operation["replacements"][0]["metadata"]["maintenance_promoted_to"] = forged_id
-        operation_id = maintenance_module._operation_id(
+        operation_id = maintenance_contracts._operation_id(
             action=MaintenanceAction.PROMOTE,
             source_ids=operation["source_ids"],
             target_ids=operation["target_ids"],
@@ -1424,7 +1453,7 @@ class MaintenancePlanContractTests(unittest.TestCase):
                 payload["target_ids"] = [target_id]
                 payload["additions"] = []
                 payload["replacements"][0]["metadata"]["maintenance_promoted_to"] = target_id
-                operation_id = maintenance_module._operation_id(
+                operation_id = maintenance_contracts._operation_id(
                     action=MaintenanceAction.PROMOTE,
                     source_ids=payload["source_ids"],
                     target_ids=payload["target_ids"],
@@ -1438,7 +1467,7 @@ class MaintenancePlanContractTests(unittest.TestCase):
                 malformed = MaintenanceOperation.from_dict(payload)
 
                 with self.assertRaises(ValueError):
-                    maintenance_module._validate_operation_conflicts(
+                    maintenance_planner._validate_operation_conflicts(
                         (malformed,),
                         repository_entries=repository,
                     )
@@ -1476,7 +1505,7 @@ class MaintenancePlanContractTests(unittest.TestCase):
             }
             replacement = anchor.to_dict()
             replacement["metadata"]["maintenance_action"] = "merge"
-            operation_id = maintenance_module._operation_id(
+            operation_id = maintenance_contracts._operation_id(
                 action=MaintenanceAction.MERGE,
                 source_ids=source_ids,
                 target_ids=(anchor.id,),
@@ -1507,7 +1536,7 @@ class MaintenancePlanContractTests(unittest.TestCase):
             operation_payload(declared_tiers=("skill", "skill"), anchor=skill)
         )
         with self.assertRaises(ValueError):
-            maintenance_module._validate_operation_conflicts(
+            maintenance_planner._validate_operation_conflicts(
                 (spoofed,),
                 repository_entries=[tip, skill],
             )
@@ -1540,7 +1569,7 @@ class MaintenancePlanContractTests(unittest.TestCase):
         malformed = MaintenanceOperation.from_dict(payload)
 
         with self.assertRaises(ValueError):
-            maintenance_module._validate_operation_conflicts(
+            maintenance_planner._validate_operation_conflicts(
                 (malformed,),
                 repository_entries=[anchor, source],
             )

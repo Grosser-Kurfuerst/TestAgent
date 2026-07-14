@@ -18,13 +18,10 @@ from my_agent.memory.evolver.contracts import (
     MaintenanceOperation,
     MaintenancePlan,
     MaintenancePlanError,
-    _operation_id,
-    _plan_id,
     maintenance_plan_json,
     write_maintenance_plan,
 )
 from my_agent.memory.evolver.planner import (
-    _validate_operation_conflicts,
     load_project_attribution,
     lookup_experiences,
     maintenance_evidence_for_entry,
@@ -33,9 +30,6 @@ from my_agent.memory.evolver.planner import (
 from my_agent.memory.evolver.service import build_maintenance_plan
 from my_agent.memory.evolver.transaction import (
     MaintenanceHistoryLockTimeout,
-    _maintenance_backup_path,
-    _write_backup_atomic,
-    append_maintenance_history,
     apply_maintenance_plan,
     record_post_commit_audit_error,
 )
@@ -58,7 +52,6 @@ __all__ = [
     "MaintenanceOperation",
     "MaintenancePlan",
     "MaintenancePlanError",
-    "append_maintenance_history",
     "apply_maintenance_plan",
     "build_maintenance_plan",
     "load_maintenance_plan",
