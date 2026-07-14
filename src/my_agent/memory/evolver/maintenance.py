@@ -23,10 +23,6 @@ from my_agent.memory.evolver.contracts import (
     maintenance_plan_json,
     write_maintenance_plan,
 )
-from my_agent.memory.evolver.artifacts import (
-    MaintenanceArtifactGraph,
-    resolve_maintenance_artifact_graph,
-)
 from my_agent.memory.evolver.planner import (
     _validate_operation_conflicts,
     load_project_attribution,
@@ -51,7 +47,6 @@ __all__ = [
     "MAINTENANCE_SCHEMA_VERSION",
     "MAINTENANCE_SCOPE_MODE",
     "MaintenanceAction",
-    "MaintenanceArtifactGraph",
     "MaintenanceApplyResult",
     "MaintenanceApplyStatus",
     "MaintenanceAttributionError",
@@ -73,6 +68,5 @@ __all__ = [
     "maintenance_plan_json",
     "redundancy_score",
     "record_post_commit_audit_error",
-    "resolve_maintenance_artifact_graph",
     "write_maintenance_plan",
 ]

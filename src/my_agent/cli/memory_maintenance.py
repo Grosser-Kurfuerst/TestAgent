@@ -15,13 +15,15 @@ from my_agent.memory.evolver import (
     MaintenanceApplyStatus,
     MaintenanceConfig,
     MaintenancePlan,
-    apply_maintenance_plan,
     build_maintenance_plan,
     load_maintenance_plan,
     load_project_attribution,
     record_post_commit_audit_error,
-    resolve_maintenance_artifact_graph,
     write_maintenance_plan,
+)
+from my_agent.memory.evolver.artifacts import _resolve_maintenance_artifact_graph
+from my_agent.memory.evolver.transaction import (
+    _apply_maintenance_plan as apply_maintenance_plan,
 )
 from my_agent.memory.long_term import (
     LOCK_FILE,
@@ -84,7 +86,7 @@ class _CommandState:
 
 
 def _run_maintenance(args: argparse.Namespace, state: _CommandState) -> int:
-    preplan_graph = resolve_maintenance_artifact_graph(
+    preplan_graph = _resolve_maintenance_artifact_graph(
         store_path=state.paths.memory_dir / STORAGE_FILE,
         store_lock_path=state.paths.memory_dir / LOCK_FILE,
         history_path=state.paths.history,
@@ -137,7 +139,7 @@ def _run_maintenance(args: argparse.Namespace, state: _CommandState) -> int:
 
     state.stage = "artifact_validation"
     state.paths_validated = False
-    artifact_graph = resolve_maintenance_artifact_graph(
+    artifact_graph = _resolve_maintenance_artifact_graph(
         store_path=store.path,
         store_lock_path=store.lock_path,
         history_path=state.paths.history,

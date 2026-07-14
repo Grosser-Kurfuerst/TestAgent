@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import tempfile
 import unittest
@@ -11,12 +12,14 @@ from tests._path import add_src_to_path
 
 add_src_to_path()
 
+import my_agent.memory.evolver as evolver_module
 import my_agent.memory.evolver.maintenance as maintenance_module
 import my_agent.memory.evolver.contracts as maintenance_contracts
 import my_agent.memory.evolver.planner as maintenance_planner
 import my_agent.memory.evolver.service as maintenance_service
 import my_agent.memory.evolver.transaction as maintenance_transaction
 import my_agent.memory.evolver.validation as maintenance_validation
+import my_agent.memory.long_term as long_term_module
 from my_agent.memory.evolver import (
     ExperienceCreatedBy,
     MaintenanceAction,
@@ -158,6 +161,21 @@ class MaintenanceModuleBoundaryTests(unittest.TestCase):
         for name in maintenance_planner.__all__:
             with self.subTest(name=name):
                 self.assertTrue(hasattr(maintenance_planner, name))
+
+    def test_artifact_graph_remains_internal_infrastructure(self) -> None:
+        for module in (maintenance_module, evolver_module):
+            with self.subTest(module=module.__name__):
+                self.assertFalse(hasattr(module, "MaintenanceArtifactGraph"))
+                self.assertFalse(
+                    hasattr(module, "resolve_maintenance_artifact_graph")
+                )
+        self.assertNotIn(
+            "artifact_graph",
+            inspect.signature(
+                maintenance_transaction.apply_maintenance_plan
+            ).parameters,
+        )
+        self.assertFalse(hasattr(long_term_module, "atomic_write_tmp_path"))
 
 
 class ProjectAttributionLoaderTests(unittest.TestCase):

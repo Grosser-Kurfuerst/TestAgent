@@ -16,6 +16,7 @@ from tests._path import add_src_to_path
 add_src_to_path()
 
 import my_agent.memory.evolver.maintenance as maintenance_module
+import my_agent.memory.evolver.artifacts as maintenance_artifacts
 import my_agent.memory.evolver.contracts as maintenance_contracts
 import my_agent.memory.evolver.planner as maintenance_planner
 import my_agent.memory.evolver.transaction as maintenance_transaction
@@ -462,7 +463,7 @@ class MaintenanceApplyTests(unittest.TestCase):
             before = store.path.read_bytes()
             backup_dir, history_path = self._paths(root)
             plan_output = root / "reviewed_plan.json"
-            graph = maintenance_module.resolve_maintenance_artifact_graph(
+            graph = maintenance_artifacts._resolve_maintenance_artifact_graph(
                 store_path=store.path,
                 store_lock_path=store.lock_path,
                 history_path=history_path,
@@ -477,7 +478,7 @@ class MaintenanceApplyTests(unittest.TestCase):
                 store.path.with_suffix(store.path.suffix + ".tmp")
             )
 
-            result = apply_maintenance_plan(
+            result = maintenance_transaction._apply_maintenance_plan(
                 store=store,
                 plan=plan,
                 backup_dir=backup_dir,

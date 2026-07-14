@@ -7,22 +7,49 @@ from pathlib import Path
 from typing import Iterable
 
 from my_agent.memory.evolver.contracts import MaintenancePlanError
-from my_agent.memory.long_term import atomic_write_tmp_path
+from my_agent.memory.long_term import _atomic_write_tmp_path
 
 
 @dataclass(frozen=True)
-class MaintenanceArtifactGraph:
-    """Concrete paths that must remain pairwise isolated for one plan."""
+class _MaintenanceArtifactGraph:
+    """Internal set of paths that must remain isolated for one plan."""
 
-    backup_path: Path | None
-    backup_tmp_path: Path | None
-    history_lock_path: Path
-    store_tmp_path: Path
-    reuse_plan_artifact: bool
-    candidates: tuple[tuple[str, Path], ...]
+    paths: tuple[tuple[str, Path], ...]
+
+    def __post_init__(self) -> None:
+        labels = [label for label, _ in self.paths]
+        if len(labels) != len(set(labels)):
+            raise MaintenancePlanError("maintenance artifact labels must be unique")
+
+    @property
+    def backup_path(self) -> Path | None:
+        return self._path("backup")
+
+    @property
+    def backup_tmp_path(self) -> Path | None:
+        return self._path("backup_tmp")
+
+    @property
+    def history_lock_path(self) -> Path:
+        path = self._path("history_lock")
+        assert path is not None
+        return path
+
+    @property
+    def store_tmp_path(self) -> Path:
+        path = self._path("memory_store_tmp")
+        assert path is not None
+        return path
+
+    @property
+    def reuse_plan_artifact(self) -> bool:
+        return self._path("plan_artifact") is not None
+
+    def _path(self, label: str) -> Path | None:
+        return next((path for name, path in self.paths if name == label), None)
 
 
-def resolve_maintenance_artifact_graph(
+def _resolve_maintenance_artifact_graph(
     *,
     store_path: str | Path,
     store_lock_path: str | Path,
@@ -35,13 +62,13 @@ def resolve_maintenance_artifact_graph(
     plan_output_path: str | Path | None = None,
     summary_path: str | Path | None = None,
     trace_path: str | Path | None = None,
-) -> MaintenanceArtifactGraph:
+) -> _MaintenanceArtifactGraph:
     """Resolve and validate the complete mutation-time artifact graph."""
     store = Path(store_path)
     history = Path(history_path)
     backup_root = Path(backup_dir)
-    store_tmp = atomic_write_tmp_path(store)
-    history_lock = history_lock_path(history)
+    store_tmp = _atomic_write_tmp_path(store)
+    history_lock = _history_lock_path(history)
 
     candidates: list[tuple[str, Path]] = [
         ("memory_store", store),
@@ -59,8 +86,8 @@ def resolve_maintenance_artifact_graph(
     backup: Path | None = None
     backup_tmp: Path | None = None
     if plan_id is not None:
-        backup = maintenance_backup_path(backup_root, plan_id)
-        backup_tmp = atomic_write_tmp_path(backup)
+        backup = _maintenance_backup_path(backup_root, plan_id)
+        backup_tmp = _atomic_write_tmp_path(backup)
         candidates.extend((
             ("backup", backup),
             ("backup_tmp", backup_tmp),
@@ -71,7 +98,7 @@ def resolve_maintenance_artifact_graph(
     reuse_plan_artifact = bool(
         plan_input is not None
         and plan_output is not None
-        and artifact_paths_alias(plan_input, plan_output)
+        and _artifact_paths_alias(plan_input, plan_output)
     )
     if reuse_plan_artifact:
         assert plan_output is not None
@@ -80,24 +107,17 @@ def resolve_maintenance_artifact_graph(
         _append_optional(candidates, "plan_input", plan_input)
         _append_optional(candidates, "plan_output", plan_output)
 
-    graph = MaintenanceArtifactGraph(
-        backup_path=backup,
-        backup_tmp_path=backup_tmp,
-        history_lock_path=history_lock,
-        store_tmp_path=store_tmp,
-        reuse_plan_artifact=reuse_plan_artifact,
-        candidates=tuple(candidates),
-    )
-    validate_maintenance_artifact_graph(graph)
+    graph = _MaintenanceArtifactGraph(paths=tuple(candidates))
+    _validate_maintenance_artifact_graph(graph)
     return graph
 
 
-def validate_maintenance_artifact_graph(graph: MaintenanceArtifactGraph) -> None:
+def _validate_maintenance_artifact_graph(graph: _MaintenanceArtifactGraph) -> None:
     """Recheck a previously resolved graph against current filesystem aliases."""
-    _validate_pairwise_isolation(graph.candidates)
+    _validate_pairwise_isolation(graph.paths)
 
 
-def maintenance_backup_path(backup_dir: str | Path, plan_id: str) -> Path:
+def _maintenance_backup_path(backup_dir: str | Path, plan_id: str) -> Path:
     root = Path(backup_dir).resolve()
     candidate = (root / f"{plan_id}.long_term_memory.jsonl").resolve()
     if candidate.parent != root:
@@ -105,12 +125,12 @@ def maintenance_backup_path(backup_dir: str | Path, plan_id: str) -> Path:
     return candidate
 
 
-def history_lock_path(path: str | Path) -> Path:
+def _history_lock_path(path: str | Path) -> Path:
     source = Path(path)
     return source.with_name(f".{source.name}.lock")
 
 
-def artifact_paths_alias(left: str | Path, right: str | Path) -> bool:
+def _artifact_paths_alias(left: str | Path, right: str | Path) -> bool:
     left_path = Path(left)
     right_path = Path(right)
     try:
@@ -138,18 +158,11 @@ def _validate_pairwise_isolation(candidates: Iterable[tuple[str, Path]]) -> None
     items = tuple(candidates)
     for index, (left_label, left_path) in enumerate(items):
         for right_label, right_path in items[index + 1:]:
-            if artifact_paths_alias(left_path, right_path):
+            if _artifact_paths_alias(left_path, right_path):
                 raise MaintenancePlanError(
                     "maintenance paths must be distinct: "
                     f"{left_label} conflicts with {right_label}"
                 )
 
 
-__all__ = [
-    "MaintenanceArtifactGraph",
-    "artifact_paths_alias",
-    "history_lock_path",
-    "maintenance_backup_path",
-    "resolve_maintenance_artifact_graph",
-    "validate_maintenance_artifact_graph",
-]
+__all__: list[str] = []

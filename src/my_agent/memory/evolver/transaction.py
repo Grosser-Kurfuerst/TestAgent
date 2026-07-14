@@ -13,12 +13,12 @@ import os
 from filelock import FileLock, Timeout as FileLockTimeout
 
 from my_agent.memory.evolver.artifacts import (
-    MaintenanceArtifactGraph,
-    artifact_paths_alias,
-    history_lock_path as _history_lock_path,
-    maintenance_backup_path as _maintenance_backup_path,
-    resolve_maintenance_artifact_graph,
-    validate_maintenance_artifact_graph,
+    _MaintenanceArtifactGraph,
+    _artifact_paths_alias,
+    _history_lock_path,
+    _maintenance_backup_path,
+    _resolve_maintenance_artifact_graph,
+    _validate_maintenance_artifact_graph,
 )
 from my_agent.memory.evolver.contracts import (
     MAINTENANCE_SCHEMA_VERSION,
@@ -45,7 +45,7 @@ from my_agent.memory.long_term import (
     MemoryStoreLockTimeout,
     MemoryStorePostCommitError,
     MemoryStoreRevisionConflict,
-    atomic_write_tmp_path,
+    _atomic_write_tmp_path,
     memory_entries_revision,
 )
 from my_agent.memory.types import MemoryEntry, MemoryScope
@@ -73,7 +73,25 @@ def apply_maintenance_plan(
     backup_dir: str | Path,
     history_path: str | Path,
     lock_timeout_seconds: float = 30.0,
-    artifact_graph: MaintenanceArtifactGraph | None = None,
+) -> MaintenanceApplyResult:
+    """Apply a reviewed plan through the stable programmatic API."""
+    return _apply_maintenance_plan(
+        store=store,
+        plan=plan,
+        backup_dir=backup_dir,
+        history_path=history_path,
+        lock_timeout_seconds=lock_timeout_seconds,
+    )
+
+
+def _apply_maintenance_plan(
+    *,
+    store: LongTermMemoryStore,
+    plan: MaintenancePlan,
+    backup_dir: str | Path,
+    history_path: str | Path,
+    lock_timeout_seconds: float = 30.0,
+    artifact_graph: _MaintenanceArtifactGraph | None = None,
 ) -> MaintenanceApplyResult:
     """Apply a reviewed plan under one process lock and one store persist."""
     if not math.isfinite(lock_timeout_seconds) or lock_timeout_seconds < 0:
@@ -105,7 +123,7 @@ def apply_maintenance_plan(
 
     stage = "artifact_validation"
     try:
-        core_artifact_graph = resolve_maintenance_artifact_graph(
+        core_artifact_graph = _resolve_maintenance_artifact_graph(
             store_path=store.path,
             store_lock_path=store.lock_path,
             history_path=history_path,
@@ -113,7 +131,7 @@ def apply_maintenance_plan(
             plan_id=plan.plan_id,
         )
         if artifact_graph is not None:
-            validate_maintenance_artifact_graph(artifact_graph)
+            _validate_maintenance_artifact_graph(artifact_graph)
             _validate_supplied_artifact_graph(
                 artifact_graph,
                 core_graph=core_artifact_graph,
@@ -473,7 +491,7 @@ def _write_backup_atomic(path: Path, raw_bytes: bytes) -> None:
         if sha256(path.read_bytes()).hexdigest() != expected_hash:
             raise MaintenancePlanError("existing maintenance backup does not match repository")
         return
-    tmp = atomic_write_tmp_path(path)
+    tmp = _atomic_write_tmp_path(path)
     try:
         with tmp.open("wb") as handle:
             handle.write(raw_bytes)
@@ -491,14 +509,14 @@ def _write_backup_atomic(path: Path, raw_bytes: bytes) -> None:
 
 
 def _validate_supplied_artifact_graph(
-    graph: MaintenanceArtifactGraph,
+    graph: _MaintenanceArtifactGraph,
     *,
-    core_graph: MaintenanceArtifactGraph,
+    core_graph: _MaintenanceArtifactGraph,
 ) -> None:
-    supplied = dict(graph.candidates)
-    for label, expected_path in core_graph.candidates:
+    supplied = dict(graph.paths)
+    for label, expected_path in core_graph.paths:
         actual_path = supplied.get(label)
-        if actual_path is None or not artifact_paths_alias(actual_path, expected_path):
+        if actual_path is None or not _artifact_paths_alias(actual_path, expected_path):
             raise MaintenancePlanError(
                 f"maintenance artifact graph does not match transaction {label}"
             )
