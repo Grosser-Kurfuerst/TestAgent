@@ -23,8 +23,8 @@ from my_agent.memory.evolver.contracts import (
     MaintenanceOperation,
     MaintenancePlan,
     MaintenancePlanError,
-    _as_float,
-    _as_int,
+    _evidence_float,
+    _evidence_int,
     _operation_id,
     _operation_summary,
     _parse_datetime,
@@ -34,6 +34,7 @@ from my_agent.memory.evolver.contracts import (
     _source_precondition,
     _validated_payload_entry,
     _valid_tier,
+    _validate_evidence_values,
 )
 from my_agent.memory.evolver.types import (
     ExperienceCreatedBy,
@@ -102,14 +103,23 @@ def _validate_attribution_record(
             raise MaintenanceAttributionError(
                 f"{name} must be a non-negative integer at line {line_no}"
             )
-    if record.candidate_count != record.selected_count + record.not_selected_count:
-        raise MaintenanceAttributionError(
-            f"candidate counts are inconsistent at line {line_no}"
+    try:
+        _validate_evidence_values(
+            value=record.value,
+            confidence=record.confidence,
+            candidate_count=record.candidate_count,
+            selected_count=record.selected_count,
+            not_selected_count=record.not_selected_count,
+            writer_confidence=0.0,
+            has_attribution=True,
+            last_used=record.last_used,
         )
+    except MaintenancePlanError as exc:
+        raise MaintenanceAttributionError(
+            f"invalid attribution evidence at line {line_no}: {exc}"
+        ) from exc
 
     finite_values = {
-        "value": record.value,
-        "confidence": record.confidence,
         "success_when_selected": record.success_when_selected,
         "success_when_candidate_not_selected": (
             record.success_when_candidate_not_selected
@@ -124,12 +134,6 @@ def _validate_attribution_record(
             raise MaintenanceAttributionError(
                 f"{name} must be finite at line {line_no}"
             )
-    if not -1.0 <= record.value <= 1.0:
-        raise MaintenanceAttributionError(f"value is out of range at line {line_no}")
-    if not 0.0 <= record.confidence <= 1.0:
-        raise MaintenanceAttributionError(
-            f"confidence is out of range at line {line_no}"
-        )
     for name, value in (
         ("success_when_selected", record.success_when_selected),
         (
@@ -141,10 +145,6 @@ def _validate_attribution_record(
             raise MaintenanceAttributionError(
                 f"{name} is out of range at line {line_no}"
             )
-    if record.last_used and _parse_datetime(record.last_used) is None:
-        raise MaintenanceAttributionError(
-            f"last_used must be a timezone-aware timestamp at line {line_no}"
-        )
 
 
 def maintenance_evidence_for_entry(
@@ -185,31 +185,36 @@ def maintenance_evidence_for_entry(
         )
     )
 
-    value = (
-        float(record.value)
-        if record is not None
-        else _as_float(metadata.get("evolver_value")) if metadata_has_attribution else 0.0
-    )
-    confidence = (
-        float(record.confidence)
-        if record is not None
-        else _as_float(metadata.get("evolver_confidence")) if metadata_has_attribution else 0.0
-    )
-    candidate_count = (
-        int(record.candidate_count)
-        if record is not None
-        else _as_int(metadata.get("evolver_candidate_count")) if metadata_has_attribution else 0
-    )
-    selected_count = (
-        int(record.selected_count)
-        if record is not None
-        else _as_int(metadata.get("evolver_selected_count")) if metadata_has_attribution else 0
-    )
-    not_selected_count = (
-        int(record.not_selected_count)
-        if record is not None
-        else _as_int(metadata.get("evolver_not_selected_count")) if metadata_has_attribution else 0
-    )
+    if record is not None:
+        value = _evidence_float(record.value, "value")
+        confidence = _evidence_float(record.confidence, "confidence")
+        candidate_count = _evidence_int(record.candidate_count, "candidate_count")
+        selected_count = _evidence_int(record.selected_count, "selected_count")
+        not_selected_count = _evidence_int(
+            record.not_selected_count,
+            "not_selected_count",
+        )
+    elif metadata_has_attribution:
+        value = _evidence_float(metadata.get("evolver_value"), "value")
+        confidence = _evidence_float(metadata.get("evolver_confidence"), "confidence")
+        candidate_count = _evidence_int(
+            metadata.get("evolver_candidate_count"),
+            "candidate_count",
+        )
+        selected_count = _evidence_int(
+            metadata.get("evolver_selected_count"),
+            "selected_count",
+        )
+        not_selected_count = _evidence_int(
+            metadata.get("evolver_not_selected_count"),
+            "not_selected_count",
+        )
+    else:
+        value = 0.0
+        confidence = 0.0
+        candidate_count = 0
+        selected_count = 0
+        not_selected_count = 0
     last_used = (
         (record.last_used if record is not None else "")
         or (
@@ -234,7 +239,7 @@ def maintenance_evidence_for_entry(
         candidate_count=candidate_count,
         selected_count=selected_count,
         not_selected_count=not_selected_count,
-        writer_confidence=_as_float(metadata.get("confidence")),
+        writer_confidence=_evidence_float(metadata.get("confidence"), "writer_confidence"),
         has_attribution=record is not None or metadata_has_attribution,
     )
 
@@ -1044,7 +1049,9 @@ def _stale_delete_eligible(
     config: MaintenanceConfig,
 ) -> bool:
     if (
-        evidence.candidate_count < config.stale_min_candidate_count
+        not evidence.has_attribution
+        or evidence.candidate_count <= 0
+        or evidence.candidate_count < config.stale_min_candidate_count
         or evidence.selected_count != 0
         or evidence.value > 0
     ):

@@ -9,6 +9,7 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 import json
+import math
 import re
 
 from my_agent.memory.evolver.types import ExperienceTier
@@ -89,11 +90,11 @@ class MaintenanceConfig:
             "delete_min_selected_count",
             "delete_min_not_selected_count",
             "stale_after_days",
-            "stale_min_candidate_count",
             "promote_min_selected_count",
             "max_promotions",
         ):
             _validate_non_negative_int(name, getattr(self, name))
+        _validate_positive_int("stale_min_candidate_count", self.stale_min_candidate_count)
         _validate_positive_int("merge_max_cluster_size", self.merge_max_cluster_size)
         if self.merge_max_cluster_size < 2:
             raise ValueError("merge_max_cluster_size must be at least 2")
@@ -130,6 +131,22 @@ class MaintenanceEvidence:
     writer_confidence: float = 0.0
     has_attribution: bool = False
 
+    def __post_init__(self) -> None:
+        _validate_evidence_values(
+            value=self.value,
+            confidence=self.confidence,
+            candidate_count=self.candidate_count,
+            selected_count=self.selected_count,
+            not_selected_count=self.not_selected_count,
+            writer_confidence=self.writer_confidence,
+            has_attribution=self.has_attribution,
+            last_used=self.last_used,
+        )
+        if _parse_datetime(self.created_at) is None:
+            raise MaintenancePlanError(
+                "maintenance evidence created_at must be a timezone-aware timestamp"
+            )
+
     def to_dict(self) -> dict[str, Any]:
         return sanitize_json_value(asdict(self))  # type: ignore[return-value]
 
@@ -144,13 +161,19 @@ class MaintenanceEvidence:
             created_at=str(data.get("created_at") or ""),
             last_used=str(data.get("last_used") or ""),
             source_task=str(data.get("source_task") or ""),
-            value=_as_float(data.get("value")),
-            confidence=_as_float(data.get("confidence")),
-            candidate_count=_as_int(data.get("candidate_count")),
-            selected_count=_as_int(data.get("selected_count")),
-            not_selected_count=_as_int(data.get("not_selected_count")),
-            writer_confidence=_as_float(data.get("writer_confidence")),
-            has_attribution=bool(data.get("has_attribution", False)),
+            value=_evidence_float(data.get("value"), "value"),
+            confidence=_evidence_float(data.get("confidence"), "confidence"),
+            candidate_count=_evidence_int(data.get("candidate_count"), "candidate_count"),
+            selected_count=_evidence_int(data.get("selected_count"), "selected_count"),
+            not_selected_count=_evidence_int(
+                data.get("not_selected_count"),
+                "not_selected_count",
+            ),
+            writer_confidence=_evidence_float(
+                data.get("writer_confidence"),
+                "writer_confidence",
+            ),
+            has_attribution=_evidence_bool(data.get("has_attribution", False)),
         )
 
 
@@ -606,6 +629,84 @@ def _validate_non_negative_int(name: str, value: Any) -> None:
 def _validate_positive_int(name: str, value: Any) -> None:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"{name} must be a positive integer")
+
+
+def _validate_evidence_values(
+    *,
+    value: Any,
+    confidence: Any,
+    candidate_count: Any,
+    selected_count: Any,
+    not_selected_count: Any,
+    writer_confidence: Any,
+    has_attribution: Any,
+    last_used: str,
+) -> None:
+    if not isinstance(has_attribution, bool):
+        raise MaintenancePlanError("maintenance evidence has_attribution must be boolean")
+    for name, number, minimum, maximum in (
+        ("value", value, -1.0, 1.0),
+        ("confidence", confidence, 0.0, 1.0),
+        ("writer_confidence", writer_confidence, 0.0, 1.0),
+    ):
+        if (
+            isinstance(number, bool)
+            or not isinstance(number, (int, float))
+            or not math.isfinite(float(number))
+            or not minimum <= float(number) <= maximum
+        ):
+            raise MaintenancePlanError(
+                f"maintenance evidence {name} must be finite and between {minimum} and {maximum}"
+            )
+    for name, count in (
+        ("candidate_count", candidate_count),
+        ("selected_count", selected_count),
+        ("not_selected_count", not_selected_count),
+    ):
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise MaintenancePlanError(
+                f"maintenance evidence {name} must be a non-negative integer"
+            )
+    if candidate_count != selected_count + not_selected_count:
+        raise MaintenancePlanError("maintenance evidence candidate counts are inconsistent")
+    if not has_attribution and any(
+        (
+            float(value) != 0.0,
+            float(confidence) != 0.0,
+            candidate_count != 0,
+            selected_count != 0,
+            not_selected_count != 0,
+        )
+    ):
+        raise MaintenancePlanError(
+            "maintenance evidence without attribution must use neutral attribution values"
+        )
+    if last_used and _parse_datetime(last_used) is None:
+        raise MaintenancePlanError(
+            "maintenance evidence last_used must be a timezone-aware timestamp"
+        )
+
+
+def _evidence_float(value: Any, name: str) -> float:
+    if value is None or value == "":
+        return 0.0
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise MaintenancePlanError(f"maintenance evidence {name} must be numeric")
+    return float(value)
+
+
+def _evidence_int(value: Any, name: str) -> int:
+    if value is None or value == "":
+        return 0
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise MaintenancePlanError(f"maintenance evidence {name} must be an integer")
+    return value
+
+
+def _evidence_bool(value: Any) -> bool:
+    if not isinstance(value, bool):
+        raise MaintenancePlanError("maintenance evidence has_attribution must be boolean")
+    return value
 
 
 def _as_float(value: Any) -> float:

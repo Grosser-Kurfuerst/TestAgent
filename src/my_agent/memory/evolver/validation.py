@@ -16,7 +16,7 @@ from my_agent.memory.evolver.contracts import (
     MaintenanceOperation,
     MaintenancePlan,
     MaintenancePlanError,
-    _as_float,
+    _evidence_float,
     _operation_summary,
     _parse_datetime,
     _validated_payload_entry,
@@ -167,7 +167,10 @@ def _validate_snapshot_evidence(
         "created_by": str(metadata.get("created_by") or ""),
         "created_at": entry.created_at.isoformat(),
         "source_task": str(metadata.get("source_task") or metadata.get("task_id") or ""),
-        "writer_confidence": _as_float(metadata.get("confidence")),
+        "writer_confidence": _evidence_float(
+            metadata.get("confidence"),
+            "writer_confidence",
+        ),
     }
     for name, expected_value in expected.items():
         if getattr(evidence, name) != expected_value:

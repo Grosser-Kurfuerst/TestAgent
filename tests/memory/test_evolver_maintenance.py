@@ -78,7 +78,7 @@ def _record(
     confidence: float = 0.75,
     candidate_count: int = 8,
     selected_count: int = 4,
-    not_selected_count: int = 4,
+    not_selected_count: int | None = None,
     last_used: str = "2026-07-09T00:00:00+00:00",
 ) -> MemoryAttributionRecord:
     return MemoryAttributionRecord(
@@ -87,7 +87,11 @@ def _record(
         memory_project_key=project_key,
         candidate_count=candidate_count,
         selected_count=selected_count,
-        not_selected_count=not_selected_count,
+        not_selected_count=(
+            candidate_count - selected_count
+            if not_selected_count is None
+            else not_selected_count
+        ),
         value=value,
         confidence=confidence,
         last_used=last_used,
@@ -130,6 +134,8 @@ class MaintenanceConfigTests(unittest.TestCase):
             MaintenanceConfig.from_dict({"max_merged_content_chars": 1_600})
         with self.assertRaises(ValueError):
             MaintenanceConfig(protect_manual=False)
+        with self.assertRaises(ValueError):
+            MaintenanceConfig(stale_min_candidate_count=0)
 
 
 class MaintenanceModuleBoundaryTests(unittest.TestCase):
@@ -294,6 +300,69 @@ class MaintenanceEvidenceTests(unittest.TestCase):
 
         self.assertFalse(evidence.has_attribution)
         self.assertEqual(evidence.value, 0.0)
+
+    def test_invalid_metadata_attribution_fails_closed(self) -> None:
+        invalid_cases = {
+            "value_out_of_range": {"evolver_value": -2.0},
+            "confidence_out_of_range": {"evolver_confidence": 2.0},
+            "negative_count": {"evolver_selected_count": -1},
+            "inconsistent_counts": {
+                "evolver_candidate_count": 8,
+                "evolver_selected_count": 2,
+                "evolver_not_selected_count": 5,
+            },
+            "invalid_timestamp": {"evolver_last_used": "not-a-timestamp"},
+        }
+        base = {
+            "evolver_value": -0.2,
+            "evolver_confidence": 0.8,
+            "evolver_candidate_count": 8,
+            "evolver_selected_count": 2,
+            "evolver_not_selected_count": 6,
+            "evolver_last_used": "2026-07-09T00:00:00+00:00",
+            "evolver_attribution_memory_project_key": PROJECT_KEY,
+        }
+        for case, updates in invalid_cases.items():
+            with self.subTest(case=case):
+                entry = _entry(
+                    f"invalid-{case}",
+                    tier="tip",
+                    created_by=ExperienceCreatedBy.WRITER,
+                    metadata={**base, **updates},
+                )
+                with self.assertRaises(ValueError):
+                    build_maintenance_plan(
+                        entries=[entry],
+                        attribution={},
+                        repository_revision=f"sha256:{case}",
+                        project_key=PROJECT_KEY,
+                        as_of=NOW,
+                    )
+
+    def test_invalid_direct_attribution_mapping_fails_closed(self) -> None:
+        entry = _entry(
+            "invalid-direct",
+            tier="tip",
+            created_by=ExperienceCreatedBy.WRITER,
+        )
+        record = _record(
+            entry.id,
+            tier="tip",
+            value=-2.0,
+            confidence=2.0,
+            candidate_count=8,
+            selected_count=2,
+            not_selected_count=6,
+        )
+
+        with self.assertRaises(ValueError):
+            build_maintenance_plan(
+                entries=[entry],
+                attribution={(entry.id, "tip", PROJECT_KEY): record},
+                repository_revision="sha256:invalid-direct",
+                project_key=PROJECT_KEY,
+                as_of=NOW,
+            )
 
 
 class LookupAndRedundancyTests(unittest.TestCase):
@@ -504,6 +573,28 @@ class RetentionPlannerTests(unittest.TestCase):
 
         self.assertEqual(plan.operations[0].action, MaintenanceAction.DELETE)
         self.assertEqual(plan.operations[0].reason_codes, ("explicitly_invalidated",))
+
+    def test_never_retrieved_old_memory_is_not_stale_deleted(self) -> None:
+        entry = _entry(
+            "never-retrieved",
+            created_by=ExperienceCreatedBy.WRITER,
+            created_at=datetime(2025, 1, 1, tzinfo=timezone.utc),
+        )
+
+        plan = build_maintenance_plan(
+            entries=[entry],
+            attribution={},
+            repository_revision="sha256:never-retrieved",
+            project_key=PROJECT_KEY,
+            as_of=NOW,
+            config=MaintenanceConfig(stale_min_candidate_count=1),
+        )
+
+        self.assertEqual(plan.operations[0].action, MaintenanceAction.KEEP)
+        self.assertNotEqual(
+            plan.operations[0].reason_codes,
+            ("stale_retrieved_never_selected",),
+        )
 
     def test_missing_or_unknown_provenance_is_never_a_destructive_candidate(self) -> None:
         for created_by in (None, "legacy-import"):
@@ -745,10 +836,34 @@ class MergePlannerTests(unittest.TestCase):
         earlier = datetime(2025, 1, 1, tzinfo=timezone.utc)
         later = datetime(2026, 1, 1, tzinfo=timezone.utc)
         cases = [
-            ("value", _record("left", value=0.3, confidence=0.1, selected_count=1),
-             _record("right", value=0.2, confidence=0.9, selected_count=9), later, earlier, "left"),
-            ("confidence", _record("left", value=0.3, confidence=0.9, selected_count=1),
-             _record("right", value=0.3, confidence=0.8, selected_count=9), later, earlier, "left"),
+            (
+                "value",
+                _record("left", value=0.3, confidence=0.1, selected_count=1),
+                _record(
+                    "right",
+                    value=0.2,
+                    confidence=0.9,
+                    candidate_count=10,
+                    selected_count=9,
+                ),
+                later,
+                earlier,
+                "left",
+            ),
+            (
+                "confidence",
+                _record("left", value=0.3, confidence=0.9, selected_count=1),
+                _record(
+                    "right",
+                    value=0.3,
+                    confidence=0.8,
+                    candidate_count=10,
+                    selected_count=9,
+                ),
+                later,
+                earlier,
+                "left",
+            ),
             ("selected", _record("left", value=0.3, confidence=0.9, selected_count=5),
              _record("right", value=0.3, confidence=0.9, selected_count=4), later, earlier, "left"),
             ("created", _record("left", value=0.3, confidence=0.9, selected_count=5),
@@ -1171,6 +1286,14 @@ class MaintenancePlanContractTests(unittest.TestCase):
         _refresh_plan_id(payload)
         with self.assertRaisesRegex(ValueError, "summary does not match"):
             MaintenancePlan.from_dict(payload)
+
+    def test_reviewed_plan_rejects_invalid_evidence_domain_values(self) -> None:
+        payload = self._plan().to_dict()
+        payload["operations"][0]["evidence"][0]["confidence"] = 2.0
+        _refresh_plan_id(payload)
+
+        with self.assertRaisesRegex(ValueError, "evidence confidence"):
+            maintenance_validation.parse_maintenance_plan(payload)
 
     def test_rehashed_promotion_target_must_match_semantic_contract(self) -> None:
         _, plan, _ = self._promotion_fixture()
