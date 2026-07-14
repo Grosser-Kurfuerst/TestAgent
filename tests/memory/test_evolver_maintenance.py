@@ -154,6 +154,11 @@ class MaintenanceModuleBoundaryTests(unittest.TestCase):
         self.assertFalse(hasattr(maintenance_contracts, "validate_plan_semantics"))
         self.assertFalse(hasattr(maintenance_planner, "validate_plan_semantics"))
 
+    def test_planner_all_only_names_existing_exports(self) -> None:
+        for name in maintenance_planner.__all__:
+            with self.subTest(name=name):
+                self.assertTrue(hasattr(maintenance_planner, name))
+
 
 class ProjectAttributionLoaderTests(unittest.TestCase):
     def _write(self, path: Path, records: list[dict | str]) -> None:

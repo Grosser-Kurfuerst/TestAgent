@@ -1294,5 +1294,4 @@ __all__ = [
     "lookup_experiences",
     "maintenance_evidence_for_entry",
     "redundancy_score",
-    "validate_plan_semantics",
 ]
