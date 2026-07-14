@@ -445,7 +445,7 @@ class LongTermMemoryStore:
         self._entries = unique
 
     def _persist(self) -> None:
-        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        tmp = atomic_write_tmp_path(self.path)
         try:
             with tmp.open("w", encoding="utf-8") as file:
                 for entry in self._entries:
@@ -469,6 +469,12 @@ class LongTermMemoryStore:
             except Exception:
                 # Tracing must never break memory operations.
                 pass
+
+
+def atomic_write_tmp_path(path: str | Path) -> Path:
+    """Return the fixed sidecar used for atomic replacement of ``path``."""
+    target = Path(path)
+    return target.with_suffix(target.suffix + ".tmp")
 
 
 def _entry_from_payload(payload: dict[str, Any]) -> MemoryEntry:
@@ -590,6 +596,7 @@ __all__ = [
     "MemoryStorePostCommitError",
     "MemoryStoreRevisionConflict",
     "MemoryStoreSnapshot",
+    "atomic_write_tmp_path",
     "memory_dedup_key",
     "memory_entries_revision",
 ]

@@ -12,6 +12,14 @@ import os
 
 from filelock import FileLock
 
+from my_agent.memory.evolver.artifacts import (
+    MaintenanceArtifactGraph,
+    artifact_paths_alias,
+    history_lock_path as _history_lock_path,
+    maintenance_backup_path as _maintenance_backup_path,
+    resolve_maintenance_artifact_graph,
+    validate_maintenance_artifact_graph,
+)
 from my_agent.memory.evolver.contracts import (
     MAINTENANCE_SCHEMA_VERSION,
     MaintenanceAction,
@@ -37,6 +45,7 @@ from my_agent.memory.long_term import (
     MemoryStoreLockTimeout,
     MemoryStorePostCommitError,
     MemoryStoreRevisionConflict,
+    atomic_write_tmp_path,
     memory_entries_revision,
 )
 from my_agent.memory.types import MemoryEntry, MemoryScope
@@ -60,6 +69,7 @@ def apply_maintenance_plan(
     backup_dir: str | Path,
     history_path: str | Path,
     lock_timeout_seconds: float = 30.0,
+    artifact_graph: MaintenanceArtifactGraph | None = None,
 ) -> MaintenanceApplyResult:
     """Apply a reviewed plan under one process lock and one store persist."""
     if not math.isfinite(lock_timeout_seconds) or lock_timeout_seconds < 0:
@@ -91,12 +101,22 @@ def apply_maintenance_plan(
 
     stage = "artifact_validation"
     try:
-        backup = _maintenance_backup_path(backup_dir, plan.plan_id)
-        _validate_transaction_artifact_paths(
-            store=store,
+        core_artifact_graph = resolve_maintenance_artifact_graph(
+            store_path=store.path,
+            store_lock_path=store.lock_path,
             history_path=history_path,
-            backup_path=backup,
+            backup_dir=backup_dir,
+            plan_id=plan.plan_id,
         )
+        if artifact_graph is not None:
+            validate_maintenance_artifact_graph(artifact_graph)
+            _validate_supplied_artifact_graph(
+                artifact_graph,
+                core_graph=core_artifact_graph,
+            )
+        backup = core_artifact_graph.backup_path
+        if backup is None:
+            raise MaintenancePlanError("maintenance backup path was not resolved")
     except Exception as exc:
         return _pre_commit_failure_result(
             plan=plan,
@@ -420,7 +440,7 @@ def _write_backup_atomic(path: Path, raw_bytes: bytes) -> None:
         if sha256(path.read_bytes()).hexdigest() != expected_hash:
             raise MaintenancePlanError("existing maintenance backup does not match repository")
         return
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp = atomic_write_tmp_path(path)
     try:
         with tmp.open("wb") as handle:
             handle.write(raw_bytes)
@@ -437,52 +457,18 @@ def _write_backup_atomic(path: Path, raw_bytes: bytes) -> None:
                 pass
 
 
-def _maintenance_backup_path(backup_dir: str | Path, plan_id: str) -> Path:
-    root = Path(backup_dir).resolve()
-    candidate = (root / f"{plan_id}.long_term_memory.jsonl").resolve()
-    if candidate.parent != root:
-        raise MaintenancePlanError("maintenance backup path escapes backup directory")
-    return candidate
-
-
-def _validate_transaction_artifact_paths(
+def _validate_supplied_artifact_graph(
+    graph: MaintenanceArtifactGraph,
     *,
-    store: LongTermMemoryStore,
-    history_path: str | Path,
-    backup_path: Path,
+    core_graph: MaintenanceArtifactGraph,
 ) -> None:
-    candidates = (
-        ("memory_store", store.path),
-        ("memory_lock", store.lock_path),
-        ("history", Path(history_path)),
-        ("history_lock", _history_lock_path(history_path)),
-        ("backup", backup_path),
-    )
-    for index, (left_label, left_path) in enumerate(candidates):
-        for right_label, right_path in candidates[index + 1:]:
-            if _artifact_paths_alias(left_path, right_path):
-                raise MaintenancePlanError(
-                    "maintenance transaction paths must be distinct: "
-                    f"{left_label} conflicts with {right_label}"
-                )
-
-
-def _artifact_paths_alias(left: Path, right: Path) -> bool:
-    try:
-        if left.resolve(strict=False) == right.resolve(strict=False):
-            return True
-        if left.exists() and right.exists() and left.samefile(right):
-            return True
-    except (OSError, RuntimeError) as exc:
-        raise MaintenancePlanError(
-            "maintenance transaction path cannot be resolved safely"
-        ) from exc
-    return False
-
-
-def _history_lock_path(path: str | Path) -> Path:
-    source = Path(path)
-    return source.with_name(f".{source.name}.lock")
+    supplied = dict(graph.candidates)
+    for label, expected_path in core_graph.candidates:
+        actual_path = supplied.get(label)
+        if actual_path is None or not artifact_paths_alias(actual_path, expected_path):
+            raise MaintenancePlanError(
+                f"maintenance artifact graph does not match transaction {label}"
+            )
 
 
 def _load_maintenance_history_state(

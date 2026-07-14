@@ -20,6 +20,7 @@ from my_agent.memory.evolver import (
     load_maintenance_plan,
     load_project_attribution,
     record_post_commit_audit_error,
+    resolve_maintenance_artifact_graph,
     write_maintenance_plan,
 )
 from my_agent.memory.long_term import (
@@ -81,10 +82,20 @@ class _CommandState:
 
 
 def _run_maintenance(args: argparse.Namespace, state: _CommandState) -> int:
-    state.reuse_plan_artifact = _validate_artifact_paths(
-        state.paths,
-        plan_input=Path(args.plan) if args.plan else None,
+    preplan_graph = resolve_maintenance_artifact_graph(
+        store_path=state.paths.memory_dir / STORAGE_FILE,
+        store_lock_path=state.paths.memory_dir / LOCK_FILE,
+        history_path=state.paths.history,
+        backup_dir=state.paths.backup_dir,
+        plan_id=None,
+        memory_dir=state.paths.memory_dir,
+        attribution_path=state.paths.attribution,
+        plan_input_path=Path(args.plan) if args.plan else None,
+        plan_output_path=state.paths.output,
+        summary_path=state.paths.summary,
+        trace_path=state.paths.trace,
     )
+    state.reuse_plan_artifact = preplan_graph.reuse_plan_artifact
     state.paths_validated = True
     store = LongTermMemoryStore.from_dir(
         state.paths.memory_dir,
@@ -122,6 +133,23 @@ def _run_maintenance(args: argparse.Namespace, state: _CommandState) -> int:
         )
         state.plan = plan
 
+    state.stage = "artifact_validation"
+    state.paths_validated = False
+    artifact_graph = resolve_maintenance_artifact_graph(
+        store_path=store.path,
+        store_lock_path=store.lock_path,
+        history_path=state.paths.history,
+        backup_dir=state.paths.backup_dir,
+        plan_id=plan.plan_id,
+        memory_dir=state.paths.memory_dir,
+        attribution_path=state.paths.attribution,
+        plan_input_path=Path(args.plan) if args.plan else None,
+        plan_output_path=state.paths.output,
+        summary_path=state.paths.summary,
+        trace_path=state.paths.trace,
+    )
+    state.reuse_plan_artifact = artifact_graph.reuse_plan_artifact
+    state.paths_validated = True
     state.stage = "validation"
     if not state.reuse_plan_artifact:
         write_maintenance_plan(plan, state.paths.output)
@@ -155,6 +183,7 @@ def _run_maintenance(args: argparse.Namespace, state: _CommandState) -> int:
         backup_dir=state.paths.backup_dir,
         history_path=state.paths.history,
         lock_timeout_seconds=float(args.lock_timeout_seconds),
+        artifact_graph=artifact_graph,
     )
     state.apply_result = result
     state.stage = "post_commit" if result.mutation_committed else "validation"
@@ -217,54 +246,6 @@ def _resolve_paths(args: argparse.Namespace) -> _MaintenancePaths:
             else memory_dir / "maintenance_backups"
         ),
     )
-
-
-def _validate_artifact_paths(
-    paths: _MaintenancePaths,
-    *,
-    plan_input: Path | None,
-) -> bool:
-    store_path = paths.memory_dir / STORAGE_FILE
-    lock_path = paths.memory_dir / LOCK_FILE
-    reuse_plan_artifact = bool(
-        plan_input is not None and _paths_alias(plan_input, paths.output)
-    )
-    candidates: list[tuple[str, Path]] = [
-        ("memory_directory", paths.memory_dir),
-        ("memory_store", store_path),
-        ("memory_lock", lock_path),
-        ("attribution", paths.attribution),
-        ("summary", paths.summary),
-        ("trace", paths.trace),
-        ("history", paths.history),
-        ("backup_dir", paths.backup_dir),
-    ]
-    if reuse_plan_artifact:
-        candidates.append(("plan_artifact", paths.output))
-    else:
-        candidates.append(("output", paths.output))
-        if plan_input is not None:
-            candidates.append(("plan_input", plan_input))
-
-    for index, (left_label, left_path) in enumerate(candidates):
-        for right_label, right_path in candidates[index + 1:]:
-            if _paths_alias(left_path, right_path):
-                raise ValueError(
-                    "maintenance paths must be distinct: "
-                    f"{left_label} conflicts with {right_label}"
-                )
-    return reuse_plan_artifact
-
-
-def _paths_alias(left: Path, right: Path) -> bool:
-    try:
-        if left.resolve(strict=False) == right.resolve(strict=False):
-            return True
-        if left.exists() and right.exists() and left.samefile(right):
-            return True
-    except (OSError, RuntimeError) as exc:
-        raise ValueError("maintenance path cannot be resolved safely") from exc
-    return False
 
 
 def _load_attribution(
@@ -874,6 +855,8 @@ def _failure_phase(stage: str) -> str:
         return "lock"
     if stage == "strict_load":
         return "strict_load"
+    if stage == "artifact_validation":
+        return "artifact_validation"
     if stage in {"backup", "audit_intent", "persist", "verify"}:
         return stage
     return "validation"

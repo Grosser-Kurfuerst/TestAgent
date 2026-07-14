@@ -387,9 +387,11 @@ class MaintenanceApplyTests(unittest.TestCase):
     def test_transaction_rejects_store_lock_history_and_backup_aliases(self) -> None:
         cases = (
             "history_store",
+            "history_store_tmp",
             "history_lock",
             "history_derived_lock",
             "history_backup",
+            "history_backup_tmp",
             "backup_hardlink_store",
         )
         for case in cases:
@@ -412,12 +414,16 @@ class MaintenanceApplyTests(unittest.TestCase):
                 history_path = default_history
                 if case == "history_store":
                     history_path = store.path
+                elif case == "history_store_tmp":
+                    history_path = store.path.with_suffix(store.path.suffix + ".tmp")
                 elif case == "history_lock":
                     history_path = store.lock_path
                 elif case == "history_derived_lock":
                     history_path = root / "long_term_memory"
                 elif case == "history_backup":
                     history_path = backup_path
+                elif case == "history_backup_tmp":
+                    history_path = backup_path.with_suffix(backup_path.suffix + ".tmp")
                 else:
                     backup_dir.mkdir(parents=True)
                     os.link(store.path, backup_path)
@@ -439,6 +445,51 @@ class MaintenanceApplyTests(unittest.TestCase):
                     self.assertFalse(backup_path.exists())
                 if case != "backup_hardlink_store":
                     self.assertFalse(default_history.exists())
+
+    def test_transaction_rechecks_supplied_full_artifact_graph(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self._store(root)
+            store.add(_experience(
+                "delete-tip",
+                tier="tip",
+                content="Invalidated tip",
+                metadata={"maintenance_invalidated": True},
+            ))
+            plan = self._plan(store)
+            before = store.path.read_bytes()
+            backup_dir, history_path = self._paths(root)
+            plan_output = root / "reviewed_plan.json"
+            graph = maintenance_module.resolve_maintenance_artifact_graph(
+                store_path=store.path,
+                store_lock_path=store.lock_path,
+                history_path=history_path,
+                backup_dir=backup_dir,
+                plan_id=plan.plan_id,
+                memory_dir=root,
+                plan_output_path=plan_output,
+                summary_path=root / "summary.json",
+                trace_path=root / "trace.jsonl",
+            )
+            plan_output.symlink_to(
+                store.path.with_suffix(store.path.suffix + ".tmp")
+            )
+
+            result = apply_maintenance_plan(
+                store=store,
+                plan=plan,
+                backup_dir=backup_dir,
+                history_path=history_path,
+                artifact_graph=graph,
+            )
+
+            self.assertEqual(result.status, MaintenanceApplyStatus.PRE_COMMIT_FAILED)
+            self.assertEqual(result.audit_error_stage, "artifact_validation")
+            self.assertFalse(result.mutation_committed)
+            self.assertEqual(store.path.read_bytes(), before)
+            self.assertIn("delete-tip", {entry.id for entry in store.all()})
+            self.assertFalse(history_path.exists())
+            self.assertFalse(backup_dir.exists())
 
     def test_completion_failure_reports_committed_without_retry(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

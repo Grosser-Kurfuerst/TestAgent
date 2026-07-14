@@ -307,6 +307,8 @@ class MaintenanceCliTests(unittest.TestCase):
             concrete_backup = (
                 backup_dir / f"{plan.plan_id}.long_term_memory.jsonl"
             )
+            summary_path = Path(str(plan_path) + ".summary.json")
+            summary_before = summary_path.read_bytes()
 
             exit_code, _, stderr = self._invoke(
                 self._base_args(memory_dir)
@@ -328,10 +330,101 @@ class MaintenanceCliTests(unittest.TestCase):
             self.assertEqual(store.path.read_bytes(), before)
             self.assertIn("delete-tip", {entry.id for entry in store.all()})
             self.assertFalse(concrete_backup.exists())
-            summary = json.loads(
-                Path(str(plan_path) + ".summary.json").read_text(encoding="utf-8")
-            )
-            self.assertEqual(summary["audit_error_stage"], "artifact_validation")
+            self.assertIn("stage=artifact_validation", stderr)
+            self.assertEqual(summary_path.read_bytes(), summary_before)
+
+    def test_derived_backup_tmp_rejects_direct_symlink_and_hardlink_outputs(self) -> None:
+        for alias_kind in ("direct", "symlink", "hardlink"):
+            with self.subTest(alias_kind=alias_kind), tempfile.TemporaryDirectory() as tmp:
+                memory_dir = Path(tmp) / "memory"
+                store = self._add_invalidated_tip(memory_dir)
+                before = store.path.read_bytes()
+                plan_path = memory_dir / "reviewed_plan.json"
+                self.assertEqual(
+                    self._invoke(
+                        self._base_args(memory_dir)
+                        + [
+                            "--output",
+                            str(plan_path),
+                            "--trace-output",
+                            str(memory_dir / "dry_trace.jsonl"),
+                        ]
+                    )[0],
+                    0,
+                )
+                plan = load_maintenance_plan(plan_path)
+                backup_dir = memory_dir / "backups"
+                backup_tmp = (
+                    backup_dir
+                    / f"{plan.plan_id}.long_term_memory.jsonl.tmp"
+                )
+                output_path = backup_tmp
+                sentinel = b""
+                if alias_kind == "symlink":
+                    output_path = memory_dir / "backup_tmp_symlink.json"
+                    output_path.symlink_to(backup_tmp)
+                elif alias_kind == "hardlink":
+                    backup_dir.mkdir(parents=True)
+                    sentinel = b"backup tmp sentinel\n"
+                    backup_tmp.write_bytes(sentinel)
+                    output_path = memory_dir / "backup_tmp_hardlink.json"
+                    os.link(backup_tmp, output_path)
+
+                exit_code, _, stderr = self._invoke(
+                    self._base_args(memory_dir)
+                    + [
+                        "--plan",
+                        str(plan_path),
+                        "--output",
+                        str(output_path),
+                        "--trace-output",
+                        str(memory_dir / "apply_trace.jsonl"),
+                        "--history-output",
+                        str(memory_dir / "apply_history.jsonl"),
+                        "--backup-dir",
+                        str(backup_dir),
+                        "--apply",
+                    ]
+                )
+
+                self.assertEqual(exit_code, 1)
+                self.assertIn("maintenance paths must be distinct", stderr)
+                self.assertIn("stage=artifact_validation", stderr)
+                self.assertEqual(store.path.read_bytes(), before)
+                self.assertIn("delete-tip", {entry.id for entry in store.all()})
+                self.assertFalse((memory_dir / "apply_trace.jsonl").exists())
+                self.assertFalse((memory_dir / "apply_history.jsonl").exists())
+                if alias_kind == "hardlink":
+                    self.assertEqual(backup_tmp.read_bytes(), sentinel)
+                else:
+                    self.assertFalse(backup_tmp.exists())
+
+    def test_store_tmp_and_history_lock_sidecars_cannot_be_cli_artifacts(self) -> None:
+        cases = ("output_store_tmp", "output_history_lock", "history_store_tmp")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                memory_dir = Path(tmp) / "memory"
+                store = self._add_invalidated_tip(memory_dir)
+                before = store.path.read_bytes()
+                store_tmp = store.path.with_suffix(store.path.suffix + ".tmp")
+                history = memory_dir / "maintenance_history.jsonl"
+                history_lock = history.with_name(f".{history.name}.lock")
+                args = self._base_args(memory_dir)
+                if case == "output_store_tmp":
+                    args += ["--output", str(store_tmp)]
+                elif case == "output_history_lock":
+                    args += ["--output", str(history_lock)]
+                else:
+                    args += ["--history-output", str(store_tmp), "--apply"]
+
+                exit_code, _, stderr = self._invoke(args)
+
+                self.assertEqual(exit_code, 1)
+                self.assertIn("maintenance paths must be distinct", stderr)
+                self.assertEqual(store.path.read_bytes(), before)
+                self.assertIn("delete-tip", {entry.id for entry in store.all()})
+                self.assertFalse(store_tmp.exists())
+                self.assertFalse(history_lock.exists())
 
     def test_reviewed_plan_alias_is_reused_without_rewrite(self) -> None:
         for alias_kind in ("direct", "symlink", "hardlink"):
