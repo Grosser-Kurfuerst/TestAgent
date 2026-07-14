@@ -5,6 +5,7 @@ import os
 import tempfile
 import threading
 import unittest
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -670,6 +671,44 @@ class MaintenanceApplyTests(unittest.TestCase):
                 ["intent", "completion", "audit_error", "audit_error"],
             )
 
+    def test_post_commit_audit_recorder_rejects_mismatched_result_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self._store(root)
+            store.add(_experience(
+                "delete-tip",
+                tier="tip",
+                content="Invalidated tip",
+                metadata={"maintenance_invalidated": True},
+            ))
+            plan = self._plan(store)
+            backup_dir, history_path = self._paths(root)
+            committed = apply_maintenance_plan(
+                store=store,
+                plan=plan,
+                backup_dir=backup_dir,
+                history_path=history_path,
+            )
+            original_history = history_path.read_bytes()
+
+            invalid_results = (
+                replace(committed, plan_id="maint-" + "0" * 24),
+                replace(committed, status=MaintenanceApplyStatus.NOOP),
+                replace(committed, should_retry=True),
+                replace(committed, before_revision="sha256:" + "0" * 64),
+            )
+            for invalid in invalid_results:
+                with self.subTest(result=invalid), self.assertRaises(ValueError):
+                    maintenance_transaction.record_post_commit_audit_error(
+                        history_path=history_path,
+                        plan=plan,
+                        result=invalid,
+                        stage="summary",
+                        error=OSError("summary unavailable"),
+                    )
+
+            self.assertEqual(history_path.read_bytes(), original_history)
+
     def test_post_commit_audit_error_uses_requested_history_lock_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -795,6 +834,49 @@ class MaintenanceApplyTests(unittest.TestCase):
             with patch.object(
                 store,
                 "_load_strict_snapshot_locked",
+                side_effect=fail_after_replace,
+            ):
+                result = apply_maintenance_plan(
+                    store=store,
+                    plan=plan,
+                    backup_dir=backup_dir,
+                    history_path=history_path,
+                )
+
+            self.assertEqual(
+                result.status,
+                MaintenanceApplyStatus.COMMITTED_WITH_AUDIT_ERROR,
+            )
+            self.assertTrue(result.mutation_committed)
+            self.assertFalse(result.should_retry)
+            self.assertEqual(result.audit_error_stage, "verify")
+            self.assertNotIn("delete-tip", {entry.id for entry in store.all()})
+
+    def test_post_replace_generation_failure_is_never_reported_pre_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self._store(root)
+            store.add(_experience(
+                "delete-tip",
+                tier="tip",
+                content="Invalidated tip",
+                metadata={"maintenance_invalidated": True},
+            ))
+            plan = self._plan(store)
+            backup_dir, history_path = self._paths(root)
+            original_generation = store._file_generation
+            calls = 0
+
+            def fail_after_replace():
+                nonlocal calls
+                calls += 1
+                if calls == 3:
+                    raise OSError("generation probe unavailable")
+                return original_generation()
+
+            with patch.object(
+                store,
+                "_file_generation",
                 side_effect=fail_after_replace,
             ):
                 result = apply_maintenance_plan(
@@ -1230,6 +1312,46 @@ class MaintenanceApplyTests(unittest.TestCase):
             self.assertFalse(result.mutation_committed)
             self.assertEqual(store.path.read_bytes(), before)
             self.assertFalse(backup_dir.exists())
+
+    def test_duplicate_history_json_keys_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self._store(root)
+            store.add(_experience(
+                "delete-tip",
+                tier="tip",
+                content="Invalidated tip",
+                metadata={"maintenance_invalidated": True},
+            ))
+            plan = self._plan(store)
+            backup_dir, history_path = self._paths(root)
+            committed = apply_maintenance_plan(
+                store=store,
+                plan=plan,
+                backup_dir=backup_dir,
+                history_path=history_path,
+            )
+            self.assertTrue(committed.mutation_committed)
+            committed_memory = store.path.read_bytes()
+            lines = history_path.read_text(encoding="utf-8").splitlines()
+            lines[1] = lines[1][:-1] + ', "mutation_committed": true}'
+            history_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+            repeated = apply_maintenance_plan(
+                store=store,
+                plan=plan,
+                backup_dir=backup_dir,
+                history_path=history_path,
+            )
+
+            self.assertEqual(
+                repeated.status,
+                MaintenanceApplyStatus.PRE_COMMIT_FAILED,
+            )
+            self.assertEqual(repeated.audit_error_stage, "history_load")
+            self.assertFalse(repeated.mutation_committed)
+            self.assertFalse(repeated.should_retry)
+            self.assertEqual(store.path.read_bytes(), committed_memory)
 
     def test_typed_history_corruption_fails_closed_during_history_load(self) -> None:
         corruptions = (

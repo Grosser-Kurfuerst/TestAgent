@@ -12,6 +12,7 @@ from typing import Any, Callable, Iterator, Sequence
 
 from filelock import FileLock, Timeout as FileLockTimeout
 
+from my_agent.json_safety import loads_json_strict
 from my_agent.memory.types import MemoryEntry, MemoryScope, content_fingerprint
 from my_agent.text_safety import sanitize_json_value
 
@@ -155,6 +156,9 @@ class LongTermMemoryStore:
                 self._loaded = True
                 try:
                     self._persist()
+                except MemoryStorePostCommitError:
+                    self._loaded_generation = None
+                    raise
                 except Exception:
                     self._entries = previous_entries
                     self._loaded = True
@@ -198,6 +202,9 @@ class LongTermMemoryStore:
                         try:
                             _validate_strict_entries(self._entries)
                             self._persist()
+                        except MemoryStorePostCommitError:
+                            self._loaded_generation = None
+                            raise
                         except Exception:
                             self._entries = snapshot
                             raise
@@ -208,6 +215,9 @@ class LongTermMemoryStore:
                 try:
                     _validate_strict_entries(self._entries)
                     self._persist()
+                except MemoryStorePostCommitError:
+                    self._loaded_generation = None
+                    raise
                 except Exception:
                     self._entries = snapshot
                     raise
@@ -267,6 +277,9 @@ class LongTermMemoryStore:
                 try:
                     _validate_strict_entries(self._entries)
                     self._persist()
+                except MemoryStorePostCommitError:
+                    self._loaded_generation = None
+                    raise
                 except Exception:
                     self._entries = snapshot
                     raise
@@ -290,6 +303,9 @@ class LongTermMemoryStore:
                     try:
                         _validate_strict_entries(self._entries)
                         self._persist()
+                    except MemoryStorePostCommitError:
+                        self._loaded_generation = None
+                        raise
                     except Exception:
                         self._entries = snapshot
                         raise
@@ -346,7 +362,7 @@ class LongTermMemoryStore:
             if not line:
                 continue
             try:
-                payload = json.loads(line)
+                payload = loads_json_strict(line)
                 if not isinstance(payload, dict):
                     raise TypeError("expected object")
                 content = str(payload.get("content") or "")
@@ -446,21 +462,40 @@ class LongTermMemoryStore:
 
     def _persist(self) -> None:
         tmp = _atomic_write_tmp_path(self.path)
+        expected_revision = ""
+        replaced = False
         try:
+            expected_revision = memory_entries_revision(self._entries)
             with tmp.open("w", encoding="utf-8") as file:
                 for entry in self._entries:
                     payload = sanitize_json_value(entry.to_dict())
-                    file.write(json.dumps(payload, ensure_ascii=False) + "\n")
+                    file.write(
+                        json.dumps(
+                            payload,
+                            ensure_ascii=False,
+                            allow_nan=False,
+                        )
+                        + "\n"
+                    )
                 file.flush()
                 os.fsync(file.fileno())
             tmp.replace(self.path)
+            replaced = True
             self._loaded_generation = self._file_generation()
+        except Exception as exc:
+            if replaced:
+                self._loaded_generation = None
+                raise MemoryStorePostCommitError(
+                    "memory replaced but post-commit finalization failed",
+                    expected_revision=expected_revision,
+                ) from exc
+            raise
         finally:
-            if tmp.exists():
-                try:
-                    tmp.unlink()
-                except OSError:
-                    pass
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                # Temp cleanup cannot change the commit status of the store.
+                pass
 
     def _trace(self, event: str, payload: dict[str, Any]) -> None:
         if self._trace_sink is not None:
@@ -554,6 +589,7 @@ def memory_entries_revision(entries: Sequence[MemoryEntry]) -> str:
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
+        allow_nan=False,
     )
     return f"sha256:{sha256(canonical.encode('utf-8')).hexdigest()}"
 

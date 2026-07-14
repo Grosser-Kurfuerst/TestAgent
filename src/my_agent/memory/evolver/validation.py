@@ -8,6 +8,7 @@ from typing import Any, Mapping, Sequence
 import json
 import math
 
+from my_agent.json_safety import loads_json_strict
 from my_agent.memory.evolver.contracts import (
     MAINTENANCE_POLICY,
     MaintenanceAction,
@@ -39,13 +40,40 @@ from my_agent.memory.evolver.types import (
 from my_agent.memory.types import MemoryEntry, MemoryScope
 
 
+_PLAN_FIELDS = frozenset({
+    "schema_version",
+    "policy",
+    "plan_id",
+    "repository_revision",
+    "scope_mode",
+    "memory_project_key",
+    "as_of",
+    "config",
+    "input_summary",
+    "operations",
+    "summary",
+})
+
+
 def parse_maintenance_plan(
     data: Mapping[str, Any],
     *,
     repository_entries: Sequence[MemoryEntry] | None = None,
 ) -> MaintenancePlan:
     """Parse a reviewed plan and apply the full available semantic contract."""
+    actual_fields = frozenset(data)
+    if actual_fields != _PLAN_FIELDS:
+        missing = sorted(_PLAN_FIELDS - actual_fields)
+        extra = sorted(actual_fields - _PLAN_FIELDS)
+        raise MaintenancePlanError(
+            "maintenance plan fields mismatch: "
+            f"missing={missing}, extra={extra}"
+        )
     plan = MaintenancePlan.from_dict(data)
+    if _canonical_json(data) != _canonical_json(plan.to_dict()):
+        raise MaintenancePlanError(
+            "maintenance plan must use canonical JSON field types and complete values"
+        )
     validate_plan_semantics(plan, repository_entries=repository_entries)
     return plan
 
@@ -57,9 +85,13 @@ def load_maintenance_plan(
 ) -> MaintenancePlan:
     source = Path(path)
     try:
-        payload = json.loads(source.read_text(encoding="utf-8"))
+        payload = loads_json_strict(source.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise MaintenancePlanError(f"invalid maintenance plan JSON: {exc.msg}") from exc
+    except ValueError as exc:
+        raise MaintenancePlanError(
+            f"invalid maintenance plan JSON: {type(exc).__name__}"
+        ) from exc
     if not isinstance(payload, dict):
         raise MaintenancePlanError("maintenance plan must be a JSON object")
     return parse_maintenance_plan(payload, repository_entries=repository_entries)
@@ -322,6 +354,19 @@ def _validate_promotion_action_semantics(
             raise MaintenancePlanError("promotion target does not match deterministic semantics")
     elif operation.reason_codes != ("promotion_linked_existing_skill",):
         raise MaintenancePlanError("existing promotion target has invalid reason codes")
+
+
+def _canonical_json(payload: Mapping[str, Any]) -> str:
+    try:
+        return json.dumps(
+            dict(payload),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise MaintenancePlanError("maintenance plan must contain canonical JSON values") from exc
 
 
 __all__ = [

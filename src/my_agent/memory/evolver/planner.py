@@ -9,6 +9,7 @@ from typing import Any, Collection, Mapping, Sequence
 import json
 import math
 
+from my_agent.json_safety import loads_json_strict
 from my_agent.memory.evolver.attribution import MemoryAttributionRecord
 from my_agent.memory.evolver.contracts import (
     AttributionKey,
@@ -52,6 +53,7 @@ from my_agent.memory.types import (
 )
 from my_agent.text_safety import sanitize_json_value
 
+
 def load_project_attribution(
     path: str | Path,
     *,
@@ -68,7 +70,7 @@ def load_project_attribution(
             if not line:
                 continue
             try:
-                payload = json.loads(line)
+                payload = loads_json_strict(line)
                 if not isinstance(payload, dict):
                     raise TypeError("expected object")
                 record = MemoryAttributionRecord.from_dict(payload)
@@ -97,12 +99,54 @@ def _validate_attribution_record(
     *,
     line_no: int,
 ) -> None:
+    for name in ("memory_id", "tier", "memory_project_key"):
+        raw = payload.get(name)
+        if not isinstance(raw, str) or not raw:
+            raise MaintenanceAttributionError(
+                f"{name} must be a non-empty string at line {line_no}"
+            )
     for name in ("candidate_count", "selected_count", "not_selected_count"):
         raw = payload.get(name, 0)
         if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
             raise MaintenanceAttributionError(
                 f"{name} must be a non-negative integer at line {line_no}"
             )
+    for name in ("value", "confidence"):
+        _validate_attribution_number(
+            payload.get(name),
+            name=name,
+            line_no=line_no,
+        )
+    for name in (
+        "success_when_selected",
+        "success_when_candidate_not_selected",
+        "reward_when_selected",
+        "reward_when_candidate_not_selected",
+    ):
+        raw = payload.get(name)
+        if raw is not None:
+            _validate_attribution_number(raw, name=name, line_no=line_no)
+    raw_last_used = payload.get("last_used", "")
+    if not isinstance(raw_last_used, str):
+        raise MaintenanceAttributionError(
+            f"last_used must be a string at line {line_no}"
+        )
+    _validate_attribution_record_domain(record, context=f"at line {line_no}")
+
+
+def _validate_attribution_record_domain(
+    record: MemoryAttributionRecord,
+    *,
+    context: str,
+) -> None:
+    if not isinstance(record.memory_id, str) or not record.memory_id:
+        raise MaintenanceAttributionError(f"memory_id must be a non-empty string {context}")
+    if _valid_tier(record.tier) is None:
+        raise MaintenanceAttributionError(f"tier is invalid {context}")
+    if not isinstance(record.memory_project_key, str) or not record.memory_project_key:
+        raise MaintenanceAttributionError(
+            f"memory_project_key must be a non-empty string {context}"
+        )
     try:
         _validate_evidence_values(
             value=record.value,
@@ -116,10 +160,10 @@ def _validate_attribution_record(
         )
     except MaintenancePlanError as exc:
         raise MaintenanceAttributionError(
-            f"invalid attribution evidence at line {line_no}: {exc}"
+            f"invalid attribution evidence {context}: {exc}"
         ) from exc
 
-    finite_values = {
+    optional_values = {
         "success_when_selected": record.success_when_selected,
         "success_when_candidate_not_selected": (
             record.success_when_candidate_not_selected
@@ -129,11 +173,9 @@ def _validate_attribution_record(
             record.reward_when_candidate_not_selected
         ),
     }
-    for name, value in finite_values.items():
-        if value is not None and not math.isfinite(float(value)):
-            raise MaintenanceAttributionError(
-                f"{name} must be finite at line {line_no}"
-            )
+    for name, value in optional_values.items():
+        if value is not None:
+            _validate_attribution_number(value, name=name, context=context)
     for name, value in (
         ("success_when_selected", record.success_when_selected),
         (
@@ -143,7 +185,59 @@ def _validate_attribution_record(
     ):
         if value is not None and not 0.0 <= value <= 1.0:
             raise MaintenanceAttributionError(
-                f"{name} is out of range at line {line_no}"
+                f"{name} is out of range {context}"
+            )
+
+
+def _validate_attribution_number(
+    value: Any,
+    *,
+    name: str,
+    line_no: int | None = None,
+    context: str = "",
+) -> None:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+    ):
+        location = context or f"at line {line_no}"
+        raise MaintenanceAttributionError(
+            f"{name} must be a finite JSON number {location}"
+        )
+
+
+def _validate_attribution_mapping(
+    attribution: Mapping[AttributionKey, MemoryAttributionRecord],
+    *,
+    project_key: str,
+) -> None:
+    for key, record in attribution.items():
+        if (
+            not isinstance(key, tuple)
+            or len(key) != 3
+            or any(not isinstance(item, str) or not item for item in key)
+        ):
+            raise MaintenanceAttributionError(
+                "attribution keys must be non-empty (memory_id, tier, project_key) strings"
+            )
+        if not isinstance(record, MemoryAttributionRecord):
+            raise MaintenanceAttributionError(
+                f"attribution value must be MemoryAttributionRecord for key {key!r}"
+            )
+        _validate_attribution_record_domain(record, context=f"for key {key!r}")
+        expected_key = (
+            record.memory_id,
+            record.tier,
+            record.memory_project_key,
+        )
+        if key != expected_key:
+            raise MaintenanceAttributionError(
+                f"attribution key does not match record identity: {key!r}"
+            )
+        if record.memory_project_key != project_key:
+            raise MaintenanceAttributionError(
+                f"attribution record crosses project boundary: {key!r}"
             )
 
 
@@ -154,6 +248,20 @@ def maintenance_evidence_for_entry(
     project_key: str,
 ) -> MaintenanceEvidence:
     """Resolve attribution and writer evidence for one experience entry."""
+    _validate_attribution_mapping(attribution, project_key=project_key)
+    return _maintenance_evidence_for_entry(
+        entry,
+        attribution=attribution,
+        project_key=project_key,
+    )
+
+
+def _maintenance_evidence_for_entry(
+    entry: MemoryEntry,
+    *,
+    attribution: Mapping[AttributionKey, MemoryAttributionRecord],
+    project_key: str,
+) -> MaintenanceEvidence:
     tier = experience_tier(entry)
     if tier is None:
         raise ValueError("maintenance evidence requires an experience entry")
@@ -340,12 +448,13 @@ def _build_maintenance_plan(
         raise ValueError("repository_revision must not be empty")
     as_of_utc = _require_aware_datetime(as_of, "as_of").astimezone(timezone.utc)
     cfg = config or MaintenanceConfig()
+    _validate_attribution_mapping(attribution, project_key=project_key)
 
     evidence_by_id: dict[str, MaintenanceEvidence] = {}
     for entry in entries:
         if experience_tier(entry) is None or not _entry_visible_to_project(entry, project_key):
             continue
-        evidence_by_id[entry.id] = maintenance_evidence_for_entry(
+        evidence_by_id[entry.id] = _maintenance_evidence_for_entry(
             entry,
             attribution=attribution,
             project_key=project_key,

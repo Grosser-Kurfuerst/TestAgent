@@ -25,6 +25,13 @@ MAINTENANCE_SCHEMA_VERSION = 1
 MAINTENANCE_POLICY = "rule_attribution_redundancy_v1"
 MAINTENANCE_SCOPE_MODE = "single_project"
 
+_INPUT_SUMMARY_FIELDS = frozenset({
+    "entries_total",
+    "experiences_considered",
+    "missing_attribution",
+    "sources_removed_before_promotion",
+})
+
 AttributionKey = tuple[str, str, str]
 
 
@@ -328,7 +335,18 @@ class MaintenancePlan:
         if len(operation_ids) != len(set(operation_ids)):
             raise MaintenancePlanError("operation_id values must be unique within a plan")
 
-        if self.summary != _operation_summary(self.operations):
+        _validate_nonnegative_int_mapping(
+            self.input_summary,
+            expected_fields=_INPUT_SUMMARY_FIELDS,
+            name="plan input_summary",
+        )
+        expected_summary = _operation_summary(self.operations)
+        _validate_nonnegative_int_mapping(
+            self.summary,
+            expected_fields=frozenset(expected_summary),
+            name="plan summary",
+        )
+        if self.summary != expected_summary:
             raise MaintenancePlanError("plan summary does not match its operations")
         expected_plan_id = _plan_id(
             repository_revision=self.repository_revision,
@@ -365,7 +383,7 @@ class MaintenancePlan:
             raise MaintenancePlanError("operations must be an array")
         config = MaintenanceConfig.from_dict(_require_mapping(data.get("config"), "config"))
         return cls(
-            schema_version=_as_int(data.get("schema_version")),
+            schema_version=_required_int(data.get("schema_version"), "schema_version"),
             policy=str(data.get("policy") or ""),
             plan_id=str(data.get("plan_id") or ""),
             repository_revision=str(data.get("repository_revision") or ""),
@@ -626,6 +644,29 @@ def _validate_non_negative_int(name: str, value: Any) -> None:
         raise ValueError(f"{name} must be a non-negative integer")
 
 
+def _validate_nonnegative_int_mapping(
+    payload: Mapping[str, Any],
+    *,
+    expected_fields: frozenset[str],
+    name: str,
+) -> None:
+    if not isinstance(payload, Mapping):
+        raise MaintenancePlanError(f"{name} must be an object")
+    actual_fields = frozenset(payload)
+    if actual_fields != expected_fields:
+        missing = sorted(expected_fields - actual_fields)
+        extra = sorted(actual_fields - expected_fields)
+        raise MaintenancePlanError(
+            f"{name} fields mismatch: missing={missing}, extra={extra}"
+        )
+    for field_name in sorted(expected_fields):
+        value = payload[field_name]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise MaintenancePlanError(
+                f"{name}.{field_name} must be a non-negative integer"
+            )
+
+
 def _validate_positive_int(name: str, value: Any) -> None:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"{name} must be a positive integer")
@@ -710,32 +751,35 @@ def _evidence_bool(value: Any) -> bool:
 
 
 def _as_float(value: Any) -> float:
-    if value is None or value == "":
-        return 0.0
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return 0.0
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise MaintenancePlanError("operation redundancy_score must be numeric")
+    result = float(value)
+    if not math.isfinite(result):
+        raise MaintenancePlanError("operation redundancy_score must be finite")
+    return result
 
 
-def _as_int(value: Any) -> int:
-    if value is None or value == "":
-        return 0
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return 0
+def _required_int(value: Any, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise MaintenancePlanError(f"{name} must be an integer")
+    return value
 
 
 def _string_tuple(value: Any) -> tuple[str, ...]:
-    if not isinstance(value, (list, tuple)):
+    if value is None:
         return ()
-    return tuple(str(item) for item in value)
+    if not isinstance(value, (list, tuple)):
+        raise MaintenancePlanError("operation string arrays must be arrays")
+    if any(not isinstance(item, str) for item in value):
+        raise MaintenancePlanError("operation string arrays must contain strings")
+    return tuple(value)
 
 
 def _mapping_tuple(value: Any) -> tuple[dict[str, Any], ...]:
-    if not isinstance(value, (list, tuple)):
+    if value is None:
         return ()
+    if not isinstance(value, (list, tuple)):
+        raise MaintenancePlanError("operation mapping fields must be arrays")
     result: list[dict[str, Any]] = []
     for item in value:
         if not isinstance(item, Mapping):

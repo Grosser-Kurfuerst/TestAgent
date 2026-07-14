@@ -192,6 +192,9 @@ class StrictSnapshotTests(unittest.TestCase):
             "forged-fingerprint": (
                 json.dumps({**first, "fingerprint": "f" * 64}) + "\n"
             ).encode(),
+            "duplicate-json-key": (
+                json.dumps(first)[:-1] + ', "id": "hidden-id"}\n'
+            ).encode(),
         }
         for name, raw in cases.items():
             with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
@@ -218,6 +221,46 @@ class StrictSnapshotTests(unittest.TestCase):
                 content_fingerprint("legacy fact"),
             )
             self.assertEqual(snapshot.raw_bytes, path.read_bytes())
+
+    def test_non_finite_metadata_is_rejected_before_persist(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = LongTermMemoryStore.from_dir(tmp)
+            baseline = _fact("baseline", "baseline fact")
+            store.add(baseline)
+            before = store.path.read_bytes()
+            invalid = replace(
+                _fact("invalid", "invalid numeric metadata"),
+                metadata={"score": float("nan")},
+            )
+
+            with self.assertRaises(ValueError):
+                store.add(invalid)
+            with self.assertRaises(ValueError):
+                memory_entries_revision([invalid])
+
+            self.assertEqual(store.path.read_bytes(), before)
+            self.assertEqual([entry.id for entry in store.all()], ["baseline"])
+
+    def test_temp_cleanup_failure_does_not_change_committed_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = LongTermMemoryStore.from_dir(tmp)
+            original_unlink = Path.unlink
+
+            def fail_tmp_cleanup(path: Path, *args, **kwargs):
+                if path.name.endswith(".tmp"):
+                    raise OSError("cleanup unavailable")
+                return original_unlink(path, *args, **kwargs)
+
+            with patch.object(Path, "unlink", new=fail_tmp_cleanup):
+                stored, created = store.add(_fact("committed", "committed fact"))
+
+            self.assertTrue(created)
+            self.assertEqual(stored.id, "committed")
+            self.assertEqual([entry.id for entry in store.all()], ["committed"])
+            self.assertEqual(
+                [entry.id for entry in LongTermMemoryStore(store.path).all()],
+                ["committed"],
+            )
 
     def test_revision_covers_every_persisted_field(self) -> None:
         base = _fact("base", "base content")

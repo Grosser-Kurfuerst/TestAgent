@@ -13,6 +13,7 @@ import os
 
 from filelock import FileLock, Timeout as FileLockTimeout
 
+from my_agent.json_safety import loads_json_strict
 from my_agent.memory.evolver.artifacts import (
     _MaintenanceArtifactGraph,
     _artifact_paths_alias,
@@ -438,8 +439,19 @@ def record_post_commit_audit_error(
     lock_timeout_seconds: float = _HISTORY_LOCK_TIMEOUT_SECONDS,
 ) -> MaintenanceApplyResult:
     """Record a post-commit sink failure without making mutation retryable."""
+    if result.plan_id != plan.plan_id:
+        raise ValueError("post-commit audit result does not match plan")
     if not result.mutation_committed:
         raise ValueError("post-commit audit errors require a committed mutation")
+    if result.status not in {
+        MaintenanceApplyStatus.COMMITTED,
+        MaintenanceApplyStatus.COMMITTED_WITH_AUDIT_ERROR,
+    }:
+        raise ValueError("post-commit audit result must have a committed status")
+    if result.should_retry:
+        raise ValueError("post-commit audit result cannot be retryable")
+    if result.before_revision != plan.repository_revision:
+        raise ValueError("post-commit audit result revision does not match plan")
     if not str(stage or ""):
         raise ValueError("post-commit audit error stage must not be empty")
     updated = replace(
@@ -1082,10 +1094,10 @@ def _load_maintenance_history_state(
                     if not line:
                         continue
                     try:
-                        payload = json.loads(line)
+                        payload = loads_json_strict(line)
                         if not isinstance(payload, dict):
                             raise TypeError("expected object")
-                    except (TypeError, json.JSONDecodeError) as exc:
+                    except (TypeError, ValueError) as exc:
                         raise MaintenancePlanError(
                             f"invalid maintenance history at line {line_no}: "
                             f"{type(exc).__name__}"

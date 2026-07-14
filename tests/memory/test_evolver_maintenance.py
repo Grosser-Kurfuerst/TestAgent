@@ -246,7 +246,10 @@ class ProjectAttributionLoaderTests(unittest.TestCase):
     def test_invalid_numeric_and_timestamp_semantics_fail_closed(self) -> None:
         invalid_cases = {
             "non_finite_value": {"value": float("nan")},
+            "string_value": {"value": "-0.2"},
+            "boolean_confidence": {"confidence": True},
             "confidence_out_of_range": {"confidence": 2.0},
+            "string_success_rate": {"success_when_selected": "0.5"},
             "success_rate_out_of_range": {"success_when_selected": -0.1},
             "negative_count": {"selected_count": -1},
             "inconsistent_counts": {
@@ -255,6 +258,8 @@ class ProjectAttributionLoaderTests(unittest.TestCase):
                 "not_selected_count": 4,
             },
             "invalid_last_used": {"last_used": "not-a-timestamp"},
+            "numeric_last_used": {"last_used": 123},
+            "numeric_memory_id": {"memory_id": 123},
         }
         for case, updates in invalid_cases.items():
             with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
@@ -265,6 +270,16 @@ class ProjectAttributionLoaderTests(unittest.TestCase):
 
                 with self.assertRaises(MaintenanceAttributionError):
                     load_project_attribution(path, memory_project_key=PROJECT_KEY)
+
+    def test_duplicate_json_keys_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "attribution.jsonl"
+            encoded = json.dumps(_record().to_dict())
+            duplicate = encoded[:-1] + ', "value": -0.9}'
+            self._write(path, [duplicate])
+
+            with self.assertRaises(MaintenanceAttributionError):
+                load_project_attribution(path, memory_project_key=PROJECT_KEY)
 
 
 class MaintenanceEvidenceTests(unittest.TestCase):
@@ -340,18 +355,25 @@ class MaintenanceEvidenceTests(unittest.TestCase):
                 self.assertEqual(evidence.candidate_count, 0)
                 self.assertEqual(evidence.writer_confidence, 0.8)
 
-    def test_explicit_record_payload_must_match_composite_mapping_key(self) -> None:
+    def test_explicit_record_payload_mismatch_fails_closed(self) -> None:
         entry = _entry()
         wrong_record = _record(project_key="other-project")
 
-        evidence = maintenance_evidence_for_entry(
-            entry,
-            attribution={(entry.id, "skill", PROJECT_KEY): wrong_record},
-            project_key=PROJECT_KEY,
-        )
+        with self.assertRaises(MaintenanceAttributionError):
+            maintenance_evidence_for_entry(
+                entry,
+                attribution={(entry.id, "skill", PROJECT_KEY): wrong_record},
+                project_key=PROJECT_KEY,
+            )
 
-        self.assertFalse(evidence.has_attribution)
-        self.assertEqual(evidence.value, 0.0)
+        with self.assertRaises(MaintenanceAttributionError):
+            build_maintenance_plan(
+                entries=[entry],
+                attribution={(entry.id, "skill", PROJECT_KEY): wrong_record},
+                repository_revision="sha256:identity-mismatch",
+                project_key=PROJECT_KEY,
+                as_of=NOW,
+            )
 
     def test_invalid_metadata_attribution_fails_closed(self) -> None:
         invalid_cases = {
@@ -1242,6 +1264,22 @@ class MaintenancePlanContractTests(unittest.TestCase):
             self.assertEqual(load_maintenance_plan(first), plan)
             self.assertEqual(first.read_text(encoding="utf-8"), maintenance_plan_json(plan))
 
+    def test_plan_file_rejects_duplicate_json_keys(self) -> None:
+        plan = self._plan()
+        text = maintenance_plan_json(plan)
+        duplicate = text.replace(
+            '  "schema_version": 1,\n',
+            '  "schema_version": 999,\n  "schema_version": 1,\n',
+            1,
+        )
+        self.assertNotEqual(duplicate, text)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "plan.json"
+            path.write_text(duplicate, encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "invalid maintenance plan JSON"):
+                load_maintenance_plan(path)
+
     def test_partial_config_is_normalized_before_round_trip(self) -> None:
         plan = self._plan()
         normalized_config = MaintenanceConfig(delete_value_threshold=-0.2).to_dict()
@@ -1338,6 +1376,29 @@ class MaintenancePlanContractTests(unittest.TestCase):
         _refresh_plan_id(payload)
         with self.assertRaisesRegex(ValueError, "summary does not match"):
             MaintenancePlan.from_dict(payload)
+
+    def test_reviewed_plan_rejects_noncanonical_types_and_unknown_fields(self) -> None:
+        schema_boolean = self._plan().to_dict()
+        schema_boolean["schema_version"] = True
+        with self.assertRaisesRegex(ValueError, "schema_version must be an integer"):
+            maintenance_validation.parse_maintenance_plan(schema_boolean)
+
+        summary_boolean = self._plan().to_dict()
+        summary_boolean["summary"]["keep"] = True
+        _refresh_plan_id(summary_boolean)
+        with self.assertRaisesRegex(ValueError, "plan summary.keep"):
+            maintenance_validation.parse_maintenance_plan(summary_boolean)
+
+        input_boolean = self._plan().to_dict()
+        input_boolean["input_summary"]["entries_total"] = True
+        _refresh_plan_id(input_boolean)
+        with self.assertRaisesRegex(ValueError, "plan input_summary.entries_total"):
+            maintenance_validation.parse_maintenance_plan(input_boolean)
+
+        extra_field = self._plan().to_dict()
+        extra_field["unreviewed_extension"] = {"enabled": True}
+        with self.assertRaisesRegex(ValueError, "fields mismatch"):
+            maintenance_validation.parse_maintenance_plan(extra_field)
 
     def test_reviewed_plan_rejects_invalid_evidence_domain_values(self) -> None:
         payload = self._plan().to_dict()
