@@ -19,6 +19,7 @@ add_src_to_path()
 
 from my_agent.cli import build_parser, main
 from my_agent.cli import memory_maintenance as maintenance_cli
+import my_agent.memory.evolver.transaction as maintenance_transaction
 from my_agent.memory.evolver import (
     ExperienceCreatedBy,
     MaintenanceApplyResult,
@@ -701,6 +702,69 @@ class MaintenanceCliTests(unittest.TestCase):
             )
             self.assertEqual(exit_code, 1)
             self.assertIn("stage=validation", stderr)
+
+    def test_typed_history_corruption_is_reported_as_history_load_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            memory_dir = Path(tmp) / "memory"
+            store = self._add_invalidated_tip(memory_dir)
+            plan_path = memory_dir / "reviewed_plan.json"
+            self.assertEqual(
+                self._invoke(
+                    self._base_args(memory_dir) + ["--output", str(plan_path)]
+                )[0],
+                0,
+            )
+            plan = load_maintenance_plan(plan_path)
+            snapshot = store.load_strict_snapshot()
+            backup_dir = memory_dir / "maintenance_backups"
+            backup_path = maintenance_transaction._maintenance_backup_path(
+                backup_dir,
+                plan.plan_id,
+            )
+            committed = maintenance_transaction._maintenance_apply_result(
+                plan=plan,
+                status=MaintenanceApplyStatus.COMMITTED,
+                mutation_committed=True,
+                audit_complete=True,
+                should_retry=False,
+                before_revision=snapshot.revision,
+                after_revision="sha256:" + "0" * 64,
+                before_count=1,
+                after_count=0,
+                removed_ids=("delete-tip",),
+                backup_path=str(backup_path),
+            )
+            record = maintenance_transaction._completion_history_record(
+                plan,
+                committed,
+            )
+            record["mutation_committed"] = "false"
+            record["result"]["mutation_committed"] = "false"
+            history_path = memory_dir / "maintenance_history.jsonl"
+            history_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+            exit_code, _, stderr = self._invoke(
+                self._base_args(memory_dir)
+                + [
+                    "--plan",
+                    str(plan_path),
+                    "--output",
+                    str(plan_path),
+                    "--apply",
+                ]
+            )
+
+            self.assertEqual(exit_code, 1)
+            self.assertIn("stage=history_load", stderr)
+            summary = json.loads(
+                Path(str(plan_path) + ".summary.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(summary["status"], "pre_commit_failed")
+            self.assertEqual(summary["audit_error_stage"], "history_load")
+            self.assertFalse(summary["mutation_committed"])
+            self.assertFalse(summary["should_retry"])
+            self.assertIn("delete-tip", {entry.id for entry in store.all()})
+            self.assertFalse(backup_path.exists())
 
     def test_reviewed_plan_schema_error_and_explicit_missing_attribution_fail(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

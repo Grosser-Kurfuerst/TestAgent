@@ -1231,6 +1231,99 @@ class MaintenanceApplyTests(unittest.TestCase):
             self.assertEqual(store.path.read_bytes(), before)
             self.assertFalse(backup_dir.exists())
 
+    def test_typed_history_corruption_fails_closed_during_history_load(self) -> None:
+        corruptions = (
+            (
+                "string_boolean",
+                lambda record: (
+                    record.__setitem__("mutation_committed", "false"),
+                    record["result"].__setitem__("mutation_committed", "false"),
+                ),
+            ),
+            (
+                "string_count",
+                lambda record: record["result"].__setitem__("before_count", "1"),
+            ),
+            (
+                "invalid_revision",
+                lambda record: record.__setitem__("after_revision", 7),
+            ),
+            (
+                "contradictory_status",
+                lambda record: (
+                    record.__setitem__("mutation_committed", False),
+                    record["result"].__setitem__("mutation_committed", False),
+                ),
+            ),
+            (
+                "non_string_id",
+                lambda record: record["result"].__setitem__("removed_ids", [1]),
+            ),
+            (
+                "unexpected_field",
+                lambda record: record.__setitem__("task", "sensitive input"),
+            ),
+        )
+        for name, corrupt in corruptions:
+            with self.subTest(case=name), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                store = self._store(root)
+                store.add(_experience(
+                    "delete-tip",
+                    tier="tip",
+                    content="Invalidated tip",
+                    metadata={"maintenance_invalidated": True},
+                ))
+                plan = self._plan(store)
+                snapshot = store.load_strict_snapshot()
+                before = store.path.read_bytes()
+                backup_dir, history_path = self._paths(root)
+                backup_path = maintenance_transaction._maintenance_backup_path(
+                    backup_dir,
+                    plan.plan_id,
+                )
+                committed = maintenance_transaction._maintenance_apply_result(
+                    plan=plan,
+                    status=MaintenanceApplyStatus.COMMITTED,
+                    mutation_committed=True,
+                    audit_complete=True,
+                    should_retry=False,
+                    before_revision=snapshot.revision,
+                    after_revision="sha256:" + "0" * 64,
+                    before_count=1,
+                    after_count=0,
+                    removed_ids=("delete-tip",),
+                    backup_path=str(backup_path),
+                )
+                record = maintenance_transaction._completion_history_record(
+                    plan,
+                    committed,
+                )
+                corrupt(record)
+                history_path.write_text(
+                    json.dumps(record) + "\n",
+                    encoding="utf-8",
+                )
+
+                result = apply_maintenance_plan(
+                    store=store,
+                    plan=plan,
+                    backup_dir=backup_dir,
+                    history_path=history_path,
+                )
+
+                self.assertEqual(
+                    result.status,
+                    MaintenanceApplyStatus.PRE_COMMIT_FAILED,
+                )
+                self.assertEqual(result.audit_error_stage, "history_load")
+                self.assertEqual(result.audit_error, "MaintenancePlanError")
+                self.assertFalse(result.should_retry)
+                self.assertFalse(result.mutation_committed)
+                self.assertEqual(store.path.read_bytes(), before)
+                self.assertIn("delete-tip", {entry.id for entry in store.all()})
+                self.assertFalse(backup_path.exists())
+
     def test_apply_lock_timeout_must_be_finite(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
