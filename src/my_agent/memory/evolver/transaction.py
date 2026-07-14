@@ -510,8 +510,6 @@ def _load_maintenance_history_state(
 ) -> _MaintenanceHistoryState:
     _validate_history_lock_timeout(lock_timeout_seconds)
     source = Path(path)
-    if not source.exists():
-        return _MaintenanceHistoryState()
     intent: dict[str, Any] | None = None
     completion: dict[str, Any] | None = None
     audit_error: dict[str, Any] | None = None

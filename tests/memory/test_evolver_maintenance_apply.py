@@ -1085,6 +1085,78 @@ class MaintenanceApplyTests(unittest.TestCase):
             self.assertFalse(backup_dir.exists())
             self.assertEqual(history_path.read_bytes(), b"")
 
+    def test_missing_history_lock_timeout_precedes_mutation_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self._store(root)
+            store.add(_experience(
+                "delete-tip",
+                tier="tip",
+                content="Invalidated tip",
+                metadata={"maintenance_invalidated": True},
+            ))
+            plan = self._plan(store)
+            before = store.path.read_bytes()
+            backup_dir, history_path = self._paths(root)
+            history_lock = FileLock(
+                str(maintenance_transaction._history_lock_path(history_path))
+            )
+
+            with history_lock:
+                result = apply_maintenance_plan(
+                    store=store,
+                    plan=plan,
+                    backup_dir=backup_dir,
+                    history_path=history_path,
+                    lock_timeout_seconds=0.05,
+                )
+
+            self.assertEqual(result.status, MaintenanceApplyStatus.PRE_COMMIT_FAILED)
+            self.assertEqual(result.audit_error_stage, "history_lock")
+            self.assertEqual(result.audit_error, "MaintenanceHistoryLockTimeout")
+            self.assertTrue(result.should_retry)
+            self.assertFalse(result.mutation_committed)
+            self.assertEqual(store.path.read_bytes(), before)
+            self.assertFalse(history_path.exists())
+            self.assertFalse(backup_dir.exists())
+
+    def test_missing_history_lock_timeout_precedes_noop_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self._store(root)
+            store.add(build_experience_entry(
+                id="manual-skill",
+                content="Manually protected skill",
+                tier="skill",
+                project_key=PROJECT_KEY,
+                created_at=NOW,
+                created_by=ExperienceCreatedBy.MANUAL,
+            ))
+            plan = self._plan(store)
+            before = store.path.read_bytes()
+            backup_dir, history_path = self._paths(root)
+            history_lock = FileLock(
+                str(maintenance_transaction._history_lock_path(history_path))
+            )
+
+            with history_lock:
+                result = apply_maintenance_plan(
+                    store=store,
+                    plan=plan,
+                    backup_dir=backup_dir,
+                    history_path=history_path,
+                    lock_timeout_seconds=0.05,
+                )
+
+            self.assertEqual(result.status, MaintenanceApplyStatus.PRE_COMMIT_FAILED)
+            self.assertEqual(result.audit_error_stage, "history_lock")
+            self.assertEqual(result.audit_error, "MaintenanceHistoryLockTimeout")
+            self.assertTrue(result.should_retry)
+            self.assertFalse(result.mutation_committed)
+            self.assertEqual(store.path.read_bytes(), before)
+            self.assertFalse(history_path.exists())
+            self.assertFalse(backup_dir.exists())
+
     def test_invalid_history_is_nonretryable_history_load_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
