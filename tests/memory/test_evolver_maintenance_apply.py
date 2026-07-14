@@ -669,6 +669,48 @@ class MaintenanceApplyTests(unittest.TestCase):
                 ["intent", "completion", "audit_error", "audit_error"],
             )
 
+    def test_post_commit_audit_error_uses_requested_history_lock_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self._store(root)
+            store.add(_experience(
+                "delete-tip",
+                tier="tip",
+                content="Invalidated tip",
+                metadata={"maintenance_invalidated": True},
+            ))
+            plan = self._plan(store)
+            backup_dir, history_path = self._paths(root)
+            committed = apply_maintenance_plan(
+                store=store,
+                plan=plan,
+                backup_dir=backup_dir,
+                history_path=history_path,
+            )
+
+            with patch.object(
+                maintenance_transaction,
+                "_best_effort_history",
+            ) as best_effort_history:
+                updated = maintenance_transaction.record_post_commit_audit_error(
+                    history_path=history_path,
+                    plan=plan,
+                    result=committed,
+                    stage="summary",
+                    error=OSError("summary unavailable"),
+                    lock_timeout_seconds=0.05,
+                )
+
+            self.assertEqual(
+                updated.status,
+                MaintenanceApplyStatus.COMMITTED_WITH_AUDIT_ERROR,
+            )
+            self.assertFalse(updated.should_retry)
+            self.assertEqual(
+                best_effort_history.call_args.kwargs["lock_timeout_seconds"],
+                0.05,
+            )
+
     def test_concurrent_audit_finalizers_append_complete_events(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

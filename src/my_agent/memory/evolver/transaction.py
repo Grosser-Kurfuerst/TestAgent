@@ -414,6 +414,7 @@ def record_post_commit_audit_error(
     result: MaintenanceApplyResult,
     stage: str,
     error: Exception,
+    lock_timeout_seconds: float = _HISTORY_LOCK_TIMEOUT_SECONDS,
 ) -> MaintenanceApplyResult:
     """Record a post-commit sink failure without making mutation retryable."""
     if not result.mutation_committed:
@@ -431,6 +432,7 @@ def record_post_commit_audit_error(
     _best_effort_history(
         history_path,
         _audit_error_history_record(plan, updated),
+        lock_timeout_seconds=lock_timeout_seconds,
     )
     return updated
 

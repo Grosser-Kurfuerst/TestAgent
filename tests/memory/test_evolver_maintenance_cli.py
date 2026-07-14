@@ -983,6 +983,53 @@ class MaintenanceCliTests(unittest.TestCase):
             self.assertEqual(history[-1]["status"], "committed_with_audit_error")
             self.assertEqual(history[-1]["audit_error_stage"], "summary")
 
+    def test_post_commit_finalizer_uses_cli_lock_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            memory_dir = Path(tmp) / "memory"
+            self._add_invalidated_tip(memory_dir)
+            plan_path = memory_dir / "reviewed_plan.json"
+            self.assertEqual(
+                self._invoke(
+                    self._base_args(memory_dir) + ["--output", str(plan_path)]
+                )[0],
+                0,
+            )
+            original_record = maintenance_cli.record_post_commit_audit_error
+            observed_timeouts: list[float] = []
+
+            def record_with_timeout(**kwargs):
+                observed_timeouts.append(kwargs["lock_timeout_seconds"])
+                return original_record(**kwargs)
+
+            with (
+                patch.object(
+                    maintenance_cli,
+                    "_write_summary",
+                    side_effect=OSError("summary unavailable"),
+                ),
+                patch.object(
+                    maintenance_cli,
+                    "record_post_commit_audit_error",
+                    side_effect=record_with_timeout,
+                ),
+            ):
+                exit_code, _, stderr = self._invoke(
+                    self._base_args(memory_dir)
+                    + [
+                        "--plan",
+                        str(plan_path),
+                        "--output",
+                        str(plan_path),
+                        "--lock-timeout-seconds",
+                        "0.05",
+                        "--apply",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0)
+            self.assertIn("DO NOT RETRY", stderr)
+            self.assertEqual(observed_timeouts, [0.05])
+
     def test_unexpected_post_commit_helpers_use_independent_emergency_finalizer(self) -> None:
         for helper_name in ("_summary_for_apply", "_render_summary"):
             with self.subTest(helper=helper_name), tempfile.TemporaryDirectory() as tmp:

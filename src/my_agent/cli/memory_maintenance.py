@@ -39,6 +39,7 @@ def run_maintenance_command(args: argparse.Namespace) -> int:
         mode="apply" if bool(args.apply) else "dry_run",
         project_key=str(args.memory_project_key),
         paths=paths,
+        lock_timeout_seconds=float(args.lock_timeout_seconds),
     )
     try:
         return _run_maintenance(args, state)
@@ -74,6 +75,7 @@ class _CommandState:
     mode: str
     project_key: str
     paths: _MaintenancePaths
+    lock_timeout_seconds: float
     stage: str = "validation"
     plan: MaintenancePlan | None = None
     paths_validated: bool = False
@@ -641,6 +643,7 @@ def _record_post_commit_failure(
         result=result,
         stage=stage,
         error=error,
+        lock_timeout_seconds=state.lock_timeout_seconds,
     )
     state.apply_result = updated
     return updated
