@@ -8,14 +8,26 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from my_agent.memory.evolver.types import ExperienceTier, normalize_experience_tier
-from my_agent.memory.types import MemoryEntry
+from my_agent.memory.evolver.serialization import (
+    experience_payload_from_dict,
+    experience_payload_to_dict,
+)
+from my_agent.memory.evolver.types import (
+    ExperienceMemory,
+    ExperiencePayload,
+    ExperienceTier,
+    ExperienceTrajectoryStep,
+    SkillPayload,
+    TipPayload,
+    ToolPayload,
+    TrajectoryPayload,
+    normalize_experience_tier,
+)
 from my_agent.text_safety import sanitize_json_value
 
 
 DEFAULT_STEP_OUTPUT_CHARS = 1_000
 DEFAULT_TASK_CHARS = 2_000
-MAX_METADATA_STRING_CHARS = 1_000
 MAX_REASON_CHARS = 500
 FAILURE_STOP_MARKERS = (
     "failed",
@@ -54,20 +66,6 @@ SECRET_PREFIX_RE = re.compile(
     r"(?i)(?:github_pat_|ghp_|glpat-|xox[baprs]-|AKIA|ASIA|AIza|ya29\.|eyJ[A-Za-z0-9_-]{8,})"
 )
 DESTRUCTIVE_COMMAND_RE = re.compile(r"(?i)(?:\brm\s+-rf\b|\bgit\s+reset\s+--hard\b)")
-RESERVED_METADATA_KEYS = {
-    "confidence",
-    "outcome_source",
-    "stop_reason",
-    "source_trace",
-    "source_task",
-    "task_type",
-    "selected_memory_ids",
-    "candidate_memory_ids",
-    "stream_id",
-    "memory_project_key",
-    "writer_policy",
-    "writer_reason",
-}
 
 
 @dataclass(frozen=True)
@@ -117,15 +115,15 @@ class ExperienceWriteRequest:
 class ExperienceWriteProposal:
     tier: ExperienceTier
     content: str
+    payload: ExperiencePayload
     confidence: float
-    metadata: dict[str, Any] = field(default_factory=dict)
     reason: str = ""
 
 
 @dataclass(frozen=True)
 class ExperienceWriteResult:
     proposals: tuple[ExperienceWriteProposal, ...] = ()
-    saved: tuple[MemoryEntry, ...] = ()
+    saved: tuple[ExperienceMemory, ...] = ()
     duplicate_ids: tuple[str, ...] = ()
     rejected: tuple[dict[str, Any], ...] = ()
     llm_used: bool = False
@@ -210,14 +208,26 @@ class ExperienceWriter:
         proposals: list[ExperienceWriteProposal] = []
         for item in payload:
             if not isinstance(item, Mapping):
-                proposals.append(ExperienceWriteProposal(tier="", content="", confidence=0.0, reason="non_object"))  # type: ignore[arg-type]
+                proposals.append(
+                    ExperienceWriteProposal(
+                        tier="",  # type: ignore[arg-type]
+                        content="",
+                        payload={},  # type: ignore[arg-type]
+                        confidence=0.0,
+                        reason="non_object",
+                    )
+                )
                 continue
             proposals.append(
                 ExperienceWriteProposal(
                     tier=item.get("tier", ""),  # type: ignore[arg-type]
                     content=str(item.get("content") or ""),
+                    payload=(
+                        dict(item.get("payload") or {})
+                        if isinstance(item.get("payload"), Mapping)
+                        else item.get("payload")  # type: ignore[arg-type]
+                    ),
                     confidence=item.get("confidence", 0.0),  # type: ignore[arg-type]
-                    metadata=dict(item.get("metadata") or {}) if isinstance(item.get("metadata"), Mapping) else {},
                     reason=str(item.get("reason") or ""),
                 )
             )
@@ -231,17 +241,17 @@ class ExperienceWriter:
 
         accepted: list[ExperienceWriteProposal] = []
         rejected: list[dict[str, Any]] = []
-        seen: set[str] = set()
+        seen: set[tuple[ExperienceTier, str]] = set()
         for proposal in proposals:
             valid, reason, normalized = self.validate_proposal(proposal)
             if not valid or normalized is None:
                 rejected.append(_rejection(proposal, reason))
                 continue
-            fingerprint = _content_fingerprint(normalized.content)
-            if fingerprint in seen:
+            identity = (normalized.tier, _content_fingerprint(normalized.content))
+            if identity in seen:
                 rejected.append(_rejection(proposal, "duplicate_proposal"))
                 continue
-            seen.add(fingerprint)
+            seen.add(identity)
             accepted.append(normalized)
             if len(accepted) >= self.max_records:
                 break
@@ -268,25 +278,37 @@ class ExperienceWriter:
         if not content:
             return False, "empty_content", None
 
-        raw_metadata = sanitize_json_value(dict(proposal.metadata or {}))
+        try:
+            if isinstance(proposal.payload, Mapping):
+                payload = experience_payload_from_dict(tier, proposal.payload)
+            else:
+                payload = proposal.payload
+                # Canonical round-trip validates both the concrete type and its tier.
+                payload = experience_payload_from_dict(
+                    tier,
+                    experience_payload_to_dict(payload),
+                )
+        except (TypeError, ValueError):
+            return False, "invalid_payload", None
+
+        raw_payload = experience_payload_to_dict(payload)
         raw_reason = str(proposal.reason or "").strip()
         if (
             _contains_forbidden_content(content)
             or _contains_forbidden_content(raw_reason)
-            or _contains_forbidden_content(_json_text(raw_metadata))
+            or _contains_forbidden_content(_json_text(raw_payload))
         ):
             return False, "unsafe_content", None
 
-        metadata = _normalize_proposal_metadata(tier, raw_metadata)
-        if tier == ExperienceTier.TOOL and _contains_destructive_tool(metadata):
+        if isinstance(payload, ToolPayload) and _contains_destructive_tool(payload):
             return False, "unsafe_tool_command", None
         reason = _truncate_text(raw_reason, MAX_REASON_CHARS).strip()
 
         normalized = ExperienceWriteProposal(
             tier=tier,
             content=content,
+            payload=payload,
             confidence=confidence,
-            metadata=metadata,
             reason=reason,
         )
         return True, "", normalized
@@ -310,18 +332,20 @@ class ExperienceWriter:
                         "inspect the failure, patch the smallest relevant path, rerun the exact test, "
                         "then finish only after the verification result is stable."
                     ),
-                    confidence=0.80,
-                    metadata={
-                        "category": "debugging",
-                        "technique": "Focused verification loop",
-                        "preconditions": "A focused run_tests command exposes or verifies the behavior.",
-                        "steps": [
+                    payload=SkillPayload(
+                        category="debugging",
+                        technique="Focused verification loop",
+                        preconditions=(
+                            "A focused run_tests command exposes or verifies the behavior.",
+                        ),
+                        steps=(
                             "inspect the focused failure or target behavior",
                             "patch the smallest relevant code path",
                             "rerun the exact focused test",
                             "finish only after the focused verification passes",
-                        ],
-                    },
+                        ),
+                    ),
+                    confidence=0.80,
                     reason="successful run with passing run_tests signal",
                 )
             )
@@ -331,16 +355,15 @@ class ExperienceWriter:
                 ExperienceWriteProposal(
                     tier=ExperienceTier.TOOL,
                     content=f"Run the focused project test from the repository root: {command}",
+                    payload=ToolPayload(
+                        name="run_focused_tests",
+                        language="bash",
+                        code=command,
+                        command=command,
+                        input_description="Run from the repository root after applying the targeted change.",
+                        output_description="Focused test result for the changed behavior.",
+                    ),
                     confidence=0.78,
-                    metadata={
-                        "name": "run_focused_tests",
-                        "language": "bash",
-                        "code": command,
-                        "input_description": "Run from the repository root after applying the targeted change.",
-                        "output_description": "Focused test result for the changed behavior.",
-                        "tool_name": "run_tests",
-                        "command": command,
-                    },
                     reason="successful run_tests command is reusable",
                 )
             )
@@ -379,12 +402,12 @@ class ExperienceWriter:
             ExperienceWriteProposal(
                 tier=ExperienceTier.TIP,
                 content=tip_text,
+                payload=TipPayload(
+                    category="debugging",
+                    severity="warning",
+                    trigger=trigger,
+                ),
                 confidence=0.76,
-                metadata={
-                    "category": "debugging",
-                    "severity": "warning",
-                    "trigger": trigger,
-                },
                 reason="failure outcome with actionable next-step guard",
             )
         ]
@@ -393,15 +416,17 @@ class ExperienceWriter:
                 ExperienceWriteProposal(
                     tier=ExperienceTier.TRAJECTORY,
                     content=_trajectory_content(request),
+                    payload=TrajectoryPayload(
+                        task_description=_truncate_text(request.task, DEFAULT_TASK_CHARS),
+                        steps=tuple(_trajectory_step_payload(step) for step in request.steps),
+                        outcome=request.outcome,
+                        total_reward=0.0,
+                        key_learnings=(
+                            "Inspect the latest failing signal before making the next change.",
+                        ),
+                        tags=("failure", "runtime"),
+                    ),
                     confidence=0.72,
-                    metadata={
-                        "task_description": _truncate_text(request.task, DEFAULT_TASK_CHARS),
-                        "steps": [_trajectory_step_payload(step) for step in request.steps],
-                        "outcome": request.outcome,
-                        "total_reward": 0.0,
-                        "key_learnings": ["Inspect the latest failing signal before making the next change."],
-                        "tags": ["failure", "runtime"],
-                    },
                     reason="failure run with multiple tool steps",
                 )
             )
@@ -414,15 +439,15 @@ class ExperienceWriter:
             ExperienceWriteProposal(
                 tier=ExperienceTier.TRAJECTORY,
                 content=_trajectory_content(request),
+                payload=TrajectoryPayload(
+                    task_description=_truncate_text(request.task, DEFAULT_TASK_CHARS),
+                    steps=tuple(_trajectory_step_payload(step) for step in request.steps),
+                    outcome=request.outcome,
+                    total_reward=0.0,
+                    key_learnings=(),
+                    tags=("unknown", "runtime"),
+                ),
                 confidence=0.60,
-                metadata={
-                    "task_description": _truncate_text(request.task, DEFAULT_TASK_CHARS),
-                    "steps": [_trajectory_step_payload(step) for step in request.steps],
-                    "outcome": request.outcome,
-                    "total_reward": 0.0,
-                    "key_learnings": [],
-                    "tags": ["unknown", "runtime"],
-                },
                 reason="unknown outcome with tool trajectory only",
             ),
         )
@@ -487,10 +512,8 @@ def proposal_tier_counts(proposals: Sequence[ExperienceWriteProposal]) -> dict[s
 def writer_policy_for_result(*, llm_used: bool, fallback_used: bool) -> str:
     """Resolve the ``writer_policy`` label for a saved experience / trace event.
 
-    The label is the provenance marker persisted on every saved entry's metadata
-    and on the ``memory.evolver_writer_saved`` trace event. It distinguishes
-    LLM-authored experiences from deterministic fallback outputs so Phase 5/8
-    distillation and human audits do not mislabel LLM work as fallback.
+    The label is task/run context kept in trace and writer datasets; it is not
+    persisted on individual experience records.
     """
     if llm_used and not fallback_used:
         return WRITER_POLICY_LLM
@@ -528,8 +551,9 @@ def _llm_prompt(request: ExperienceWriteRequest, *, max_input_chars: int) -> str
         ],
     }
     prompt = (
-        "Return JSON array only. Each item must have tier, content, confidence, metadata, and reason. "
-        "Allowed tiers: trajectory, tip, skill, tool. Keep content reusable and independent.\n"
+        "Return JSON array only. Each item must have tier, content, payload, confidence, and reason. "
+        "Allowed tiers: trajectory, tip, skill, tool. Payload must use the tier's canonical schema; "
+        "do not add task/run metadata to payload. Keep content reusable and independent.\n"
         f"Run summary:\n{json.dumps(sanitize_json_value(payload), ensure_ascii=False, sort_keys=True)}"
     )
     return _truncate_text(prompt, max_input_chars)
@@ -605,55 +629,15 @@ def _trajectory_content(request: ExperienceWriteRequest) -> str:
     return "\n".join(lines)
 
 
-def _trajectory_step_payload(step: ExperienceWriteStep) -> dict[str, Any]:
-    return {
-        "step_num": step.step_num,
-        "observation": "",
-        "action": step.tool,
-        "action_params": dict(step.arguments),
-        "result": _truncate_text(step.output, 240),
-        "reward": 1.0 if step.ok else 0.0,
-    }
-
-
-def _normalize_proposal_metadata(tier: ExperienceTier, metadata: Any) -> dict[str, Any]:
-    normalized_value = _normalize_metadata_value(metadata)
-    normalized = dict(normalized_value) if isinstance(normalized_value, Mapping) else {}
-    for key in RESERVED_METADATA_KEYS:
-        normalized.pop(key, None)
-    if tier != ExperienceTier.TRAJECTORY:
-        return normalized
-    steps = normalized.get("steps")
-    if not isinstance(steps, list):
-        return normalized
-    safe_steps: list[Any] = []
-    for step in steps:
-        if not isinstance(step, Mapping):
-            safe_steps.append(step)
-            continue
-        safe_step = dict(step)
-        for key in ("result", "output"):
-            value = safe_step.get(key)
-            if isinstance(value, str):
-                safe_step[key] = _truncate_text(value, 240)
-        safe_steps.append(safe_step)
-    normalized["steps"] = safe_steps
-    return normalized
-
-
-def _normalize_metadata_value(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return {
-            _truncate_text(str(key), MAX_METADATA_STRING_CHARS): _normalize_metadata_value(item)
-            for key, item in value.items()
-        }
-    if isinstance(value, list):
-        return [_normalize_metadata_value(item) for item in value]
-    if isinstance(value, tuple):
-        return [_normalize_metadata_value(item) for item in value]
-    if isinstance(value, str):
-        return _truncate_text(value, MAX_METADATA_STRING_CHARS)
-    return value
+def _trajectory_step_payload(step: ExperienceWriteStep) -> ExperienceTrajectoryStep:
+    return ExperienceTrajectoryStep(
+        step_num=step.step_num,
+        observation="",
+        action=step.tool,
+        action_params=dict(step.arguments),
+        result=_truncate_text(step.output, 240),
+        reward=1.0 if step.ok else 0.0,
+    )
 
 
 def _contains_forbidden_content(value: str) -> bool:
@@ -664,9 +648,8 @@ def _contains_forbidden_content(value: str) -> bool:
     return any(marker in lower for marker in FORBIDDEN_MARKERS)
 
 
-def _contains_destructive_tool(metadata: Mapping[str, Any]) -> bool:
-    for key in ("code", "command", "template"):
-        value = metadata.get(key)
+def _contains_destructive_tool(payload: ToolPayload) -> bool:
+    for value in (payload.code, payload.command):
         if isinstance(value, str) and DESTRUCTIVE_COMMAND_RE.search(value):
             return True
     return False

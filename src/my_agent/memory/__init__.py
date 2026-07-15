@@ -19,6 +19,11 @@ from my_agent.memory.experience_store import (
     ExperienceStoreIndexSnapshot,
     ExperienceStoreSnapshot,
 )
+from my_agent.memory.experience_retrieval import (
+    ExperienceRetrievalMetrics,
+    ExperienceRetriever,
+    experience_searchable_text,
+)
 from my_agent.memory.evolver import (
     ExperienceCreatedBy,
     ExperienceMemory,
@@ -52,6 +57,8 @@ from my_agent.memory.types import (
 __all__ = [
     "CompressionResult",
     "ExperienceCreatedBy",
+    "ExperienceRetrievalMetrics",
+    "ExperienceRetriever",
     "ExperienceStore",
     "ExperienceStoreIndexSnapshot",
     "ExperienceStoreSnapshot",
@@ -78,6 +85,7 @@ __all__ = [
     "build_experience_entry",
     "content_fingerprint",
     "experience_record_from_entry",
+    "experience_searchable_text",
     "experience_tier",
     "is_experience_entry",
     "normalize_content",

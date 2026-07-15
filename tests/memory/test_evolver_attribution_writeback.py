@@ -11,12 +11,21 @@ add_src_to_path()
 from my_agent.memory.evolver import (
     MemoryAttributionRecord,
     build_experience_entry,
-    selection_score,
 )
 from my_agent.memory.evolver.attribution import write_back_attribution
 from my_agent.memory.evolver.types import ExperienceTier
 from my_agent.memory.long_term import LongTermMemoryStore
-from my_agent.memory.types import MemoryScope, RetrievalHit
+from my_agent.memory.types import MemoryScope
+
+
+def _legacy_selection_score(entry, *, retrieval_score: float = 1.0) -> float:
+    value = float(entry.metadata.get("evolver_value", 0.0) or 0.0)
+    confidence = entry.metadata.get("evolver_confidence")
+    if confidence is None:
+        confidence = entry.metadata.get("confidence", 1.0)
+    value_weight = max(0.5, min(1.5, 1.0 + value))
+    confidence_weight = max(0.5, min(1.2, float(confidence)))
+    return retrieval_score * value_weight * confidence_weight
 
 
 def _entry(
@@ -57,8 +66,7 @@ class AttributionWriteBackTests(unittest.TestCase):
             store.load()
             stored, _ = store.add(_entry("mem-1", extra_metadata={"confidence": 0.73}))
             before = stored
-            before_hit = RetrievalHit(before, score=1.0, matched_terms=(), source_weight=1.0, time_decay=1.0)
-            before_score = selection_score(before_hit, ExperienceTier.SKILL, before.metadata)
+            before_score = _legacy_selection_score(before)
 
             summary = write_back_attribution(
                 store=store,
@@ -80,8 +88,7 @@ class AttributionWriteBackTests(unittest.TestCase):
             self.assertEqual(after.metadata["evolver_candidate_count"], 2)
             self.assertEqual(after.metadata["evolver_selected_count"], 1)
             self.assertEqual(after.metadata["evolver_not_selected_count"], 1)
-            after_hit = RetrievalHit(after, score=1.0, matched_terms=(), source_weight=1.0, time_decay=1.0)
-            self.assertGreater(selection_score(after_hit, ExperienceTier.SKILL, after.metadata), before_score)
+            self.assertGreater(_legacy_selection_score(after), before_score)
 
     def test_low_evidence_write_back_clears_old_value_but_updates_counters(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

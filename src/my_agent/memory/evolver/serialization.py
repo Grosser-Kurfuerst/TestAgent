@@ -8,6 +8,7 @@ from typing import Any
 from my_agent.memory.evolver.types import (
     ExperienceCreatedBy,
     ExperienceMemory,
+    ExperiencePayload,
     ExperienceTier,
     ExperienceTrajectoryStep,
     SkillPayload,
@@ -68,7 +69,7 @@ def experience_to_dict(memory: ExperienceMemory) -> dict[str, Any]:
         "id": memory.id,
         "content": memory.content,
         "tier": memory.tier.value,
-        "payload": _payload_to_dict(memory),
+        "payload": experience_payload_to_dict(memory.payload),
         "scope": memory.scope.value,
         "project_key": memory.project_key,
         "created_at": memory.created_at.isoformat(),
@@ -170,8 +171,8 @@ def experience_canonical_json(memory: ExperienceMemory) -> str:
     )
 
 
-def _payload_to_dict(memory: ExperienceMemory) -> dict[str, Any]:
-    payload = memory.payload
+def experience_payload_to_dict(payload: ExperiencePayload) -> dict[str, Any]:
+    """Serialize one concrete tier payload using the canonical v2 schema."""
     if isinstance(payload, TrajectoryPayload):
         return {
             "task_description": payload.task_description,
@@ -206,6 +207,16 @@ def _payload_to_dict(memory: ExperienceMemory) -> dict[str, Any]:
             "repo_context": payload.repo_context,
         }
     raise TypeError(f"unsupported experience payload: {type(payload).__name__}")
+
+
+def experience_payload_from_dict(
+    tier: ExperienceTier,
+    payload: Mapping[str, Any],
+) -> ExperiencePayload:
+    """Parse a writer/manual payload through the same strict store boundary."""
+    if not isinstance(tier, ExperienceTier):
+        raise ValueError("experience payload tier must be an ExperienceTier")
+    return _payload_from_dict(tier, payload)
 
 
 def _trajectory_step_to_dict(step: ExperienceTrajectoryStep) -> dict[str, Any]:
@@ -456,5 +467,7 @@ __all__ = [
     "EXPERIENCE_SCHEMA_VERSION",
     "experience_canonical_json",
     "experience_from_dict",
+    "experience_payload_from_dict",
+    "experience_payload_to_dict",
     "experience_to_dict",
 ]

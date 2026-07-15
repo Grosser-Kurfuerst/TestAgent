@@ -17,12 +17,13 @@ from my_agent.cancellation import CancellationToken
 from my_agent.hitl import ApprovalDecision, ApprovalEvent, ApprovalRequest, ApprovalResult, ApprovalScope
 from my_agent.llm import FakeLLM
 from my_agent.llm.types import ChatResponse, LLMToolCall, MessageLike, messages_to_openai
-from my_agent.memory import MemoryManager, MemoryScope, is_experience_entry
+from my_agent.memory import MemoryManager, MemoryScope
 from my_agent.plan import AgentMode
 from my_agent.runtime import CodingAgentRuntime, run_agent
 from my_agent.schema import AgentState, TraceEvent
 from my_agent.react import ReActAgent
 from my_agent.tracing import TraceWriter
+from tests.memory.experience_fixtures import save_typed_experience
 
 
 def write_runtime_repo(repo: Path) -> None:
@@ -141,7 +142,12 @@ class WriterAwareFakeLLM(FakeLLM):
                                 "tier": "skill",
                                 "content": "For pytest regressions, use the focused failing test as the repair loop.",
                                 "confidence": 0.84,
-                                "metadata": {"category": "debugging", "technique": "LLM writer focused pytest loop"},
+                                "payload": {
+                                    "category": "debugging",
+                                    "technique": "LLM writer focused pytest loop",
+                                    "preconditions": [],
+                                    "steps": ["use the focused failing test as the repair loop"],
+                                },
                                 "reason": "writer proposal",
                             }
                         ]
@@ -398,6 +404,7 @@ class RuntimeTests(unittest.TestCase):
                 base / "traces",
                 memory_dir=base / "memory",
                 memory_auto_extract=False,
+                memory_evolver_mode="full",
                 memory_evolver_writer_enabled=True,
                 memory_project_key="stream:a",
             )
@@ -422,11 +429,11 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(saved_payload["memory_project_key"], "stream:a")
 
             manager = MemoryManager.from_config(config=config, llm=FakeLLM(), repo_path=repo)
-            entries = [entry for entry in manager.long_term.all(project_key="stream:a") if is_experience_entry(entry)]
+            entries = manager.experience_store.all(project_key="stream:a")
             self.assertTrue(entries)
             self.assertTrue(any(entry.run_id == state.run_id for entry in entries))
-            self.assertTrue(all(entry.metadata["source_task"] == "manifest-task-1" for entry in entries))
-            self.assertTrue(any(entry.metadata["created_by"] == "writer" for entry in entries))
+            self.assertTrue(all(entry.source_task == "manifest-task-1" for entry in entries))
+            self.assertTrue(any(entry.created_by.value == "writer" for entry in entries))
 
     def test_runtime_llm_writer_saves_llm_proposal(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -439,6 +446,7 @@ class RuntimeTests(unittest.TestCase):
                 base / "traces",
                 memory_dir=base / "memory",
                 memory_auto_extract=False,
+                memory_evolver_mode="full",
                 memory_evolver_writer_enabled=True,
                 memory_evolver_writer_mode="llm",
                 memory_project_key="stream:a",
@@ -460,10 +468,10 @@ class RuntimeTests(unittest.TestCase):
             self.assertFalse(proposed["fallback_used"])
             self.assertTrue(llm.writer_prompts)
             manager = MemoryManager.from_config(config=config, llm=FakeLLM(), repo_path=repo)
-            entries = [entry for entry in manager.long_term.all(project_key="stream:a") if is_experience_entry(entry)]
+            entries = manager.experience_store.all(project_key="stream:a")
             self.assertEqual(len(entries), 1)
             self.assertIn("focused failing test", entries[0].content)
-            self.assertEqual(entries[0].metadata["technique"], "LLM writer focused pytest loop")
+            self.assertEqual(entries[0].payload.technique, "LLM writer focused pytest loop")
 
     def test_memory_disabled_uses_noop_memory_even_with_external_manager(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -908,12 +916,17 @@ class RuntimeTests(unittest.TestCase):
             repo = base / "repo"
             repo.mkdir()
             write_runtime_repo(repo)
-            config = fake_config(base / "traces", memory_dir=base / "memory")
+            config = fake_config(
+                base / "traces",
+                memory_dir=base / "memory",
+                memory_evolver_mode="retrieve_select",
+            )
             llm = RecordingFakeLLM([ChatResponse(content="done", finish_reason="stop")])
             memory = MemoryManager.from_config(config=config, llm=llm, repo_path=repo)
-            memory.save_fact(
+            save_typed_experience(
+                memory,
                 "Project calculator.py contains calculator functions.",
-                scope=MemoryScope.PROJECT,
+                tier="tip",
             )
 
             state = run_agent(
@@ -928,7 +941,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(state.stop_reason, "assistant_final")
             self.assertGreaterEqual(memory.status(include_entries=False).short_term_entries, 2)
             first_request = json.dumps(llm.requests[0], ensure_ascii=False)
-            self.assertIn("Relevant long-term memory:", first_request)
+            self.assertIn("Relevant selected experience:", first_request)
             self.assertIn("calculator.py contains calculator functions", first_request)
             event_names = [event["event"] for event in read_trace(state.trace_path)]
             self.assertIn("memory.loaded", event_names)
@@ -950,7 +963,8 @@ class RuntimeTests(unittest.TestCase):
             llm = RecordingFakeLLM([ChatResponse(content="done", finish_reason="stop")])
             memory = MemoryManager.from_config(config=config, llm=llm, repo_path=repo)
             memory.save_fact("ordinary calculator memory should not be selected", scope=MemoryScope.PROJECT)
-            memory.save_experience(
+            save_typed_experience(
+                memory,
                 "calculator selected skill: inspect subtract before editing",
                 tier="skill",
                 source_task="task-runtime",

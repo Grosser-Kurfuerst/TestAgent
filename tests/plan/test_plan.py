@@ -37,6 +37,7 @@ from my_agent.plan import (
     should_use_plan,
 )
 from my_agent.config import AgentConfig
+from tests.memory.experience_fixtures import save_typed_experience
 
 
 def task(
@@ -884,7 +885,8 @@ class PlanExecuteAgentTests(unittest.TestCase):
             llm = RecordingPlannerLLM()
             memory = MemoryManager.from_config(config=config, llm=llm, repo_path=repo)
             memory.save_fact("ordinary calculator planner fact", scope=MemoryScope.PROJECT)
-            memory.save_experience(
+            save_typed_experience(
+                memory,
                 "calculator selected planner skill",
                 tier="skill",
                 source_task="task-plan",

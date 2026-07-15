@@ -34,6 +34,7 @@ from my_agent.team import (
     validate_team_graph,
 )
 from my_agent.team.types import AgentRole, TeamStatus
+from tests.memory.experience_fixtures import save_typed_experience
 
 
 def step(
@@ -1032,9 +1033,9 @@ class TeamAgentTests(unittest.TestCase):
             repo = base / "repo"
             repo.mkdir()
             write_runtime_repo(repo)
-            config = fake_config(base / "traces")
+            config = fake_config(base / "traces", memory_evolver_mode="retrieve_select")
             memory = MemoryManager.from_config(config=config, llm=FakeLLM(), repo_path=repo)
-            memory.save_fact("AgentCli team memory fact", scope=MemoryScope.PROJECT)
+            save_typed_experience(memory, "AgentCli team memory fact", tier="tip")
             team = TeamState.create(goal="AgentCli task", steps=[step("step_1")])
             planner = RecordingPlanner(team)
 
@@ -1074,7 +1075,8 @@ class TeamAgentTests(unittest.TestCase):
             )
             memory = MemoryManager.from_config(config=config, llm=FakeLLM(), repo_path=repo)
             memory.save_fact("ordinary AgentCli team fact", scope=MemoryScope.PROJECT)
-            memory.save_experience(
+            save_typed_experience(
+                memory,
                 "AgentCli selected team skill",
                 tier="skill",
                 source_task="task-team",

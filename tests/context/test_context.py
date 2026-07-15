@@ -21,6 +21,7 @@ from my_agent.llm import FakeLLM
 from my_agent.llm.types import ChatResponse, LLMToolCall, Message, messages_to_openai
 from my_agent.memory import MemoryManager, MemoryScope
 from my_agent.tools import ToolExecutionResult
+from tests.memory.experience_fixtures import save_typed_experience
 
 
 def _config(memory_dir: Path, **overrides: object) -> AgentConfig:
@@ -263,8 +264,8 @@ class AgentContextManagerTests(unittest.TestCase):
                 repo_path=repo,
                 trace_sink=lambda event, payload: events.append((event, payload)),
             )
-            manager.save_experience("pytest oversized tip " * 120, tier="tip")
-            manager.save_experience("pytest compact skill", tier="skill")
+            save_typed_experience(manager, "pytest oversized tip " * 120, tier="tip")
+            save_typed_experience(manager, "pytest compact skill", tier="skill")
 
             messages, memory_context, _ = AgentContextManager(manager.context_profile).prepare_messages(
                 base_messages=[Message(role="system", content="base")],
@@ -304,7 +305,7 @@ class AgentContextManagerTests(unittest.TestCase):
                     repo_path=repo,
                     trace_sink=lambda event, payload: events.append((event, payload)),
                 )
-                manager.save_experience("pytest selected skill", tier="skill")
+                save_typed_experience(manager, "pytest selected skill", tier="skill")
                 AgentContextManager(manager.context_profile).prepare_messages(
                     base_messages=[Message(role="system", content=base_content)],
                     query="pytest",

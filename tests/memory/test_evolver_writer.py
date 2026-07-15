@@ -17,10 +17,38 @@ from my_agent.memory.evolver import (
     ExperienceWriteStep,
     ExperienceWriter,
     MemoryWriterDatasetLogger,
+    SkillPayload,
+    TipPayload,
+    ToolPayload,
+    TrajectoryPayload,
     build_write_steps_from_tool_history,
     runtime_outcome_from_tool_records,
     writer_policy_for_result,
 )
+
+
+def _skill_proposal(content: str, confidence: float, *, reason: str = "") -> ExperienceWriteProposal:
+    return ExperienceWriteProposal(
+        tier=ExperienceTier.SKILL,
+        content=content,
+        payload=SkillPayload(
+            category="debugging",
+            technique="Focused verification",
+            preconditions=(),
+            steps=("rerun the focused test",),
+        ),
+        confidence=confidence,
+        reason=reason,
+    )
+
+
+def _tip_proposal(content: str, confidence: float) -> ExperienceWriteProposal:
+    return ExperienceWriteProposal(
+        tier=ExperienceTier.TIP,
+        content=content,
+        payload=TipPayload(category="debugging", severity="warning", trigger="test failure"),
+        confidence=confidence,
+    )
 
 
 class FakeWriterLLM:
@@ -91,9 +119,9 @@ class EvolverWriterTests(unittest.TestCase):
 
         accepted, rejected = writer.validate_proposals(
             [
-                ExperienceWriteProposal(ExperienceTier.SKILL, "Reusable loop for focused tests", 0.8),
-                ExperienceWriteProposal(ExperienceTier.SKILL, "Reusable loop for focused tests", 0.9),
-                ExperienceWriteProposal(ExperienceTier.TIP, "too weak", 0.1),
+                _skill_proposal("Reusable loop for focused tests", 0.8),
+                _skill_proposal("Reusable loop for focused tests", 0.9),
+                _tip_proposal("too weak", 0.1),
             ]
         )
 
@@ -106,7 +134,7 @@ class EvolverWriterTests(unittest.TestCase):
         writer = ExperienceWriter(max_records=0)
 
         accepted, rejected = writer.validate_proposals(
-            [ExperienceWriteProposal(ExperienceTier.SKILL, "Reusable loop", 0.8)]
+            [_skill_proposal("Reusable loop", 0.8)]
         )
 
         self.assertEqual(accepted, ())
@@ -116,7 +144,7 @@ class EvolverWriterTests(unittest.TestCase):
         writer = ExperienceWriter(max_content_chars=0)
 
         accepted, rejected = writer.validate_proposals(
-            [ExperienceWriteProposal(ExperienceTier.SKILL, "Reusable loop", 0.8)]
+            [_skill_proposal("Reusable loop", 0.8)]
         )
 
         self.assertEqual(accepted, ())
@@ -140,7 +168,8 @@ class EvolverWriterTests(unittest.TestCase):
 
         self.assertTrue(result.fallback_used)
         self.assertEqual([proposal.tier for proposal in result.proposals], [ExperienceTier.SKILL, ExperienceTier.TOOL])
-        self.assertEqual(result.proposals[1].metadata["command"], "pytest tests/test_example.py -q")
+        self.assertIsInstance(result.proposals[1].payload, ToolPayload)
+        self.assertEqual(result.proposals[1].payload.command, "pytest tests/test_example.py -q")
 
     def test_fallback_failure_proposes_tip_and_trajectory(self) -> None:
         request = _request(
@@ -155,7 +184,8 @@ class EvolverWriterTests(unittest.TestCase):
         result = ExperienceWriter().propose(request)
 
         self.assertEqual([proposal.tier for proposal in result.proposals], [ExperienceTier.TIP, ExperienceTier.TRAJECTORY])
-        self.assertEqual(result.proposals[1].metadata["outcome"], "failure")
+        self.assertIsInstance(result.proposals[1].payload, TrajectoryPayload)
+        self.assertEqual(result.proposals[1].payload.outcome, "failure")
 
     def test_fallback_unknown_trajectory_is_low_confidence_by_default(self) -> None:
         request = _request(
@@ -176,7 +206,12 @@ class EvolverWriterTests(unittest.TestCase):
                         "tier": "skill",
                         "content": "For focused pytest failures, rerun the narrow test after the smallest patch.",
                         "confidence": 0.82,
-                        "metadata": {"category": "debugging"},
+                        "payload": {
+                            "category": "debugging",
+                            "technique": "Focused pytest loop",
+                            "preconditions": [],
+                            "steps": ["rerun the narrow test after the smallest patch"],
+                        },
                         "reason": "reusable loop",
                     }
                 ]
@@ -189,13 +224,15 @@ class EvolverWriterTests(unittest.TestCase):
         self.assertFalse(result.fallback_used)
         self.assertEqual(len(result.proposals), 1)
         self.assertEqual(result.proposals[0].tier, ExperienceTier.SKILL)
-        self.assertEqual(result.proposals[0].metadata["category"], "debugging")
+        self.assertIsInstance(result.proposals[0].payload, SkillPayload)
+        self.assertEqual(result.proposals[0].payload.category, "debugging")
 
     def test_llm_writer_accepts_fenced_json(self) -> None:
         llm = FakeWriterLLM(
             "```json\n"
             "[{\"tier\":\"tip\",\"content\":\"Inspect the latest failing assertion before broad reruns.\","
-            "\"confidence\":0.77,\"metadata\":{\"category\":\"debugging\"}}]\n"
+            "\"confidence\":0.77,\"payload\":{\"category\":\"debugging\","
+            "\"severity\":\"warning\",\"trigger\":\"failing assertion\"}}]\n"
             "```"
         )
 
@@ -220,23 +257,36 @@ class EvolverWriterTests(unittest.TestCase):
                     {
                         "tier": "skill",
                         "content": "Useful but low confidence",
+                        "payload": {
+                            "category": "debugging", "technique": "focused", "preconditions": [],
+                            "steps": ["rerun tests"]
+                        },
                         "confidence": 0.2,
                     },
                     {
                         "tier": "tip",
                         "content": f"Never save {secret_like}",
+                        "payload": {"category": "safety", "severity": "warning", "trigger": "secret"},
                         "confidence": 0.9,
                     },
                     {
                         "tier": "trajectory",
                         "content": "Do not save hidden_test_output details.",
+                        "payload": {
+                            "task_description": "hidden run",
+                            "steps": [{"step_num": 1, "action": "test"}],
+                            "outcome": "failure"
+                        },
                         "confidence": 0.9,
                     },
                     {
                         "tier": "tool",
                         "content": "Reset the repo.",
                         "confidence": 0.9,
-                        "metadata": {"command": "git reset --hard"},
+                        "payload": {
+                            "name": "reset", "language": "bash", "code": "git reset --hard",
+                            "command": "git reset --hard"
+                        },
                     },
                 ]
             )
@@ -256,6 +306,10 @@ class EvolverWriterTests(unittest.TestCase):
                     {
                         "tier": "skill",
                         "content": "Use focused pytest verification after a small patch.",
+                        "payload": {
+                            "category": "debugging", "technique": "focused", "preconditions": [],
+                            "steps": ["rerun tests"]
+                        },
                         "confidence": 0.9,
                         "reason": "contains hidden_test_output",
                     }
@@ -268,9 +322,7 @@ class EvolverWriterTests(unittest.TestCase):
         self.assertTrue(result.fallback_used)
         self.assertIn("unsafe_content", [item["reason"] for item in result.rejected])
 
-    def test_llm_writer_truncates_nested_metadata_strings_and_removes_reserved_keys(self) -> None:
-        long_log = "x" * 2_000
-        long_key = "k" * 2_000
+    def test_llm_writer_rejects_incomplete_or_unknown_payload_fields(self) -> None:
         llm = FakeWriterLLM(
             json.dumps(
                 [
@@ -278,14 +330,16 @@ class EvolverWriterTests(unittest.TestCase):
                         "tier": "skill",
                         "content": "Use focused pytest verification after a small patch.",
                         "confidence": 0.9,
-                        "metadata": {
-                            "debug_log": long_log,
-                            "nested": {"log": long_log},
-                            long_key: "long key value",
-                            "source_task": "llm-overrides-task",
-                            "memory_project_key": "llm-overrides-project",
+                        "payload": {"category": "debugging", "technique": "focused", "steps": []},
+                    },
+                    {
+                        "tier": "tip",
+                        "content": "Inspect a failing assertion.",
+                        "confidence": 0.9,
+                        "payload": {
+                            "category": "debugging", "severity": "warning", "trigger": "failure",
+                            "source_task": "must-not-enter-payload"
                         },
-                        "reason": long_log,
                     }
                 ]
             )
@@ -293,15 +347,8 @@ class EvolverWriterTests(unittest.TestCase):
 
         result = ExperienceWriter(llm=llm).propose(_successful_request(), mode="llm")
 
-        proposal = result.proposals[0]
-        self.assertNotIn("source_task", proposal.metadata)
-        self.assertNotIn("memory_project_key", proposal.metadata)
-        self.assertNotIn(long_key, proposal.metadata)
-        self.assertTrue(any(key.startswith("k" * 100) for key in proposal.metadata))
-        self.assertTrue(all(len(key) <= 1_000 for key in proposal.metadata))
-        self.assertLessEqual(len(proposal.metadata["debug_log"]), 1_000)
-        self.assertLessEqual(len(proposal.metadata["nested"]["log"]), 1_000)
-        self.assertLessEqual(len(proposal.reason), 500)
+        self.assertTrue(result.fallback_used)
+        self.assertEqual([item["reason"] for item in result.rejected].count("invalid_payload"), 2)
 
     def test_llm_prompt_truncates_tool_output(self) -> None:
         llm = FakeWriterLLM("[]")
@@ -316,8 +363,7 @@ class EvolverWriterTests(unittest.TestCase):
         self.assertNotIn(long_output, llm.prompts[0])
         self.assertIn("x" * 997 + "...", llm.prompts[0])
 
-    def test_llm_writer_truncates_trajectory_metadata_step_results(self) -> None:
-        long_result = "x" * 2_000
+    def test_llm_writer_parses_canonical_trajectory_payload(self) -> None:
         llm = FakeWriterLLM(
             json.dumps(
                 [
@@ -325,13 +371,13 @@ class EvolverWriterTests(unittest.TestCase):
                         "tier": "trajectory",
                         "content": "Task: fix tests\nOutcome: success\nKey steps: run_tests passed",
                         "confidence": 0.9,
-                        "metadata": {
+                        "payload": {
+                            "task_description": "Fix tests",
                             "steps": [
                                 {
                                     "step_num": 1,
                                     "action": "run_tests",
-                                    "result": long_result,
-                                    "output": long_result,
+                                    "result": "passed",
                                 }
                             ],
                             "outcome": "success",
@@ -343,11 +389,10 @@ class EvolverWriterTests(unittest.TestCase):
 
         result = ExperienceWriter(llm=llm).propose(_successful_request(), mode="llm")
 
-        step = result.proposals[0].metadata["steps"][0]
-        self.assertNotEqual(step["result"], long_result)
-        self.assertNotEqual(step["output"], long_result)
-        self.assertLessEqual(len(step["result"]), 240)
-        self.assertLessEqual(len(step["output"]), 240)
+        payload = result.proposals[0].payload
+        self.assertIsInstance(payload, TrajectoryPayload)
+        self.assertEqual(payload.steps[0].action, "run_tests")
+        self.assertEqual(payload.steps[0].result, "passed")
 
     def test_writer_dataset_logger_creates_parent_and_appends_jsonl(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -387,7 +432,8 @@ class EvolverWriterTests(unittest.TestCase):
         tip = result.proposals[0]
         self.assertEqual(tip.tier, ExperienceTier.TIP)
         self.assertIn("run_tests signal failed", tip.content)
-        self.assertEqual(tip.metadata["trigger"], "assertion_failed")
+        self.assertIsInstance(tip.payload, TipPayload)
+        self.assertEqual(tip.payload.trigger, "assertion_failed")
 
     def test_failure_fallback_tip_attributes_to_failing_or_blocked_tool_signal(self) -> None:
         request = _request(
@@ -406,7 +452,8 @@ class EvolverWriterTests(unittest.TestCase):
         # Must NOT misattribute to a run_tests signal that did not fail.
         self.assertNotIn("run_tests signal failed", tip.content)
         # The blocked tool's error_code is the most specific signal, so it leads the trigger.
-        self.assertEqual(tip.metadata["trigger"], "BLOCKED")
+        self.assertIsInstance(tip.payload, TipPayload)
+        self.assertEqual(tip.payload.trigger, "BLOCKED")
 
     def test_failure_fallback_tip_uses_stop_reason_only_when_no_signal(self) -> None:
         # Failure inferred purely from stop_reason (budget / max steps / timeout) with
@@ -426,7 +473,8 @@ class EvolverWriterTests(unittest.TestCase):
         tip = result.proposals[0]
         self.assertIn("before reaching a verified success", tip.content)
         self.assertNotIn("signal failed", tip.content)
-        self.assertEqual(tip.metadata["trigger"], "context_over_budget")
+        self.assertIsInstance(tip.payload, TipPayload)
+        self.assertEqual(tip.payload.trigger, "context_over_budget")
 
 
 def _request(

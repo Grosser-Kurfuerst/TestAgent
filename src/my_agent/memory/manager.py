@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 from uuid import uuid4
@@ -14,6 +15,8 @@ from my_agent.llm.types import ChatResponse, LLMToolCall, Message, MessageLike, 
 from my_agent.memory.compression import MemoryCompressor
 from my_agent.memory.evolver import (
     ExperienceCreatedBy,
+    ExperienceMemory,
+    ExperiencePayload,
     ExperienceWriteRequest,
     ExperienceWriteResult,
     ExperienceWriter,
@@ -21,15 +24,19 @@ from my_agent.memory.evolver import (
     ExperienceSelector,
     ExperienceTier,
     SelectionResult,
-    build_experience_entry,
     build_write_steps_from_tool_history,
-    candidate_tier,
+    experience_payload_to_dict,
     proposal_tier_counts,
     selection_candidate_summary,
     selection_tier_counts,
     writer_policy_for_result,
 )
-from my_agent.memory.evolver.attribution import MemoryAttributionRecord, attribution_metadata
+from my_agent.memory.evolver.attribution import MemoryAttributionRecord
+from my_agent.memory.experience_retrieval import (
+    ExperienceRetrievalMetrics,
+    ExperienceRetriever,
+)
+from my_agent.memory.experience_store import ExperienceStore
 from my_agent.memory.long_term import LongTermMemoryStore, STORAGE_FILE
 from my_agent.memory.retrieval import MemoryRetriever
 from my_agent.memory.short_term import ShortTermMemory
@@ -41,6 +48,8 @@ from my_agent.memory.types import (
     MemoryScope,
     MemoryStatus,
     MemoryType,
+    RetrievalHit,
+    content_fingerprint,
 )
 from my_agent.tools import ToolExecutionResult
 
@@ -99,6 +108,8 @@ class MemoryManager:
         short_term: ShortTermMemory,
         long_term: LongTermMemoryStore,
         retriever: MemoryRetriever,
+        experience_store: ExperienceStore,
+        experience_retriever: ExperienceRetriever,
         compressor: MemoryCompressor,
         project_key: str,
         session_id: str = "",
@@ -112,6 +123,8 @@ class MemoryManager:
         self.short_term = short_term
         self.long_term = long_term
         self.retriever = retriever
+        self.experience_store = experience_store
+        self.experience_retriever = experience_retriever
         self.compressor = compressor
         self.project_key = project_key
         self.session_id = session_id
@@ -133,17 +146,25 @@ class MemoryManager:
         )
         self.last_evolver_selection: SelectionResult | None = None
 
-    def set_trace_sink(self, trace_sink: Any | None) -> tuple[Any | None, Any | None]:
-        previous = (self._trace_sink, getattr(self.long_term, "_trace_sink", None))
+    def set_trace_sink(self, trace_sink: Any | None) -> tuple[Any | None, Any | None, Any | None]:
+        previous = (
+            self._trace_sink,
+            getattr(self.long_term, "_trace_sink", None),
+            getattr(self.experience_store, "_trace_sink", None),
+        )
         self._trace_sink = trace_sink
         if hasattr(self.long_term, "_trace_sink"):
             self.long_term._trace_sink = trace_sink
+        if hasattr(self.experience_store, "_trace_sink"):
+            self.experience_store._trace_sink = trace_sink
         return previous
 
-    def restore_trace_sink(self, snapshot: tuple[Any | None, Any | None]) -> None:
+    def restore_trace_sink(self, snapshot: tuple[Any | None, Any | None, Any | None]) -> None:
         self._trace_sink = snapshot[0]
         if hasattr(self.long_term, "_trace_sink"):
             self.long_term._trace_sink = snapshot[1]
+        if hasattr(self.experience_store, "_trace_sink"):
+            self.experience_store._trace_sink = snapshot[2]
 
     @classmethod
     def from_config(
@@ -159,12 +180,15 @@ class MemoryManager:
         memory_dir.mkdir(parents=True, exist_ok=True)
         long_term = LongTermMemoryStore(memory_dir / STORAGE_FILE, trace_sink=trace_sink)
         long_term.load()
+        experience_store = ExperienceStore.from_dir(memory_dir, trace_sink=trace_sink)
+        experience_store.load()
         context_profile = ContextProfile.resolve(config, _model_name(llm, config))
         short_term = ShortTermMemory(
             max_tokens=context_profile.short_term_storage_token_limit,
             max_entries=config.memory_short_term_entries,
         )
         retriever = MemoryRetriever()
+        experience_retriever = ExperienceRetriever()
         compressor = MemoryCompressor(
             llm=llm,
             chunk_size=config.memory_map_chunk_size,
@@ -181,6 +205,8 @@ class MemoryManager:
             short_term=short_term,
             long_term=long_term,
             retriever=retriever,
+            experience_store=experience_store,
+            experience_retriever=experience_retriever,
             compressor=compressor,
             project_key=project_key,
             session_id=session_id or "",
@@ -304,49 +330,59 @@ class MemoryManager:
 
     def save_experience(
         self,
-        content: str,
         *,
-        tier: ExperienceTier | str,
+        tier: ExperienceTier,
+        content: str,
+        payload: ExperiencePayload,
         scope: MemoryScope = MemoryScope.PROJECT,
         source_task: str = "",
-        created_by: ExperienceCreatedBy | str = ExperienceCreatedBy.MANUAL,
         run_id: str = "",
-        metadata: dict[str, Any] | None = None,
-    ) -> tuple[MemoryEntry, bool]:
+        stream_id: str = "",
+        created_by: ExperienceCreatedBy = ExperienceCreatedBy.MANUAL,
+        writer_confidence: float = 1.0,
+    ) -> tuple[ExperienceMemory, bool]:
         project_key = "" if scope == MemoryScope.GLOBAL else self.project_key
-        entry = build_experience_entry(
+        entry = ExperienceMemory(
             id=_new_id("exp"),
             content=content,
             tier=tier,
-            project_key=project_key,
+            payload=payload,
             scope=scope,
-            run_id=run_id,
+            project_key=project_key,
+            created_at=datetime.now(timezone.utc),
+            token_count=estimate_tokens(content),
+            fingerprint=content_fingerprint(content),
             source_task=source_task,
+            run_id=run_id,
+            stream_id=stream_id,
             created_by=created_by,
-            extra_metadata=metadata,
+            writer_confidence=writer_confidence,
         )
-        stored, created = self.long_term.add(entry)
+        stored, created = self.experience_store.add(entry)
         self._trace(
             "memory.evolver_saved",
             {
                 "id": stored.id,
                 "created": created,
-                "tier": stored.metadata.get("evolver_tier", ""),
+                "tier": stored.tier.value,
                 "scope": stored.scope.value,
                 "tokens": stored.token_count,
-                "source_task": str(stored.metadata.get("source_task") or ""),
-                "created_by": str(stored.metadata.get("created_by") or ""),
+                "source_task": stored.source_task,
+                "created_by": stored.created_by.value,
             },
         )
         return stored, created
 
     def update_experience_attribution(self, record: MemoryAttributionRecord) -> bool:
         """Write one attribution record onto a visible experience memory."""
-        return self.long_term.update_metadata_by_id(
-            record.memory_id,
-            attribution_metadata(record),
+        try:
+            expected_tier = ExperienceTier(record.tier)
+        except ValueError:
+            return False
+        return self.experience_store.update_attribution(
+            record,
             project_key=self.project_key,
-            expected_tier=record.tier,
+            expected_tier=expected_tier,
         )
 
     def append_summary(
@@ -387,46 +423,19 @@ class MemoryManager:
                 max_tokens=max_tokens,
                 top_k_per_tier=limit,
             )
-        return self._build_legacy_context_for_query(
-            query,
-            max_tokens=max_tokens,
-            limit=limit,
-            include_short_term=include_short_term,
+        context: MemoryContext[ExperienceMemory] = MemoryContext(
+            injected_text="",
+            hits=[],
+            estimated_tokens=0,
         )
-
-    def _build_legacy_context_for_query(
-        self,
-        query: str,
-        *,
-        max_tokens: int | None = None,
-        limit: int | None = None,
-        include_short_term: bool = False,
-    ) -> MemoryContext:
-        """Retrieve memory and return a token-bounded injection block.
-
-        This is the 3.2 acceptance target (plan §15). By default only
-        long-term facts are injected so the current turn is not re-injected as
-        "history"; ``include_short_term=True`` is for the ``/memory`` debug
-        view.
-        """
-        resolved_limit = limit if limit is not None else self.config.memory_retrieval_limit
-        resolved_tokens = max_tokens if max_tokens is not None else self.context_profile.memory_context_tokens
-        hits = self.retriever.retrieve(
-            query,
-            short_term=self.short_term,
-            long_term=self.long_term,
-            project_key=self.project_key,
-            limit=resolved_limit,
-            include_short_term=include_short_term,
-        )
-        context = self.retriever.build_context(hits, max_tokens=resolved_tokens)
         self._trace(
             "memory.retrieved",
             {
                 "query_chars": len(query),
-                "hits": len(context.hits),
-                "tokens": context.estimated_tokens,
-                "include_short_term": include_short_term,
+                "hits": 0,
+                "tokens": 0,
+                "include_short_term": False,
+                "mode": "off",
             },
         )
         return context
@@ -436,32 +445,18 @@ class MemoryManager:
         query: str,
         *,
         top_k_per_tier: int | None = None,
-    ) -> list:
+    ) -> list[RetrievalHit[ExperienceMemory]]:
         resolved_top_k = top_k_per_tier if top_k_per_tier is not None else self.config.memory_evolver_top_k_per_tier
         resolved_top_k = max(1, int(resolved_top_k))
-        hits = self.retriever.retrieve(
+        return list(self.experience_retriever.retrieve_candidates(
             query,
-            short_term=self.short_term,
-            long_term=self.long_term,
+            store=self.experience_store,
             project_key=self.project_key,
-            limit=0,
-            include_short_term=False,
-        )
-        groups: dict[ExperienceTier, list] = {tier: [] for tier in ExperienceTier}
-        for hit in hits:
-            tier = candidate_tier(hit.entry)
-            if tier is None:
-                continue
-            groups[tier].append(hit)
-
-        selected: list = []
-        for tier in ExperienceTier:
-            selected.extend(groups[tier][:resolved_top_k])
-        selected.sort(key=lambda hit: hit.score, reverse=True)
-        return selected
+            top_k_per_tier=resolved_top_k,
+        ))
 
     def count_visible_experiences(self) -> int:
-        return sum(1 for entry in self.long_term.all(project_key=self.project_key) if candidate_tier(entry) is not None)
+        return len(self.experience_store.all(project_key=self.project_key))
 
     def build_evolver_context_for_query(
         self,
@@ -476,6 +471,27 @@ class MemoryManager:
         resolved_top_k = max(1, int(resolved_top_k))
         visible_count = self.count_visible_experiences()
         if resolved_tokens <= 0 or visible_count < self.config.memory_evolver_min_experience_entries:
+            index = self.experience_store.index_snapshot()
+            visible_entries = self.experience_store.all(project_key=self.project_key)
+            tier_metrics = {
+                tier.value: {
+                    "visible_count": sum(1 for entry in visible_entries if entry.tier == tier),
+                    "indexed_count": sum(
+                        1 for entry in visible_entries if entry.tier == tier and not entry.invalidated
+                    ),
+                    "posting_candidate_count": 0,
+                    "scored_count": 0,
+                    "matched_count": 0,
+                    "returned_count": 0,
+                }
+                for tier in ExperienceTier
+            }
+            self.experience_retriever.last_metrics = ExperienceRetrievalMetrics(
+                repository_revision=index.revision,
+                visible_count=len(visible_entries),
+                indexed_count=sum(1 for entry in visible_entries if not entry.invalidated),
+                per_tier=tier_metrics,
+            )
             result = SelectionResult(
                 candidates=(),
                 selected=(),
@@ -598,6 +614,7 @@ class MemoryManager:
             "insufficient_experience_entries": insufficient_experience_entries,
             "visible_experience_count": visible_experience_count,
             "memory_project_key": self.project_key,
+            **self.experience_retriever.last_metrics.to_trace_payload(),
         }
         selected_payload = {
             "selected_count": len(result.selected),
@@ -612,7 +629,7 @@ class MemoryManager:
                 {
                     "id": item.candidate.id,
                     "reason": f"selected: score={item.candidate.selection_score:.2f} "
-                    f"tier={item.candidate.tier.value if item.candidate.tier is not None else ''} "
+                    f"tier={item.candidate.tier.value} "
                     f"rank={item.rank}",
                 }
                 for item in result.selected
@@ -631,6 +648,7 @@ class MemoryManager:
                 "include_short_term": False,
                 "mode": self.config.memory_evolver_mode,
                 "selection_policy": result.policy,
+                **self.experience_retriever.last_metrics.to_trace_payload(),
             },
         )
 
@@ -695,7 +713,10 @@ class MemoryManager:
         task_type: str = "",
         memory_mode: str = "",
     ) -> ExperienceWriteResult:
-        if not self.config.memory_evolver_writer_enabled:
+        if (
+            self.config.memory_evolver_mode != "full"
+            or not self.config.memory_evolver_writer_enabled
+        ):
             return ExperienceWriteResult()
 
         steps = build_write_steps_from_tool_history(
@@ -762,39 +783,23 @@ class MemoryManager:
                 self._append_writer_dataset(request, proposed)
                 return proposed
 
-            saved: list[MemoryEntry] = []
+            saved: list[ExperienceMemory] = []
             duplicate_ids: list[str] = []
             safe_source_task = _safe_dataset_join_text(request.source_task)
-            safe_source_trace = _safe_dataset_join_text(str(request.trace_path or ""))
             writer_policy = writer_policy_for_result(
                 llm_used=proposed.llm_used,
                 fallback_used=proposed.fallback_used,
             )
             for proposal in proposed.proposals:
-                proposal_metadata = _sanitize_writer_metadata(proposal.metadata)
-                metadata = {
-                    **proposal_metadata,
-                    "confidence": proposal.confidence,
-                    "outcome": request.outcome,
-                    "outcome_source": request.outcome_source,
-                    "stop_reason": request.stop_reason,
-                    "source_trace": safe_source_trace,
-                    "source_task": safe_source_task,
-                    "task_type": request.task_type,
-                    "selected_memory_ids": list(request.selected_memory_ids),
-                    "candidate_memory_ids": list(request.candidate_memory_ids),
-                    "stream_id": request.stream_id,
-                    "memory_project_key": request.project_key,
-                    "writer_policy": writer_policy,
-                    "writer_reason": proposal.reason,
-                }
                 entry, created = self.save_experience(
-                    proposal.content,
                     tier=proposal.tier,
+                    content=proposal.content,
+                    payload=proposal.payload,
                     source_task=safe_source_task,
                     created_by=ExperienceCreatedBy.WRITER,
                     run_id=request.run_id,
-                    metadata=metadata,
+                    stream_id=request.stream_id,
+                    writer_confidence=proposal.confidence,
                 )
                 if created:
                     saved.append(entry)
@@ -867,6 +872,8 @@ class MemoryManager:
             ),
             long_term=self.long_term,
             retriever=self.retriever,
+            experience_store=self.experience_store,
+            experience_retriever=self.experience_retriever.fork(),
             compressor=MemoryCompressor(
                 llm=self.llm,
                 chunk_size=self.config.memory_map_chunk_size,
@@ -1148,33 +1155,18 @@ def _writer_dataset_step(step: Any) -> dict[str, Any]:
 
 def _writer_dataset_proposal(proposal: Any) -> dict[str, Any]:
     tier = getattr(proposal, "tier", "")
+    payload = getattr(proposal, "payload", None)
+    try:
+        serialized_payload = experience_payload_to_dict(payload)
+    except (TypeError, ValueError):
+        serialized_payload = {}
     return {
         "tier": tier.value if isinstance(tier, ExperienceTier) else str(tier),
         "content": _safe_dataset_text(str(getattr(proposal, "content", "") or ""), WRITER_DATASET_CONTENT_CHARS),
+        "payload": _safe_dataset_value(serialized_payload),
         "confidence": float(getattr(proposal, "confidence", 0.0) or 0.0),
-        "metadata": _safe_dataset_value(_sanitize_writer_metadata(getattr(proposal, "metadata", {}) or {})),
+        "reason": _safe_dataset_text(str(getattr(proposal, "reason", "") or ""), WRITER_METADATA_STRING_CHARS),
     }
-
-
-def _sanitize_writer_metadata(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return {
-            _truncate_writer_metadata_string(str(key)): _sanitize_writer_metadata(item)
-            for key, item in value.items()
-        }
-    if isinstance(value, list):
-        return [_sanitize_writer_metadata(item) for item in value]
-    if isinstance(value, tuple):
-        return [_sanitize_writer_metadata(item) for item in value]
-    if isinstance(value, str):
-        return _truncate_writer_metadata_string(value)
-    return value
-
-
-def _truncate_writer_metadata_string(value: str) -> str:
-    if len(value) <= WRITER_METADATA_STRING_CHARS:
-        return value
-    return value[: WRITER_METADATA_STRING_CHARS - 3].rstrip() + "..."
 
 
 def _safe_dataset_value(value: Any) -> Any:
@@ -1239,9 +1231,7 @@ def _selection_candidate_ids_by_tier(selection: SelectionResult | None) -> dict[
         return {}
     grouped: dict[str, list[str]] = {}
     for candidate in selection.candidates:
-        tier = candidate.tier.value if candidate.tier is not None else ""
-        if not tier:
-            continue
+        tier = candidate.tier.value
         grouped.setdefault(tier, []).append(candidate.id)
     return grouped
 
@@ -1251,9 +1241,7 @@ def _selection_selected_ids_by_tier(selection: SelectionResult | None) -> dict[s
         return {}
     grouped: dict[str, list[str]] = {}
     for item in selection.selected:
-        tier = item.candidate.tier.value if item.candidate.tier is not None else ""
-        if not tier:
-            continue
+        tier = item.candidate.tier.value
         grouped.setdefault(tier, []).append(item.candidate.id)
     return grouped
 
@@ -1266,22 +1254,21 @@ def _rejected_reason_counts(rejected: tuple[dict[str, Any], ...]) -> dict[str, i
     return counts
 
 
-def _saved_records(entries: list[MemoryEntry]) -> list[dict[str, str]]:
+def _saved_records(entries: list[ExperienceMemory]) -> list[dict[str, str]]:
     return [
         {
             "id": entry.id,
-            "tier": str(entry.metadata.get("evolver_tier") or ""),
+            "tier": entry.tier.value,
+            "source_task": entry.source_task,
         }
         for entry in entries
     ]
 
 
-def _saved_tier_counts(entries: list[MemoryEntry]) -> dict[str, int]:
+def _saved_tier_counts(entries: list[ExperienceMemory]) -> dict[str, int]:
     counts: dict[str, int] = {}
     for entry in entries:
-        tier = str(entry.metadata.get("evolver_tier") or "")
-        if not tier:
-            continue
+        tier = entry.tier.value
         counts[tier] = counts.get(tier, 0) + 1
     return counts
 
@@ -1290,13 +1277,11 @@ def _new_id(prefix: str) -> str:
     return f"{prefix}_{uuid4().hex[:12]}"
 
 
-def _hit_tier_counts(hits: list) -> dict[str, int]:
+def _hit_tier_counts(hits: list[RetrievalHit[ExperienceMemory]]) -> dict[str, int]:
     counts: dict[str, int] = {}
     for hit in hits:
-        tier = candidate_tier(hit.entry)
-        if tier is None:
-            continue
-        counts[tier.value] = counts.get(tier.value, 0) + 1
+        tier = hit.entry.tier.value
+        counts[tier] = counts.get(tier, 0) + 1
     return counts
 
 

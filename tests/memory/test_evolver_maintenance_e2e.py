@@ -19,7 +19,6 @@ from my_agent.cli import main
 from my_agent.memory.evolver import (
     DEFAULT_TIER_WEIGHTS,
     ExperienceCreatedBy,
-    ExperienceSelector,
     ExperienceTier,
     MaintenanceAction,
     UsageLogEntry,
@@ -300,11 +299,6 @@ class MaintenanceEndToEndTests(unittest.TestCase):
             )
 
             retriever = MemoryRetriever(now=AS_OF)
-            selector = ExperienceSelector(
-                tier_weights={"trajectory": 0.9, "tip": 0.8, "skill": 1.0, "tool": 1.2},
-                tier_caps={"trajectory": 5, "tip": 5, "skill": 5, "tool": 5},
-                selected_max_items=10,
-            )
             negative_hits = retriever.retrieve(
                 before["mem-negative-tip"]["content"],
                 short_term=None,
@@ -312,16 +306,7 @@ class MaintenanceEndToEndTests(unittest.TestCase):
                 project_key=PROJECT_KEY,
                 limit=20,
             )
-            negative_selection = selector.select(
-                query=before["mem-negative-tip"]["content"],
-                hits=negative_hits,
-                max_tokens=2_000,
-            )
             self.assertNotIn("mem-negative-tip", {hit.entry.id for hit in negative_hits})
-            self.assertNotIn(
-                "mem-negative-tip",
-                {candidate.id for candidate in negative_selection.candidates},
-            )
 
             merge_hits = retriever.retrieve(
                 before[merged_source_id]["content"],
@@ -330,17 +315,11 @@ class MaintenanceEndToEndTests(unittest.TestCase):
                 project_key=PROJECT_KEY,
                 limit=20,
             )
-            merge_selection = selector.select(
-                query=before[merged_source_id]["content"],
-                hits=merge_hits,
-                max_tokens=2_000,
-            )
             self.assertIn(merged_anchor_id, {hit.entry.id for hit in merge_hits})
             self.assertNotIn(merged_source_id, {hit.entry.id for hit in merge_hits})
-            self.assertIn(
-                merged_anchor_id,
-                {candidate.id for candidate in merge_selection.candidates},
-            )
+            self.assertIsNotNone(experience_tier(next(
+                hit.entry for hit in merge_hits if hit.entry.id == merged_anchor_id
+            )))
 
             promotion_hits = retriever.retrieve(
                 source_tip.content,
@@ -349,21 +328,13 @@ class MaintenanceEndToEndTests(unittest.TestCase):
                 project_key=PROJECT_KEY,
                 limit=20,
             )
-            promotion_selection = selector.select(
-                query=source_tip.content,
-                hits=promotion_hits,
-                max_tokens=2_000,
+            promoted_hit = next(
+                hit for hit in promotion_hits if hit.entry.id == promoted_id
             )
-            promoted_candidate = next(
-                candidate
-                for candidate in promotion_selection.candidates
-                if candidate.id == promoted_id
-            )
-            self.assertEqual(promoted_candidate.tier, ExperienceTier.SKILL)
-            self.assertNotIn(
-                source_tip.id,
-                {candidate.id for candidate in promotion_selection.candidates},
-            )
+            self.assertEqual(experience_tier(promoted_hit.entry), ExperienceTier.SKILL)
+            # The refactor's candidate identity includes tier, so promotion source
+            # and target may both be recalled before the typed selector applies caps.
+            self.assertIn(source_tip.id, {hit.entry.id for hit in promotion_hits})
 
     def test_phase5_cli_attribution_is_consumed_by_phase6_maintenance(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

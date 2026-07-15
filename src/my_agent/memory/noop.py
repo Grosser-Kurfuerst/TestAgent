@@ -8,8 +8,22 @@ from uuid import uuid4
 from my_agent.config import AgentConfig
 from my_agent.context import ContextProfile
 from my_agent.llm.types import ChatResponse, MessageLike
-from my_agent.memory.evolver import ExperienceCreatedBy, ExperienceTier, ExperienceWriteResult, build_experience_entry
-from my_agent.memory.types import MemoryContext, MemoryEntry, MemoryScope, MemoryStatus, MemoryType
+from my_agent.memory.evolver import (
+    ExperienceCreatedBy,
+    ExperienceMemory,
+    ExperiencePayload,
+    ExperienceTier,
+    ExperienceWriteResult,
+)
+from my_agent.memory.token import estimate_tokens
+from my_agent.memory.types import (
+    MemoryContext,
+    MemoryEntry,
+    MemoryScope,
+    MemoryStatus,
+    MemoryType,
+    content_fingerprint,
+)
 
 
 class NoopMemoryManager:
@@ -34,12 +48,12 @@ class NoopMemoryManager:
         self._trace_sink = trace_sink
         self.last_evolver_selection = None
 
-    def set_trace_sink(self, trace_sink: Any | None) -> tuple[Any | None, Any | None]:
-        previous = (self._trace_sink, None)
+    def set_trace_sink(self, trace_sink: Any | None) -> tuple[Any | None, Any | None, Any | None]:
+        previous = (self._trace_sink, None, None)
         self._trace_sink = trace_sink
         return previous
 
-    def restore_trace_sink(self, snapshot: tuple[Any | None, Any | None]) -> None:
+    def restore_trace_sink(self, snapshot: tuple[Any | None, Any | None, Any | None]) -> None:
         self._trace_sink = snapshot[0]
 
     def append_user_message(self, content: str, *, run_id: str = "") -> MemoryEntry:
@@ -85,26 +99,33 @@ class NoopMemoryManager:
 
     def save_experience(
         self,
-        content: str,
         *,
-        tier: ExperienceTier | str,
+        tier: ExperienceTier,
+        content: str,
+        payload: ExperiencePayload,
         scope: MemoryScope = MemoryScope.PROJECT,
         source_task: str = "",
-        created_by: ExperienceCreatedBy | str = ExperienceCreatedBy.MANUAL,
         run_id: str = "",
-        metadata: dict[str, Any] | None = None,
-    ) -> tuple[MemoryEntry, bool]:
+        stream_id: str = "",
+        created_by: ExperienceCreatedBy = ExperienceCreatedBy.MANUAL,
+        writer_confidence: float = 1.0,
+    ) -> tuple[ExperienceMemory, bool]:
         project_key = "" if scope == MemoryScope.GLOBAL else self.project_key
-        entry = build_experience_entry(
+        entry = ExperienceMemory(
             id=f"noop_exp_{uuid4().hex[:12]}",
             content=content,
             tier=tier,
-            project_key=project_key,
+            payload=payload,
             scope=scope,
-            run_id=run_id,
+            project_key=project_key,
+            created_at=datetime.now(timezone.utc),
+            token_count=estimate_tokens(content),
+            fingerprint=content_fingerprint(content),
             source_task=source_task,
+            run_id=run_id,
+            stream_id=stream_id,
             created_by=created_by,
-            extra_metadata=metadata,
+            writer_confidence=writer_confidence,
         )
         return entry, False
 
