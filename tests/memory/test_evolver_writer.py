@@ -196,7 +196,21 @@ class EvolverWriterTests(unittest.TestCase):
         result = ExperienceWriter().propose(request)
 
         self.assertEqual(result.proposals, ())
-        self.assertEqual(result.rejected[0]["reason"], "low_confidence")
+        self.assertEqual(result.rejected, ({"reason": "low_confidence", "tier": "trajectory"},))
+
+    def test_fallback_unknown_proposes_typed_trajectory_when_threshold_allows_it(self) -> None:
+        request = _request(
+            outcome="unknown",
+            steps=(ExperienceWriteStep(step_num=1, tool="read_file", ok=True, output="code"),),
+        )
+
+        result = ExperienceWriter(min_confidence=0.60).propose(request)
+
+        self.assertEqual([proposal.tier for proposal in result.proposals], [ExperienceTier.TRAJECTORY])
+        self.assertEqual(result.proposals[0].confidence, 0.60)
+        self.assertIsInstance(result.proposals[0].payload, TrajectoryPayload)
+        self.assertEqual(result.proposals[0].payload.outcome, "unknown")
+        self.assertEqual(result.rejected, ())
 
     def test_llm_writer_accepts_json_array_proposals(self) -> None:
         llm = FakeWriterLLM(

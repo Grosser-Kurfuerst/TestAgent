@@ -20,7 +20,7 @@ from my_agent.memory.evolver.types import (
     SkillPayload,
     TipPayload,
 )
-from my_agent.memory.experience_retrieval import experience_index_terms
+from my_agent.memory.experience_retrieval import ExperienceRetriever, experience_index_terms
 from my_agent.memory.experience_store import (
     EXPERIENCE_LOCK_FILE,
     EXPERIENCE_STORAGE_FILE,
@@ -249,17 +249,24 @@ class ExperienceStoreTests(unittest.TestCase):
                 project_key="/repo",
                 expected_tier=ExperienceTier.SKILL,
             ))
+            before_update = datetime.now(timezone.utc)
             self.assertTrue(store.update_attribution(
                 record,
                 project_key="/repo",
                 expected_tier=ExperienceTier.TIP,
             ))
+            after_update = datetime.now(timezone.utc)
             updated = store.get("tip")
             self.assertIsNotNone(updated)
             assert updated is not None
             self.assertEqual(updated.attribution_value, 0.3)
             self.assertEqual(updated.attribution_confidence, 0.75)
             self.assertEqual(updated.last_used, NOW)
+            self.assertIsNotNone(updated.attribution_updated_at)
+            assert updated.attribution_updated_at is not None
+            self.assertIsNotNone(updated.attribution_updated_at.utcoffset())
+            self.assertLessEqual(before_update, updated.attribution_updated_at)
+            self.assertLessEqual(updated.attribution_updated_at, after_update)
             for field_name in (
                 "id",
                 "content",
@@ -332,9 +339,13 @@ class ExperienceStoreTests(unittest.TestCase):
                 )
             self.assertEqual(store.path.read_bytes(), before)
 
-    def test_post_commit_index_failure_keeps_complete_old_index_and_recovers(self) -> None:
+    def test_persistent_post_commit_index_failure_keeps_old_snapshot_readable_and_recovers(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            store = ExperienceStore.from_dir(tmp)
+            events: list[tuple[str, dict]] = []
+            store = ExperienceStore.from_dir(
+                tmp,
+                trace_sink=lambda name, payload: events.append((name, payload)),
+            )
             store.add(_memory("first", "first memory"))
             old_index = store.index_snapshot()
             import my_agent.memory.experience_store as store_module
@@ -342,18 +353,48 @@ class ExperienceStoreTests(unittest.TestCase):
             original_build = store_module._build_index_snapshot
             build_calls = 0
 
-            def fail_post_commit_build(*args, **kwargs):
+            def fail_after_precommit_build(*args, **kwargs):
                 nonlocal build_calls
                 build_calls += 1
-                if build_calls == 2:
+                if build_calls >= 2:
                     raise RuntimeError("index failed")
                 return original_build(*args, **kwargs)
 
             second = _memory("second", "second memory")
             expected_revision = experience_memories_revision((store.get("first"), second))  # type: ignore[arg-type]
-            with patch.object(store_module, "_build_index_snapshot", side_effect=fail_post_commit_build):
+            fresh = ExperienceStore(store.path)
+            with patch.object(store_module, "_build_index_snapshot", side_effect=fail_after_precommit_build):
                 with self.assertRaises(MemoryStorePostCommitError) as raised:
                     store.add(second)
+
+                served_index = store.index_snapshot()
+                self.assertEqual(served_index.revision, old_index.revision)
+                self.assertEqual(set(served_index.by_id), {"first"})
+                self.assertIs(store.index_snapshot(), served_index)
+                self.assertEqual([memory.id for memory in store.all(project_key="/repo")], ["first"])
+                retriever = ExperienceRetriever(now=NOW)
+                hits = retriever.retrieve_candidates(
+                    "first",
+                    store=store,
+                    project_key="/repo",
+                    top_k_per_tier=5,
+                )
+                self.assertEqual([hit.entry.id for hit in hits], ["first"])
+                self.assertEqual(retriever.last_metrics.repository_revision, old_index.revision)
+                self.assertEqual(retriever.last_metrics.retrieval_fallback, "")
+                self.assertIsNone(store.get("second"))
+
+                failures = [
+                    payload
+                    for event, payload in events
+                    if event == "memory.experience_index_rebuild_failed"
+                ]
+                self.assertTrue(failures)
+                self.assertTrue(all(payload["using_previous_snapshot"] for payload in failures))
+                self.assertTrue(all(payload["fallback_revision"] == old_index.revision for payload in failures))
+
+                with self.assertRaises(MemoryStoreLoadError):
+                    fresh.load()
 
             self.assertEqual(set(old_index.by_id), {"first"})
             self.assertEqual(raised.exception.expected_revision, expected_revision)

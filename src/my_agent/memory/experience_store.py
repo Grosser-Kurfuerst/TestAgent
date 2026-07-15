@@ -8,7 +8,7 @@ from collections import defaultdict
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
 from types import MappingProxyType
@@ -43,6 +43,10 @@ DedupKey = tuple[str, str, str, str]
 
 EXPERIENCE_STORAGE_FILE = "experience_memory.jsonl"
 EXPERIENCE_LOCK_FILE = ".experience_memory.lock"
+
+
+class _ExperienceIndexBuildError(MemoryStoreLoadError):
+    """Internal marker for a complete snapshot whose index could not be built."""
 
 
 @dataclass(frozen=True)
@@ -109,7 +113,12 @@ class ExperienceStore:
         """Load valid lines permissively for runtime startup."""
         with self.exclusive_process_lock():
             with self._lock:
-                self._load_permissive_locked()
+                try:
+                    self._load_permissive_locked()
+                except _ExperienceIndexBuildError:
+                    if not self._loaded:
+                        raise
+                    self._loaded_generation = None
 
     @contextmanager
     def exclusive_process_lock(
@@ -236,6 +245,7 @@ class ExperienceStore:
                         "reward_when_candidate_not_selected",
                     ),
                     last_used=_attribution_datetime(getattr(record, "last_used", "")),
+                    attribution_updated_at=datetime.now(timezone.utc),
                 )
                 next_memories = [
                     replacement if memory.id == memory_id else memory
@@ -286,15 +296,11 @@ class ExperienceStore:
             return written
         except Exception as exc:
             self._loaded_generation = None
-            self._trace(
-                "memory.experience_index_rebuild_failed",
-                {
-                    "experience_schema_version": EXPERIENCE_SCHEMA_VERSION,
-                    "storage_file": self.path.name,
-                    "expected_revision": expected_revision,
-                    "error": f"{type(exc).__name__}: {exc}",
-                },
-            )
+            if not isinstance(exc, _ExperienceIndexBuildError):
+                self._trace_index_rebuild_failed(
+                    expected_revision=expected_revision,
+                    error=exc,
+                )
             raise MemoryStorePostCommitError(
                 "experience repository committed but post-commit verification failed",
                 expected_revision=expected_revision,
@@ -369,9 +375,18 @@ class ExperienceStore:
 
     def _publish_snapshot_locked(self, snapshot: ExperienceStoreSnapshot) -> None:
         # Build every view first; only publish after the whole immutable index succeeds.
-        next_index = _build_index_snapshot(snapshot.memories, revision=snapshot.revision)
-        if next_index.revision != snapshot.revision:  # pragma: no cover - construction invariant
-            raise MemoryStoreLoadError("experience index revision mismatch")
+        try:
+            next_index = _build_index_snapshot(snapshot.memories, revision=snapshot.revision)
+            if next_index.revision != snapshot.revision:  # pragma: no cover - construction invariant
+                raise MemoryStoreLoadError("experience index revision mismatch")
+        except Exception as exc:
+            self._trace_index_rebuild_failed(
+                expected_revision=snapshot.revision,
+                error=exc,
+            )
+            raise _ExperienceIndexBuildError(
+                f"experience index build failed for revision {snapshot.revision}"
+            ) from exc
         self._memories = list(snapshot.memories)
         self._index = next_index
         self._loaded = True
@@ -389,10 +404,17 @@ class ExperienceStore:
                 generation = self._file_generation()
                 if self._loaded and self._loaded_generation == generation:
                     return
-                if self._loaded:
-                    self._load_strict_snapshot_locked()
-                else:
-                    self._load_permissive_locked()
+                try:
+                    if self._loaded:
+                        self._load_strict_snapshot_locked()
+                    else:
+                        self._load_permissive_locked()
+                except _ExperienceIndexBuildError:
+                    if not self._loaded:
+                        raise
+                    # Keep serving the previous complete snapshot. Leaving the
+                    # generation unresolved makes the next read retry the rebuild.
+                    self._loaded_generation = None
 
     def _persist_memories(self, memories: Sequence[ExperienceMemory]) -> None:
         tmp = _atomic_write_tmp_path(self.path)
@@ -434,6 +456,24 @@ class ExperienceStore:
                 "storage_file": self.path.name,
                 "experience_schema_version": EXPERIENCE_SCHEMA_VERSION,
                 "line": line_no,
+                "error": f"{type(error).__name__}: {error}",
+            },
+        )
+
+    def _trace_index_rebuild_failed(
+        self,
+        *,
+        expected_revision: str,
+        error: BaseException,
+    ) -> None:
+        self._trace(
+            "memory.experience_index_rebuild_failed",
+            {
+                "experience_schema_version": EXPERIENCE_SCHEMA_VERSION,
+                "storage_file": self.path.name,
+                "expected_revision": expected_revision,
+                "fallback_revision": self._index.revision if self._loaded else "",
+                "using_previous_snapshot": self._loaded,
                 "error": f"{type(error).__name__}: {error}",
             },
         )
