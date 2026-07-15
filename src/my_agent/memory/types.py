@@ -4,9 +4,12 @@ import hashlib
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any
+from typing import Any, Generic, TypeVar
 
 from my_agent.text_safety import sanitize_json_value
+
+
+MemoryItemT = TypeVar("MemoryItemT")
 
 
 class MemoryType(str, Enum):
@@ -124,10 +127,10 @@ class MemoryEntry:
 
 
 @dataclass(frozen=True)
-class RetrievalHit:
+class RetrievalHit(Generic[MemoryItemT]):
     """A scored retrieval result."""
 
-    entry: MemoryEntry
+    entry: MemoryItemT
     score: float
     matched_terms: tuple[str, ...]
     source_weight: float
@@ -135,11 +138,11 @@ class RetrievalHit:
 
 
 @dataclass(frozen=True)
-class MemoryContext:
+class MemoryContext(Generic[MemoryItemT]):
     """Rendered memory context ready to inject into the LLM prompt."""
 
     injected_text: str
-    hits: list[RetrievalHit]
+    hits: list[RetrievalHit[MemoryItemT]]
     estimated_tokens: int
 
 
