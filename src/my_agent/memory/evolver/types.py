@@ -609,7 +609,35 @@ def _json_object_copy(value: Any, name: str) -> dict[str, Any]:
         raise ValueError(f"{name} must be JSON serializable") from exc
     if not isinstance(decoded, dict):  # pragma: no cover - guarded by the input check
         raise ValueError(f"{name} must be a JSON object")
-    return decoded
+    return _freeze_json_object(decoded)
+
+
+class _FrozenJsonObject(dict[str, Any]):
+    """JSON-compatible dict that prevents mutation through frozen payloads."""
+
+    def _immutable(self, *args: Any, **kwargs: Any) -> None:
+        raise TypeError("experience payload JSON objects are immutable")
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    __ior__ = _immutable
+    clear = _immutable
+    pop = _immutable
+    popitem = _immutable
+    setdefault = _immutable
+    update = _immutable
+
+
+def _freeze_json_object(value: dict[str, Any]) -> dict[str, Any]:
+    return _FrozenJsonObject({key: _freeze_json_value(item) for key, item in value.items()})
+
+
+def _freeze_json_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return _freeze_json_object(value)
+    if isinstance(value, list):
+        return tuple(_freeze_json_value(item) for item in value)
+    return value
 
 
 def _finite_float(value: Any, name: str) -> float:

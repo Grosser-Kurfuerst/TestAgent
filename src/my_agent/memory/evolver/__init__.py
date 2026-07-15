@@ -12,6 +12,12 @@ from my_agent.memory.evolver.selector import (
     selection_score,
     selection_tier_counts,
 )
+from my_agent.memory.evolver.serialization import (
+    EXPERIENCE_SCHEMA_VERSION,
+    experience_canonical_json,
+    experience_from_dict,
+    experience_to_dict,
+)
 from my_agent.memory.evolver.attribution import (
     AttributionConfig,
     AttributionWriteBackSummary,
@@ -115,6 +121,7 @@ __all__ = [
     "AttributionConfig",
     "AttributionWriteBackSummary",
     "EVOLVER_SCHEMA_VERSION",
+    "EXPERIENCE_SCHEMA_VERSION",
     "BenchmarkOutcome",
     "DEFAULT_TIER_WEIGHTS",
     "DatasetScoringSummary",
@@ -172,7 +179,10 @@ __all__ = [
     "collect_usage_from_manifest_results",
     "experience_metadata",
     "experience_record_from_entry",
+    "experience_canonical_json",
+    "experience_from_dict",
     "experience_tier",
+    "experience_to_dict",
     "flatten_tier_ids",
     "group_ids_by_tier",
     "is_experience_entry",

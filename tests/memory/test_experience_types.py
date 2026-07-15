@@ -151,6 +151,10 @@ class ExperiencePayloadTests(unittest.TestCase):
         schema["properties"]["count"]["type"] = "string"  # type: ignore[index]
 
         self.assertEqual(payload.args_schema["properties"]["count"]["type"], "integer")
+        with self.assertRaises(TypeError):
+            payload.args_schema["new"] = {}  # type: ignore[index]
+        with self.assertRaises(TypeError):
+            payload.args_schema["properties"]["count"]["type"] = "number"  # type: ignore[index]
         with self.assertRaises(ValueError):
             ToolPayload("tool", "python", "print('ok')", args_schema={"value": float("inf")})
         with self.assertRaises(ValueError):

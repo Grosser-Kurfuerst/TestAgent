@@ -13,6 +13,12 @@ from typing import Any, Callable, Iterator, Sequence
 from filelock import FileLock, Timeout as FileLockTimeout
 
 from my_agent.json_safety import loads_json_strict
+from my_agent.memory.store_errors import (
+    MemoryStoreLoadError,
+    MemoryStoreLockTimeout,
+    MemoryStorePostCommitError,
+    MemoryStoreRevisionConflict,
+)
 from my_agent.memory.types import MemoryEntry, MemoryScope, content_fingerprint
 from my_agent.text_safety import sanitize_json_value
 
@@ -22,26 +28,6 @@ FileGeneration = tuple[int, int, int]
 
 STORAGE_FILE = "long_term_memory.jsonl"
 LOCK_FILE = ".long_term_memory.lock"
-
-
-class MemoryStoreLockTimeout(RuntimeError):
-    """Raised when the directory-scoped process lock cannot be acquired."""
-
-
-class MemoryStoreLoadError(ValueError):
-    """Raised when a strict repository snapshot is malformed or ambiguous."""
-
-
-class MemoryStoreRevisionConflict(RuntimeError):
-    """Raised when an atomic replace was planned against a stale revision."""
-
-
-class MemoryStorePostCommitError(RuntimeError):
-    """Raised when replacement occurred but write verification did not finish."""
-
-    def __init__(self, message: str, *, expected_revision: str) -> None:
-        super().__init__(message)
-        self.expected_revision = expected_revision
 
 
 @dataclass(frozen=True)
