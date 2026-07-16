@@ -899,7 +899,7 @@ class ManifestBenchmarkTests(unittest.TestCase):
             result = run_manifest_benchmark(
                 tasks_path=manifest,
                 output_dir=base / "out",
-                config=fake_config(base / "traces", memory_enabled=True, memory_auto_extract=False),
+                config=fake_config(base / "traces", memory_enabled=True),
                 agent_runner=fake_agent_runner,
             )
             result_records = read_jsonl(result.results_path)
@@ -1034,7 +1034,7 @@ class ManifestBenchmarkTests(unittest.TestCase):
             result = run_manifest_benchmark(
                 tasks_path=manifest,
                 output_dir=base / "out",
-                config=fake_config(base / "traces", memory_enabled=True, memory_auto_extract=False),
+                config=fake_config(base / "traces", memory_enabled=True),
                 agent_runner=fake_agent_runner,
             )
 

@@ -25,12 +25,12 @@ from my_agent.memory.evolver.artifacts import _resolve_maintenance_artifact_grap
 from my_agent.memory.evolver.transaction import (
     _apply_maintenance_plan as apply_maintenance_plan,
 )
-from my_agent.memory.long_term import (
-    LOCK_FILE,
-    STORAGE_FILE,
-    LongTermMemoryStore,
-    MemoryStoreLockTimeout,
+from my_agent.memory.experience_store import (
+    EXPERIENCE_LOCK_FILE,
+    EXPERIENCE_STORAGE_FILE,
+    ExperienceStore,
 )
+from my_agent.memory.store_errors import MemoryStoreLockTimeout
 from my_agent.observability.tracing import TraceWriter
 from my_agent.schema import TraceEvent
 
@@ -87,8 +87,8 @@ class _CommandState:
 
 def _run_maintenance(args: argparse.Namespace, state: _CommandState) -> int:
     preplan_graph = _resolve_maintenance_artifact_graph(
-        store_path=state.paths.memory_dir / STORAGE_FILE,
-        store_lock_path=state.paths.memory_dir / LOCK_FILE,
+        store_path=state.paths.memory_dir / EXPERIENCE_STORAGE_FILE,
+        store_lock_path=state.paths.memory_dir / EXPERIENCE_LOCK_FILE,
         history_path=state.paths.history,
         backup_dir=state.paths.backup_dir,
         plan_id=None,
@@ -101,7 +101,7 @@ def _run_maintenance(args: argparse.Namespace, state: _CommandState) -> int:
     )
     state.reuse_plan_artifact = preplan_graph.reuse_plan_artifact
     state.paths_validated = True
-    store = LongTermMemoryStore.from_dir(
+    store = ExperienceStore.from_dir(
         state.paths.memory_dir,
         lock_timeout_seconds=float(args.lock_timeout_seconds),
     )
@@ -111,7 +111,7 @@ def _run_maintenance(args: argparse.Namespace, state: _CommandState) -> int:
         state.stage = "plan_load"
         plan = load_maintenance_plan(
             args.plan,
-            repository_entries=snapshot.entries,
+            repository_entries=snapshot.memories,
         )
         state.plan = plan
         state.stage = "validation"
@@ -128,7 +128,7 @@ def _run_maintenance(args: argparse.Namespace, state: _CommandState) -> int:
         )
         config = _maintenance_config_from_args(args)
         plan = build_maintenance_plan(
-            entries=snapshot.entries,
+            entries=snapshot.memories,
             attribution=attribution,
             repository_revision=snapshot.revision,
             project_key=state.project_key,
@@ -165,7 +165,7 @@ def _run_maintenance(args: argparse.Namespace, state: _CommandState) -> int:
             plan,
             mode=state.mode,
             current_revision=snapshot.revision,
-            entries_total=len(snapshot.entries),
+            entries_total=len(snapshot.memories),
         ),
         run_id=run_id,
     ))

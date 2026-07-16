@@ -12,13 +12,13 @@ from my_agent.memory.evolver.contracts import (
     MaintenancePlan,
 )
 from my_agent.memory.evolver.planner import _build_maintenance_plan
+from my_agent.memory.evolver.types import ExperienceMemory
 from my_agent.memory.evolver.validation import validate_plan_semantics
-from my_agent.memory.types import MemoryEntry
 
 
 def build_maintenance_plan(
     *,
-    entries: Sequence[MemoryEntry],
+    entries: Sequence[ExperienceMemory],
     attribution: Mapping[AttributionKey, MemoryAttributionRecord],
     repository_revision: str,
     project_key: str,

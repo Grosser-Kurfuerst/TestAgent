@@ -334,7 +334,6 @@ class AgentContextManagerTests(unittest.TestCase):
                     response_reserve_tokens_explicit=True,
                     compression_buffer_tokens=900,
                     compression_buffer_tokens_explicit=True,
-                    memory_auto_extract=False,
                 ),
                 llm=FakeLLM(),
                 repo_path=repo,

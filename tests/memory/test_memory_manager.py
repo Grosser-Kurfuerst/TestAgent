@@ -28,6 +28,7 @@ from my_agent.memory import (
     TrajectoryPayload,
 )
 from my_agent.memory.evolver import ExperienceWriteProposal, ExperienceWriteResult, experience_to_dict
+from my_agent.memory.store_errors import MemoryStoreLoadError
 from my_agent.tools import ToolExecutionResult
 from tests.memory.experience_fixtures import save_typed_experience
 
@@ -288,7 +289,7 @@ class MemoryManagerSaveExperienceTests(unittest.TestCase):
                 for legacy_name in ("long_term", "retriever", "retrieve_hits", "save_fact", "extract_facts"):
                     self.assertFalse(hasattr(candidate, legacy_name), legacy_name)
 
-    def test_runtime_manager_does_not_load_legacy_long_term_file(self) -> None:
+    def test_runtime_manager_fails_closed_on_legacy_long_term_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "repo"
             repo.mkdir()
@@ -296,10 +297,10 @@ class MemoryManagerSaveExperienceTests(unittest.TestCase):
             memory_dir.mkdir()
             (memory_dir / "long_term_memory.jsonl").write_text("{not valid json}\n", encoding="utf-8")
 
-            manager = MemoryManager.from_config(config=_config(memory_dir), llm=FakeLLM(), repo_path=repo)
-
-            self.assertEqual(manager.status().storage_path, str(memory_dir / "experience_memory.jsonl"))
-            self.assertFalse(hasattr(manager, "long_term"))
+            with self.assertRaisesRegex(MemoryStoreLoadError, "explicit four-tier memory reset"):
+                MemoryManager.from_config(config=_config(memory_dir), llm=FakeLLM(), repo_path=repo)
+            self.assertTrue((memory_dir / "long_term_memory.jsonl").exists())
+            self.assertFalse((memory_dir / "experience_memory.jsonl").exists())
 
     def test_save_experience_persists_typed_payload_and_traces(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1802,7 +1803,7 @@ class AgentContextManagerPromptTests(unittest.TestCase):
             repo.mkdir()
             traces: list[tuple[str, dict[str, object]]] = []
             manager = MemoryManager.from_config(
-                config=_config(Path(tmp) / "memory", memory_auto_extract=True),
+                config=_config(Path(tmp) / "memory"),
                 llm=RecordingMemoryLLM(),
                 repo_path=repo,
                 trace_sink=lambda event, payload: traces.append((event, payload)),

@@ -88,9 +88,6 @@ class AgentConfig:
     memory_retain_recent_turns: int = 3
     memory_map_chunk_size: int = 5
     memory_tool_result_chars: int = 500
-    # Deprecated compatibility setting. Ordinary long-term fact extraction has
-    # been removed; typed experiences are written only through the Evolver.
-    memory_auto_extract: bool = False
     memory_short_term_tokens_explicit: bool = False
     memory_context_tokens_explicit: bool = False
     memory_tool_result_chars_explicit: bool = False
@@ -318,12 +315,6 @@ class AgentConfig:
                 values,
                 "AGENTCLI_MEMORY_TOOL_RESULT_CHARS",
                 "MY_AGENT_MEMORY_TOOL_RESULT_CHARS",
-            ),
-            # Deprecated input retained so existing env files continue to load.
-            # MemoryManager no longer reads this setting or extracts facts.
-            memory_auto_extract=_as_bool(
-                values.get("AGENTCLI_MEMORY_AUTO_EXTRACT", values.get("MY_AGENT_MEMORY_AUTO_EXTRACT", "")),
-                default=False,
             ),
             memory_evolver_mode=_memory_evolver_mode(values),
             memory_evolver_top_k_per_tier=_as_min_int(

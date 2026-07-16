@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -10,7 +11,6 @@ import math
 
 from my_agent.json_safety import loads_json_strict
 from my_agent.memory.evolver.contracts import (
-    MAINTENANCE_POLICY,
     MaintenanceAction,
     MaintenanceConfig,
     MaintenanceEvidence,
@@ -24,7 +24,6 @@ from my_agent.memory.evolver.contracts import (
 )
 from my_agent.memory.evolver.planner import (
     _automatic_maintenance_provenance,
-    _entry_payload_with_metadata,
     _merge_replacement_payload,
     _merge_threshold,
     _plan_operations_from_evidence,
@@ -34,10 +33,10 @@ from my_agent.memory.evolver.planner import (
 )
 from my_agent.memory.evolver.types import (
     ExperienceCreatedBy,
+    ExperienceMemory,
     ExperienceTier,
-    experience_tier,
 )
-from my_agent.memory.types import MemoryEntry, MemoryScope
+from my_agent.memory.types import MemoryScope
 
 
 _PLAN_FIELDS = frozenset({
@@ -58,7 +57,7 @@ _PLAN_FIELDS = frozenset({
 def parse_maintenance_plan(
     data: Mapping[str, Any],
     *,
-    repository_entries: Sequence[MemoryEntry] | None = None,
+    repository_entries: Sequence[ExperienceMemory] | None = None,
 ) -> MaintenancePlan:
     """Parse a reviewed plan and apply the full available semantic contract."""
     actual_fields = frozenset(data)
@@ -81,7 +80,7 @@ def parse_maintenance_plan(
 def load_maintenance_plan(
     path: str | Path,
     *,
-    repository_entries: Sequence[MemoryEntry] | None = None,
+    repository_entries: Sequence[ExperienceMemory] | None = None,
 ) -> MaintenancePlan:
     source = Path(path)
     try:
@@ -100,7 +99,7 @@ def load_maintenance_plan(
 def validate_plan_semantics(
     plan: MaintenancePlan,
     *,
-    repository_entries: Sequence[MemoryEntry] | None = None,
+    repository_entries: Sequence[ExperienceMemory] | None = None,
 ) -> None:
     """Validate action meaning independently from plan and operation digests."""
     as_of = _parse_datetime(plan.as_of)
@@ -186,23 +185,18 @@ def validate_plan_semantics(
 
 
 def _validate_snapshot_evidence(
-    entry: MemoryEntry,
+    entry: ExperienceMemory,
     evidence: MaintenanceEvidence,
 ) -> None:
-    tier = experience_tier(entry)
-    metadata = entry.metadata
     expected = {
         "memory_id": entry.id,
-        "tier": tier.value if tier is not None else "",
+        "tier": entry.tier.value,
         "scope": entry.scope.value,
         "project_key": entry.project_key,
-        "created_by": str(metadata.get("created_by") or ""),
+        "created_by": entry.created_by.value,
         "created_at": entry.created_at.isoformat(),
-        "source_task": str(metadata.get("source_task") or metadata.get("task_id") or ""),
-        "writer_confidence": _evidence_float(
-            metadata.get("confidence"),
-            "writer_confidence",
-        ),
+        "source_task": entry.source_task,
+        "writer_confidence": _evidence_float(entry.writer_confidence, "writer_confidence"),
     }
     for name, expected_value in expected.items():
         if getattr(evidence, name) != expected_value:
@@ -241,7 +235,7 @@ def _validate_merge_action_semantics(
     *,
     evidence_by_id: Mapping[str, MaintenanceEvidence],
     as_of: datetime,
-    repository_by_id: Mapping[str, MemoryEntry] | None,
+    repository_by_id: Mapping[str, ExperienceMemory] | None,
     config: MaintenanceConfig,
 ) -> None:
     if operation.reason_codes != ("near_duplicate_complete_link",):
@@ -257,29 +251,10 @@ def _validate_merge_action_semantics(
         raise MaintenancePlanError("merge redundancy score is below the configured threshold")
 
     replacement = _validated_payload_entry(operation.replacements[0], "merge replacement")
-    metadata = replacement.metadata
-    expected_lineage = {
-        "created_by": ExperienceCreatedBy.MAINTENANCE.value,
-        "maintenance_action": MaintenanceAction.MERGE.value,
-        "maintenance_policy": MAINTENANCE_POLICY,
-        "maintenance_operation_id": operation.operation_id,
-        "maintenance_as_of": as_of.isoformat(),
-        "maintenance_source_ids": list(operation.source_ids),
-        "maintenance_source_fingerprints": {
-            source_id: operation.source_preconditions[source_id]["fingerprint"]
-            for source_id in operation.source_ids
-        },
-        "maintenance_redundancy_min": operation.redundancy_score,
-        "maintenance_source_evidence": {
-            source_id: evidence_by_id[source_id].to_dict()
-            for source_id in operation.source_ids
-        },
-    }
-    for key, expected in expected_lineage.items():
-        if metadata.get(key) != expected:
-            raise MaintenancePlanError(
-                f"merge replacement lineage mismatch for {key}: {replacement.id}"
-            )
+    if replacement.created_by != ExperienceCreatedBy.MAINTENANCE:
+        raise MaintenancePlanError("merge replacement must be maintenance-created")
+    if replacement.maintenance_operation_id != operation.operation_id:
+        raise MaintenancePlanError("merge replacement operation id mismatch")
 
     if repository_by_id is None:
         return
@@ -302,40 +277,34 @@ def _validate_promotion_action_semantics(
     *,
     evidence_by_id: Mapping[str, MaintenanceEvidence],
     as_of: datetime,
-    repository_by_id: Mapping[str, MemoryEntry] | None,
+    repository_by_id: Mapping[str, ExperienceMemory] | None,
     config: MaintenanceConfig,
 ) -> None:
     source_id = operation.source_ids[0]
     evidence = evidence_by_id[source_id]
     replacement = _validated_payload_entry(operation.replacements[0], "promotion source")
-    replacement_metadata = replacement.metadata
-    expected_source_lineage = {
-        "maintenance_promoted_to": operation.target_ids[0],
-        "maintenance_promoted_at": as_of.isoformat(),
-        "maintenance_operation_id": operation.operation_id,
-    }
-    for key, expected in expected_source_lineage.items():
-        if replacement_metadata.get(key) != expected:
-            raise MaintenancePlanError(
-                f"promotion source lineage mismatch for {key}: {source_id}"
-            )
+    if replacement.promoted_to != operation.target_ids[0]:
+        raise MaintenancePlanError(f"promotion source target mismatch: {source_id}")
+    if replacement.maintenance_operation_id != operation.operation_id:
+        raise MaintenancePlanError(f"promotion source operation mismatch: {source_id}")
 
     if repository_by_id is not None:
         source = repository_by_id[source_id]
-        expected_source_metadata = dict(source.metadata)
-        expected_source_metadata.update(expected_source_lineage)
-        expected_replacement = _entry_payload_with_metadata(source, expected_source_metadata)
+        expected_replacement = replace(
+            source,
+            promoted_to=operation.target_ids[0],
+            maintenance_operation_id=operation.operation_id,
+        )
         if operation.replacements[0] != expected_replacement:
             raise MaintenancePlanError("promotion source replacement changes non-lineage fields")
     else:
-        source_payload = replacement.to_dict()
-        source_metadata = dict(replacement_metadata)
-        for key in expected_source_lineage:
-            source_metadata.pop(key, None)
-        source_payload["metadata"] = source_metadata
-        source = MemoryEntry.from_dict(source_payload)
+        source = replace(
+            replacement,
+            promoted_to="",
+            maintenance_operation_id="",
+        )
 
-    if experience_tier(source) not in {ExperienceTier.TIP, ExperienceTier.TRAJECTORY}:
+    if source.tier not in {ExperienceTier.TIP, ExperienceTier.TRAJECTORY}:
         raise MaintenancePlanError(f"invalid promotion source tier: {source_id}")
     if not _promotion_eligible(source, evidence, config=config):
         raise MaintenancePlanError(f"promotion source is not eligible: {source_id}")
@@ -350,7 +319,7 @@ def _validate_promotion_action_semantics(
         )
         if operation.target_ids != (expected_target.id,):
             raise MaintenancePlanError("promotion target id is not deterministic")
-        if operation.additions[0] != expected_target.to_dict():
+        if operation.additions[0] != expected_target:
             raise MaintenancePlanError("promotion target does not match deterministic semantics")
     elif operation.reason_codes != ("promotion_linked_existing_skill",):
         raise MaintenancePlanError("existing promotion target has invalid reason codes")

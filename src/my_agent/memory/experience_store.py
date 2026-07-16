@@ -44,6 +44,7 @@ DedupKey = tuple[str, str, str, str]
 
 EXPERIENCE_STORAGE_FILE = "experience_memory.jsonl"
 EXPERIENCE_LOCK_FILE = ".experience_memory.lock"
+LEGACY_LONG_TERM_STORAGE_FILE = "long_term_memory.jsonl"
 
 
 class _ExperienceIndexBuildError(MemoryStoreLoadError):
@@ -82,6 +83,12 @@ class ExperienceStore:
         lock_timeout_seconds: float = 30.0,
     ) -> None:
         self.path = Path(path)
+        legacy_path = self.path.parent / LEGACY_LONG_TERM_STORAGE_FILE
+        if self.path.name == EXPERIENCE_STORAGE_FILE and legacy_path.exists():
+            raise MemoryStoreLoadError(
+                "legacy long_term_memory.jsonl exists; stop memory processes and run "
+                "the explicit four-tier memory reset before starting this runtime"
+            )
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if not math.isfinite(lock_timeout_seconds) or lock_timeout_seconds < 0:
             raise ValueError("lock_timeout_seconds must be finite and non-negative")
@@ -609,6 +616,7 @@ def _atomic_write_tmp_path(path: str | Path) -> Path:
 __all__ = [
     "EXPERIENCE_LOCK_FILE",
     "EXPERIENCE_STORAGE_FILE",
+    "LEGACY_LONG_TERM_STORAGE_FILE",
     "ExperienceStore",
     "ExperienceStoreIndexSnapshot",
     "ExperienceStoreSnapshot",

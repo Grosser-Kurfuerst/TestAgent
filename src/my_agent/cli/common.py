@@ -177,8 +177,6 @@ def tool_environment_overrides(env: Mapping[str, str]) -> dict[str, str]:
         "MY_AGENT_MEMORY_MAP_CHUNK_SIZE",
         "AGENTCLI_MEMORY_TOOL_RESULT_CHARS",
         "MY_AGENT_MEMORY_TOOL_RESULT_CHARS",
-        "AGENTCLI_MEMORY_AUTO_EXTRACT",
-        "MY_AGENT_MEMORY_AUTO_EXTRACT",
         "AGENTCLI_MEMORY_EVOLVER",
         "MY_AGENT_MEMORY_EVOLVER",
         "AGENTCLI_MEMORY_EVOLVER_MODE",

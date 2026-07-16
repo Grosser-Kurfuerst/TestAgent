@@ -28,17 +28,12 @@ from my_agent.memory.evolver import (
     ExperienceCreatedBy,
     ExperienceMemory,
     ExperiencePayload,
-    ExperienceRecord,
     ExperienceTier,
     ExperienceTrajectoryStep,
     SkillPayload,
     TipPayload,
     ToolPayload,
     TrajectoryPayload,
-    build_experience_entry,
-    experience_record_from_entry,
-    experience_tier,
-    is_experience_entry,
 )
 from my_agent.memory.manager import MemoryManager
 from my_agent.memory.noop import NoopMemoryManager
@@ -64,7 +59,6 @@ __all__ = [
     "ExperienceStoreSnapshot",
     "ExperienceMemory",
     "ExperiencePayload",
-    "ExperienceRecord",
     "ExperienceTier",
     "ExperienceTrajectoryStep",
     "EXPERIENCE_LOCK_FILE",
@@ -82,11 +76,7 @@ __all__ = [
     "MemoryStatus",
     "MemoryType",
     "RetrievalHit",
-    "build_experience_entry",
     "content_fingerprint",
-    "experience_record_from_entry",
     "experience_searchable_text",
-    "experience_tier",
-    "is_experience_entry",
     "normalize_content",
 ]

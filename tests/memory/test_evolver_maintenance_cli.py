@@ -22,13 +22,13 @@ from my_agent.cli import memory_maintenance as maintenance_cli
 import my_agent.memory.evolver.transaction as maintenance_transaction
 from my_agent.memory.evolver import (
     ExperienceCreatedBy,
+    ExperienceTier,
     MaintenanceApplyResult,
     MaintenanceApplyStatus,
-    build_experience_entry,
     load_maintenance_plan,
 )
-from my_agent.memory.long_term import LongTermMemoryStore
-from my_agent.memory.types import MemoryEntry, MemoryScope, MemoryType
+from my_agent.memory.experience_store import ExperienceStore
+from tests.memory.experience_fixtures import typed_experience
 
 
 PROJECT_KEY = "manifest:demo:memory:shared_stream:stream:python"
@@ -38,19 +38,19 @@ NOW = datetime(2026, 7, 12, tzinfo=timezone.utc)
 
 
 class MaintenanceCliTests(unittest.TestCase):
-    def _store(self, memory_dir: Path) -> LongTermMemoryStore:
-        return LongTermMemoryStore.from_dir(memory_dir)
+    def _store(self, memory_dir: Path) -> ExperienceStore:
+        return ExperienceStore.from_dir(memory_dir)
 
-    def _add_invalidated_tip(self, memory_dir: Path) -> LongTermMemoryStore:
+    def _add_invalidated_tip(self, memory_dir: Path) -> ExperienceStore:
         store = self._store(memory_dir)
-        store.add(build_experience_entry(
-            id="delete-tip",
-            content="This parser warning is obsolete.",
-            tier="tip",
+        store.add(typed_experience(
+            "delete-tip",
+            "This parser warning is obsolete.",
+            ExperienceTier.TIP,
             project_key=PROJECT_KEY,
             created_at=NOW,
             created_by=ExperienceCreatedBy.WRITER,
-            extra_metadata={"maintenance_invalidated": True},
+            invalidated=True,
         ))
         return store
 
@@ -308,7 +308,7 @@ class MaintenanceCliTests(unittest.TestCase):
             plan = load_maintenance_plan(plan_path)
             backup_dir = memory_dir / "backups"
             concrete_backup = (
-                backup_dir / f"{plan.plan_id}.long_term_memory.jsonl"
+                backup_dir / f"{plan.plan_id}.experience_memory.jsonl"
             )
             summary_path = Path(str(plan_path) + ".summary.json")
             summary_before = summary_path.read_bytes()
@@ -359,7 +359,7 @@ class MaintenanceCliTests(unittest.TestCase):
                 backup_dir = memory_dir / "backups"
                 backup_tmp = (
                     backup_dir
-                    / f"{plan.plan_id}.long_term_memory.jsonl.tmp"
+                    / f"{plan.plan_id}.experience_memory.jsonl.tmp"
                 )
                 output_path = backup_tmp
                 sentinel = b""
@@ -480,7 +480,7 @@ class MaintenanceCliTests(unittest.TestCase):
                 self.assertEqual(plan_path.read_bytes(), before)
                 self.assertNotIn(
                     "delete-tip",
-                    {entry.id for entry in store.load_strict_snapshot().entries},
+                    {entry.id for entry in store.load_strict_snapshot().memories},
                 )
 
     def test_apply_reviewed_plan_writes_history_backup_and_completed_trace(self) -> None:
@@ -516,7 +516,7 @@ class MaintenanceCliTests(unittest.TestCase):
             self.assertIn("Status: committed", stdout)
             self.assertNotIn(
                 "delete-tip",
-                {entry.id for entry in store.load_strict_snapshot().entries},
+                {entry.id for entry in store.load_strict_snapshot().memories},
             )
             summary = json.loads(
                 Path(str(plan_path) + ".summary.json").read_text(encoding="utf-8")
@@ -582,7 +582,7 @@ class MaintenanceCliTests(unittest.TestCase):
             self.assertEqual(exit_code, 0)
             self.assertNotIn(
                 "delete-tip",
-                {entry.id for entry in store.load_strict_snapshot().entries},
+                {entry.id for entry in store.load_strict_snapshot().memories},
             )
 
     def test_reviewed_plan_project_mismatch_fails_before_mutation(self) -> None:
@@ -633,13 +633,10 @@ class MaintenanceCliTests(unittest.TestCase):
                 )[0],
                 0,
             )
-            store.add(MemoryEntry.build(
-                id="later-fact",
-                content="A later unrelated fact.",
-                type=MemoryType.FACT,
-                scope=MemoryScope.PROJECT,
-                source="manual",
-                token_count=4,
+            store.add(typed_experience(
+                "later-skill",
+                "A later unrelated skill.",
+                ExperienceTier.SKILL,
                 project_key=PROJECT_KEY,
                 created_at=NOW,
             ))
@@ -672,7 +669,7 @@ class MaintenanceCliTests(unittest.TestCase):
                 {event["event"] for event in events},
             )
             self.assertIn("delete-tip", {entry.id for entry in store.all()})
-            self.assertIn("later-fact", {entry.id for entry in store.all()})
+            self.assertIn("later-skill", {entry.id for entry in store.all()})
 
     def test_strict_load_and_invalid_config_fail_with_safe_trace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -976,7 +973,7 @@ class MaintenanceCliTests(unittest.TestCase):
             self.assertIn("DO NOT RETRY", stderr)
             self.assertNotIn(
                 "delete-tip",
-                {entry.id for entry in store.load_strict_snapshot().entries},
+                {entry.id for entry in store.load_strict_snapshot().memories},
             )
             summary = json.loads(
                 Path(str(plan_path) + ".summary.json").read_text(encoding="utf-8")
@@ -1029,7 +1026,7 @@ class MaintenanceCliTests(unittest.TestCase):
             self.assertIn("DO NOT RETRY", stderr)
             self.assertNotIn(
                 "delete-tip",
-                {entry.id for entry in store.load_strict_snapshot().entries},
+                {entry.id for entry in store.load_strict_snapshot().memories},
             )
             events = _read_jsonl(trace_path)
             self.assertEqual(events[-1]["event"], "memory.maintenance_completed")
@@ -1136,7 +1133,7 @@ class MaintenanceCliTests(unittest.TestCase):
                 self.assertIn("DO NOT RETRY", stderr)
                 self.assertNotIn(
                     "delete-tip",
-                    {entry.id for entry in store.load_strict_snapshot().entries},
+                    {entry.id for entry in store.load_strict_snapshot().memories},
                 )
                 summary = json.loads(
                     Path(str(plan_path) + ".summary.json").read_text(
@@ -1217,7 +1214,7 @@ class MaintenanceCliTests(unittest.TestCase):
             self.assertIn("DO NOT RETRY", stderr)
             self.assertNotIn(
                 "delete-tip",
-                {entry.id for entry in store.load_strict_snapshot().entries},
+                {entry.id for entry in store.load_strict_snapshot().memories},
             )
             summary = json.loads(
                 Path(str(plan_path) + ".summary.json").read_text(encoding="utf-8")
@@ -1315,7 +1312,7 @@ class MaintenanceCliTests(unittest.TestCase):
             self.assertEqual(completed_attempts, 1)
             self.assertNotIn(
                 "delete-tip",
-                {entry.id for entry in store.load_strict_snapshot().entries},
+                {entry.id for entry in store.load_strict_snapshot().memories},
             )
             events = _read_jsonl(trace_path)
             self.assertEqual(

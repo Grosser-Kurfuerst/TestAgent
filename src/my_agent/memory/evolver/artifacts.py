@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Iterable
 
 from my_agent.memory.evolver.contracts import MaintenancePlanError
-from my_agent.memory.long_term import _atomic_write_tmp_path
 
 
 @dataclass(frozen=True)
@@ -103,7 +102,7 @@ def _validate_maintenance_artifact_graph(graph: _MaintenanceArtifactGraph) -> No
 
 def _maintenance_backup_path(backup_dir: str | Path, plan_id: str) -> Path:
     root = Path(backup_dir).resolve()
-    candidate = (root / f"{plan_id}.long_term_memory.jsonl").resolve()
+    candidate = (root / f"{plan_id}.experience_memory.jsonl").resolve()
     if candidate.parent != root:
         raise MaintenancePlanError("maintenance backup path escapes backup directory")
     return candidate
@@ -112,6 +111,11 @@ def _maintenance_backup_path(backup_dir: str | Path, plan_id: str) -> Path:
 def _history_lock_path(path: str | Path) -> Path:
     source = Path(path)
     return source.with_name(f".{source.name}.lock")
+
+
+def _atomic_write_tmp_path(path: str | Path) -> Path:
+    target = Path(path)
+    return target.with_suffix(target.suffix + ".tmp")
 
 
 def _artifact_paths_alias(left: str | Path, right: str | Path) -> bool:

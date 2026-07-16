@@ -259,8 +259,7 @@ class AgentConfigTests(unittest.TestCase):
         self.assertEqual(config.memory_evolver_writer_max_input_chars, 12_000)
         self.assertEqual(config.memory_evolver_writer_max_content_chars, 1_200)
         self.assertIsNone(config.memory_evolver_writer_dataset_path)
-        # Deprecated compatibility field; no runtime path performs fact extraction.
-        self.assertFalse(config.memory_auto_extract)
+        self.assertFalse(hasattr(config, "memory_auto_extract"))
         self.assertFalse(config.hitl_enabled)
         self.assertEqual(config.hitl_audit_dir, Path("~/.agentcli/audit").expanduser())
         self.assertEqual(config.hitl_non_interactive, "reject")
@@ -354,7 +353,6 @@ class AgentConfigTests(unittest.TestCase):
                     "AGENTCLI_MEMORY_RETAIN_RECENT_TURNS": "2",
                     "AGENTCLI_MEMORY_MAP_CHUNK_SIZE": "3",
                     "AGENTCLI_MEMORY_TOOL_RESULT_CHARS": "250",
-                    "AGENTCLI_MEMORY_AUTO_EXTRACT": "true",
                 },
                 env_file=env_file,
             )
@@ -373,7 +371,6 @@ class AgentConfigTests(unittest.TestCase):
         self.assertEqual(config.memory_map_chunk_size, 3)
         self.assertEqual(config.memory_tool_result_chars, 250)
         self.assertTrue(config.memory_tool_result_chars_explicit)
-        self.assertTrue(config.memory_auto_extract)
 
     def test_hitl_config_loaded_from_env_mapping(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -405,7 +402,7 @@ class AgentConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "AGENTCLI_HITL_MEDIUM_RISK_MODE"):
                 AgentConfig.from_env(env_file=env_file)
 
-    def test_deprecated_memory_auto_extract_setting_is_still_accepted(self) -> None:
+    def test_removed_memory_auto_extract_setting_is_not_exposed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             env_file = Path(tmp) / ".env"
             env_file.write_text("", encoding="utf-8")
@@ -415,7 +412,7 @@ class AgentConfigTests(unittest.TestCase):
                 env_file=env_file,
             )
 
-        self.assertFalse(config.memory_auto_extract)
+        self.assertFalse(hasattr(config, "memory_auto_extract"))
 
     def test_memory_can_be_disabled_explicitly(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -438,14 +435,12 @@ class AgentConfigTests(unittest.TestCase):
                 env={
                     "MY_AGENT_MEMORY_CONTEXT_TOKENS": "1024",
                     "MY_AGENT_MEMORY_PROJECT_KEY": "stream:legacy",
-                    "MY_AGENT_MEMORY_AUTO_EXTRACT": "on",
                 },
                 env_file=env_file,
             )
 
         self.assertEqual(config.memory_context_tokens, 1_024)
         self.assertEqual(config.memory_project_key, "stream:legacy")
-        self.assertTrue(config.memory_auto_extract)
 
     def test_memory_evolver_bool_alias_enables_retrieve_select(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

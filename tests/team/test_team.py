@@ -93,7 +93,6 @@ def fake_config(trace_dir: Path | None = None, **overrides: object) -> AgentConf
         "trace_dir": resolved_trace_dir,
         "memory_dir": resolved_trace_dir.parent / "memory",
         "use_fake_llm": True,
-        "memory_auto_extract": False,
     }
     values.update(overrides)
     return AgentConfig(**values)

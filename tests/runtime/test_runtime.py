@@ -378,7 +378,7 @@ class RuntimeTests(unittest.TestCase):
             repo = base / "repo"
             repo.mkdir()
             write_runtime_repo(repo)
-            config = fake_config(base / "traces", memory_dir=base / "memory", memory_auto_extract=False)
+            config = fake_config(base / "traces", memory_dir=base / "memory")
 
             state = run_agent(
                 repo_path=repo,
@@ -403,7 +403,6 @@ class RuntimeTests(unittest.TestCase):
             config = fake_config(
                 base / "traces",
                 memory_dir=base / "memory",
-                memory_auto_extract=False,
                 memory_evolver_mode="full",
                 memory_evolver_writer_enabled=True,
                 memory_project_key="stream:a",
@@ -445,7 +444,6 @@ class RuntimeTests(unittest.TestCase):
             config = fake_config(
                 base / "traces",
                 memory_dir=base / "memory",
-                memory_auto_extract=False,
                 memory_evolver_mode="full",
                 memory_evolver_writer_enabled=True,
                 memory_evolver_writer_mode="llm",
@@ -1054,7 +1052,6 @@ class RuntimeTests(unittest.TestCase):
                     response_reserve_tokens_explicit=True,
                     compression_buffer_tokens=900,
                     compression_buffer_tokens_explicit=True,
-                    memory_auto_extract=False,
                 ),
                 llm=llm,
                 trace_dir=base / "traces",

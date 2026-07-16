@@ -6,7 +6,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 import json
 import math
 import os
@@ -38,20 +38,22 @@ from my_agent.memory.evolver.contracts import (
 from my_agent.memory.evolver.planner import (
     _repository_after_operations,
 )
+from my_agent.memory.evolver.serialization import experience_to_dict
 from my_agent.memory.evolver.validation import (
     parse_maintenance_plan,
     validate_plan_semantics,
 )
-from my_agent.memory.long_term import (
-    LongTermMemoryStore,
+from my_agent.memory.evolver.types import ExperienceMemory
+from my_agent.memory.store_errors import (
     MemoryStoreLockTimeout,
     MemoryStorePostCommitError,
     MemoryStoreRevisionConflict,
-    _atomic_write_tmp_path,
-    memory_entries_revision,
 )
-from my_agent.memory.types import MemoryEntry, MemoryScope
+from my_agent.memory.types import MemoryScope
 from my_agent.text_safety import sanitize_json_value
+
+if TYPE_CHECKING:
+    from my_agent.memory.experience_store import ExperienceStore
 
 
 _HISTORY_LOCK_TIMEOUT_SECONDS = 30.0
@@ -70,7 +72,7 @@ class _MaintenanceHistoryState:
 
 def apply_maintenance_plan(
     *,
-    store: LongTermMemoryStore,
+    store: ExperienceStore,
     plan: MaintenancePlan,
     backup_dir: str | Path,
     history_path: str | Path,
@@ -88,7 +90,7 @@ def apply_maintenance_plan(
 
 def _apply_maintenance_plan(
     *,
-    store: LongTermMemoryStore,
+    store: ExperienceStore,
     plan: MaintenancePlan,
     backup_dir: str | Path,
     history_path: str | Path,
@@ -155,12 +157,12 @@ def _apply_maintenance_plan(
     stage = "lock"
     removed_ids = tuple(sorted({item for op in plan.operations for item in op.remove_ids}))
     updated_ids = tuple(sorted({
-        str(payload.get("id") or "")
+        payload.id
         for op in plan.operations
         for payload in op.replacements
     }))
     added_ids = tuple(sorted({
-        str(payload.get("id") or "")
+        payload.id
         for op in plan.operations
         for payload in op.additions
     }))
@@ -172,7 +174,7 @@ def _apply_maintenance_plan(
                 snapshot = store.load_strict_snapshot()
                 before_revision = snapshot.revision
                 after_revision = snapshot.revision
-                before_count = len(snapshot.entries)
+                before_count = len(snapshot.memories)
                 after_count = before_count
 
                 stage = "history_load"
@@ -206,9 +208,9 @@ def _apply_maintenance_plan(
                         "reviewed plan repository revision no longer matches"
                     )
 
-                validate_plan_semantics(plan, repository_entries=snapshot.entries)
-                _validate_apply_project_boundaries(plan, snapshot.entries)
-                next_entries = _repository_after_operations(snapshot.entries, plan.operations)
+                validate_plan_semantics(plan, repository_entries=snapshot.memories)
+                _validate_apply_project_boundaries(plan, snapshot.memories)
+                next_entries = _repository_after_operations(snapshot.memories, plan.operations)
                 after_count = len(next_entries)
 
                 has_mutation = any(
@@ -248,7 +250,7 @@ def _apply_maintenance_plan(
                 _write_backup_atomic(backup, snapshot.raw_bytes)
                 backup_path = str(backup)
 
-                expected_after_revision = memory_entries_revision(next_entries)
+                expected_after_revision = _experience_memories_revision(next_entries)
                 if reuse_intent:
                     assert history_state.intent is not None
                     recorded_after = history_state.intent["expected_after_revision"]
@@ -294,9 +296,9 @@ def _apply_maintenance_plan(
 
                 stage = "verify"
                 written = store.load_strict_snapshot()
-                if written.revision != after_revision or len(written.entries) != after_count:
+                if written.revision != after_revision or len(written.memories) != after_count:
                     raise MaintenancePlanError("post-commit repository verification mismatch")
-                written_ids = {entry.id for entry in written.entries}
+                written_ids = {entry.id for entry in written.memories}
                 if set(removed_ids).intersection(written_ids):
                     raise MaintenancePlanError("removed maintenance sources remain after commit")
                 if not set(updated_ids).union(added_ids).issubset(written_ids):
@@ -480,7 +482,7 @@ def _validated_plan_copy(plan: MaintenancePlan) -> MaintenancePlan:
 
 def _validate_apply_project_boundaries(
     plan: MaintenancePlan,
-    entries: Sequence[MemoryEntry],
+    entries: Sequence[ExperienceMemory],
 ) -> None:
     by_id = {entry.id: entry for entry in entries}
     for operation in plan.operations:
@@ -521,6 +523,26 @@ def _write_backup_atomic(path: Path, raw_bytes: bytes) -> None:
                 tmp.unlink()
             except OSError:
                 pass
+
+
+def _atomic_write_tmp_path(path: str | Path) -> Path:
+    target = Path(path)
+    return target.with_suffix(target.suffix + ".tmp")
+
+
+def _experience_memories_revision(memories: Sequence[ExperienceMemory]) -> str:
+    payload = [
+        experience_to_dict(memory)
+        for memory in sorted(memories, key=lambda item: item.id)
+    ]
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return f"sha256:{sha256(canonical.encode('utf-8')).hexdigest()}"
 
 
 def _validate_supplied_artifact_graph(
@@ -1044,12 +1066,12 @@ def _plan_mutation_ids(
 ) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
     removed_ids = tuple(sorted({item for op in plan.operations for item in op.remove_ids}))
     updated_ids = tuple(sorted({
-        str(payload.get("id") or "")
+        payload.id
         for op in plan.operations
         for payload in op.replacements
     }))
     added_ids = tuple(sorted({
-        str(payload.get("id") or "")
+        payload.id
         for op in plan.operations
         for payload in op.additions
     }))

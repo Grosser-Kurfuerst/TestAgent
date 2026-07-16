@@ -12,16 +12,15 @@ import json
 import math
 import re
 
-from my_agent.memory.evolver.types import ExperienceTier
+from my_agent.memory.evolver.serialization import experience_from_dict, experience_to_dict
+from my_agent.memory.evolver.types import ExperienceMemory, ExperienceTier
 from my_agent.memory.types import (
-    MemoryEntry,
     MemoryScope,
-    content_fingerprint,
 )
 from my_agent.text_safety import sanitize_json_value
 
 
-MAINTENANCE_SCHEMA_VERSION = 1
+MAINTENANCE_SCHEMA_VERSION = 2
 MAINTENANCE_POLICY = "rule_attribution_redundancy_v1"
 MAINTENANCE_SCOPE_MODE = "single_project"
 
@@ -186,7 +185,7 @@ class MaintenanceEvidence:
 
 @dataclass(frozen=True)
 class MaintenanceLookupHit:
-    entry: MemoryEntry
+    memory: ExperienceMemory
     tier: str
     score: float
     matched_terms: tuple[str, ...] = ()
@@ -204,8 +203,8 @@ class MaintenanceOperation:
     redundancy_score: float | None = None
     evidence: tuple[dict[str, Any], ...] = ()
     remove_ids: tuple[str, ...] = ()
-    replacements: tuple[dict[str, Any], ...] = ()
-    additions: tuple[dict[str, Any], ...] = ()
+    replacements: tuple[ExperienceMemory, ...] = ()
+    additions: tuple[ExperienceMemory, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.operation_id:
@@ -261,8 +260,8 @@ class MaintenanceOperation:
             "redundancy_score": self.redundancy_score,
             "evidence": [dict(item) for item in self.evidence],
             "remove_ids": list(self.remove_ids),
-            "replacements": [dict(item) for item in self.replacements],
-            "additions": [dict(item) for item in self.additions],
+            "replacements": [experience_to_dict(item) for item in self.replacements],
+            "additions": [experience_to_dict(item) for item in self.additions],
         }
         return sanitize_json_value(payload)  # type: ignore[return-value]
 
@@ -292,8 +291,8 @@ class MaintenanceOperation:
             ),
             evidence=_mapping_tuple(data.get("evidence")),
             remove_ids=_string_tuple(data.get("remove_ids")),
-            replacements=_mapping_tuple(data.get("replacements")),
-            additions=_mapping_tuple(data.get("additions")),
+            replacements=_experience_tuple(data.get("replacements"), "replacements"),
+            additions=_experience_tuple(data.get("additions"), "additions"),
         )
 
 
@@ -476,13 +475,13 @@ def _validate_operation_shape(operation: MaintenanceOperation) -> None:
     if operation.operation_id != expected_operation_id:
         raise MaintenancePlanError("operation_id does not match its deterministic payload")
 
-    mutation_entries: tuple[MemoryEntry, ...] = ()
+    mutation_entries: tuple[ExperienceMemory, ...] = ()
     if operation.action == MaintenanceAction.MERGE:
         mutation_entries = replacement_entries
     elif operation.action == MaintenanceAction.PROMOTE:
         mutation_entries = replacement_entries + addition_entries
     for entry in mutation_entries:
-        if str(entry.metadata.get("maintenance_operation_id") or "") != operation.operation_id:
+        if entry.maintenance_operation_id != operation.operation_id:
             raise MaintenancePlanError(f"mutation payload operation id mismatch: {entry.id}")
 
     if operation.action == MaintenanceAction.KEEP:
@@ -516,27 +515,26 @@ def _validate_operation_shape(operation: MaintenanceOperation) -> None:
             raise MaintenancePlanError("promote addition must be its target")
 
 
-def _validated_payload_entry(payload: Mapping[str, Any], kind: str) -> MemoryEntry:
-    content = str(payload.get("content") or "")
-    declared_fingerprint = str(payload.get("fingerprint") or "")
-    expected_fingerprint = content_fingerprint(content)
-    if declared_fingerprint and declared_fingerprint != expected_fingerprint:
-        memory_id = str(payload.get("id") or "")
-        raise MaintenancePlanError(f"{kind} fingerprint mismatch: {memory_id}")
-    return MemoryEntry.from_dict(dict(payload))
+def _validated_payload_entry(
+    memory: ExperienceMemory,
+    kind: str,
+) -> ExperienceMemory:
+    if not isinstance(memory, ExperienceMemory):
+        raise MaintenancePlanError(f"{kind} payload must be an ExperienceMemory")
+    return memory
 
 
-def _payload_ids(payloads: Sequence[Mapping[str, Any]], kind: str) -> tuple[str, ...]:
+def _payload_ids(payloads: Sequence[ExperienceMemory], kind: str) -> tuple[str, ...]:
     result: list[str] = []
     for payload in payloads:
-        memory_id = str(payload.get("id") or "")
+        memory_id = payload.id
         if not memory_id:
             raise MaintenancePlanError(f"{kind} payload requires a non-empty id")
         result.append(memory_id)
     return tuple(result)
 
 
-def _source_precondition(entry: MemoryEntry, tier: str) -> dict[str, str]:
+def _source_precondition(entry: ExperienceMemory, tier: str) -> dict[str, str]:
     return {
         "fingerprint": entry.fingerprint,
         "tier": tier,
@@ -550,8 +548,8 @@ def _operation_id(
     action: MaintenanceAction,
     source_ids: Sequence[str],
     target_ids: Sequence[str],
-    replacements: Sequence[Mapping[str, Any]],
-    additions: Sequence[Mapping[str, Any]],
+    replacements: Sequence[ExperienceMemory],
+    additions: Sequence[ExperienceMemory],
 ) -> str:
     payload = {
         "policy": MAINTENANCE_POLICY,
@@ -559,10 +557,10 @@ def _operation_id(
         "source_ids": sorted(str(item) for item in source_ids),
         "target_ids": sorted(str(item) for item in target_ids),
         "replacement_fingerprints": sorted(
-            str(item.get("fingerprint") or "") for item in replacements
+            item.fingerprint for item in replacements
         ),
         "addition_fingerprints": sorted(
-            str(item.get("fingerprint") or "") for item in additions
+            item.fingerprint for item in additions
         ),
     }
     return f"op-{_stable_digest(payload)[:24]}"
@@ -785,6 +783,24 @@ def _mapping_tuple(value: Any) -> tuple[dict[str, Any], ...]:
         if not isinstance(item, Mapping):
             raise MaintenancePlanError("operation mapping arrays must contain objects")
         result.append(dict(item))
+    return tuple(result)
+
+
+def _experience_tuple(value: Any, name: str) -> tuple[ExperienceMemory, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, (list, tuple)):
+        raise MaintenancePlanError(f"operation {name} must be an array")
+    result: list[ExperienceMemory] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            raise MaintenancePlanError(f"operation {name} must contain objects")
+        try:
+            result.append(experience_from_dict(item))
+        except (TypeError, ValueError) as exc:
+            raise MaintenancePlanError(
+                f"operation {name} contains an invalid experience"
+            ) from exc
     return tuple(result)
 
 
