@@ -22,8 +22,9 @@ from my_agent.evaluation.manifest_benchmark import (
     run_manifest_benchmark,
     summarize_manifest_results,
 )
-from my_agent.memory import MemoryManager, MemoryScope
+from my_agent.memory import MemoryManager
 from my_agent.tools import RepoTools
+from tests.memory.experience_fixtures import save_typed_experience
 
 
 def fake_config(trace_dir: Path | None = None, **overrides: object) -> AgentConfig:
@@ -881,10 +882,10 @@ class ManifestBenchmarkTests(unittest.TestCase):
                 repo_path = Path(kwargs["repo_path"])  # type: ignore[arg-type]
                 memory = MemoryManager.from_config(config=config, llm=None, repo_path=repo_path)
                 if trace_dir.name == "first":
-                    memory.save_fact("stream marker: prefer VALUE = 1", scope=MemoryScope.PROJECT)
+                    save_typed_experience(memory, "stream marker: prefer VALUE = 1", tier="tip")
                 else:
-                    hits = memory.retrieve_hits("stream marker VALUE", limit=5)
-                    second_saw_marker = any("stream marker" in hit.entry.content for hit in hits)
+                    entries = memory.experience_store.all(project_key=memory.project_key)
+                    second_saw_marker = any("stream marker" in entry.content for entry in entries)
                 (repo_path / "solution.py").write_text("VALUE = 1\n", encoding="utf-8")
                 trace_path = write_agent_trace(trace_dir, f"run-{trace_dir.name}")
                 return SimpleNamespace(
@@ -1016,10 +1017,10 @@ class ManifestBenchmarkTests(unittest.TestCase):
                 repo_path = Path(kwargs["repo_path"])  # type: ignore[arg-type]
                 memory = MemoryManager.from_config(config=config, llm=None, repo_path=repo_path)
                 if trace_dir.name == "first":
-                    memory.save_fact("isolated stream marker VALUE", scope=MemoryScope.PROJECT)
+                    save_typed_experience(memory, "isolated stream marker VALUE", tier="tip")
                 else:
-                    hits = memory.retrieve_hits("isolated stream marker VALUE", limit=5)
-                    second_saw_marker = any("isolated stream marker" in hit.entry.content for hit in hits)
+                    entries = memory.experience_store.all(project_key=memory.project_key)
+                    second_saw_marker = any("isolated stream marker" in entry.content for entry in entries)
                 (repo_path / "solution.py").write_text("VALUE = 1\n", encoding="utf-8")
                 trace_path = write_agent_trace(trace_dir, f"run-{trace_dir.name}")
                 return SimpleNamespace(

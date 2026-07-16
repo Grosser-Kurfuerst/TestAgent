@@ -16,7 +16,7 @@ from my_agent.llm.types import ChatResponse, MessageLike, messages_to_openai
 from my_agent.config import AgentConfig
 from my_agent.cancellation import CancellationToken
 from my_agent.plan import AgentMode, PlanValidationError, TaskResult, TaskType, normalize_mode, resolve_mode
-from my_agent.memory import MemoryManager, MemoryScope
+from my_agent.memory import MemoryManager
 from my_agent.schema import AgentState
 from my_agent.team import (
     ExecutionStep,
@@ -1074,7 +1074,6 @@ class TeamAgentTests(unittest.TestCase):
                 memory_evolver_selected_max_items=1,
             )
             memory = MemoryManager.from_config(config=config, llm=FakeLLM(), repo_path=repo)
-            memory.save_fact("ordinary AgentCli team fact", scope=MemoryScope.PROJECT)
             save_typed_experience(
                 memory,
                 "AgentCli selected team skill",

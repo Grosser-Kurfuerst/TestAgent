@@ -113,7 +113,6 @@ class AgentRepl:
         try:
             self._cancel_current_task(shutting_down=True)
             self._run_executor.shutdown(wait=False, cancel_futures=True)
-            self._memory.extract_facts(reason="session_end")
         finally:
             McpServerManagerPool.close_all()
 

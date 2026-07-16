@@ -22,7 +22,7 @@ from my_agent.context import (
     DEFAULT_TOOL_RESULT_CHARS,
 )
 from my_agent.evaluation.agent_benchmark import record_benchmark_result
-from my_agent.memory.long_term import LongTermMemoryStore
+from my_agent.memory.experience_store import ExperienceStore
 from my_agent.observability.trace_metrics import collect_trace_metrics
 from my_agent.runtime import run_agent
 
@@ -331,7 +331,7 @@ def _memory_project_key(manifest_path: Path, mode: str, stream_id: str) -> str:
 
 
 def _memory_counts(memory_dir: Path, *, project_key: str = "") -> dict[str, int]:
-    store = LongTermMemoryStore.from_dir(memory_dir)
+    store = ExperienceStore.from_dir(memory_dir)
     store.load()
     total = len(store.all())
     visible = len(store.all(project_key=project_key)) if project_key else total
@@ -1038,7 +1038,6 @@ def _config_env_values(config: AgentConfig) -> dict[str, str]:
         "AGENTCLI_MEMORY_COMPRESSION_TRIGGER_RATIO": str(config.memory_compression_trigger_ratio),
         "AGENTCLI_MEMORY_RETAIN_RECENT_TURNS": str(config.memory_retain_recent_turns),
         "AGENTCLI_MEMORY_MAP_CHUNK_SIZE": str(config.memory_map_chunk_size),
-        "AGENTCLI_MEMORY_AUTO_EXTRACT": _bool_env(config.memory_auto_extract),
         "AGENTCLI_MEMORY_EVOLVER_MODE": config.memory_evolver_mode,
         "AGENTCLI_MEMORY_EVOLVER_TOP_K_PER_TIER": str(config.memory_evolver_top_k_per_tier),
         "AGENTCLI_MEMORY_EVOLVER_SELECTED_MAX_ITEMS": str(config.memory_evolver_selected_max_items),

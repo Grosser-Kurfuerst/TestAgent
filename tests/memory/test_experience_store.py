@@ -98,18 +98,19 @@ class ExperienceStoreTests(unittest.TestCase):
             self.assertEqual(restored, memory)
             self.assertEqual(store.path.read_text(encoding="utf-8"), experience_canonical_json(memory) + "\n")
 
-            fact = MemoryEntry.build(
-                id="fact",
-                content="ordinary fact",
-                type=MemoryType.FACT,
-                scope=MemoryScope.PROJECT,
-                source="manual",
-                token_count=3,
-                project_key="/repo",
-                created_at=NOW,
-            )
-            with self.assertRaises(TypeError):
-                store.add(fact)  # type: ignore[arg-type]
+            for memory_type in MemoryType:
+                legacy_entry = MemoryEntry.build(
+                    id=f"legacy-{memory_type.value}",
+                    content=f"legacy {memory_type.value}",
+                    type=memory_type,
+                    scope=MemoryScope.PROJECT,
+                    source="legacy",
+                    token_count=3,
+                    project_key="/repo",
+                    created_at=NOW,
+                )
+                with self.subTest(memory_type=memory_type), self.assertRaises(TypeError):
+                    store.add(legacy_entry)  # type: ignore[arg-type]
 
     def test_same_tier_dedup_preserves_first_record_and_cross_tier_coexists(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

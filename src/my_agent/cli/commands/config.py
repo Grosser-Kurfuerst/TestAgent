@@ -69,7 +69,6 @@ def _config_payload(config: object) -> dict[str, object]:
         "memory_retain_recent_turns": config.memory_retain_recent_turns,
         "memory_map_chunk_size": config.memory_map_chunk_size,
         "memory_tool_result_chars": config.memory_tool_result_chars,
-        "memory_auto_extract": config.memory_auto_extract,
         "memory_evolver_mode": config.memory_evolver_mode,
         "memory_evolver_top_k_per_tier": config.memory_evolver_top_k_per_tier,
         "memory_evolver_selected_max_items": config.memory_evolver_selected_max_items,

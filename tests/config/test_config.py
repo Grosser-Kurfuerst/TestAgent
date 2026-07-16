@@ -259,8 +259,8 @@ class AgentConfigTests(unittest.TestCase):
         self.assertEqual(config.memory_evolver_writer_max_input_chars, 12_000)
         self.assertEqual(config.memory_evolver_writer_max_content_chars, 1_200)
         self.assertIsNone(config.memory_evolver_writer_dataset_path)
-        # memory_auto_extract defaults to True per plan §13 (line 544).
-        self.assertTrue(config.memory_auto_extract)
+        # Deprecated compatibility field; no runtime path performs fact extraction.
+        self.assertFalse(config.memory_auto_extract)
         self.assertFalse(config.hitl_enabled)
         self.assertEqual(config.hitl_audit_dir, Path("~/.agentcli/audit").expanduser())
         self.assertEqual(config.hitl_non_interactive, "reject")
@@ -405,7 +405,7 @@ class AgentConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "AGENTCLI_HITL_MEDIUM_RISK_MODE"):
                 AgentConfig.from_env(env_file=env_file)
 
-    def test_memory_auto_extract_can_be_disabled_explicitly(self) -> None:
+    def test_deprecated_memory_auto_extract_setting_is_still_accepted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             env_file = Path(tmp) / ".env"
             env_file.write_text("", encoding="utf-8")

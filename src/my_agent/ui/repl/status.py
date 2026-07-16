@@ -286,5 +286,8 @@ def format_memory_text(memory: object) -> str:
         return "\n".join(lines)
     for entry in status.long_term_entries_detail:
         timestamp = entry.created_at.isoformat()
-        lines.append(f"- {entry.id} [{entry.type.value} {entry.scope.value} {entry.source} {timestamp}] {entry.content}")
+        lines.append(
+            f"- {entry.id} [{entry.tier.value} {entry.scope.value} "
+            f"{entry.created_by.value} {timestamp}] {entry.content}"
+        )
     return "\n".join(lines)

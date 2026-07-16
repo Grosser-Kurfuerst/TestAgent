@@ -4,9 +4,12 @@ import hashlib
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Generic, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 from my_agent.text_safety import sanitize_json_value
+
+if TYPE_CHECKING:
+    from my_agent.memory.evolver.types import ExperienceMemory
 
 
 MemoryItemT = TypeVar("MemoryItemT")
@@ -173,7 +176,7 @@ class MemoryStatus:
     compression_trigger_ratio: float
     retain_recent_turns: int
     map_chunk_size: int
-    long_term_entries_detail: tuple[MemoryEntry, ...] = ()
+    long_term_entries_detail: tuple["ExperienceMemory", ...] = ()
 
 
 def normalize_content(text: str) -> str:

@@ -201,7 +201,6 @@ class TeamAgent(AgentBase):
                 )
                 completed = self._execute_team(team, writer, state)
                 self._record_team_step_summaries(memory, completed, run_id=state.run_id)
-                memory.extract_facts(reason="team_completed", run_id=state.run_id)
                 return self._final_state(state, completed, writer)
             except PlanValidationError as exc:
                 team = TeamState.create(goal=goal, summary="Team plan validation failed.")

@@ -14,7 +14,7 @@ add_src_to_path()
 from my_agent.llm import FakeLLM
 from my_agent.llm.types import ChatResponse, LLMToolCall, MessageLike, messages_to_openai
 from my_agent.cancellation import CancellationToken
-from my_agent.memory import MemoryManager, MemoryScope
+from my_agent.memory import MemoryManager
 from my_agent.schema import AgentState
 from my_agent.plan import (
     AgentMode,
@@ -833,10 +833,7 @@ class PlanExecuteAgentTests(unittest.TestCase):
             config = fake_config(base / "traces", memory_dir=base / "memory")
             llm = FakeLLM()
             memory = MemoryManager.from_config(config=config, llm=llm, repo_path=repo)
-            memory.save_fact(
-                "Project calculator.py uses subtract tests.",
-                scope=MemoryScope.PROJECT,
-            )
+            save_typed_experience(memory, "Project calculator uses subtract tests.", tier="tip")
             agent = PlanExecuteAgent(
                 config=config,
                 llm=llm,
@@ -884,7 +881,6 @@ class PlanExecuteAgentTests(unittest.TestCase):
             )
             llm = RecordingPlannerLLM()
             memory = MemoryManager.from_config(config=config, llm=llm, repo_path=repo)
-            memory.save_fact("ordinary calculator planner fact", scope=MemoryScope.PROJECT)
             save_typed_experience(
                 memory,
                 "calculator selected planner skill",
@@ -947,11 +943,11 @@ class PlanExecuteAgentTests(unittest.TestCase):
             ))
             before = read_trace(state.trace_path)
 
-            memory.save_fact("用户偏好：回答中文", scope=MemoryScope.PROJECT)
+            save_typed_experience(memory, "用户偏好：回答中文", tier="tip")
 
             after = read_trace(state.trace_path)
             self.assertEqual(after, before)
-            self.assertNotIn("memory.saved", [event["event"] for event in after])
+            self.assertNotIn("memory.evolver_saved", [event["event"] for event in after])
 
     def test_plan_agent_uses_configured_max_tasks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

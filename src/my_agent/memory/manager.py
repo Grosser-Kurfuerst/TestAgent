@@ -88,7 +88,7 @@ class MemoryManager:
     The manager owns short-term and long-term memory primitives:
 
     * :meth:`from_config` — build a manager wired to the config's memory dir.
-    * :meth:`save_fact` — persist a durable fact to long-term memory.
+    * :meth:`save_experience` — persist a typed four-tier experience.
     * :meth:`build_context_for_query` — retrieve long-term memory and return a
       token-bounded injection block (the 3.2 acceptance target).
     * :meth:`append_user_message` / :meth:`append_assistant_response` /
@@ -129,8 +129,6 @@ class MemoryManager:
         self.project_key = project_key
         self.session_id = session_id
         self._trace_sink = trace_sink
-        self.last_fact_extraction_error = ""
-        self.last_fact_save_errors: list[str] = []
         self.evolver_selector = ExperienceSelector(
             tier_weights=self.config.memory_evolver_tier_weights,
             tier_caps=self.config.memory_evolver_tier_caps,
@@ -293,40 +291,6 @@ class MemoryManager:
         )
         self.short_term.append(entry)
         return entry
-
-    def save_fact(
-        self,
-        content: str,
-        *,
-        scope: MemoryScope = MemoryScope.PROJECT,
-        source: str = "manual",
-        metadata: dict[str, Any] | None = None,
-    ) -> tuple[MemoryEntry, bool]:
-        project_key = "" if scope == MemoryScope.GLOBAL else self.project_key
-        fact_metadata = {"source": source}
-        fact_metadata.update(metadata or {})
-        entry = MemoryEntry.build(
-            id=_new_id("fact"),
-            content=content,
-            type=MemoryType.FACT,
-            scope=scope,
-            source=source,
-            token_count=estimate_tokens(content),
-            project_key=project_key,
-            metadata=fact_metadata,
-        )
-        stored, created = self.long_term.add(entry)
-        self._trace(
-            "memory.saved",
-            {
-                "id": stored.id,
-                "created": created,
-                "scope": stored.scope.value,
-                "source": stored.source,
-                "tokens": stored.token_count,
-            },
-        )
-        return stored, created
 
     def save_experience(
         self,
@@ -673,11 +637,11 @@ class MemoryManager:
     # ------------------------------------------------------------------ status
 
     def status(self, *, include_entries: bool = True) -> MemoryStatus:
-        long_entries = self.long_term.all(project_key=self.project_key)
+        long_entries = self.experience_store.all(project_key=self.project_key)
         long_tokens = sum(max(0, entry.token_count) for entry in long_entries)
         return MemoryStatus(
             project_key=self.project_key,
-            storage_path=str(self.long_term.path),
+            storage_path=str(self.experience_store.path),
             short_term_entries=len(self.short_term),
             short_term_tokens=self.short_term.token_count(),
             short_term_storage_token_limit=self.context_profile.short_term_storage_token_limit,
@@ -690,12 +654,6 @@ class MemoryManager:
         )
 
     # ------------------------------------------------------------------ memory operations
-
-    def extract_facts(self, *, reason: str, run_id: str = "") -> list[MemoryEntry]:
-        entries = self.short_term.all()
-        if run_id:
-            entries = [entry for entry in entries if entry.run_id == run_id]
-        return self._extract_and_store_facts(entries, reason=reason, run_id=run_id)
 
     def write_experiences_from_run(
         self,
@@ -887,12 +845,16 @@ class MemoryManager:
         )
 
     def clear_short_term(self, *, extract_first: bool = True, reason: str = "clear") -> tuple[int, list[MemoryEntry]]:
-        extracted: list[MemoryEntry] = []
-        if extract_first:
-            extracted = self.extract_facts(reason=reason)
+        """Clear session memory without creating long-term facts.
+
+        ``extract_first`` remains a no-op compatibility argument until the
+        legacy public API is removed.  Typed long-term experiences are only
+        produced through ``save_experience`` or the Evolver writer.
+        """
+        del extract_first
         removed = self.short_term.clear()
-        self._trace("memory.clear", {"removed": len(removed), "extracted_facts": len(extracted), "reason": reason})
-        return len(removed), extracted
+        self._trace("memory.clear", {"removed": len(removed), "extracted_facts": 0, "reason": reason})
+        return len(removed), []
 
     def render_short_term_messages(self, *, max_tokens: int | None = None) -> list[MessageLike]:
         entries = self.short_term.all()
@@ -964,7 +926,6 @@ class MemoryManager:
             metadata={"map_count": map_count, "reduce_used": reduce_used, "fallback": fallback},
         )
         self.short_term.replace_old_entries_with_summary({entry.id for entry in old_entries}, summary_entry)
-        extracted = self._extract_and_store_facts(old_entries, reason="compression")
         after = self.short_term.token_count() + tools_tokens
 
         result = CompressionResult(
@@ -973,7 +934,7 @@ class MemoryManager:
             after,
             map_count=map_count,
             reduce_used=reduce_used,
-            extracted_facts=len(extracted),
+            extracted_facts=0,
             fallback=fallback,
         )
         if trace_completed:
@@ -985,7 +946,7 @@ class MemoryManager:
                         "after_tokens": after,
                         "map_count": map_count,
                         "reduce_used": reduce_used,
-                        "extracted_facts": len(extracted),
+                        "extracted_facts": 0,
                         "fallback": fallback,
                         "estimated_prompt_tokens": after,
                     }
@@ -1010,51 +971,6 @@ class MemoryManager:
             }
         )
         return enriched
-
-    def _extract_and_store_facts(
-        self,
-        entries: list[MemoryEntry],
-        *,
-        reason: str,
-        run_id: str = "",
-    ) -> list[MemoryEntry]:
-        self.last_fact_extraction_error = ""
-        self.last_fact_save_errors = []
-        if not self.config.memory_auto_extract:
-            return []
-        candidates = self.compressor.extract_facts(entries, reason=reason, project_key=self.project_key, run_id=run_id)
-        if self.compressor.last_fact_error:
-            self.last_fact_extraction_error = self.compressor.last_fact_error
-            self._trace(
-                "memory.fact_extraction_failed",
-                {"reason": reason, "run_id": run_id, "error": self.last_fact_extraction_error},
-            )
-            return []
-        stored: list[MemoryEntry] = []
-        for candidate in candidates:
-            try:
-                entry, created = self.long_term.add(candidate)
-            except Exception as exc:  # noqa: BLE001 - automatic extraction must not break the agent loop
-                error = f"{type(exc).__name__}: {exc}"
-                self.last_fact_save_errors.append(error)
-                self._trace(
-                    "memory.save_failed",
-                    {
-                        "reason": reason,
-                        "run_id": run_id,
-                        "candidate_id": candidate.id,
-                        "error": error,
-                    },
-                )
-                continue
-            if created:
-                stored.append(entry)
-        if stored:
-            self._trace(
-                "memory.fact_extracted",
-                {"count": len(stored), "reason": reason, "run_id": run_id},
-            )
-        return stored
 
     def _trace(self, event: str, payload: dict[str, Any]) -> None:
         if self._trace_sink is None:

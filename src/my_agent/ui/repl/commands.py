@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shlex
 import sys
 from dataclasses import replace
 from typing import TYPE_CHECKING
@@ -7,7 +8,7 @@ from typing import TYPE_CHECKING
 from my_agent.context import budget_tool_definitions
 from my_agent.llm.types import Message
 from my_agent.mcp.observability import format_mcp_disabled, format_mcp_logs, format_mcp_status
-from my_agent.memory import MemoryScope
+from my_agent.memory import ExperienceTier, MemoryScope, SkillPayload, TipPayload
 from my_agent.plan import AgentMode, normalize_mode
 from my_agent.ui.repl.status import format_context_text, format_memory_text, format_tools_text
 
@@ -25,9 +26,9 @@ HELP_TEXT = """Commands:
 /mcp reload       Reload MCP servers and tools.
 /context          Show memory and context budget estimates.
 /memory           Show memory system status and long-term entries.
-/save <fact>      Save a durable fact to long-term memory.
+/save ...         Save a typed tip or skill to long-term memory; use /save --tier ... for syntax.
 /compact [focus]  Compact session context for the supplied focus.
-/clear            Extract facts, then clear short-term memory.
+/clear            Clear short-term memory.
 /trace            Show the latest trace path.
 /plan <task>      Run a task with Plan-and-Execute.
 /plan             Run the next task with Plan-and-Execute.
@@ -39,6 +40,13 @@ HELP_TEXT = """Commands:
 /hitl off         Disable HITL approvals and clear approve-all grants.
 /mode <mode>      Set mode: react, plan, team, or auto.
 /quit             Exit.
+"""
+
+SAVE_USAGE = """Usage:
+  /save [--global] --tier tip --category <category> --severity <info|warning|critical> --trigger <trigger> <content>
+  /save [--global] --tier skill --category <category> --technique <technique> --step <step> [--step <step> ...] <content>
+
+Quote option values that contain spaces. Only tip and skill can be saved from the text command.
 """
 
 
@@ -86,18 +94,12 @@ def handle_repl_command(repl: "AgentRepl", command: str) -> bool:
         _handle_compact(repl, command)
         return False
     if command == "/clear":
-        removed, extracted = repl._memory.clear_short_term(extract_first=True, reason="clear_command")
+        removed, _ = repl._memory.clear_short_term(extract_first=True, reason="clear_command")
         repl._hitl_handler.clear_approved_all()
-        if repl._memory.last_fact_extraction_error:
-            repl.renderer.status(
-                f"Fact extraction failed; cleared {removed} short-term entries.\n"
-                "Cleared HITL approve-all grants."
-            )
-        else:
-            repl.renderer.status(
-                f"Extracted {len(extracted)} facts, cleared {removed} short-term entries.\n"
-                "Cleared HITL approve-all grants."
-            )
+        repl.renderer.status(
+            f"Cleared {removed} short-term entries.\n"
+            "Cleared HITL approve-all grants."
+        )
         return False
     if command == "/trace":
         repl.renderer.status(f"Latest trace: {repl._latest_trace or 'none'}")
@@ -182,23 +184,87 @@ def _handle_mcp(repl: "AgentRepl", command: str) -> None:
 
 
 def _handle_save(repl: "AgentRepl", command: str) -> None:
-    content = command.removeprefix("/save").strip()
-    scope = MemoryScope.PROJECT
-    if content.startswith("--global"):
-        scope = MemoryScope.GLOBAL
-        content = content.removeprefix("--global").strip()
-    if not content:
-        repl.renderer.status("Usage: /save <fact>")
-        return
     try:
-        entry, created = repl._memory.save_fact(content, scope=scope)
+        tokens = shlex.split(command.removeprefix("/save"))
+    except ValueError as exc:
+        repl.renderer.error(f"Error: {exc}\n{SAVE_USAGE}")
+        return
+
+    scope = MemoryScope.PROJECT
+    options: dict[str, list[str]] = {}
+    content_parts: list[str] = []
+    option_names = {"--tier", "--category", "--severity", "--trigger", "--technique", "--step", "--precondition"}
+    single_value_options = option_names - {"--step", "--precondition"}
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--global":
+            scope = MemoryScope.GLOBAL
+            index += 1
+            continue
+        if token.startswith("--"):
+            if token not in option_names or index + 1 >= len(tokens) or tokens[index + 1].startswith("--"):
+                repl.renderer.status(SAVE_USAGE)
+                return
+            if token in single_value_options and token in options:
+                repl.renderer.status(SAVE_USAGE)
+                return
+            options.setdefault(token, []).append(tokens[index + 1])
+            index += 2
+            continue
+        content_parts.append(token)
+        index += 1
+
+    tier_values = options.get("--tier", [])
+    if not tier_values:
+        repl.renderer.status("Usage: /save requires --tier.\n" + SAVE_USAGE)
+        return
+    tier_name = tier_values[0].casefold()
+    content = " ".join(content_parts).strip()
+    if not content:
+        repl.renderer.status(SAVE_USAGE)
+        return
+
+    try:
+        if tier_name == ExperienceTier.TIP.value:
+            required = ("--category", "--severity", "--trigger")
+            if any(not options.get(name) for name in required):
+                repl.renderer.status(SAVE_USAGE)
+                return
+            tier = ExperienceTier.TIP
+            payload = TipPayload(
+                category=options["--category"][0],
+                severity=options["--severity"][0],
+                trigger=options["--trigger"][0],
+            )
+        elif tier_name == ExperienceTier.SKILL.value:
+            required = ("--category", "--technique", "--step")
+            if any(not options.get(name) for name in required):
+                repl.renderer.status(SAVE_USAGE)
+                return
+            tier = ExperienceTier.SKILL
+            payload = SkillPayload(
+                category=options["--category"][0],
+                technique=options["--technique"][0],
+                preconditions=tuple(options.get("--precondition", [])),
+                steps=tuple(options["--step"]),
+            )
+        else:
+            repl.renderer.status("Usage: /save supports only --tier tip or --tier skill.\n" + SAVE_USAGE)
+            return
+        entry, created = repl._memory.save_experience(
+            tier=tier,
+            content=content,
+            payload=payload,
+            scope=scope,
+        )
     except Exception as exc:  # noqa: BLE001 - interactive shell should report and continue
         repl.renderer.error(f"Error: {exc}")
         return
     if created:
-        repl.renderer.status(f"Saved memory: {entry.id}")
+        repl.renderer.status(f"Saved {entry.tier.value} experience: {entry.id}")
     else:
-        repl.renderer.status(f"Memory already exists: {entry.id}")
+        repl.renderer.status(f"Experience already exists: {entry.id}")
 
 
 def _handle_hitl(repl: "AgentRepl", command: str) -> None:

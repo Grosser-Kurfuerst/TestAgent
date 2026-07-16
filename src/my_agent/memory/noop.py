@@ -29,9 +29,6 @@ from my_agent.memory.types import (
 class NoopMemoryManager:
     """No-op memory implementation used for no-memory evaluation groups."""
 
-    last_fact_extraction_error = ""
-    last_fact_save_errors: list[str] = []
-
     def __init__(
         self,
         *,
@@ -78,24 +75,6 @@ class NoopMemoryManager:
             run_id=run_id,
             project_key=self.project_key,
         )
-
-    def save_fact(
-        self,
-        content: str,
-        *,
-        scope: MemoryScope = MemoryScope.PROJECT,
-        source: str = "manual",
-        metadata: dict[str, Any] | None = None,
-    ) -> tuple[MemoryEntry, bool]:
-        entry = _entry(
-            content,
-            type=MemoryType.FACT,
-            scope=scope,
-            source=source,
-            project_key=self.project_key,
-            metadata=metadata,
-        )
-        return entry, False
 
     def save_experience(
         self,
@@ -211,9 +190,6 @@ class NoopMemoryManager:
             long_term_entries_detail=(),
         )
 
-    def extract_facts(self, *, reason: str, run_id: str = "") -> list[MemoryEntry]:
-        return []
-
     def fork_for_task(self, *, session_id: str, run_id: str = "") -> "NoopMemoryManager":
         return NoopMemoryManager(
             config=self.config,
@@ -223,6 +199,7 @@ class NoopMemoryManager:
         )
 
     def clear_short_term(self, *, extract_first: bool = True, reason: str = "clear") -> tuple[int, list[MemoryEntry]]:
+        del extract_first, reason
         return 0, []
 
 

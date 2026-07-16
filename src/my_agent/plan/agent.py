@@ -176,7 +176,6 @@ class PlanExecuteAgent(AgentBase):
                 )
                 completed = executor.execute(plan)
                 self._record_plan_task_summaries(memory, completed, run_id=state.run_id)
-                memory.extract_facts(reason="plan_completed", run_id=state.run_id)
                 return self._final_state(state, completed, writer)
             except PlanValidationError as exc:
                 plan = PlanState.create(goal=goal, summary="Plan validation failed.")

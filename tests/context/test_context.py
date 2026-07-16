@@ -19,7 +19,7 @@ from my_agent.context import (
 )
 from my_agent.llm import FakeLLM
 from my_agent.llm.types import ChatResponse, LLMToolCall, Message, messages_to_openai
-from my_agent.memory import MemoryManager, MemoryScope
+from my_agent.memory import MemoryManager
 from my_agent.tools import ToolExecutionResult
 from tests.memory.experience_fixtures import save_typed_experience
 
@@ -196,7 +196,7 @@ class AgentContextManagerTests(unittest.TestCase):
                 repo_path=repo,
                 trace_sink=lambda event, payload: events.append((event, payload)),
             )
-            manager.save_fact("用户偏好：回答中文", scope=MemoryScope.PROJECT)
+            save_typed_experience(manager, "用户偏好：回答中文", tier="tip")
 
             messages, _, _ = AgentContextManager(manager.context_profile).prepare_messages(
                 base_messages=[Message(role="system", content="base")],
@@ -234,7 +234,7 @@ class AgentContextManagerTests(unittest.TestCase):
                 repo_path=repo,
                 trace_sink=lambda event, payload: events.append((event, payload)),
             )
-            manager.save_fact("Project fact about subtract.", scope=MemoryScope.PROJECT)
+            save_typed_experience(manager, "Project tip about subtract.", tier="tip")
             base = [Message(role="system", content="x" * 20_000)]
 
             AgentContextManager(manager.context_profile).prepare_messages(

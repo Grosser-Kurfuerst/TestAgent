@@ -5,7 +5,7 @@ storage, retrieval, and compression primitives. Prompt assembly and
 context-window budgeting live in :mod:`my_agent.context`.
 
 Phase 3 ships the data model, short/long-term storage, config wiring,
-retrieval, map-reduce compression, fact extraction, and the
+retrieval, map-reduce compression, and the
 :class:`MemoryManager` entry point.
 """
 

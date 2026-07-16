@@ -209,7 +209,6 @@ class ReActAgent(AgentBase):
                 if stop_reason and not state.done:
                     self._stop_by_budget(state, writer, budget, stop_reason)
 
-            memory.extract_facts(reason="run_completed", run_id=state.run_id)
             tool_history = [record.to_dict() for record in state.tool_history]
             writer_metadata = dict(getattr(state, "metadata", {}) or {})
             memory.write_experiences_from_run(

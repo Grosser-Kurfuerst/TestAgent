@@ -28,7 +28,6 @@ from my_agent.memory import (
     TrajectoryPayload,
 )
 from my_agent.memory.evolver import ExperienceWriteProposal, ExperienceWriteResult, experience_to_dict
-from my_agent.memory.long_term import LongTermMemoryStore
 from my_agent.tools import ToolExecutionResult
 from tests.memory.experience_fixtures import save_typed_experience
 
@@ -58,12 +57,10 @@ def _config(memory_dir: Path, **overrides: object) -> AgentConfig:
 class RecordingMemoryLLM:
     supports_tools = True
 
-    def __init__(self, *, fail_map: bool = False, fact_response: str | None = None) -> None:
+    def __init__(self, *, fail_map: bool = False) -> None:
         self.fail_map = fail_map
-        self.fact_response = fact_response or "[]"
         self.map_prompts: list[str] = []
         self.reduce_prompts: list[str] = []
-        self.fact_prompts: list[str] = []
 
     def chat(self, messages: list[MessageLike], tools: list[dict[str, object]] | None = None) -> ChatResponse:
         prompt = _messages_text(messages)
@@ -75,17 +72,7 @@ class RecordingMemoryLLM:
         if "请合并以下多个对话摘要" in prompt:
             self.reduce_prompts.append(prompt)
             return ChatResponse(content="reduced summary")
-        if "稳定事实" in prompt and "JSON 数组" in prompt:
-            self.fact_prompts.append(prompt)
-            return ChatResponse(content=self.fact_response)
         return ChatResponse(content="noop")
-
-
-class FailingFactLLM:
-    supports_tools = True
-
-    def chat(self, messages: list[MessageLike], tools: list[dict[str, object]] | None = None) -> ChatResponse:
-        raise RuntimeError("fact llm failed")
 
 
 def _messages_text(messages: list[MessageLike]) -> str:
@@ -202,8 +189,8 @@ class MemoryManagerBuildContextTests(unittest.TestCase):
             self.assertEqual(ctx.estimated_tokens, 0)
 
 
-class MemoryManagerSaveFactTests(unittest.TestCase):
-    def test_save_fact_persists_and_deduplicates(self) -> None:
+class MemoryManagerExperienceVisibilityTests(unittest.TestCase):
+    def test_save_experience_persists_and_deduplicates(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "repo"
             repo.mkdir()
@@ -212,26 +199,36 @@ class MemoryManagerSaveFactTests(unittest.TestCase):
                 llm=FakeLLM(),
                 repo_path=repo,
             )
-            entry, created = manager.save_fact("用户偏好：回答中文", scope=MemoryScope.PROJECT)
+            entry, created = save_typed_experience(
+                manager,
+                "用户偏好：回答中文",
+                tier="tip",
+                scope=MemoryScope.PROJECT,
+            )
             self.assertTrue(created)
 
-            same, created2 = manager.save_fact("用户偏好：回答中文", scope=MemoryScope.PROJECT)
+            same, created2 = save_typed_experience(
+                manager,
+                "用户偏好：回答中文",
+                tier="tip",
+                scope=MemoryScope.PROJECT,
+            )
             self.assertFalse(created2)
             self.assertEqual(same.id, entry.id)
 
-    def test_save_fact_survives_new_manager_instance(self) -> None:
+    def test_save_experience_survives_new_manager_instance(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "repo"
             repo.mkdir()
             config = _config(Path(tmp) / "memory")
             manager = MemoryManager.from_config(config=config, llm=FakeLLM(), repo_path=repo)
-            manager.save_fact("durable fact about config", scope=MemoryScope.PROJECT)
+            save_typed_experience(manager, "durable tip about config", tier="tip", scope=MemoryScope.PROJECT)
 
             reopened = MemoryManager.from_config(config=config, llm=FakeLLM(), repo_path=repo)
-            contents = {entry.content for entry in reopened.long_term.all(project_key=reopened.project_key)}
-            self.assertIn("durable fact about config", contents)
+            contents = {entry.content for entry in reopened.experience_store.all(project_key=reopened.project_key)}
+            self.assertIn("durable tip about config", contents)
 
-    def test_save_fact_global_scope_visible_to_other_repo(self) -> None:
+    def test_save_experience_global_scope_visible_to_other_repo(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_a = Path(tmp) / "repo_a"
             repo_b = Path(tmp) / "repo_b"
@@ -239,11 +236,11 @@ class MemoryManagerSaveFactTests(unittest.TestCase):
             repo_b.mkdir()
             config = _config(Path(tmp) / "memory")
             manager_a = MemoryManager.from_config(config=config, llm=FakeLLM(), repo_path=repo_a)
-            manager_a.save_fact("global rule about config", scope=MemoryScope.GLOBAL)
+            save_typed_experience(manager_a, "global tip about config", tier="tip", scope=MemoryScope.GLOBAL)
 
             manager_b = MemoryManager.from_config(config=config, llm=FakeLLM(), repo_path=repo_b)
-            contents = {entry.content for entry in manager_b.long_term.all(project_key=manager_b.project_key)}
-            self.assertIn("global rule about config", contents)
+            contents = {entry.content for entry in manager_b.experience_store.all(project_key=manager_b.project_key)}
+            self.assertIn("global tip about config", contents)
 
     def test_memory_project_key_override_controls_project_scope_visibility(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -258,13 +255,18 @@ class MemoryManagerSaveFactTests(unittest.TestCase):
             config_y = _config(memory_dir, memory_project_key="stream:y")
 
             manager_a = MemoryManager.from_config(config=config_x, llm=FakeLLM(), repo_path=repo_a)
-            manager_a.save_fact("stream marker VALUE equals 1", scope=MemoryScope.PROJECT)
+            save_typed_experience(
+                manager_a,
+                "stream marker VALUE equals 1",
+                tier="skill",
+                scope=MemoryScope.PROJECT,
+            )
 
             manager_b = MemoryManager.from_config(config=config_x, llm=FakeLLM(), repo_path=repo_b)
             manager_c = MemoryManager.from_config(config=config_y, llm=FakeLLM(), repo_path=repo_c)
 
-            contents_b = {entry.content for entry in manager_b.long_term.all(project_key=manager_b.project_key)}
-            contents_c = {entry.content for entry in manager_c.long_term.all(project_key=manager_c.project_key)}
+            contents_b = {entry.content for entry in manager_b.experience_store.all(project_key=manager_b.project_key)}
+            contents_c = {entry.content for entry in manager_c.experience_store.all(project_key=manager_c.project_key)}
 
         self.assertEqual(manager_a.project_key, "stream:x")
         self.assertEqual(manager_b.project_key, "stream:x")
@@ -274,6 +276,18 @@ class MemoryManagerSaveFactTests(unittest.TestCase):
 
 
 class MemoryManagerSaveExperienceTests(unittest.TestCase):
+    def test_managers_do_not_expose_ordinary_fact_write_apis(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            config = _config(Path(tmp) / "memory")
+            manager = MemoryManager.from_config(config=config, llm=FakeLLM(), repo_path=repo)
+            noop = NoopMemoryManager(config=config, repo_path=repo)
+
+            for candidate in (manager, noop):
+                self.assertFalse(hasattr(candidate, "save_fact"))
+                self.assertFalse(hasattr(candidate, "extract_facts"))
+
     def test_save_experience_persists_typed_payload_and_traces(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "repo"
@@ -426,7 +440,7 @@ class MemoryManagerSaveExperienceTests(unittest.TestCase):
             self.assertEqual(trajectory.payload.steps[0].action, "run_tests")
             self.assertEqual(trajectory.payload.key_learnings, ("parser strips comments before tokenization",))
 
-    def test_runtime_retrieves_typed_experience_but_never_legacy_fact(self) -> None:
+    def test_runtime_retrieves_typed_experience_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "repo"
             repo.mkdir()
@@ -435,17 +449,16 @@ class MemoryManagerSaveExperienceTests(unittest.TestCase):
                 llm=FakeLLM(),
                 repo_path=repo,
             )
-            manager.save_fact("ordinary durable fact about config", scope=MemoryScope.PROJECT)
             save_typed_experience(
                 manager,
                 "pytest fixture cleanup issue: clear tmp_path state before rerun",
                 tier="tip",
             )
 
-            fact_ctx = manager.build_context_for_query("ordinary config")
+            unrelated_ctx = manager.build_context_for_query("ordinary config")
             experience_ctx = manager.build_context_for_query("pytest fixture cleanup")
 
-            self.assertEqual(fact_ctx.injected_text, "")
+            self.assertEqual(unrelated_ctx.injected_text, "")
             self.assertIn("pytest fixture cleanup issue", experience_ctx.injected_text)
 
     def test_noop_save_experience_returns_entry_without_writing_or_tracing(self) -> None:
@@ -1025,9 +1038,9 @@ class MemoryManagerEvolverContextTests(unittest.TestCase):
                 repo_path=repo,
                 trace_sink=lambda event, payload: traces.append((event, payload)),
             )
-            manager.save_fact("ordinary durable fact about config", scope=MemoryScope.PROJECT)
+            save_typed_experience(manager, "ordinary typed tip about config", tier="tip")
 
-            context = manager.build_context_for_query("ordinary config")
+            context = manager.build_context_for_query("ordinary typed config")
 
             self.assertEqual(context.injected_text, "")
             self.assertEqual(context.hits, [])
@@ -1048,7 +1061,6 @@ class MemoryManagerEvolverContextTests(unittest.TestCase):
                 llm=FakeLLM(),
                 repo_path=repo,
             )
-            manager.save_fact("ordinary pytest fact should stay out", scope=MemoryScope.PROJECT)
             save_typed_experience(
                 manager,
                 "pytest weak tip",
@@ -1067,7 +1079,6 @@ class MemoryManagerEvolverContextTests(unittest.TestCase):
             self.assertTrue(context.injected_text.startswith("Relevant selected experience:"))
             self.assertIn("pytest boosted skill", context.injected_text)
             self.assertNotIn("pytest weak tip", context.injected_text)
-            self.assertNotIn("ordinary pytest fact", context.injected_text)
             self.assertEqual([hit.entry.content for hit in context.hits], ["pytest boosted skill"])
             self.assertIsNotNone(manager.last_evolver_selection)
 
@@ -1084,7 +1095,6 @@ class MemoryManagerEvolverContextTests(unittest.TestCase):
                 llm=FakeLLM(),
                 repo_path=repo,
             )
-            manager.save_fact("ordinary pytest fact should not be injected", scope=MemoryScope.PROJECT)
             manager.append_user_message("short-term pytest note should not be injected")
             save_typed_experience(
                 manager,
@@ -1097,7 +1107,6 @@ class MemoryManagerEvolverContextTests(unittest.TestCase):
 
             self.assertTrue(context.injected_text.startswith("Relevant selected experience:"))
             self.assertIn("selected pytest tip", context.injected_text)
-            self.assertNotIn("ordinary pytest fact", context.injected_text)
             self.assertNotIn("short-term pytest note", context.injected_text)
             self.assertEqual([hit.entry.content for hit in context.hits], ["selected pytest tip"])
 
@@ -1183,7 +1192,6 @@ class MemoryManagerEvolverContextTests(unittest.TestCase):
                 repo_path=repo,
                 trace_sink=lambda event, payload: traces.append((event, payload)),
             )
-            manager.save_fact("ordinary pytest fact must not leak through fallback", scope=MemoryScope.PROJECT)
             save_typed_experience(manager, "pytest tip selected before selector fails", tier="tip")
             manager.evolver_selector = RaisingSelector()  # type: ignore[assignment]
 
@@ -1197,7 +1205,6 @@ class MemoryManagerEvolverContextTests(unittest.TestCase):
             self.assertEqual(failed["fallback"], "empty_context")
             self.assertTrue(selected["fallback"])
             self.assertEqual(retrieved["hits"], 0)
-            self.assertNotIn("ordinary pytest fact", context.injected_text)
 
     def test_evolver_candidate_retrieval_is_top_k_per_tier_not_global_top_k(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1341,14 +1348,14 @@ class MemoryManagerStatusTests(unittest.TestCase):
                 repo_path=repo,
             )
             manager.append_user_message("hello")
-            manager.save_fact("用户偏好：回答中文", scope=MemoryScope.PROJECT)
+            save_typed_experience(manager, "用户偏好：回答中文", tier="tip", scope=MemoryScope.PROJECT)
 
             status = manager.status()
 
             self.assertEqual(status.short_term_entries, 1)
             self.assertEqual(status.long_term_entries, 1)
             self.assertEqual(status.project_key, str(repo.resolve()))
-            self.assertTrue(status.storage_path.endswith("long_term_memory.jsonl"))
+            self.assertTrue(status.storage_path.endswith("experience_memory.jsonl"))
             self.assertEqual(status.compression_trigger_ratio, 0.8)
             self.assertEqual(status.retain_recent_turns, 3)
             self.assertEqual(status.map_chunk_size, 5)
@@ -1363,7 +1370,7 @@ class MemoryManagerStatusTests(unittest.TestCase):
                 llm=FakeLLM(),
                 repo_path=repo,
             )
-            manager.save_fact("a fact", scope=MemoryScope.PROJECT)
+            save_typed_experience(manager, "a typed tip", tier="tip", scope=MemoryScope.PROJECT)
             status = manager.status(include_entries=False)
             self.assertEqual(status.long_term_entries_detail, ())
 
@@ -1603,56 +1610,13 @@ class MemoryManagerCompressionTests(unittest.TestCase):
             self.assertTrue(compaction.fallback)
             self.assertIn("[Fallback memory summary]", manager.short_term.all()[0].content)
 
-    def test_compaction_extracts_stable_facts_and_filters_temporary_tasks(self) -> None:
+    def test_compaction_keeps_short_term_summary_without_extracting_facts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "repo"
             repo.mkdir()
-            fact_response = json.dumps(
-                [
-                    {"content": "用户偏好：回答中文，先给结论", "scope": "project", "confidence": 0.95},
-                    {"content": "本次任务：修复 calculator.py", "scope": "project", "confidence": 0.99},
-                ],
-                ensure_ascii=False,
-            )
             manager = MemoryManager.from_config(
                 config=_config(Path(tmp) / "memory"),
-                llm=RecordingMemoryLLM(fact_response=fact_response),
-                repo_path=repo,
-            )
-            for index in range(5):
-                _append_turn(manager, index, payload="用户偏好：回答中文，先给结论")
-
-            _, _, compaction = _prepare_messages(
-                manager,
-                base_messages=[Message(role="system", content="base")],
-                query="用户偏好",
-                tools=[],
-                force_compact=True,
-            )
-
-            self.assertIsNotNone(compaction)
-            self.assertEqual(compaction.extracted_facts, 1)
-            facts = "\n".join(entry.content for entry in manager.long_term.all(project_key=str(repo.resolve())))
-            self.assertIn("用户偏好：回答中文，先给结论", facts)
-            self.assertNotIn("本次任务", facts)
-
-    def test_compaction_extracts_english_project_facts(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = Path(tmp) / "repo"
-            repo.mkdir()
-            fact_response = json.dumps(
-                [
-                    {
-                        "content": "Project uses FastAPI for REST APIs",
-                        "scope": "project",
-                        "confidence": 0.92,
-                    }
-                ],
-                ensure_ascii=False,
-            )
-            manager = MemoryManager.from_config(
-                config=_config(Path(tmp) / "memory"),
-                llm=RecordingMemoryLLM(fact_response=fact_response),
+                llm=RecordingMemoryLLM(),
                 repo_path=repo,
             )
             for index in range(5):
@@ -1667,9 +1631,10 @@ class MemoryManagerCompressionTests(unittest.TestCase):
             )
 
             self.assertIsNotNone(compaction)
-            self.assertEqual(compaction.extracted_facts, 1)
-            facts = [entry.content for entry in manager.long_term.all(project_key=str(repo.resolve()))]
-            self.assertIn("Project uses FastAPI for REST APIs", facts)
+            self.assertTrue(compaction.compacted)
+            self.assertEqual(compaction.extracted_facts, 0)
+            self.assertEqual(manager.experience_store.all(project_key=manager.project_key), [])
+            self.assertTrue(any(entry.type.value == "summary" for entry in manager.short_term.all()))
 
 
 class AgentContextManagerPromptTests(unittest.TestCase):
@@ -1718,36 +1683,6 @@ class AgentContextManagerPromptTests(unittest.TestCase):
             self.assertTrue(tool_payload["ok"])
             self.assertEqual(tool_payload["error_code"], "")
             self.assertEqual(tool_payload["content"], "def subtract(a, b): return a - b")
-
-    def test_manual_save_upgrades_existing_auto_extracted_fact(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = Path(tmp) / "repo"
-            repo.mkdir()
-            fact_response = json.dumps(
-                [{"content": "用户偏好：回答中文", "scope": "project", "confidence": 0.9}],
-                ensure_ascii=False,
-            )
-            manager = MemoryManager.from_config(
-                config=_config(Path(tmp) / "memory"),
-                llm=RecordingMemoryLLM(fact_response=fact_response),
-                repo_path=repo,
-            )
-            manager.append_user_message("用户偏好：回答中文")
-            extracted = manager.extract_facts(reason="test")
-            self.assertEqual(len(extracted), 1)
-            auto_entry = extracted[0]
-            self.assertEqual(auto_entry.source, "fact_extractor")
-
-            manual_entry, created = manager.save_fact("用户偏好：回答中文", scope=MemoryScope.PROJECT)
-
-            self.assertFalse(created)
-            self.assertEqual(manual_entry.id, auto_entry.id)
-            self.assertEqual(manual_entry.created_at, auto_entry.created_at)
-            self.assertEqual(manual_entry.source, "manual")
-            self.assertEqual(manual_entry.metadata.get("source"), "manual")
-            entries = manager.long_term.all(project_key=str(repo.resolve()))
-            self.assertEqual(len(entries), 1)
-            self.assertEqual(entries[0].source, "manual")
 
     def test_prepare_messages_downgrades_orphan_tool_result_to_user_memory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1848,97 +1783,14 @@ class AgentContextManagerPromptTests(unittest.TestCase):
             self.assertEqual(extracted, [])
             self.assertEqual(len(manager.short_term), 0)
 
-    def test_clear_short_term_with_extract_saves_facts_before_clearing(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = Path(tmp) / "repo"
-            repo.mkdir()
-            fact_response = json.dumps(
-                [{"content": "用户偏好：回答中文", "scope": "project", "confidence": 0.9}],
-                ensure_ascii=False,
-            )
-            manager = MemoryManager.from_config(
-                config=_config(Path(tmp) / "memory"),
-                llm=RecordingMemoryLLM(fact_response=fact_response),
-                repo_path=repo,
-            )
-            manager.append_user_message("用户偏好：回答中文")
-            count, extracted = manager.clear_short_term(extract_first=True)
-            self.assertEqual(count, 1)
-            self.assertEqual(len(extracted), 1)
-            self.assertEqual(len(manager.short_term), 0)
-            self.assertIn("用户偏好：回答中文", manager.long_term.all(project_key=str(repo.resolve()))[0].content)
-
-    def test_extract_facts_does_not_raise_when_auto_save_fails(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = Path(tmp) / "repo"
-            repo.mkdir()
-            traces: list[tuple[str, dict[str, object]]] = []
-            fact_response = json.dumps(
-                [{"content": "用户偏好：回答中文", "scope": "project", "confidence": 0.9}],
-                ensure_ascii=False,
-            )
-            manager = MemoryManager.from_config(
-                config=_config(Path(tmp) / "memory"),
-                llm=RecordingMemoryLLM(fact_response=fact_response),
-                repo_path=repo,
-                trace_sink=lambda event, payload: traces.append((event, payload)),
-            )
-            manager.append_user_message("用户偏好：回答中文", run_id="run_1")
-
-            def fail_add(entry: object) -> tuple[object, bool]:
-                raise OSError("disk full")
-
-            manager.long_term.add = fail_add  # type: ignore[method-assign]
-
-            extracted = manager.extract_facts(reason="run_completed", run_id="run_1")
-
-            self.assertEqual(extracted, [])
-            self.assertTrue(manager.last_fact_save_errors)
-            self.assertIn("memory.save_failed", [event for event, _ in traces])
-
-    def test_extract_facts_rolls_back_memory_when_persist_fails(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = Path(tmp) / "repo"
-            repo.mkdir()
-            traces: list[tuple[str, dict[str, object]]] = []
-            fact_response = json.dumps(
-                [{"content": "用户偏好：回答中文", "scope": "project", "confidence": 0.9}],
-                ensure_ascii=False,
-            )
-            manager = MemoryManager.from_config(
-                config=_config(Path(tmp) / "memory"),
-                llm=RecordingMemoryLLM(fact_response=fact_response),
-                repo_path=repo,
-                trace_sink=lambda event, payload: traces.append((event, payload)),
-            )
-            manager.append_user_message("用户偏好：回答中文", run_id="run_1")
-            original_persist = manager.long_term._persist
-
-            def fail_persist() -> None:
-                raise OSError("disk full")
-
-            manager.long_term._persist = fail_persist  # type: ignore[method-assign]
-
-            extracted = manager.extract_facts(reason="run_completed", run_id="run_1")
-
-            self.assertEqual(extracted, [])
-            self.assertFalse(any("用户偏好：回答中文" in entry.content for entry in manager.long_term.all()))
-            self.assertIn("memory.save_failed", [event for event, _ in traces])
-            self.assertNotIn("memory.fact_extracted", [event for event, _ in traces])
-
-            manager.long_term._persist = original_persist  # type: ignore[method-assign]
-            entry, created = manager.save_fact("用户偏好：回答中文")
-            self.assertTrue(created)
-            self.assertIn("用户偏好：回答中文", entry.content)
-
-    def test_extract_facts_records_llm_failure_without_raising(self) -> None:
+    def test_clear_short_term_with_extract_flag_does_not_write_facts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "repo"
             repo.mkdir()
             traces: list[tuple[str, dict[str, object]]] = []
             manager = MemoryManager.from_config(
-                config=_config(Path(tmp) / "memory"),
-                llm=FailingFactLLM(),
+                config=_config(Path(tmp) / "memory", memory_auto_extract=True),
+                llm=RecordingMemoryLLM(),
                 repo_path=repo,
                 trace_sink=lambda event, payload: traces.append((event, payload)),
             )
@@ -1948,36 +1800,9 @@ class AgentContextManagerPromptTests(unittest.TestCase):
 
             self.assertEqual(count, 1)
             self.assertEqual(extracted, [])
-            self.assertIn("RuntimeError: fact llm failed", manager.last_fact_extraction_error)
-            self.assertIn("memory.fact_extraction_failed", [event for event, _ in traces])
-            self.assertEqual(len(manager.short_term), 0)
-
-    def test_run_completed_fact_extraction_only_uses_matching_run_id(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = Path(tmp) / "repo"
-            repo.mkdir()
-            fact_response = json.dumps(
-                [
-                    {"content": "用户偏好：回答中文", "scope": "project", "confidence": 0.95},
-                    {"content": "项目 AgentCli 使用 Python src 布局", "scope": "project", "confidence": 0.9},
-                ],
-                ensure_ascii=False,
-            )
-            manager = MemoryManager.from_config(
-                config=_config(Path(tmp) / "memory"),
-                llm=RecordingMemoryLLM(fact_response=fact_response),
-                repo_path=repo,
-            )
-            manager.append_user_message("用户偏好：回答中文", run_id="old")
-            manager.append_user_message("项目 AgentCli 使用 Python src 布局", run_id="new")
-
-            extracted = manager.extract_facts(reason="run_completed", run_id="new")
-
-            contents = [entry.content for entry in extracted]
-            self.assertIn("项目 AgentCli 使用 Python src 布局", contents)
-            prompts = manager.compressor.llm.fact_prompts  # type: ignore[union-attr]
-            self.assertEqual(len(prompts), 1)
-            self.assertNotIn("用户偏好：回答中文", prompts[0])
+            self.assertEqual(manager.experience_store.all(project_key=manager.project_key), [])
+            clear_payload = [payload for event, payload in traces if event == "memory.clear"][-1]
+            self.assertEqual(clear_payload["extracted_facts"], 0)
 
 
 if __name__ == "__main__":

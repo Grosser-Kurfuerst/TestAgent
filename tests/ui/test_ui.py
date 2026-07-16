@@ -96,7 +96,7 @@ class ReplTests(unittest.TestCase):
         self.assertIn("compression trigger", text)
         self.assertNotIn("evolver selector:", text)
         self.assertIn("No conversation history was compacted", text)
-        self.assertIn("Extracted 0 facts, cleared 0 short-term entries", text)
+        self.assertIn("Cleared 0 short-term entries", text)
         self.assertIn("Latest trace: none", text)
         self.assertEqual(errors.getvalue(), "")
 
@@ -269,7 +269,7 @@ class ReplTests(unittest.TestCase):
                 trace_dir=base / "traces",
                 renderer=PlainRenderer(output=output, errors=errors),
                 input_stream=io.StringIO(
-                    "/save 用户偏好：回答中文，先给结论\n"
+                    "/save --tier tip --category preference --severity info --trigger response 用户偏好：回答中文，先给结论\n"
                     "/memory\n"
                     "读取 calculator.py\n"
                     "/clear\n"
@@ -282,11 +282,10 @@ class ReplTests(unittest.TestCase):
 
             self.assertEqual(exit_code, 0)
             text = output.getvalue()
-            self.assertIn("Saved memory:", text)
+            self.assertIn("Saved tip experience:", text)
             self.assertIn("Memory", text)
             self.assertIn("用户偏好：回答中文，先给结论", text)
-            self.assertIn("Extracted", text)
-            self.assertIn("cleared", text)
+            self.assertIn("Cleared", text)
             self.assertIn("short-term: 0 entries", text)
             self.assertEqual(errors.getvalue(), "")
 
@@ -301,13 +300,39 @@ class ReplTests(unittest.TestCase):
             reopened.run(show_banner=False)
             self.assertIn("用户偏好：回答中文，先给结论", reopened_output.getvalue())
 
-    def test_clear_reports_fact_extraction_failure_but_still_clears(self) -> None:
-        class FailingFactLLM:
-            supports_tools = True
+    def test_save_skill_builds_typed_payload_with_repeated_steps(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            output = io.StringIO()
+            errors = io.StringIO()
+            repl = AgentRepl(
+                repo_path=repo,
+                config=fake_config(base / "traces", memory_dir=base / "memory"),
+                trace_dir=base / "traces",
+                renderer=PlainRenderer(output=output, errors=errors),
+                input_stream=io.StringIO(
+                    "/save --global --tier skill --category testing --technique focused-loop "
+                    "--precondition target-known --step focused-test --step full-suite reusable testing workflow\n/quit\n"
+                ),
+            )
 
-            def chat(self, messages: list[object], tools: list[dict[str, object]] | None = None) -> object:
-                raise RuntimeError("fact extraction unavailable")
+            exit_code = repl.run(show_banner=False)
 
+            self.assertEqual(exit_code, 0)
+            entries = repl._memory.experience_store.all(project_key=repl._memory.project_key)
+            self.assertEqual(len(entries), 1)
+            entry = entries[0]
+            self.assertEqual(entry.tier.value, "skill")
+            self.assertEqual(entry.scope.value, "global")
+            self.assertEqual(entry.payload.technique, "focused-loop")
+            self.assertEqual(entry.payload.preconditions, ("target-known",))
+            self.assertEqual(entry.payload.steps, ("focused-test", "full-suite"))
+            self.assertIn("Saved skill experience:", output.getvalue())
+            self.assertEqual(errors.getvalue(), "")
+
+    def test_save_requires_explicit_tier_and_required_payload_fields(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             repo = base / "repo"
@@ -320,20 +345,23 @@ class ReplTests(unittest.TestCase):
                 config=fake_config(base / "traces", memory_dir=base / "memory"),
                 trace_dir=base / "traces",
                 renderer=PlainRenderer(output=output, errors=errors),
-                input_stream=io.StringIO("/clear\n/memory\n/quit\n"),
+                input_stream=io.StringIO(
+                    "/save 用户偏好：回答中文\n"
+                    "/save --tier skill --category testing --technique focused-tests reusable content\n"
+                    "/memory\n/quit\n"
+                ),
             )
-            repl._memory.compressor.llm = FailingFactLLM()  # type: ignore[assignment]
-            repl._memory.append_user_message("用户偏好：回答中文")
 
             exit_code = repl.run(show_banner=False)
 
             self.assertEqual(exit_code, 0)
             text = output.getvalue()
-            self.assertIn("Fact extraction failed; cleared 1 short-term entries.", text)
-            self.assertIn("short-term: 0 entries", text)
+            self.assertIn("Usage: /save requires --tier.", text)
+            self.assertIn("--step <step>", text)
+            self.assertIn("- none", text)
             self.assertEqual(errors.getvalue(), "")
 
-    def test_repl_extracts_session_facts_when_input_stream_ends(self) -> None:
+    def test_repl_shutdown_does_not_extract_session_facts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             repo = base / "repo"
@@ -347,18 +375,11 @@ class ReplTests(unittest.TestCase):
                 renderer=PlainRenderer(output=output, errors=errors),
                 input_stream=io.StringIO(""),
             )
-            reasons: list[str] = []
-
-            def record_extract(*, reason: str, run_id: str = "") -> list[object]:
-                reasons.append(reason)
-                return []
-
-            repl._memory.extract_facts = record_extract  # type: ignore[method-assign]
 
             exit_code = repl.run(show_banner=False)
 
             self.assertEqual(exit_code, 0)
-            self.assertEqual(reasons, ["session_end"])
+            self.assertFalse(hasattr(repl._memory, "extract_facts"))
             self.assertEqual(errors.getvalue(), "")
 
     def test_plan_command_runs_plan_agent(self) -> None:

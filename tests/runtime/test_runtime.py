@@ -17,7 +17,7 @@ from my_agent.cancellation import CancellationToken
 from my_agent.hitl import ApprovalDecision, ApprovalEvent, ApprovalRequest, ApprovalResult, ApprovalScope
 from my_agent.llm import FakeLLM
 from my_agent.llm.types import ChatResponse, LLMToolCall, MessageLike, messages_to_openai
-from my_agent.memory import MemoryManager, MemoryScope
+from my_agent.memory import MemoryManager
 from my_agent.plan import AgentMode
 from my_agent.runtime import CodingAgentRuntime, run_agent
 from my_agent.schema import AgentState, TraceEvent
@@ -481,7 +481,7 @@ class RuntimeTests(unittest.TestCase):
             write_runtime_repo(repo)
             config = fake_config(base / "traces", memory_dir=base / "memory", memory_enabled=False)
             memory = MemoryManager.from_config(config=fake_config(base / "other-memory"), llm=FakeLLM(), repo_path=repo)
-            memory.save_fact("This fact must not be injected.", scope=MemoryScope.PROJECT)
+            save_typed_experience(memory, "This experience must not be injected.", tier="tip")
             llm = RecordingFakeLLM([ChatResponse(content="done", finish_reason="stop")])
 
             state = run_agent(
@@ -498,7 +498,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertIn("memory.loaded", event_names)
             self.assertNotIn("memory.retrieved", event_names)
             first_request = json.dumps(llm.requests[0], ensure_ascii=False)
-            self.assertNotIn("This fact must not be injected.", first_request)
+            self.assertNotIn("This experience must not be injected.", first_request)
 
     def test_hitl_approval_events_are_traced_and_forwarded(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -962,7 +962,6 @@ class RuntimeTests(unittest.TestCase):
             )
             llm = RecordingFakeLLM([ChatResponse(content="done", finish_reason="stop")])
             memory = MemoryManager.from_config(config=config, llm=llm, repo_path=repo)
-            memory.save_fact("ordinary calculator memory should not be selected", scope=MemoryScope.PROJECT)
             save_typed_experience(
                 memory,
                 "calculator selected skill: inspect subtract before editing",
@@ -983,7 +982,6 @@ class RuntimeTests(unittest.TestCase):
             first_request = json.dumps(llm.requests[0], ensure_ascii=False)
             self.assertIn("Relevant selected experience:", first_request)
             self.assertIn("calculator selected skill", first_request)
-            self.assertNotIn("ordinary calculator memory", first_request)
             events = read_trace(state.trace_path)
             event_names = [event["event"] for event in events]
             self.assertIn("memory.evolver_candidates", event_names)
@@ -1090,11 +1088,11 @@ class RuntimeTests(unittest.TestCase):
             )
             before = read_trace(state.trace_path)
 
-            memory.save_fact("用户偏好：回答中文", scope=MemoryScope.PROJECT)
+            save_typed_experience(memory, "用户偏好：回答中文", tier="tip")
 
             after = read_trace(state.trace_path)
             self.assertEqual(after, before)
-            self.assertNotIn("memory.saved", [event["event"] for event in after])
+            self.assertNotIn("memory.evolver_saved", [event["event"] for event in after])
 
     def test_memory_preparation_handles_single_user_react_history(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
