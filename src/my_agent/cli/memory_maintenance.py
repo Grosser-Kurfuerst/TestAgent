@@ -25,12 +25,13 @@ from my_agent.memory.evolver.artifacts import _resolve_maintenance_artifact_grap
 from my_agent.memory.evolver.transaction import (
     _apply_maintenance_plan as apply_maintenance_plan,
 )
+from my_agent.memory.evolver.validation import validate_plan_semantics
 from my_agent.memory.experience_store import (
     EXPERIENCE_LOCK_FILE,
     EXPERIENCE_STORAGE_FILE,
     ExperienceStore,
 )
-from my_agent.memory.store_errors import MemoryStoreLockTimeout
+from my_agent.memory.store_errors import MemoryStoreLockTimeout, MemoryStoreRevisionConflict
 from my_agent.observability.tracing import TraceWriter
 from my_agent.schema import TraceEvent
 
@@ -109,14 +110,17 @@ def _run_maintenance(args: argparse.Namespace, state: _CommandState) -> int:
         state.stage = "strict_load"
         snapshot = store.load_strict_snapshot()
         state.stage = "plan_load"
-        plan = load_maintenance_plan(
-            args.plan,
-            repository_entries=snapshot.memories,
-        )
+        plan = load_maintenance_plan(args.plan)
         state.plan = plan
         state.stage = "validation"
         if plan.memory_project_key != state.project_key:
             raise ValueError("reviewed plan memory_project_key does not match CLI value")
+        if plan.repository_revision != snapshot.revision:
+            raise MemoryStoreRevisionConflict(
+                "reviewed maintenance plan is stale: "
+                f"expected {plan.repository_revision}, got {snapshot.revision}"
+            )
+        validate_plan_semantics(plan, repository_entries=snapshot.memories)
     else:
         state.stage = "strict_load"
         snapshot = store.load_strict_snapshot()

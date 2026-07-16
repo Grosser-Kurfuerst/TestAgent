@@ -48,6 +48,7 @@ from my_agent.memory.evolver.types import (
     ToolPayload,
     TrajectoryPayload,
 )
+from my_agent.memory.evolver.repository_rules import experience_dedup_key
 from my_agent.memory.experience_retrieval import tokenize_experience_text
 from my_agent.memory.types import (
     MemoryScope,
@@ -964,12 +965,12 @@ def _find_existing_skill(
     repository_entries: Sequence[ExperienceMemory],
     target: ExperienceMemory,
 ) -> ExperienceMemory | None:
-    target_key = _experience_dedup_key(target)
+    target_key = experience_dedup_key(target)
     matches = [
         entry
         for entry in repository_entries
         if entry.tier == ExperienceTier.SKILL
-        and _experience_dedup_key(entry) == target_key
+        and experience_dedup_key(entry) == target_key
     ]
     return min(matches, key=lambda entry: entry.id) if matches else None
 
@@ -1191,7 +1192,7 @@ def _validate_operation_conflicts(
 
     seen_dedup_keys: dict[tuple[str, str, str, str], str] = {}
     for entry in final_entries:
-        key = _experience_dedup_key(entry)
+        key = experience_dedup_key(entry)
         previous = seen_dedup_keys.get(key)
         if previous is not None:
             raise MaintenancePlanError(
@@ -1222,17 +1223,16 @@ def _validate_merge_repository_contract(
     replacement = final_by_id.get(anchor.id)
     if replacement is None:
         raise MaintenancePlanError(f"merge anchor replacement is absent: {anchor.id}")
+    mutable_fields = {"payload", "created_by", "maintenance_operation_id"}
     preserved_fields = (
-        replacement.id == anchor.id,
-        replacement.content == anchor.content,
-        replacement.fingerprint == anchor.fingerprint,
-        replacement.created_at == anchor.created_at,
-        replacement.scope == anchor.scope,
-        replacement.project_key == anchor.project_key,
-        replacement.run_id == anchor.run_id,
-        replacement.tier == anchor.tier,
+        field_name
+        for field_name in anchor.__dataclass_fields__
+        if field_name not in mutable_fields
     )
-    if not all(preserved_fields):
+    if any(
+        getattr(replacement, field_name) != getattr(anchor, field_name)
+        for field_name in preserved_fields
+    ):
         raise MaintenancePlanError(f"merge replacement does not preserve anchor identity: {anchor.id}")
 
 
@@ -1313,15 +1313,6 @@ def _operation_sort_key(operation: MaintenanceOperation) -> tuple[int, tuple[str
 def _entry_visible_to_project(entry: ExperienceMemory, project_key: str) -> bool:
     return entry.scope == MemoryScope.GLOBAL or (
         entry.scope == MemoryScope.PROJECT and entry.project_key == project_key
-    )
-
-
-def _experience_dedup_key(memory: ExperienceMemory) -> tuple[str, str, str, str]:
-    return (
-        memory.scope.value,
-        "" if memory.scope == MemoryScope.GLOBAL else memory.project_key,
-        memory.tier.value,
-        memory.fingerprint,
     )
 
 

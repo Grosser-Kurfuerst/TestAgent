@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import shutil
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -17,14 +18,12 @@ from my_agent.cli import main
 from my_agent.cli.memory_reset import RESET_CONFIRMATION
 from my_agent.config import AgentConfig
 from my_agent.memory.evolver import (
-    ExperienceCreatedBy,
     ExperienceTier,
     MaintenanceAction,
-    SkillPayload,
     load_maintenance_plan,
 )
 from my_agent.memory.experience_retrieval import ExperienceRetriever
-from my_agent.memory.experience_store import ExperienceStore
+from my_agent.memory.experience_store import EXPERIENCE_STORAGE_FILE, ExperienceStore
 from my_agent.memory.manager import MemoryManager
 from my_agent.memory.store_errors import MemoryStoreLoadError
 from tests.memory.experience_fixtures import typed_experience
@@ -32,6 +31,7 @@ from tests.memory.experience_fixtures import typed_experience
 
 PROJECT_KEY = "manifest:maintenance:e2e"
 NOW = datetime(2026, 7, 16, tzinfo=timezone.utc)
+FIXTURE_DIR = Path(__file__).parents[1] / "fixtures" / "evolver_maintenance"
 
 
 class MaintenanceEndToEndTests(unittest.TestCase):
@@ -43,64 +43,13 @@ class MaintenanceEndToEndTests(unittest.TestCase):
         return code, stdout.getvalue(), stderr.getvalue()
 
     def _seed(self, memory_dir: Path) -> ExperienceStore:
-        store = ExperienceStore.from_dir(memory_dir)
-        entries = (
-            typed_experience(
-                "delete-tip",
-                "Obsolete parser warning.",
-                ExperienceTier.TIP,
-                project_key=PROJECT_KEY,
-                created_at=NOW,
-                created_by=ExperienceCreatedBy.WRITER,
-                invalidated=True,
-            ),
-            typed_experience(
-                "merge-a",
-                "Run focused tests, then run the full suite.",
-                ExperienceTier.SKILL,
-                payload=SkillPayload(
-                    category="testing",
-                    technique="test loop",
-                    preconditions=("tests exist",),
-                    steps=("focused",),
-                ),
-                project_key=PROJECT_KEY,
-                created_at=NOW,
-                created_by=ExperienceCreatedBy.WRITER,
-            ),
-            typed_experience(
-                "merge-b",
-                "Run focused tests then run the full suite.",
-                ExperienceTier.SKILL,
-                payload=SkillPayload(
-                    category="testing",
-                    technique="test loop",
-                    preconditions=("suite exists",),
-                    steps=("full",),
-                ),
-                project_key=PROJECT_KEY,
-                created_at=NOW,
-                created_by=ExperienceCreatedBy.WRITER,
-            ),
-            typed_experience(
-                "promote-tip",
-                "Inspect the focused failure before editing.",
-                ExperienceTier.TIP,
-                project_key=PROJECT_KEY,
-                created_at=NOW,
-                source_task="task-1",
-                created_by=ExperienceCreatedBy.WRITER,
-                writer_confidence=0.8,
-                attribution_value=0.2,
-                attribution_confidence=0.9,
-                candidate_count=6,
-                selected_count=4,
-                not_selected_count=2,
-                attribution_updated_at=NOW,
-            ),
+        memory_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(
+            FIXTURE_DIR / "experience_memory.jsonl",
+            memory_dir / EXPERIENCE_STORAGE_FILE,
         )
-        for entry in entries:
-            store.add(entry)
+        store = ExperienceStore.from_dir(memory_dir)
+        store.load_strict_snapshot()
         return store
 
     def _base_args(self, memory_dir: Path) -> list[str]:
@@ -187,6 +136,24 @@ class MaintenanceEndToEndTests(unittest.TestCase):
             self.assertTrue(
                 any(op.action == MaintenanceAction.PROMOTE for op in plan.operations)
             )
+
+    def test_corrupt_typed_fixture_fails_closed_without_rewriting_repository(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            memory_dir = Path(tmp) / "memory"
+            memory_dir.mkdir()
+            store_path = memory_dir / EXPERIENCE_STORAGE_FILE
+            shutil.copyfile(
+                FIXTURE_DIR / "experience_memory_corrupt.jsonl",
+                store_path,
+            )
+            before = store_path.read_bytes()
+
+            exit_code, _, stderr = self._invoke(self._base_args(memory_dir))
+
+            self.assertEqual(exit_code, 1)
+            self.assertIn("invalid experience JSONL at line 2", stderr)
+            self.assertEqual(store_path.read_bytes(), before)
+            self.assertFalse((memory_dir / "maintenance_plan.json").exists())
 
 
 class ResetAndLegacyCutoverTests(unittest.TestCase):

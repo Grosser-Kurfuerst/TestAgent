@@ -38,7 +38,7 @@ from my_agent.memory.evolver.contracts import (
 from my_agent.memory.evolver.planner import (
     _repository_after_operations,
 )
-from my_agent.memory.evolver.serialization import experience_to_dict
+from my_agent.memory.evolver.repository_rules import experience_memories_revision
 from my_agent.memory.evolver.validation import (
     parse_maintenance_plan,
     validate_plan_semantics,
@@ -250,7 +250,7 @@ def _apply_maintenance_plan(
                 _write_backup_atomic(backup, snapshot.raw_bytes)
                 backup_path = str(backup)
 
-                expected_after_revision = _experience_memories_revision(next_entries)
+                expected_after_revision = experience_memories_revision(next_entries)
                 if reuse_intent:
                     assert history_state.intent is not None
                     recorded_after = history_state.intent["expected_after_revision"]
@@ -528,21 +528,6 @@ def _write_backup_atomic(path: Path, raw_bytes: bytes) -> None:
 def _atomic_write_tmp_path(path: str | Path) -> Path:
     target = Path(path)
     return target.with_suffix(target.suffix + ".tmp")
-
-
-def _experience_memories_revision(memories: Sequence[ExperienceMemory]) -> str:
-    payload = [
-        experience_to_dict(memory)
-        for memory in sorted(memories, key=lambda item: item.id)
-    ]
-    canonical = json.dumps(
-        payload,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    )
-    return f"sha256:{sha256(canonical.encode('utf-8')).hexdigest()}"
 
 
 def _validate_supplied_artifact_graph(

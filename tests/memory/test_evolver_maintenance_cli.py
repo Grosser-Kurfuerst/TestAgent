@@ -6,6 +6,7 @@ import json
 import os
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -178,6 +179,53 @@ class MaintenanceCliTests(unittest.TestCase):
             self.assertEqual(proposed["source_entries_removed"], 1)
             self.assertIsInstance(proposed["operation_summaries"], list)
             self.assertTrue(events[0]["run_id"].startswith("maintenance-maint-"))
+
+    def test_reviewed_plan_dry_run_rejects_stale_repository_revision(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            memory_dir = Path(tmp) / "memory"
+            store = self._add_invalidated_tip(memory_dir)
+            plan_path = memory_dir / "reviewed.json"
+            self.assertEqual(
+                self._invoke(
+                    self._base_args(memory_dir) + ["--output", str(plan_path)]
+                )[0],
+                0,
+            )
+            summary_path = Path(str(plan_path) + ".summary.json")
+            summary_path.unlink()
+            (memory_dir / "maintenance_trace.jsonl").unlink()
+
+            snapshot = store.load_strict_snapshot()
+            store.replace_all_atomically(
+                (replace(snapshot.memories[0], run_id="new-run"),),
+                expected_revision=snapshot.revision,
+            )
+            before = store.path.read_bytes()
+
+            exit_code, _, stderr = self._invoke(
+                self._base_args(memory_dir)
+                + [
+                    "--plan",
+                    str(plan_path),
+                    "--output",
+                    str(plan_path),
+                    "--dry-run",
+                ]
+            )
+
+            self.assertEqual(exit_code, 1)
+            self.assertIn("reviewed maintenance plan is stale", stderr)
+            self.assertEqual(store.path.read_bytes(), before)
+            self.assertEqual(
+                json.loads(summary_path.read_text(encoding="utf-8"))["status"],
+                "pre_commit_failed",
+            )
+            events = _read_jsonl(memory_dir / "maintenance_trace.jsonl")
+            self.assertEqual(
+                [event["event"] for event in events],
+                ["memory.maintenance_failed"],
+            )
+            self.assertEqual(events[0]["payload"]["status"], "pre_commit_failed")
 
     def test_default_as_of_and_threshold_overrides_are_serialized_in_plan(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
