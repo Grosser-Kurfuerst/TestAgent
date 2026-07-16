@@ -12,11 +12,10 @@ add_src_to_path()
 from my_agent.memory.evolver import (
     AttributionConfig,
     DEFAULT_TIER_WEIGHTS,
+    ExperienceTier,
     MemoryAttributionRecord,
     UsageLogEntry,
-    attribution_metadata,
     attribution_summary,
-    build_experience_entry,
     load_attribution_jsonl,
     render_attribution_summary,
     score_all_memories,
@@ -25,15 +24,16 @@ from my_agent.memory.evolver import (
 )
 from my_agent.memory.token import estimate_tokens
 from my_agent.memory.types import MemoryEntry, MemoryScope, MemoryType
+from tests.memory.experience_fixtures import typed_experience
 
 
-def _entry(memory_id: str, tier: str, *, project_key: str = "proj-A") -> MemoryEntry:
-    return build_experience_entry(
-        id=memory_id,
-        content=f"experience {memory_id}",
-        tier=tier,
+def _entry(memory_id: str, tier: str, *, project_key: str = "proj-A"):
+    return typed_experience(
+        memory_id,
+        f"experience {memory_id}",
+        ExperienceTier(tier),
         project_key=project_key,
-        scope=MemoryScope.PROJECT,
+        scope=MemoryScope.PROJECT if project_key else MemoryScope.GLOBAL,
     )
 
 
@@ -207,8 +207,6 @@ class ScoreMemoryTests(unittest.TestCase):
         record = score_memory(memory_id="mem-1", tier="skill", usage_logs=logs)
 
         self.assertEqual(record.last_used, "2026-07-03T00:00:00+00:00")
-        metadata = attribution_metadata(record, updated_at="2026-07-06T00:00:00+00:00")
-        self.assertEqual(metadata["evolver_last_used"], record.last_used)
 
     def test_last_used_remains_empty_without_selected_timestamp(self) -> None:
         record = score_memory(
@@ -245,11 +243,32 @@ class ScoreAllMemoriesTests(unittest.TestCase):
 
         self.assertEqual(records, [])
 
-    def test_non_experience_entries_excluded(self) -> None:
+    def test_non_experience_entries_are_rejected_at_typed_boundary(self) -> None:
         plain = _plain_entry("plain-1")
         logs = [_log(task_id="A", candidates=["plain-1", "mem-2"], selected=["plain-1"], reward=1.0)]
-        records = score_all_memories(entries=[plain], usage_logs=logs, project_key="proj-A")
-        self.assertEqual(records, [])
+        with self.assertRaisesRegex(TypeError, "ExperienceMemory"):
+            score_all_memories(
+                entries=[plain],  # type: ignore[list-item]
+                usage_logs=logs,
+                project_key="proj-A",
+            )
+
+    def test_typed_cutover_preserves_score_formula_output(self) -> None:
+        entry = _entry("mem-1", "skill")
+        logs = [
+            _log(task_id="A", candidates=["mem-1"], selected=["mem-1"], reward=1.0),
+            _log(task_id="B", candidates=["mem-1"], selected=[], reward=0.0),
+        ]
+
+        expected = score_memory(
+            memory_id="mem-1",
+            tier="skill",
+            usage_logs=logs,
+            project_key="proj-A",
+        )
+        records = score_all_memories(entries=[entry], usage_logs=logs, project_key="proj-A")
+
+        self.assertEqual(records, [expected])
 
     def test_project_key_filters_usage_logs_and_entries(self) -> None:
         # Same memory_id appears in two different streams with different outcomes.

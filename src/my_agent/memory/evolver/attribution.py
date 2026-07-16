@@ -12,20 +12,22 @@ byte-stable JSONL, with output sorted by ``memory_id``.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
+import json
+import warnings
+from dataclasses import dataclass, field, replace
+from datetime import datetime
 from math import sqrt
 from pathlib import Path
 from statistics import mean
-from typing import Any, Mapping, Sequence
-import json
-import warnings
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
-from my_agent.memory.long_term import LongTermMemoryStore
-from my_agent.memory.evolver.types import experience_tier
+from my_agent.memory.evolver.types import ExperienceMemory, ExperienceTier
 from my_agent.memory.evolver.usage_log import UsageLogEntry
-from my_agent.memory.types import MemoryEntry, MemoryScope
+from my_agent.memory.types import MemoryScope
 from my_agent.text_safety import sanitize_json_value
+
+if TYPE_CHECKING:
+    from my_agent.memory.experience_store import ExperienceStore
 
 
 DEFAULT_TIER_WEIGHTS: dict[str, float] = {
@@ -282,7 +284,7 @@ def _rate(values: Sequence[bool]) -> float | None:
 
 def score_all_memories(
     *,
-    entries: Sequence[MemoryEntry],
+    entries: Sequence[ExperienceMemory],
     usage_logs: Sequence[UsageLogEntry],
     project_key: str = "",
     config: AttributionConfig | None = None,
@@ -290,7 +292,7 @@ def score_all_memories(
     """Score every experience memory that appears in the candidate/selected pool.
 
     Filtering rules (see plan -> "Attribution Formula"):
-    - Only entries with an experience tier are considered.
+    - Every entry must be a typed four-tier experience.
     - A non-empty ``project_key`` requires an exact
       ``log.memory_project_key == project_key`` match and restricts candidate
       entries to that project. An explicitly empty API key is the
@@ -311,13 +313,17 @@ def score_all_memories(
         scoped_logs.append(log)
         candidate_ids.update(log.all_candidate_ids())
 
-    # Project-visible experience entries.
-    visible_entries: list[MemoryEntry] = []
+    # Project-visible typed experience entries. The store is a closed domain;
+    # silently filtering legacy generic values would hide a cutover bug.
+    visible_entries: list[ExperienceMemory] = []
     for entry in entries:
-        tier = experience_tier(entry)
-        if tier is None:
-            continue
-        if project_key and entry.project_key and entry.project_key != project_key:
+        if not isinstance(entry, ExperienceMemory):
+            raise TypeError("score_all_memories requires ExperienceMemory entries")
+        if (
+            project_key
+            and entry.scope != MemoryScope.GLOBAL
+            and entry.project_key != project_key
+        ):
             continue
         if entry.id in candidate_ids:
             visible_entries.append(entry)
@@ -326,7 +332,7 @@ def score_all_memories(
     for entry in visible_entries:
         record = score_memory(
             memory_id=entry.id,
-            tier=experience_tier(entry).value,  # type: ignore[union-attr]
+            tier=entry.tier.value,
             usage_logs=scoped_logs,
             config=cfg,
             project_key=project_key,
@@ -373,50 +379,22 @@ def load_attribution_jsonl(path: str | Path) -> dict[str, MemoryAttributionRecor
     return records
 
 
-def attribution_metadata(
-    record: MemoryAttributionRecord,
-    *,
-    updated_at: str | None = None,
-    value: float | None = None,
-) -> dict[str, Any]:
-    """Metadata fragment written onto a memory entry for selector scoring."""
-    stamp = updated_at if updated_at is not None else datetime.now(timezone.utc).isoformat()
-    stored_value = float(record.value if value is None else value)
-    return {
-        "evolver_value": round(stored_value, 6),
-        "evolver_confidence": round(float(record.confidence), 6),
-        "evolver_attribution_version": 1,
-        "evolver_attribution_updated_at": str(stamp or ""),
-        "evolver_attribution_memory_project_key": str(record.memory_project_key or ""),
-        "evolver_candidate_count": int(record.candidate_count),
-        "evolver_selected_count": int(record.selected_count),
-        "evolver_not_selected_count": int(record.not_selected_count),
-        "evolver_success_when_selected": _maybe_round(record.success_when_selected),
-        "evolver_success_when_candidate_not_selected": _maybe_round(record.success_when_candidate_not_selected),
-        "evolver_reward_when_selected": _maybe_round(record.reward_when_selected),
-        "evolver_reward_when_candidate_not_selected": _maybe_round(record.reward_when_candidate_not_selected),
-        "evolver_attribution_task_types": list(record.task_types),
-        "evolver_attribution_stream_ids": list(record.stream_ids),
-        "evolver_last_used": str(record.last_used or ""),
-    }
-
-
 def write_back_attribution(
     *,
-    store: LongTermMemoryStore,
+    store: ExperienceStore,
     records: Sequence[MemoryAttributionRecord],
     project_key: str | None = None,
     all_projects: bool = False,
     min_abs_value_to_write: float = 0.01,
     min_candidate_count: int = 2,
-    updated_at: str | None = None,
+    updated_at: datetime | str | None = None,
 ) -> AttributionWriteBackSummary:
-    """Write attribution metadata back through ``LongTermMemoryStore``.
+    """Write attribution fields back through ``ExperienceStore``.
 
-    The update is intentionally narrow: only metadata is changed, and the store
-    enforces rollback on persistence errors. Unless ``all_projects`` is true,
-    each record is restricted to the requested ``project_key`` or to the
-    record's own ``memory_project_key``.
+    The update is intentionally narrow: only flat attribution fields change,
+    and the store enforces atomic persistence. Unless ``all_projects`` is true,
+    each record is restricted to the requested ``project_key`` or the record's
+    own ``memory_project_key``.
     """
     attempted = 0
     updated = 0
@@ -425,7 +403,7 @@ def write_back_attribution(
     skipped_tier_mismatch = 0
     skipped_low_evidence = 0
 
-    all_entries = {entry.id: entry for entry in store.all(project_key=None)}
+    all_entries = {entry.id: entry for entry in store.all()}
     for record in records:
         attempted += 1
 
@@ -435,12 +413,20 @@ def write_back_attribution(
             continue
 
         target_project_key = _record_project_key(project_key, record)
-        if not all_projects and target_project_key is not None and not _entry_visible_to_project(entry, target_project_key):
+        if (
+            not all_projects
+            and target_project_key is not None
+            and not _memory_visible_to_project(entry, target_project_key)
+        ):
             skipped_by_project_key += 1
             continue
 
-        tier = experience_tier(entry)
-        if tier is None or tier.value != record.tier:
+        try:
+            expected_tier = ExperienceTier(record.tier)
+        except ValueError:
+            skipped_tier_mismatch += 1
+            continue
+        if entry.tier != expected_tier:
             skipped_tier_mismatch += 1
             continue
 
@@ -449,17 +435,16 @@ def write_back_attribution(
             value_to_write = 0.0
             skipped_low_evidence += 1
 
-        changed = store.update_metadata_by_id(
-            record.memory_id,
-            attribution_metadata(record, updated_at=updated_at, value=value_to_write),
+        stored_record = replace(record, value=value_to_write)
+        changed = store.update_attribution(
+            stored_record,
             project_key=target_project_key,
-            expected_tier=record.tier,
+            expected_tier=expected_tier,
             all_projects=all_projects,
+            updated_at=updated_at,
         )
         if changed:
             updated += 1
-            refreshed = store.all(project_key=None)
-            all_entries = {item.id: item for item in refreshed}
         else:
             skipped_missing += 1
 
@@ -538,10 +523,10 @@ def _record_project_key(project_key: str | None, record: MemoryAttributionRecord
     return None
 
 
-def _entry_visible_to_project(entry: MemoryEntry, project_key: str) -> bool:
-    if entry.scope == MemoryScope.GLOBAL:
+def _memory_visible_to_project(memory: ExperienceMemory, project_key: str) -> bool:
+    if memory.scope == MemoryScope.GLOBAL:
         return True
-    return bool(project_key) and entry.project_key == project_key
+    return bool(project_key) and memory.project_key == project_key
 
 
 def _summary_item(record: MemoryAttributionRecord) -> dict[str, Any]:
@@ -560,7 +545,6 @@ __all__ = [
     "AttributionWriteBackSummary",
     "DEFAULT_TIER_WEIGHTS",
     "MemoryAttributionRecord",
-    "attribution_metadata",
     "attribution_summary",
     "load_attribution_jsonl",
     "render_attribution_summary",

@@ -27,8 +27,10 @@ from my_agent.memory.evolver import (
     experience_tier,
     load_maintenance_plan,
 )
+from my_agent.memory.experience_store import ExperienceStore
 from my_agent.memory.long_term import LongTermMemoryStore, memory_dedup_key
 from my_agent.memory.retrieval import MemoryRetriever
+from tests.memory.experience_fixtures import typed_experience
 
 
 PROJECT_KEY = "manifest:phase6-e2e:memory:shared_stream:stream:python"
@@ -341,12 +343,22 @@ class MaintenanceEndToEndTests(unittest.TestCase):
             root = Path(tmp)
             memory_dir = root / "memory"
             store = LongTermMemoryStore.from_dir(memory_dir)
-            store.add(build_experience_entry(
+            legacy_entry = build_experience_entry(
                 id="phase5-negative-tip",
                 content="Delete diagnostics before understanding the failing assertion.",
                 tier="tip",
                 project_key=PROJECT_KEY,
                 created_at=datetime(2026, 6, 1, tzinfo=timezone.utc),
+                created_by=ExperienceCreatedBy.WRITER,
+            )
+            store.add(legacy_entry)
+            ExperienceStore.from_dir(memory_dir).add(typed_experience(
+                legacy_entry.id,
+                legacy_entry.content,
+                ExperienceTier.TIP,
+                project_key=PROJECT_KEY,
+                created_at=legacy_entry.created_at,
+                source_task="phase5-to-phase6",
                 created_by=ExperienceCreatedBy.WRITER,
             ))
             usage_path = root / "usage_logs.jsonl"

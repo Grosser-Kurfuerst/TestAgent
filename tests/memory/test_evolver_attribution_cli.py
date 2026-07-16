@@ -12,9 +12,9 @@ from tests._path import add_src_to_path
 add_src_to_path()
 
 from my_agent.cli import main
-from my_agent.memory.evolver import build_experience_entry
-from my_agent.memory.long_term import LongTermMemoryStore
-from my_agent.memory.types import MemoryScope
+from my_agent.memory.evolver import ExperienceTier, UsageLogEntry, UsageLogger
+from my_agent.memory.experience_store import ExperienceStore
+from tests.memory.experience_fixtures import typed_experience
 
 
 PROJECT_KEY = "manifest:demo:memory:shared_stream:stream:python"
@@ -72,40 +72,48 @@ def _benchmark_event(task_id: str, *, resolved: bool, timestamp: str, run_id: st
 
 def _write_trace(path: Path, task_id: str, memory_id: str, *, selected: bool, resolved: bool) -> None:
     run_id = f"run-{task_id}"
+    offset = max(0, ord(task_id[-1].upper()) - ord("A")) * 3
     events = [
         _candidate_event(
             memory_id,
-            timestamp=f"2026-01-01T00:00:{task_id[-1]}0+00:00",
+            timestamp=f"2026-01-01T00:00:{offset:02d}+00:00",
             run_id=run_id,
         ),
         _selected_event(
             [memory_id] if selected else [],
-            timestamp=f"2026-01-01T00:00:{task_id[-1]}1+00:00",
+            timestamp=f"2026-01-01T00:00:{offset + 1:02d}+00:00",
             run_id=run_id,
         ),
         _benchmark_event(
             task_id,
             resolved=resolved,
-            timestamp=f"2026-01-01T00:01:{task_id[-1]}0+00:00",
+            timestamp=f"2026-01-01T00:00:{offset + 2:02d}+00:00",
             run_id=run_id,
         ),
     ]
     path.write_text("\n".join(json.dumps(event, ensure_ascii=False) for event in events) + "\n", encoding="utf-8")
 
 
-def _add_memory(store: LongTermMemoryStore, memory_id: str) -> None:
+def _add_memory(store: ExperienceStore, memory_id: str) -> None:
     store.add(
-        build_experience_entry(
-            id=memory_id,
-            content=f"experience {memory_id}",
-            tier="skill",
+        typed_experience(
+            memory_id,
+            f"experience {memory_id}",
+            ExperienceTier.SKILL,
             project_key=PROJECT_KEY,
-            scope=MemoryScope.PROJECT,
         )
     )
 
 
 class EvolverAttributionCliTests(unittest.TestCase):
+    def test_score_memory_attribution_help_names_typed_store(self) -> None:
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout), self.assertRaises(SystemExit):
+            main(["data", "score-memory-attribution", "--help"])
+
+        self.assertIn("experience_memory.jsonl", stdout.getvalue())
+        self.assertNotIn("long_term_memory.jsonl", stdout.getvalue())
+
     def test_score_memory_attribution_requires_nonempty_project_key(self) -> None:
         cases = (
             [],
@@ -128,8 +136,7 @@ class EvolverAttributionCliTests(unittest.TestCase):
             base = Path(tmp)
             memory_dir = base / "memory"
             memory_dir.mkdir()
-            store = LongTermMemoryStore.from_dir(memory_dir)
-            store.load()
+            store = ExperienceStore.from_dir(memory_dir)
             _add_memory(store, "mem-good")
             _add_memory(store, "mem-bad")
 
@@ -200,11 +207,12 @@ class EvolverAttributionCliTests(unittest.TestCase):
             attribution_summary = json.loads(Path(str(attribution) + ".summary.json").read_text(encoding="utf-8"))
             self.assertEqual(attribution_summary["write_back_updated"], 2)
 
-            reloaded = LongTermMemoryStore.from_dir(memory_dir)
+            reloaded = ExperienceStore.from_dir(memory_dir)
             reloaded.load()
             memory_by_id = {entry.id: entry for entry in reloaded.all(project_key=PROJECT_KEY)}
-            self.assertGreater(memory_by_id["mem-good"].metadata["evolver_value"], 0.0)
-            self.assertLess(memory_by_id["mem-bad"].metadata["evolver_value"], 0.0)
+            self.assertGreater(memory_by_id["mem-good"].attribution_value, 0.0)
+            self.assertLess(memory_by_id["mem-bad"].attribution_value, 0.0)
+            self.assertIsNotNone(memory_by_id["mem-good"].attribution_updated_at)
 
             writer_dataset = base / "writer.jsonl"
             writer_output = base / "writer.scored.jsonl"
@@ -228,6 +236,56 @@ class EvolverAttributionCliTests(unittest.TestCase):
                 "skill": {"mem-good": by_id["mem-good"]["value"]},
             })
             self.assertTrue(Path(str(writer_output) + ".summary.json").exists())
+
+    def test_score_memory_attribution_does_not_write_back_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            memory_dir = base / "memory"
+            store = ExperienceStore.from_dir(memory_dir)
+            _add_memory(store, "mem-default")
+            usage_log = base / "usage_logs.jsonl"
+            UsageLogger(usage_log).overwrite([
+                UsageLogEntry(
+                    task_id="selected",
+                    task_type="humaneval",
+                    memory_project_key=PROJECT_KEY,
+                    retrieved_candidates={"skill": ["mem-default"]},
+                    selected_memory_ids={"skill": ["mem-default"]},
+                    env_reward=1.0,
+                    success=True,
+                    status="complete",
+                ),
+                UsageLogEntry(
+                    task_id="control",
+                    task_type="humaneval",
+                    memory_project_key=PROJECT_KEY,
+                    retrieved_candidates={"skill": ["mem-default"]},
+                    selected_memory_ids={"skill": []},
+                    env_reward=0.0,
+                    success=False,
+                    status="complete",
+                ),
+            ])
+            attribution = base / "memory_attribution.jsonl"
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                exit_code = main([
+                    "data",
+                    "score-memory-attribution",
+                    "--memory-dir", str(memory_dir),
+                    "--memory-project-key", PROJECT_KEY,
+                    "--usage-log", str(usage_log),
+                    "--output", str(attribution),
+                ])
+
+            self.assertEqual(exit_code, 0)
+            self.assertTrue(attribution.exists())
+            unchanged = ExperienceStore.from_dir(memory_dir).get("mem-default")
+            self.assertIsNotNone(unchanged)
+            assert unchanged is not None
+            self.assertEqual(unchanged.attribution_value, 0.0)
+            self.assertEqual(unchanged.candidate_count, 0)
+            self.assertIsNone(unchanged.attribution_updated_at)
 
     def test_build_usage_log_strict_fails_on_bad_trace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

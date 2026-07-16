@@ -30,7 +30,7 @@ from my_agent.memory.evolver import (
     write_back_attribution,
     write_dataset_summary_json,
 )
-from my_agent.memory.long_term import LongTermMemoryStore
+from my_agent.memory.experience_store import ExperienceStore
 
 DATA_COMMANDS = {
     "build-mbpp",
@@ -143,7 +143,11 @@ def _add_memory_attribution_parsers(subparsers: argparse._SubParsersAction[argpa
         "score-memory-attribution",
         help="Score experience memories from usage logs.",
     )
-    attribution_parser.add_argument("--memory-dir", required=True, help="Directory containing long_term_memory.jsonl.")
+    attribution_parser.add_argument(
+        "--memory-dir",
+        required=True,
+        help="Directory containing experience_memory.jsonl.",
+    )
     attribution_parser.add_argument(
         "--memory-project-key",
         required=True,
@@ -157,8 +161,8 @@ def _add_memory_attribution_parsers(subparsers: argparse._SubParsersAction[argpa
     attribution_parser.add_argument("--min-not-selected-count", type=int, default=1)
     attribution_parser.add_argument("--value-clip", type=float, default=0.5)
     attribution_parser.add_argument("--min-abs-value-to-write", type=float, default=0.01)
-    attribution_parser.add_argument("--write-back", action="store_true", help="Update long-term memory metadata.")
-    attribution_parser.add_argument("--dry-run", action="store_true", help="Do not write back metadata.")
+    attribution_parser.add_argument("--write-back", action="store_true", help="Update experience attribution fields.")
+    attribution_parser.add_argument("--dry-run", action="store_true", help="Do not write back attribution fields.")
     attribution_parser.add_argument("--all-projects", action="store_true", help="Allow write-back across project keys.")
     attribution_parser.add_argument("--top-n", type=int, default=5, help="Number of top/bottom records in summary.")
     attribution_parser.set_defaults(_handler=handle)
@@ -305,7 +309,7 @@ def _score_memory_attribution(args: argparse.Namespace) -> _RenderedResult:
     memory_dir = Path(args.memory_dir)
     usage_log = Path(args.usage_log) if args.usage_log else memory_dir / "usage_logs.jsonl"
     output = Path(args.output) if args.output else memory_dir / "memory_attribution.jsonl"
-    store = LongTermMemoryStore.from_dir(memory_dir)
+    store = ExperienceStore.from_dir(memory_dir)
     store.load()
     if not usage_log.exists():
         raise FileNotFoundError(str(usage_log))

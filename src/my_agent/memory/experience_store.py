@@ -209,6 +209,7 @@ class ExperienceStore:
         project_key: str | None,
         expected_tier: ExperienceTier,
         all_projects: bool = False,
+        updated_at: datetime | str | None = None,
     ) -> bool:
         if not isinstance(expected_tier, ExperienceTier):
             raise ValueError("expected_tier must be an ExperienceTier")
@@ -244,8 +245,18 @@ class ExperienceStore:
                         record,
                         "reward_when_candidate_not_selected",
                     ),
-                    last_used=_attribution_datetime(getattr(record, "last_used", "")),
-                    attribution_updated_at=datetime.now(timezone.utc),
+                    last_used=_attribution_datetime(
+                        getattr(record, "last_used", ""),
+                        field_name="last_used",
+                    ),
+                    attribution_updated_at=(
+                        datetime.now(timezone.utc)
+                        if updated_at in (None, "")
+                        else _attribution_datetime(
+                            updated_at,
+                            field_name="attribution_updated_at",
+                        )
+                    ),
                 )
                 next_memories = [
                     replacement if memory.id == memory_id else memory
@@ -614,7 +625,7 @@ def _is_visible(memory: ExperienceMemory, project_key: str) -> bool:
     return bool(project_key) and memory.project_key == project_key
 
 
-def _attribution_datetime(value: Any) -> datetime | None:
+def _attribution_datetime(value: Any, *, field_name: str) -> datetime | None:
     if value in (None, ""):
         return None
     if isinstance(value, datetime):
@@ -623,11 +634,11 @@ def _attribution_datetime(value: Any) -> datetime | None:
         try:
             parsed = datetime.fromisoformat(value)
         except ValueError as exc:
-            raise ValueError("attribution last_used must be an ISO datetime") from exc
+            raise ValueError(f"attribution {field_name} must be an ISO datetime") from exc
     else:
-        raise ValueError("attribution last_used must be an ISO datetime")
+        raise ValueError(f"attribution {field_name} must be an ISO datetime")
     if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise ValueError("attribution last_used must be timezone-aware")
+        raise ValueError(f"attribution {field_name} must be timezone-aware")
     return parsed
 
 
