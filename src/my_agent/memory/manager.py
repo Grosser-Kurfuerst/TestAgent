@@ -37,8 +37,6 @@ from my_agent.memory.experience_retrieval import (
     ExperienceRetriever,
 )
 from my_agent.memory.experience_store import ExperienceStore
-from my_agent.memory.long_term import LongTermMemoryStore, STORAGE_FILE
-from my_agent.memory.retrieval import MemoryRetriever
 from my_agent.memory.short_term import ShortTermMemory
 from my_agent.memory.token import estimate_tokens
 from my_agent.memory.types import (
@@ -85,7 +83,7 @@ WRITER_DATASET_SECRET_PREFIX_RE = re.compile(
 class MemoryManager:
     """Memory storage, retrieval, and compression entry point.
 
-    The manager owns short-term and long-term memory primitives:
+    The manager owns short-term memory and typed long-term experiences:
 
     * :meth:`from_config` — build a manager wired to the config's memory dir.
     * :meth:`save_experience` — persist a typed four-tier experience.
@@ -106,8 +104,6 @@ class MemoryManager:
         llm: AgentLLM | None,
         repo_path: Path,
         short_term: ShortTermMemory,
-        long_term: LongTermMemoryStore,
-        retriever: MemoryRetriever,
         experience_store: ExperienceStore,
         experience_retriever: ExperienceRetriever,
         compressor: MemoryCompressor,
@@ -121,8 +117,6 @@ class MemoryManager:
         self.context_profile = context_profile or ContextProfile.resolve(config, _model_name(llm, config))
         self.repo_path = Path(repo_path)
         self.short_term = short_term
-        self.long_term = long_term
-        self.retriever = retriever
         self.experience_store = experience_store
         self.experience_retriever = experience_retriever
         self.compressor = compressor
@@ -144,25 +138,20 @@ class MemoryManager:
         )
         self.last_evolver_selection: SelectionResult | None = None
 
-    def set_trace_sink(self, trace_sink: Any | None) -> tuple[Any | None, Any | None, Any | None]:
+    def set_trace_sink(self, trace_sink: Any | None) -> tuple[Any | None, Any | None]:
         previous = (
             self._trace_sink,
-            getattr(self.long_term, "_trace_sink", None),
             getattr(self.experience_store, "_trace_sink", None),
         )
         self._trace_sink = trace_sink
-        if hasattr(self.long_term, "_trace_sink"):
-            self.long_term._trace_sink = trace_sink
         if hasattr(self.experience_store, "_trace_sink"):
             self.experience_store._trace_sink = trace_sink
         return previous
 
-    def restore_trace_sink(self, snapshot: tuple[Any | None, Any | None, Any | None]) -> None:
+    def restore_trace_sink(self, snapshot: tuple[Any | None, Any | None]) -> None:
         self._trace_sink = snapshot[0]
-        if hasattr(self.long_term, "_trace_sink"):
-            self.long_term._trace_sink = snapshot[1]
         if hasattr(self.experience_store, "_trace_sink"):
-            self.experience_store._trace_sink = snapshot[2]
+            self.experience_store._trace_sink = snapshot[1]
 
     @classmethod
     def from_config(
@@ -176,8 +165,6 @@ class MemoryManager:
     ) -> "MemoryManager":
         memory_dir = Path(config.memory_dir)
         memory_dir.mkdir(parents=True, exist_ok=True)
-        long_term = LongTermMemoryStore(memory_dir / STORAGE_FILE, trace_sink=trace_sink)
-        long_term.load()
         experience_store = ExperienceStore.from_dir(memory_dir, trace_sink=trace_sink)
         experience_store.load()
         context_profile = ContextProfile.resolve(config, _model_name(llm, config))
@@ -185,7 +172,6 @@ class MemoryManager:
             max_tokens=context_profile.short_term_storage_token_limit,
             max_entries=config.memory_short_term_entries,
         )
-        retriever = MemoryRetriever()
         experience_retriever = ExperienceRetriever()
         compressor = MemoryCompressor(
             llm=llm,
@@ -201,8 +187,6 @@ class MemoryManager:
             llm=llm,
             repo_path=Path(repo_path),
             short_term=short_term,
-            long_term=long_term,
-            retriever=retriever,
             experience_store=experience_store,
             experience_retriever=experience_retriever,
             compressor=compressor,
@@ -616,24 +600,6 @@ class MemoryManager:
             },
         )
 
-    def retrieve_hits(
-        self,
-        query: str,
-        *,
-        limit: int | None = None,
-        include_short_term: bool = False,
-    ) -> list:
-        """Raw scored hits, for ``/memory`` search and tests."""
-        resolved_limit = limit if limit is not None else self.config.memory_retrieval_limit
-        return self.retriever.retrieve(
-            query,
-            short_term=self.short_term,
-            long_term=self.long_term,
-            project_key=self.project_key,
-            limit=resolved_limit,
-            include_short_term=include_short_term,
-        )
-
     # ------------------------------------------------------------------ status
 
     def status(self, *, include_entries: bool = True) -> MemoryStatus:
@@ -828,8 +794,6 @@ class MemoryManager:
                 max_tokens=self.context_profile.short_term_storage_token_limit,
                 max_entries=self.config.memory_short_term_entries,
             ),
-            long_term=self.long_term,
-            retriever=self.retriever,
             experience_store=self.experience_store,
             experience_retriever=self.experience_retriever.fork(),
             compressor=MemoryCompressor(

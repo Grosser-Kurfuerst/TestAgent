@@ -45,12 +45,12 @@ class NoopMemoryManager:
         self._trace_sink = trace_sink
         self.last_evolver_selection = None
 
-    def set_trace_sink(self, trace_sink: Any | None) -> tuple[Any | None, Any | None, Any | None]:
-        previous = (self._trace_sink, None, None)
+    def set_trace_sink(self, trace_sink: Any | None) -> tuple[Any | None, Any | None]:
+        previous = (self._trace_sink, None)
         self._trace_sink = trace_sink
         return previous
 
-    def restore_trace_sink(self, snapshot: tuple[Any | None, Any | None, Any | None]) -> None:
+    def restore_trace_sink(self, snapshot: tuple[Any | None, Any | None]) -> None:
         self._trace_sink = snapshot[0]
 
     def append_user_message(self, content: str, *, run_id: str = "") -> MemoryEntry:
@@ -147,15 +147,6 @@ class NoopMemoryManager:
         max_items: int | None = None,
     ) -> MemoryContext:
         return MemoryContext(injected_text="", hits=[], estimated_tokens=0)
-
-    def retrieve_hits(
-        self,
-        query: str,
-        *,
-        limit: int | None = None,
-        include_short_term: bool = False,
-    ) -> list[Any]:
-        return []
 
     def render_short_term_messages(self, *, max_tokens: int | None = None) -> list[MessageLike]:
         return []

@@ -276,7 +276,7 @@ class MemoryManagerExperienceVisibilityTests(unittest.TestCase):
 
 
 class MemoryManagerSaveExperienceTests(unittest.TestCase):
-    def test_managers_do_not_expose_ordinary_fact_write_apis(self) -> None:
+    def test_managers_do_not_expose_legacy_fact_or_retrieval_channels(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "repo"
             repo.mkdir()
@@ -285,8 +285,21 @@ class MemoryManagerSaveExperienceTests(unittest.TestCase):
             noop = NoopMemoryManager(config=config, repo_path=repo)
 
             for candidate in (manager, noop):
-                self.assertFalse(hasattr(candidate, "save_fact"))
-                self.assertFalse(hasattr(candidate, "extract_facts"))
+                for legacy_name in ("long_term", "retriever", "retrieve_hits", "save_fact", "extract_facts"):
+                    self.assertFalse(hasattr(candidate, legacy_name), legacy_name)
+
+    def test_runtime_manager_does_not_load_legacy_long_term_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            memory_dir = Path(tmp) / "memory"
+            memory_dir.mkdir()
+            (memory_dir / "long_term_memory.jsonl").write_text("{not valid json}\n", encoding="utf-8")
+
+            manager = MemoryManager.from_config(config=_config(memory_dir), llm=FakeLLM(), repo_path=repo)
+
+            self.assertEqual(manager.status().storage_path, str(memory_dir / "experience_memory.jsonl"))
+            self.assertFalse(hasattr(manager, "long_term"))
 
     def test_save_experience_persists_typed_payload_and_traces(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
