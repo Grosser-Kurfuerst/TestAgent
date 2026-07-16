@@ -20,11 +20,14 @@ from my_agent.memory.evolver.serialization import (
 )
 from my_agent.memory.evolver.attribution import (
     AttributionConfig,
+    AttributionWriteBackPlan,
     AttributionWriteBackSummary,
     DEFAULT_TIER_WEIGHTS,
     MemoryAttributionRecord,
+    apply_attribution_write_back,
     attribution_summary,
     load_attribution_jsonl,
+    prepare_attribution_write_back,
     render_attribution_summary,
     score_all_memories,
     score_memory,
@@ -118,6 +121,7 @@ from my_agent.memory.evolver.writer import (
 __all__ = [
     "AttributionKey",
     "AttributionConfig",
+    "AttributionWriteBackPlan",
     "AttributionWriteBackSummary",
     "EVOLVER_SCHEMA_VERSION",
     "EXPERIENCE_SCHEMA_VERSION",
@@ -167,6 +171,7 @@ __all__ = [
     "apply_maintenance_plan",
     "annotate_selector_dataset_scores",
     "annotate_writer_dataset_scores",
+    "apply_attribution_write_back",
     "attribution_summary",
     "build_maintenance_plan",
     "build_experience_entry",
@@ -193,6 +198,7 @@ __all__ = [
     "record_post_commit_audit_error",
     "normalize_experience_tier",
     "proposal_tier_counts",
+    "prepare_attribution_write_back",
     "read_trace_events",
     "render_selected_experiences",
     "render_attribution_summary",

@@ -8,7 +8,7 @@ from collections import defaultdict
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime
 from hashlib import sha256
 from pathlib import Path
 from types import MappingProxyType
@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, Callable
 from filelock import FileLock, Timeout as FileLockTimeout
 
 from my_agent.json_safety import loads_json_strict
+from my_agent.memory.experience_attribution import replace_experience_attribution
 from my_agent.memory.evolver.serialization import (
     EXPERIENCE_SCHEMA_VERSION,
     experience_canonical_json,
@@ -228,35 +229,10 @@ class ExperienceStore:
                     return False
                 if not all_projects and project_key is not None and not _is_visible(target, project_key):
                     return False
-                replacement = replace(
+                replacement = replace_experience_attribution(
                     target,
-                    attribution_value=getattr(record, "value"),
-                    attribution_confidence=getattr(record, "confidence"),
-                    candidate_count=getattr(record, "candidate_count"),
-                    selected_count=getattr(record, "selected_count"),
-                    not_selected_count=getattr(record, "not_selected_count"),
-                    success_when_selected=getattr(record, "success_when_selected"),
-                    success_when_candidate_not_selected=getattr(
-                        record,
-                        "success_when_candidate_not_selected",
-                    ),
-                    reward_when_selected=getattr(record, "reward_when_selected"),
-                    reward_when_candidate_not_selected=getattr(
-                        record,
-                        "reward_when_candidate_not_selected",
-                    ),
-                    last_used=_attribution_datetime(
-                        getattr(record, "last_used", ""),
-                        field_name="last_used",
-                    ),
-                    attribution_updated_at=(
-                        datetime.now(timezone.utc)
-                        if updated_at in (None, "")
-                        else _attribution_datetime(
-                            updated_at,
-                            field_name="attribution_updated_at",
-                        )
-                    ),
+                    record,
+                    updated_at=updated_at,
                 )
                 next_memories = [
                     replacement if memory.id == memory_id else memory
@@ -623,23 +599,6 @@ def _is_visible(memory: ExperienceMemory, project_key: str) -> bool:
     if memory.scope == MemoryScope.GLOBAL:
         return True
     return bool(project_key) and memory.project_key == project_key
-
-
-def _attribution_datetime(value: Any, *, field_name: str) -> datetime | None:
-    if value in (None, ""):
-        return None
-    if isinstance(value, datetime):
-        parsed = value
-    elif isinstance(value, str):
-        try:
-            parsed = datetime.fromisoformat(value)
-        except ValueError as exc:
-            raise ValueError(f"attribution {field_name} must be an ISO datetime") from exc
-    else:
-        raise ValueError(f"attribution {field_name} must be an ISO datetime")
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise ValueError(f"attribution {field_name} must be timezone-aware")
-    return parsed
 
 
 def _atomic_write_tmp_path(path: str | Path) -> Path:

@@ -233,10 +233,10 @@ class ExperienceStoreTests(unittest.TestCase):
                 not_selected_count=1,
                 success_when_selected=1.0,
                 success_when_candidate_not_selected=0.0,
-                reward_when_selected=0.8,
-                reward_when_candidate_not_selected=0.2,
-                value=0.3,
-                confidence=0.75,
+                reward_when_selected=0.888888888,
+                reward_when_candidate_not_selected=0.222222222,
+                value=0.123456789,
+                confidence=0.876543219,
                 last_used=NOW.isoformat(),
             )
 
@@ -260,8 +260,10 @@ class ExperienceStoreTests(unittest.TestCase):
             updated = store.get("tip")
             self.assertIsNotNone(updated)
             assert updated is not None
-            self.assertEqual(updated.attribution_value, 0.3)
-            self.assertEqual(updated.attribution_confidence, 0.75)
+            self.assertEqual(updated.attribution_value, 0.123457)
+            self.assertEqual(updated.attribution_confidence, 0.876543)
+            self.assertEqual(updated.reward_when_selected, 0.888889)
+            self.assertEqual(updated.reward_when_candidate_not_selected, 0.222222)
             self.assertEqual(updated.last_used, NOW)
             self.assertIsNotNone(updated.attribution_updated_at)
             assert updated.attribution_updated_at is not None

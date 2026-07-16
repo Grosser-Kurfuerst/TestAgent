@@ -16,11 +16,16 @@ import json
 import warnings
 from dataclasses import dataclass, field, replace
 from datetime import datetime
-from math import sqrt
+from math import isfinite, sqrt
 from pathlib import Path
 from statistics import mean
 from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
+from my_agent.memory.experience_attribution import (
+    canonical_attribution_float,
+    canonical_optional_attribution_float,
+    replace_experience_attribution,
+)
 from my_agent.memory.evolver.types import ExperienceMemory, ExperienceTier
 from my_agent.memory.evolver.usage_log import UsageLogEntry
 from my_agent.memory.types import MemoryScope
@@ -37,7 +42,6 @@ DEFAULT_TIER_WEIGHTS: dict[str, float] = {
     "tool": 1.20,
 }
 
-
 @dataclass(frozen=True)
 class AttributionConfig:
     """Knobs for the attribution formula. Defaults match the plan."""
@@ -48,6 +52,12 @@ class AttributionConfig:
     min_not_selected_count: int = 1
     min_selected_count_for_full_confidence: int = 8
     value_clip: float = 0.5
+
+    def __post_init__(self) -> None:
+        value_clip = float(self.value_clip)
+        if not isfinite(value_clip) or not 0.0 <= value_clip <= 1.0:
+            raise ValueError("attribution value_clip must be finite and between 0.0 and 1.0")
+        object.__setattr__(self, "value_clip", value_clip)
 
 
 @dataclass(frozen=True)
@@ -73,26 +83,51 @@ class MemoryAttributionRecord:
     not_selected_task_ids: tuple[str, ...] = ()
     last_used: str = ""
 
+    def canonicalized(self) -> "MemoryAttributionRecord":
+        """Return the six-decimal representation used at persistence boundaries."""
+        return replace(
+            self,
+            success_when_selected=canonical_optional_attribution_float(
+                self.success_when_selected,
+                field_name="success_when_selected",
+            ),
+            success_when_candidate_not_selected=canonical_optional_attribution_float(
+                self.success_when_candidate_not_selected,
+                field_name="success_when_candidate_not_selected",
+            ),
+            reward_when_selected=canonical_optional_attribution_float(
+                self.reward_when_selected,
+                field_name="reward_when_selected",
+            ),
+            reward_when_candidate_not_selected=canonical_optional_attribution_float(
+                self.reward_when_candidate_not_selected,
+                field_name="reward_when_candidate_not_selected",
+            ),
+            value=canonical_attribution_float(self.value, field_name="value"),
+            confidence=canonical_attribution_float(self.confidence, field_name="confidence"),
+        )
+
     def to_dict(self) -> dict[str, Any]:
+        canonical = self.canonicalized()
         payload: dict[str, Any] = {
-            "memory_id": str(self.memory_id),
-            "tier": str(self.tier),
-            "memory_project_key": str(self.memory_project_key or ""),
-            "candidate_count": int(self.candidate_count),
-            "selected_count": int(self.selected_count),
-            "not_selected_count": int(self.not_selected_count),
-            "success_when_selected": _maybe_round(self.success_when_selected),
-            "success_when_candidate_not_selected": _maybe_round(self.success_when_candidate_not_selected),
-            "reward_when_selected": _maybe_round(self.reward_when_selected),
-            "reward_when_candidate_not_selected": _maybe_round(self.reward_when_candidate_not_selected),
-            "value": round(float(self.value), 6),
-            "confidence": round(float(self.confidence), 6),
-            "groups": list(self.groups),
-            "task_types": list(self.task_types),
-            "stream_ids": list(self.stream_ids),
-            "selected_task_ids": list(self.selected_task_ids),
-            "not_selected_task_ids": list(self.not_selected_task_ids),
-            "last_used": str(self.last_used or ""),
+            "memory_id": str(canonical.memory_id),
+            "tier": str(canonical.tier),
+            "memory_project_key": str(canonical.memory_project_key or ""),
+            "candidate_count": int(canonical.candidate_count),
+            "selected_count": int(canonical.selected_count),
+            "not_selected_count": int(canonical.not_selected_count),
+            "success_when_selected": canonical.success_when_selected,
+            "success_when_candidate_not_selected": canonical.success_when_candidate_not_selected,
+            "reward_when_selected": canonical.reward_when_selected,
+            "reward_when_candidate_not_selected": canonical.reward_when_candidate_not_selected,
+            "value": canonical.value,
+            "confidence": canonical.confidence,
+            "groups": list(canonical.groups),
+            "task_types": list(canonical.task_types),
+            "stream_ids": list(canonical.stream_ids),
+            "selected_task_ids": list(canonical.selected_task_ids),
+            "not_selected_task_ids": list(canonical.not_selected_task_ids),
+            "last_used": str(canonical.last_used or ""),
         }
         return sanitize_json_value(payload)  # type: ignore[return-value]
 
@@ -142,8 +177,21 @@ class AttributionWriteBackSummary:
         }
 
 
-def _maybe_round(value: float | None) -> float | None:
-    return round(value, 6) if value is not None else None
+@dataclass(frozen=True)
+class _PreparedAttributionUpdate:
+    record: MemoryAttributionRecord
+    project_key: str | None
+    expected_tier: ExperienceTier
+
+
+@dataclass(frozen=True)
+class AttributionWriteBackPlan:
+    """Opaque validated batch shared by explicit preflight and apply stages."""
+
+    _updates: tuple[_PreparedAttributionUpdate, ...]
+    summary: AttributionWriteBackSummary
+    all_projects: bool
+    updated_at: datetime | str | None
 
 
 def _maybe_float(value: Any) -> float | None:
@@ -396,17 +444,67 @@ def write_back_attribution(
     each record is restricted to the requested ``project_key`` or the record's
     own ``memory_project_key``.
     """
-    attempted = 0
+    plan = prepare_attribution_write_back(
+        store=store,
+        records=records,
+        project_key=project_key,
+        all_projects=all_projects,
+        min_abs_value_to_write=min_abs_value_to_write,
+        min_candidate_count=min_candidate_count,
+        updated_at=updated_at,
+    )
+    return apply_attribution_write_back(store=store, plan=plan)
+
+
+def apply_attribution_write_back(
+    *,
+    store: ExperienceStore,
+    plan: AttributionWriteBackPlan,
+) -> AttributionWriteBackSummary:
+    """Apply a validated plan while retaining each store mutation's final guard."""
     updated = 0
+    skipped_missing = plan.summary.skipped_missing
+    for item in plan._updates:
+        changed = store.update_attribution(
+            item.record,
+            project_key=item.project_key,
+            expected_tier=item.expected_tier,
+            all_projects=plan.all_projects,
+            updated_at=plan.updated_at,
+        )
+        if changed:
+            updated += 1
+        else:
+            skipped_missing += 1
+
+    return replace(
+        plan.summary,
+        updated=updated,
+        skipped_missing=skipped_missing,
+    )
+
+
+def prepare_attribution_write_back(
+    *,
+    store: ExperienceStore,
+    records: Sequence[MemoryAttributionRecord],
+    project_key: str | None = None,
+    all_projects: bool = False,
+    min_abs_value_to_write: float = 0.01,
+    min_candidate_count: int = 2,
+    updated_at: datetime | str | None = None,
+) -> AttributionWriteBackPlan:
+    attempted = 0
     skipped_missing = 0
     skipped_by_project_key = 0
     skipped_tier_mismatch = 0
     skipped_low_evidence = 0
+    prepared: list[_PreparedAttributionUpdate] = []
 
-    all_entries = {entry.id: entry for entry in store.all()}
+    strict_snapshot = store.load_strict_snapshot()
+    all_entries = {entry.id: entry for entry in strict_snapshot.memories}
     for record in records:
         attempted += 1
-
         entry = all_entries.get(record.memory_id)
         if entry is None:
             skipped_missing += 1
@@ -436,25 +534,26 @@ def write_back_attribution(
             skipped_low_evidence += 1
 
         stored_record = replace(record, value=value_to_write)
-        changed = store.update_attribution(
-            stored_record,
-            project_key=target_project_key,
-            expected_tier=expected_tier,
-            all_projects=all_projects,
-            updated_at=updated_at,
+        replace_experience_attribution(entry, stored_record, updated_at=updated_at)
+        prepared.append(
+            _PreparedAttributionUpdate(
+                record=stored_record,
+                project_key=target_project_key,
+                expected_tier=expected_tier,
+            )
         )
-        if changed:
-            updated += 1
-        else:
-            skipped_missing += 1
 
-    return AttributionWriteBackSummary(
-        attempted=attempted,
-        updated=updated,
-        skipped_missing=skipped_missing,
-        skipped_by_project_key=skipped_by_project_key,
-        skipped_tier_mismatch=skipped_tier_mismatch,
-        skipped_low_evidence=skipped_low_evidence,
+    return AttributionWriteBackPlan(
+        _updates=tuple(prepared),
+        summary=AttributionWriteBackSummary(
+            attempted=attempted,
+            skipped_missing=skipped_missing,
+            skipped_by_project_key=skipped_by_project_key,
+            skipped_tier_mismatch=skipped_tier_mismatch,
+            skipped_low_evidence=skipped_low_evidence,
+        ),
+        all_projects=all_projects,
+        updated_at=updated_at,
     )
 
 
@@ -542,11 +641,14 @@ def _summary_item(record: MemoryAttributionRecord) -> dict[str, Any]:
 
 __all__ = [
     "AttributionConfig",
+    "AttributionWriteBackPlan",
     "AttributionWriteBackSummary",
     "DEFAULT_TIER_WEIGHTS",
     "MemoryAttributionRecord",
+    "apply_attribution_write_back",
     "attribution_summary",
     "load_attribution_jsonl",
+    "prepare_attribution_write_back",
     "render_attribution_summary",
     "score_all_memories",
     "score_memory",

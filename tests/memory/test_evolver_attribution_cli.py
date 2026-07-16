@@ -131,6 +131,60 @@ class EvolverAttributionCliTests(unittest.TestCase):
                             *extra_args,
                         ])
 
+    def test_score_memory_attribution_rejects_invalid_value_clip_before_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            memory_dir = Path(tmp) / "memory"
+            store = ExperienceStore.from_dir(memory_dir)
+            _add_memory(store, "mem-clip")
+            output = Path(tmp) / "memory_attribution.jsonl"
+
+            for value in ("-0.1", "1.5", "nan", "inf"):
+                with self.subTest(value=value), contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit):
+                        main([
+                            "data",
+                            "score-memory-attribution",
+                            "--memory-dir", str(memory_dir),
+                            "--memory-project-key", PROJECT_KEY,
+                            "--output", str(output),
+                            "--value-clip", value,
+                            "--write-back",
+                        ])
+                self.assertFalse(output.exists())
+                unchanged = ExperienceStore.from_dir(memory_dir).get("mem-clip")
+                self.assertIsNotNone(unchanged)
+                assert unchanged is not None
+                self.assertEqual(unchanged.attribution_value, 0.0)
+                self.assertEqual(unchanged.candidate_count, 0)
+
+    def test_score_memory_attribution_strict_preflight_rejects_corrupt_store_before_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            memory_dir = Path(tmp) / "memory"
+            store = ExperienceStore.from_dir(memory_dir)
+            _add_memory(store, "mem-batch")
+            with store.path.open("a", encoding="utf-8") as handle:
+                handle.write("{bad}\n")
+            usage_log = Path(tmp) / "usage_logs.jsonl"
+            UsageLogger(usage_log).overwrite([])
+            output = Path(tmp) / "memory_attribution.jsonl"
+
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                exit_code = main([
+                    "data",
+                    "score-memory-attribution",
+                    "--memory-dir", str(memory_dir),
+                    "--memory-project-key", PROJECT_KEY,
+                    "--usage-log", str(usage_log),
+                    "--output", str(output),
+                    "--write-back",
+                ])
+
+            self.assertEqual(exit_code, 1)
+            self.assertIn("invalid experience JSONL at line 2", stderr.getvalue())
+            self.assertFalse(output.exists())
+            self.assertFalse(Path(str(output) + ".summary.json").exists())
+
     def test_cli_end_to_end_usage_attribution_dataset_and_writeback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from math import isfinite
 from pathlib import Path
 
 from my_agent.cli.common import CliContext
@@ -20,14 +21,15 @@ from my_agent.memory.evolver import (
     UsageLogger,
     annotate_selector_dataset_scores,
     annotate_writer_dataset_scores,
+    apply_attribution_write_back,
     attribution_summary,
     load_attribution_jsonl,
+    prepare_attribution_write_back,
     render_attribution_summary,
     score_all_memories,
     selection_from_trace,
     usage_entry_from_result_row,
     write_attribution_jsonl,
-    write_back_attribution,
     write_dataset_summary_json,
 )
 from my_agent.memory.experience_store import ExperienceStore
@@ -159,7 +161,7 @@ def _add_memory_attribution_parsers(subparsers: argparse._SubParsersAction[argpa
     attribution_parser.add_argument("--min-candidate-count", type=int, default=2)
     attribution_parser.add_argument("--min-selected-count", type=int, default=1)
     attribution_parser.add_argument("--min-not-selected-count", type=int, default=1)
-    attribution_parser.add_argument("--value-clip", type=float, default=0.5)
+    attribution_parser.add_argument("--value-clip", type=_unit_interval_float, default=0.5)
     attribution_parser.add_argument("--min-abs-value-to-write", type=float, default=0.01)
     attribution_parser.add_argument("--write-back", action="store_true", help="Update experience attribution fields.")
     attribution_parser.add_argument("--dry-run", action="store_true", help="Do not write back attribution fields.")
@@ -326,10 +328,10 @@ def _score_memory_attribution(args: argparse.Namespace) -> _RenderedResult:
         project_key=str(args.memory_project_key or ""),
         config=config,
     )
-    write_attribution_jsonl(records, output)
+    should_write_back = bool(args.write_back and not args.dry_run)
     write_back_summary = None
-    if args.write_back and not args.dry_run:
-        write_back_summary = write_back_attribution(
+    if should_write_back:
+        write_back_plan = prepare_attribution_write_back(
             store=store,
             records=records,
             project_key=str(args.memory_project_key or "") if args.memory_project_key else None,
@@ -337,6 +339,13 @@ def _score_memory_attribution(args: argparse.Namespace) -> _RenderedResult:
             min_abs_value_to_write=float(args.min_abs_value_to_write),
             min_candidate_count=int(args.min_candidate_count),
         )
+        write_attribution_jsonl(records, output)
+        write_back_summary = apply_attribution_write_back(
+            store=store,
+            plan=write_back_plan,
+        )
+    else:
+        write_attribution_jsonl(records, output)
     summary = attribution_summary(
         records,
         output=output,
@@ -390,6 +399,16 @@ def _nonempty_text(value: str) -> str:
     if not normalized:
         raise argparse.ArgumentTypeError("value must not be empty")
     return normalized
+
+
+def _unit_interval_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("value must be a number between 0.0 and 1.0") from exc
+    if not isfinite(parsed) or not 0.0 <= parsed <= 1.0:
+        raise argparse.ArgumentTypeError("value must be finite and between 0.0 and 1.0")
+    return parsed
 
 
 def _read_jsonl(path: Path) -> list[dict[str, object]]:
