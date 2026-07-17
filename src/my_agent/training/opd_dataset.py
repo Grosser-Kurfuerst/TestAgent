@@ -10,6 +10,11 @@ from random import Random
 from typing import Any
 import json
 
+from my_agent.opd_ablation import (
+    MAIN_ABLATION_RECIPE_HASH,
+    ablation_excluded_roles,
+    ablation_recipe_hash,
+)
 from my_agent.opd_data.export import load_learner_samples
 from my_agent.opd_data.schema import ExportManifest, LearnerSample
 from my_agent.policy.contracts import EVOLVER_ROLES
@@ -45,20 +50,36 @@ class OPDLearnerDataset(Sequence[LearnerSample]):
         require_all_roles: bool = True,
         learner_dataset_hash: str | None = None,
         export_manifest_hash: str | None = None,
+        ablation: str = "",
+        ablation_recipe_hash_value: str = MAIN_ABLATION_RECIPE_HASH,
+        dataset_source_hashes: Mapping[str, str] | None = None,
+        sample_policy_identity_hashes: Sequence[str] = (),
+        sample_collection_rounds: Sequence[int] = (),
     ) -> None:
         selected = tuple(sample for sample in samples if sample.split == split)
         if not selected:
             raise ValueError(f"OPD dataset split {split!r} is empty")
+        normalized_ablation = str(ablation).strip().lower()
+        if normalized_ablation != ablation:
+            raise ValueError("OPD dataset ablation must be normalized")
+        if ablation_recipe_hash_value != ablation_recipe_hash(normalized_ablation):
+            raise ValueError("OPD dataset ablation recipe hash mismatch")
+        allowed_identity_hashes = frozenset(
+            sample_policy_identity_hashes
+            or (initialization_identity.identity_hash,)
+        )
+        allowed_rounds = frozenset(sample_collection_rounds or (collection_round,))
         for sample in selected:
-            if sample.collection_round != collection_round:
-                raise ValueError("OPD dataset crosses collection rounds")
-            if sample.policy_identity != initialization_identity:
-                raise ValueError("learner sample identity does not match trainer initialization")
+            if sample.collection_round not in allowed_rounds:
+                raise ValueError("OPD dataset sample collection round is not declared")
+            if sample.policy_identity.identity_hash not in allowed_identity_hashes:
+                raise ValueError("learner sample identity is absent from dataset provenance")
             if not sample.student_completion_token_ids or not any(sample.assistant_loss_mask):
                 raise ValueError("OPD dataset sample has no trainable assistant tokens")
         roles = frozenset(sample.role for sample in selected)
-        if require_all_roles and roles != EVOLVER_ROLES:
-            missing = sorted(EVOLVER_ROLES - roles)
+        expected_roles = EVOLVER_ROLES - ablation_excluded_roles(normalized_ablation)
+        if require_all_roles and roles != expected_roles:
+            missing = sorted(expected_roles - roles)
             raise ValueError(f"formal OPD dataset is missing roles: {missing}")
         self._samples = selected
         self.initialization_identity = initialization_identity
@@ -70,6 +91,11 @@ class OPDLearnerDataset(Sequence[LearnerSample]):
             else canonical_sha256([sample.to_dict() for sample in samples])
         )
         self.export_manifest_hash = export_manifest_hash
+        self.ablation = normalized_ablation
+        self.ablation_recipe_hash = ablation_recipe_hash_value
+        self.dataset_source_hashes = dict(dataset_source_hashes or {})
+        self.sample_policy_identity_hashes = tuple(sorted(allowed_identity_hashes))
+        self.sample_collection_rounds = tuple(sorted(allowed_rounds))
 
     @classmethod
     def from_files(
@@ -99,6 +125,11 @@ class OPDLearnerDataset(Sequence[LearnerSample]):
             require_all_roles=require_all_roles,
             learner_dataset_hash=manifest.learner_dataset_hash,
             export_manifest_hash=canonical_sha256(payload),
+            ablation=manifest.ablation,
+            ablation_recipe_hash_value=manifest.ablation_recipe_hash,
+            dataset_source_hashes=manifest.source_hashes,
+            sample_policy_identity_hashes=manifest.sample_policy_identity_hashes,
+            sample_collection_rounds=manifest.sample_collection_rounds,
         )
 
     def __len__(self) -> int:

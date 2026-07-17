@@ -12,6 +12,7 @@ import json
 import yaml
 
 from my_agent.config import AgentConfig
+from my_agent.opd_ablation import PAPER_ABLATIONS
 from my_agent.policy.contracts import DecisionRequest
 from my_agent.policy.identity import (
     PolicyIdentity,
@@ -34,6 +35,12 @@ RUN_CONFIG_SCHEMA_VERSION = "opd-train-run-v1"
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
+    parser.add_argument("--checkpoint")
+    parser.add_argument("--identity-manifest")
+    parser.add_argument("--learner-dataset")
+    parser.add_argument("--export-manifest")
+    parser.add_argument("--output-dir")
+    parser.add_argument("--ablation", choices=PAPER_ABLATIONS)
     args = parser.parse_args()
     config_path = Path(args.config).expanduser().resolve()
     payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
@@ -42,11 +49,15 @@ def main() -> int:
     if payload.get("schema_version") != RUN_CONFIG_SCHEMA_VERSION:
         raise ValueError("unsupported OPD train run config schema")
     base = config_path.parent
-    learner_path = _resolve_path(base, payload, "learner_dataset")
-    export_manifest_path = _resolve_path(base, payload, "export_manifest")
-    identity_manifest_path = _resolve_path(base, payload, "identity_manifest")
-    output_dir = _resolve_path(base, payload, "output_dir")
-    checkpoint_value = payload.get("checkpoint")
+    learner_path = _resolve_override(base, args.learner_dataset, payload, "learner_dataset")
+    export_manifest_path = _resolve_override(
+        base, args.export_manifest, payload, "export_manifest"
+    )
+    identity_manifest_path = _resolve_override(
+        base, args.identity_manifest, payload, "identity_manifest"
+    )
+    output_dir = _resolve_override(base, args.output_dir, payload, "output_dir")
+    checkpoint_value = args.checkpoint if args.checkpoint is not None else payload.get("checkpoint")
     checkpoint = (
         _resolve_path_value(base, checkpoint_value, "checkpoint")
         if checkpoint_value is not None
@@ -98,6 +109,13 @@ def main() -> int:
         split="train",
         require_all_roles=True,
     )
+    requested_ablation = (
+        args.ablation
+        if args.ablation is not None
+        else str(payload.get("ablation", "")).strip().lower()
+    )
+    if requested_ablation != dataset.ablation:
+        raise ValueError("trainer ablation does not match the learner export manifest")
     try:
         validation_dataset = OPDLearnerDataset.from_files(
             learner_path,
@@ -148,6 +166,7 @@ def main() -> int:
         "collection_round": result.manifest.collection_round,
         "role_kl": dict(result.manifest.train_role_kl),
         "reload_identity_verified": result.manifest.reload_identity_verified,
+        "ablation": result.manifest.ablation,
     }, ensure_ascii=False, sort_keys=True))
     return 0
 
@@ -156,6 +175,19 @@ def _resolve_path(base: Path, payload: Mapping[str, Any], key: str) -> Path:
     if key not in payload:
         raise ValueError(f"OPD train run config requires {key}")
     return _resolve_path_value(base, payload[key], key)
+
+
+def _resolve_override(
+    base: Path,
+    override: str | None,
+    payload: Mapping[str, Any],
+    key: str,
+) -> Path:
+    return (
+        _resolve_path_value(Path.cwd(), override, key)
+        if override is not None
+        else _resolve_path(base, payload, key)
+    )
 
 
 def _resolve_path_value(base: Path, value: Any, key: str) -> Path:

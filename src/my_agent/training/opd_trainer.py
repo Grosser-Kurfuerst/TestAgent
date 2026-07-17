@@ -147,6 +147,11 @@ class OPDTrainer:
             )
             if validation_dataset.collection_round != dataset.collection_round:
                 raise ValueError("validation dataset crosses collection rounds")
+            if (
+                validation_dataset.ablation != dataset.ablation
+                or validation_dataset.ablation_recipe_hash != dataset.ablation_recipe_hash
+            ):
+                raise ValueError("validation dataset uses a different ablation recipe")
         self.policy = policy
         self.dataset = dataset
         self.validation_dataset = validation_dataset
@@ -177,9 +182,13 @@ class OPDTrainer:
             lr=self.config.learning_rate,
             weight_decay=self.config.weight_decay,
         )
+        active_role_weights = {
+            role: self.config.role_sampling_weights[role]
+            for role in self.dataset.statistics.role_counts
+        }
         sampler = RoleSampler(
             self.dataset,
-            role_weights=self.config.role_sampling_weights,
+            role_weights=active_role_weights,
             num_samples=self.config.samples_per_epoch,
             seed=self.config.seed,
         )
@@ -352,7 +361,7 @@ class OPDTrainer:
                 output_identity=output_identity,
                 learner_dataset_hash=self.dataset.learner_dataset_hash,
                 export_manifest_hash=_required_export_manifest_hash(self.dataset),
-                role_sampling_weights=self.config.role_sampling_weights,
+                role_sampling_weights=active_role_weights,
                 raw_role_counts=self.dataset.statistics.role_counts,
                 valid_role_counts=self.dataset.statistics.role_counts,
                 sampled_role_counts=dict(sampled_role_counts),
@@ -386,6 +395,9 @@ class OPDTrainer:
                 },
                 shared_adapter_name=adapter_name,
                 reload_identity_verified=False,
+                ablation=self.dataset.ablation,
+                ablation_recipe_hash=self.dataset.ablation_recipe_hash,
+                dataset_source_hashes=self.dataset.dataset_source_hashes,
             )
             write_checkpoint_manifests(root, manifest)
         self.accelerator.wait_for_everyone()

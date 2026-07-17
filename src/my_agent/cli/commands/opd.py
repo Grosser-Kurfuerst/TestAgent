@@ -8,6 +8,7 @@ from pathlib import Path
 
 from my_agent.cli.common import CliContext
 from my_agent.config import AgentConfig
+from my_agent.opd_ablation import PAPER_ABLATIONS
 from my_agent.opd_data.export import (
     load_learner_samples,
     load_maintenance_attempts,
@@ -31,9 +32,11 @@ from my_agent.training.collection_round import (
     EXPORT_MANIFEST_FILENAME,
     LEARNER_EVENTS_FILENAME,
     build_collection_round,
+    build_replay_ablation_dataset,
     validate_learner_samples,
 )
 from my_agent.training.decision_log import load_decision_events
+from my_agent.training.recollection import verify_recollection
 
 
 def add_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -49,11 +52,28 @@ def add_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) 
     build.add_argument("--output", required=True)
     build.add_argument("--collection-round", type=int, required=True)
     build.add_argument("--seed", type=int)
+    build.add_argument("--ablation", choices=PAPER_ABLATIONS)
     build.set_defaults(_handler=handle)
+
+    replay = commands.add_parser(
+        "build-replay-ablation",
+        help="Build the explicit off-policy D0+D1 replay dataset.",
+    )
+    replay.add_argument("--d0", required=True)
+    replay.add_argument("--d1", required=True)
+    replay.add_argument("--output", required=True)
+    replay.set_defaults(_handler=handle)
 
     verify = commands.add_parser("verify-run", help="Verify a generated learner dataset manifest.")
     verify.add_argument("--run-dir", required=True)
     verify.set_defaults(_handler=handle)
+
+    recollection = commands.add_parser(
+        "verify-recollection",
+        help="Verify the isolated M0 -> D0 -> M1 -> D1 -> M2 chain.",
+    )
+    recollection.add_argument("--run-dir", required=True)
+    recollection.set_defaults(_handler=handle)
 
 
 def handle(args: argparse.Namespace, ctx: CliContext) -> int:
@@ -61,6 +81,20 @@ def handle(args: argparse.Namespace, ctx: CliContext) -> int:
     try:
         if args.opd_command == "build-round":
             payload = _build_round(args)
+        elif args.opd_command == "build-replay-ablation":
+            result = build_replay_ablation_dataset(
+                d0_dir=args.d0,
+                d1_dir=args.d1,
+                output_dir=args.output,
+            )
+            payload = {
+                "learner_path": str(result.learner_path),
+                "manifest_path": str(result.manifest_path),
+                "sample_count": result.manifest.sample_count,
+                "ablation": result.manifest.ablation,
+            }
+        elif args.opd_command == "verify-recollection":
+            payload = verify_recollection(Path(args.run_dir))
         else:
             payload = _verify_run(Path(args.run_dir))
     except Exception as exc:  # noqa: BLE001 - CLI reports fail-closed evidence errors
@@ -87,6 +121,14 @@ def _build_round(args: argparse.Namespace) -> dict[str, object]:
         policy_adapter_path=checkpoint if expected_identity.adapter_hash is not None else None,
         policy_identity_manifest=identity_manifest,
     )
+    requested_ablation = args.ablation or config.opd_ablation
+    if args.ablation is not None and (
+        config.memory_evolver_mode != "formal"
+        or config.opd_ablation != args.ablation
+    ):
+        raise ValueError(
+            "opd build-round ablation must match the formal collection runtime"
+        )
     policy = TransformersPolicy.from_config(config)
     require_matching_policy_identity(expected_identity, policy.identity())
     if not isinstance(policy, TrainablePolicy):
@@ -115,12 +157,14 @@ def _build_round(args: argparse.Namespace) -> dict[str, object]:
         writing_top_fraction=config.memory_evolver_writing_top_fraction,
         teacher_minimum_score=config.memory_evolver_teacher_min_score,
         seed=args.seed,
+        ablation=requested_ablation,
     )
     return {
         "learner_path": str(result.learner_path),
         "manifest_path": str(result.manifest_path),
         "sample_count": result.manifest.sample_count,
         "policy_identity_hash": result.manifest.trainer_initialization_identity.identity_hash,
+        "ablation": result.manifest.ablation,
     }
 
 
@@ -135,12 +179,22 @@ def _verify_run(run_dir: Path) -> dict[str, object]:
         samples,
         collection_round=manifest.collection_round,
         trainer_identity_hash=manifest.trainer_initialization_identity.identity_hash,
+        sample_policy_identity_hashes=manifest.sample_policy_identity_hashes,
+        sample_collection_rounds=manifest.sample_collection_rounds,
     )
     dataset_hash = canonical_sha256([sample.to_dict() for sample in samples])
     if dataset_hash != manifest.learner_dataset_hash:
         raise ValueError("learner dataset hash does not match export manifest")
     if len(samples) != manifest.sample_count:
         raise ValueError("learner sample count does not match export manifest")
+    if tuple(sorted({sample.policy_identity.identity_hash for sample in samples})) != tuple(
+        sorted(manifest.sample_policy_identity_hashes)
+    ):
+        raise ValueError("learner sample policy provenance does not match export manifest")
+    if tuple(sorted({sample.collection_round for sample in samples})) != tuple(
+        sorted(manifest.sample_collection_rounds)
+    ):
+        raise ValueError("learner sample round provenance does not match export manifest")
     stats = sample_statistics(samples)
     if (
         dict(manifest.role_counts) != dict(stats["role_counts"])
@@ -153,6 +207,7 @@ def _verify_run(run_dir: Path) -> dict[str, object]:
         "sample_count": len(samples),
         "collection_round": manifest.collection_round,
         "policy_identity_hash": manifest.trainer_initialization_identity.identity_hash,
+        "ablation": manifest.ablation,
     }
 
 

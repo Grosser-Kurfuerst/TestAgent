@@ -5,6 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping
 
+from my_agent.opd_ablation import (
+    MAIN_ABLATION_RECIPE_HASH,
+    ablation_excluded_roles,
+    ablation_recipe_hash,
+    ablation_uses_replay,
+)
 from my_agent.policy.identity import PolicyIdentity, canonical_sha256, require_sha256
 from my_agent.training.role_views import (
     CandidateSnapshotEntry,
@@ -21,7 +27,7 @@ from my_agent.training.role_views import (
 OPD_EVIDENCE_SCHEMA_VERSION = "opd-round-evidence-v1"
 OPD_MAINTENANCE_ATTEMPT_SCHEMA_VERSION = "opd-maintenance-attempt-v1"
 OPD_LEARNER_SCHEMA_VERSION = "opd-learner-sample-v1"
-OPD_EXPORT_MANIFEST_SCHEMA_VERSION = "opd-export-manifest-v1"
+OPD_EXPORT_MANIFEST_SCHEMA_VERSION = "opd-export-manifest-v2"
 DATASET_SPLITS = frozenset({"train", "validation", "test"})
 
 
@@ -875,6 +881,10 @@ class ExportManifest:
     source_hashes: Mapping[str, str]
     writing_score_decisions: tuple[Mapping[str, Any], ...]
     exclusions: tuple[Mapping[str, Any], ...]
+    ablation: str = ""
+    ablation_recipe_hash: str = MAIN_ABLATION_RECIPE_HASH
+    sample_policy_identity_hashes: tuple[str, ...] = ()
+    sample_collection_rounds: tuple[int, ...] = ()
     current_checkpoint_only: bool = True
     replay_enabled: bool = False
     schema_version: str = OPD_EXPORT_MANIFEST_SCHEMA_VERSION
@@ -884,13 +894,67 @@ class ExportManifest:
             raise ValueError("unsupported export manifest schema")
         if self.collection_round < 0 or self.sample_count < 0:
             raise ValueError("export manifest counts are invalid")
-        if not self.current_checkpoint_only or self.replay_enabled:
+        normalized_ablation = self.ablation.strip().lower()
+        if normalized_ablation != self.ablation:
+            raise ValueError("export manifest ablation must be normalized")
+        if self.ablation_recipe_hash != ablation_recipe_hash(normalized_ablation):
+            raise ValueError("export manifest ablation recipe hash mismatch")
+        if not self.sample_policy_identity_hashes:
+            object.__setattr__(
+                self,
+                "sample_policy_identity_hashes",
+                (self.trainer_initialization_identity.identity_hash,),
+            )
+        if not self.sample_collection_rounds:
+            object.__setattr__(self, "sample_collection_rounds", (self.collection_round,))
+        if len(set(self.sample_policy_identity_hashes)) != len(
+            self.sample_policy_identity_hashes
+        ):
+            raise ValueError("sample policy identity hashes must be unique")
+        for identity_hash in self.sample_policy_identity_hashes:
+            require_sha256(identity_hash, field_name="sample policy identity hash")
+        if len(set(self.sample_collection_rounds)) != len(self.sample_collection_rounds):
+            raise ValueError("sample collection rounds must be unique")
+        if any(round_index < 0 for round_index in self.sample_collection_rounds):
+            raise ValueError("sample collection rounds must be non-negative")
+        if ablation_uses_replay(normalized_ablation):
+            if self.current_checkpoint_only or not self.replay_enabled:
+                raise ValueError("replay ablation manifest must declare off-policy replay")
+            if set(self.sample_collection_rounds) != {0, 1}:
+                raise ValueError("replay D0+D1 manifest must bind collection rounds 0 and 1")
+            if (
+                len(self.sample_policy_identity_hashes) < 2
+                or self.trainer_initialization_identity.identity_hash
+                not in self.sample_policy_identity_hashes
+            ):
+                raise ValueError("replay D0+D1 manifest must bind old and current policies")
+            required_sources = {
+                "d0_learner_dataset", "d0_export_manifest",
+                "d1_learner_dataset", "d1_export_manifest",
+            }
+            if not required_sources.issubset(self.source_hashes):
+                raise ValueError("replay D0+D1 manifest lacks source dataset hashes")
+        elif not self.current_checkpoint_only or self.replay_enabled:
             raise ValueError("formal export manifest must be strict current-checkpoint only")
+        elif self.sample_policy_identity_hashes != (
+            self.trainer_initialization_identity.identity_hash,
+        ) or self.sample_collection_rounds != (self.collection_round,):
+            raise ValueError("current-checkpoint manifest contains mixed sample provenance")
         require_sha256(self.learner_dataset_hash, field_name="learner_dataset_hash")
         for source_hash in self.source_hashes.values():
             require_sha256(source_hash, field_name="source_hash")
         if sum(self.role_counts.values()) != self.sample_count:
             raise ValueError("role_counts do not match sample_count")
+        if ablation_excluded_roles(normalized_ablation).intersection(self.role_counts):
+            raise ValueError("ablation dataset contains an explicitly disabled role")
+        if normalized_ablation in {"no_attribution", "similarity_only"}:
+            required_sources = {"attribution_input", "attribution_effective"}
+            if not required_sources.issubset(self.source_hashes):
+                raise ValueError("attribution ablation lacks input/effective evidence hashes")
+            if self.source_hashes["attribution_input"] == self.source_hashes[
+                "attribution_effective"
+            ]:
+                raise ValueError("attribution ablation did not change effective evidence")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -909,6 +973,10 @@ class ExportManifest:
             "source_hashes": dict(sorted(self.source_hashes.items())),
             "writing_score_decisions": [dict(item) for item in self.writing_score_decisions],
             "exclusions": [dict(item) for item in self.exclusions],
+            "ablation": self.ablation,
+            "ablation_recipe_hash": self.ablation_recipe_hash,
+            "sample_policy_identity_hashes": list(self.sample_policy_identity_hashes),
+            "sample_collection_rounds": list(self.sample_collection_rounds),
             "current_checkpoint_only": self.current_checkpoint_only,
             "replay_enabled": self.replay_enabled,
         }
@@ -920,6 +988,8 @@ class ExportManifest:
             "trainer_initialization_identity_hash", "learner_dataset_hash", "sample_count",
             "role_counts", "split_counts", "task_group_counts", "outcome_counts",
             "source_hashes", "writing_score_decisions", "exclusions",
+            "ablation", "ablation_recipe_hash", "sample_policy_identity_hashes",
+            "sample_collection_rounds",
             "current_checkpoint_only", "replay_enabled",
         }
         _require_exact(data, expected, "export manifest")
@@ -943,6 +1013,17 @@ class ExportManifest:
             source_hashes=_string_mapping(data["source_hashes"], "source_hashes"),
             writing_score_decisions=writing,
             exclusions=exclusions,
+            ablation=_string(data["ablation"], "ablation"),
+            ablation_recipe_hash=_string(
+                data["ablation_recipe_hash"], "ablation_recipe_hash"
+            ),
+            sample_policy_identity_hashes=_strings(
+                data["sample_policy_identity_hashes"],
+                "sample_policy_identity_hashes",
+            ),
+            sample_collection_rounds=_ints(
+                data["sample_collection_rounds"], "sample_collection_rounds"
+            ),
             current_checkpoint_only=_bool(
                 data["current_checkpoint_only"], "current_checkpoint_only"
             ),

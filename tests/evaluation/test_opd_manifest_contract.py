@@ -61,6 +61,48 @@ class OpdManifestContractTests(unittest.TestCase):
         self.assertEqual(resolved.memory_evolver_mode, "formal")
         self.assertEqual(resolved.policy_base_revision, "model-revision-1")
 
+    def test_formal_eval_config_round_trip_preserves_runtime_ablation(self) -> None:
+        cases = (
+            ("lexical_retrieval", "lexical_ablation", "llm", True),
+            ("similarity_only", "embedding_cosine", "similarity_ablation", True),
+            ("no_maintenance", "embedding_cosine", "llm", False),
+        )
+        for ablation, retrieval_backend, selection_backend, maintenance_enabled in cases:
+            with self.subTest(ablation=ablation), tempfile.TemporaryDirectory() as tmp:
+                config = AgentConfig.from_env(
+                    {
+                        "MY_AGENT_LLM_PROVIDER": "fake",
+                        "AGENTCLI_MEMORY_EVOLVER_MODE": "formal",
+                        "AGENTCLI_POLICY_BASE_REVISION": "model-revision-1",
+                        "AGENTCLI_POLICY_TOKENIZER_REVISION": "tokenizer-revision-1",
+                        "AGENTCLI_POLICY_IDENTITY_MANIFEST": "/tmp/policy-identity.json",
+                        "AGENTCLI_EMBEDDING_REVISION": "embedding-revision-1",
+                        "AGENTCLI_OPD_ABLATION": ablation,
+                        "AGENTCLI_MEMORY_EVOLVER_RETRIEVAL_BACKEND": retrieval_backend,
+                        "AGENTCLI_MEMORY_EVOLVER_SELECTION_BACKEND": selection_backend,
+                        "AGENTCLI_MEMORY_EVOLVER_MAINTENANCE_ENABLED": (
+                            "1" if maintenance_enabled else "0"
+                        ),
+                    },
+                    require_env_file=False,
+                )
+
+                resolved = _config_for_eval_env(
+                    config,
+                    {},
+                    trace_dir=Path(tmp) / "traces",
+                    memory_dir=Path(tmp) / "memory",
+                    command_timeout=10,
+                )
+
+            self.assertEqual(resolved.opd_ablation, ablation)
+            self.assertEqual(resolved.memory_evolver_retrieval_backend, retrieval_backend)
+            self.assertEqual(resolved.memory_evolver_selection_backend, selection_backend)
+            self.assertEqual(
+                resolved.memory_evolver_maintenance_enabled,
+                maintenance_enabled,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

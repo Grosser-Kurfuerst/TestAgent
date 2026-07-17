@@ -1298,6 +1298,16 @@ def _config_env_values(config: AgentConfig) -> dict[str, str]:
             "AGENTCLI_MEMORY_EVOLVER_WRITING_TOP_FRACTION": str(
                 config.memory_evolver_writing_top_fraction
             ),
+            "AGENTCLI_OPD_ABLATION": config.opd_ablation,
+            "AGENTCLI_MEMORY_EVOLVER_RETRIEVAL_BACKEND": (
+                config.memory_evolver_retrieval_backend
+            ),
+            "AGENTCLI_MEMORY_EVOLVER_SELECTION_BACKEND": (
+                config.memory_evolver_selection_backend
+            ),
+            "AGENTCLI_MEMORY_EVOLVER_MAINTENANCE_ENABLED": _bool_env(
+                config.memory_evolver_maintenance_enabled
+            ),
             "AGENTCLI_EMBEDDING_MODEL": config.embedding_model,
             "AGENTCLI_EMBEDDING_REVISION": config.embedding_revision,
             "AGENTCLI_POLICY_BACKEND": config.policy_backend,

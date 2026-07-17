@@ -35,7 +35,10 @@ from my_agent.memory.evolver import (
     selection_tier_counts,
     writer_policy_for_result,
 )
-from my_agent.memory.evolver.coordinator import EvolverCoordinator
+from my_agent.memory.evolver.coordinator import (
+    EvolverCoordinator,
+    SimilarityTaskSelectionPolicy,
+)
 from my_agent.memory.evolver.task_session import TaskEvolverSession
 from my_agent.memory.evolver.attribution import MemoryAttributionRecord
 from my_agent.memory.experience_retrieval import (
@@ -116,7 +119,7 @@ class MemoryManager:
         experience_retriever: ExperienceRetriever,
         compressor: MemoryCompressor,
         project_key: str,
-        embedding_retriever: EmbeddingRetriever | None = None,
+        embedding_retriever: Any | None = None,
         evolver_coordinator: EvolverCoordinator | None = None,
         session_id: str = "",
         trace_sink: Any | None = None,
@@ -200,20 +203,27 @@ class MemoryManager:
         project_key = str(getattr(config, "memory_project_key", "") or "").strip()
         if not project_key:
             project_key = _normalize_project_key(repo_path)
-        embedding_retriever: EmbeddingRetriever | None = None
+        embedding_retriever: Any | None = None
         evolver_coordinator: EvolverCoordinator | None = None
         if config.memory_evolver_mode == "formal":
             policy_identity = require_formal_policy(config, llm)
             if policy_identity is None:
                 raise ValueError("formal memory evolver requires a validated policy identity")
-            embedding_retriever = EmbeddingRetriever(
-                TransformersEmbeddingEncoder.from_config(config)
+            embedding_retriever = (
+                ExperienceRetriever()
+                if config.memory_evolver_retrieval_backend == "lexical_ablation"
+                else EmbeddingRetriever(TransformersEmbeddingEncoder.from_config(config))
             )
             evolver_coordinator = EvolverCoordinator(
                 store=experience_store,
                 project_key=project_key,
                 policy_identity=policy_identity,
                 retriever=embedding_retriever,
+                selector=(
+                    SimilarityTaskSelectionPolicy()
+                    if config.memory_evolver_selection_backend == "similarity_ablation"
+                    else None
+                ),
                 policy=llm,
                 dataset_dir=config.memory_evolver_dataset_dir,
                 trace_sink=trace_sink,
@@ -224,6 +234,7 @@ class MemoryManager:
                 maintenance_max_turns=config.memory_evolver_maintenance_max_turns,
                 collection_round=config.memory_evolver_collection_round,
                 dataset_split=config.memory_evolver_dataset_split,
+                maintenance_enabled=config.memory_evolver_maintenance_enabled,
             )
         return cls(
             config=config,
@@ -266,7 +277,7 @@ class MemoryManager:
         if coordinator.project_key != self.project_key:
             raise ValueError("formal MemoryManager coordinator project_key mismatch")
         if self.embedding_retriever is None or coordinator.retriever is not self.embedding_retriever:
-            raise ValueError("formal MemoryManager embedding retriever binding mismatch")
+            raise ValueError("formal MemoryManager candidate retriever binding mismatch")
         expected_limits = (
             config.memory_evolver_candidate_top_k_per_tier,
             config.memory_evolver_selected_max_items,

@@ -63,6 +63,7 @@ class ExperienceRetrievalMetrics:
     returned_count: int = 0
     per_tier: dict[str, dict[str, int]] = field(default_factory=dict)
     retrieval_fallback: str = ""
+    retrieval_backend: str = "lexical"
 
     def to_trace_payload(self) -> dict[str, Any]:
         return {
@@ -77,6 +78,7 @@ class ExperienceRetrievalMetrics:
                 tier: dict(counts) for tier, counts in self.per_tier.items()
             },
             "retrieval_fallback": self.retrieval_fallback,
+            "retrieval_backend": self.retrieval_backend,
         }
 
 

@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Mapping
 import json
 
 from my_agent.memory.evolver.attribution_schema import PAPER_ATTRIBUTION_SCHEMA_VERSION
+from my_agent.opd_ablation import MAIN_ABLATION_RECIPE_HASH, ablation_recipe_hash
 from my_agent.opd_data.schema import OPD_LEARNER_SCHEMA_VERSION
 from my_agent.policy.identity import (
     PolicyIdentity,
@@ -19,7 +20,7 @@ from my_agent.policy.transformers_policy import hash_adapter_artifacts
 from my_agent.training.role_views import ROLE_VIEW_SCHEMA_VERSION
 
 
-OPD_CHECKPOINT_MANIFEST_SCHEMA_VERSION = "opd-checkpoint-manifest-v1"
+OPD_CHECKPOINT_MANIFEST_SCHEMA_VERSION = "opd-checkpoint-manifest-v2"
 OPD_PROMPT_VERSION = "opd-role-prompts-v1"
 CHECKPOINT_MANIFEST_FILENAME = "opd_checkpoint_manifest.json"
 POLICY_IDENTITY_MANIFEST_FILENAME = "policy_identity_manifest.json"
@@ -48,6 +49,9 @@ class CheckpointManifest:
     mixed_step_gradient_norm_by_role: Mapping[str, float]
     shared_adapter_name: str
     reload_identity_verified: bool
+    ablation: str = ""
+    ablation_recipe_hash: str = MAIN_ABLATION_RECIPE_HASH
+    dataset_source_hashes: Mapping[str, str] = field(default_factory=dict)
     learner_schema_version: str = OPD_LEARNER_SCHEMA_VERSION
     role_view_schema_version: str = ROLE_VIEW_SCHEMA_VERSION
     attribution_schema_version: str = PAPER_ATTRIBUTION_SCHEMA_VERSION
@@ -65,6 +69,14 @@ class CheckpointManifest:
             raise ValueError("checkpoint requires one shared adapter name")
         if self.output_identity.adapter_hash is None:
             raise ValueError("OPD checkpoint output identity requires a shared adapter hash")
+        if self.ablation.strip().lower() != self.ablation:
+            raise ValueError("checkpoint ablation must be normalized")
+        if self.ablation_recipe_hash != ablation_recipe_hash(self.ablation):
+            raise ValueError("checkpoint ablation recipe hash mismatch")
+        if self.ablation and not self.dataset_source_hashes:
+            raise ValueError("ablation checkpoint requires dataset source hashes")
+        for source_hash in self.dataset_source_hashes.values():
+            require_sha256(source_hash, field_name="checkpoint dataset source hash")
         if set(self.role_sampling_weights) != set(self.raw_role_counts):
             raise ValueError("role sampling weights and raw counts must cover the same roles")
         if any(value <= 0.0 for value in self.role_sampling_weights.values()):
@@ -106,6 +118,9 @@ class CheckpointManifest:
             )),
             "shared_adapter_name": self.shared_adapter_name,
             "reload_identity_verified": self.reload_identity_verified,
+            "ablation": self.ablation,
+            "ablation_recipe_hash": self.ablation_recipe_hash,
+            "dataset_source_hashes": dict(sorted(self.dataset_source_hashes.items())),
         }
 
     @classmethod
@@ -163,6 +178,11 @@ class CheckpointManifest:
             ),
             shared_adapter_name=str(data.get("shared_adapter_name", "")),
             reload_identity_verified=bool(data.get("reload_identity_verified", False)),
+            ablation=str(data.get("ablation", "")),
+            ablation_recipe_hash=str(data.get("ablation_recipe_hash", "")),
+            dataset_source_hashes=_string_mapping(
+                data.get("dataset_source_hashes"), "dataset_source_hashes"
+            ),
         )
 
 

@@ -61,6 +61,12 @@ class CollectionRoundTests(unittest.TestCase):
             "0",
         ])
         verify = parser.parse_args(["opd", "verify-run", "--run-dir", "/tmp/output"])
+        replay = parser.parse_args([
+            "opd", "build-replay-ablation",
+            "--d0", "/tmp/d0",
+            "--d1", "/tmp/d1",
+            "--output", "/tmp/replay",
+        ])
         attribution = parser.parse_args([
             "data",
             "compute-opd-attribution",
@@ -71,6 +77,7 @@ class CollectionRoundTests(unittest.TestCase):
         ])
         self.assertEqual(build.opd_command, "build-round")
         self.assertEqual(verify.opd_command, "verify-run")
+        self.assertEqual(replay.opd_command, "build-replay-ablation")
         self.assertEqual(attribution.data_command, "compute-opd-attribution")
 
     def test_empty_completion_is_rejected_from_formal_dataset(self) -> None:
@@ -102,6 +109,52 @@ class CollectionRoundTests(unittest.TestCase):
                     output_dir=Path(tmp),
                 )
 
+    def test_attribution_ablations_change_the_effective_training_evidence(self) -> None:
+        fixture = round_fixture()
+        for ablation in ("no_attribution", "similarity_only"):
+            with self.subTest(ablation=ablation), tempfile.TemporaryDirectory() as tmp:
+                result = build_collection_round(
+                    collection_round=0,
+                    policy=FakeTrainablePolicy(),
+                    tasks=fixture.tasks,
+                    outcomes=fixture.outcomes,
+                    repositories=fixture.repositories,
+                    maintenance=fixture.maintenance,
+                    decision_events=fixture.decisions,
+                    attribution=fixture.attribution,
+                    output_dir=tmp,
+                    ablation=ablation,
+                )
+
+            self.assertEqual(result.manifest.ablation, ablation)
+            self.assertNotEqual(
+                result.manifest.source_hashes["attribution_input"],
+                result.manifest.source_hashes["attribution_effective"],
+            )
+
+    def test_role_ablations_remove_the_disabled_training_role(self) -> None:
+        fixture = round_fixture()
+        cases = (
+            ("no_writing_distillation", "writing"),
+            ("no_maintenance", "maintenance"),
+        )
+        for ablation, disabled_role in cases:
+            with self.subTest(ablation=ablation), tempfile.TemporaryDirectory() as tmp:
+                result = build_collection_round(
+                    collection_round=0,
+                    policy=FakeTrainablePolicy(),
+                    tasks=fixture.tasks,
+                    outcomes=fixture.outcomes,
+                    repositories=fixture.repositories,
+                    maintenance=fixture.maintenance,
+                    decision_events=fixture.decisions,
+                    attribution=fixture.attribution,
+                    output_dir=tmp,
+                    ablation=ablation,
+                )
+
+            self.assertNotIn(disabled_role, result.manifest.role_counts)
+            self.assertEqual(result.manifest.ablation, ablation)
 
 if __name__ == "__main__":
     unittest.main()

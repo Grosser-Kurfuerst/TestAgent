@@ -1,0 +1,52 @@
+schema_version: opd-evaluation-plan-v1
+root: ../runs/opd-paper-evaluation
+baseline_commit: REPLACE_WITH_BASELINE_COMMIT
+lockfile: ../uv.lock
+
+protocol:
+  tasks: REPLACE_WITH_HELDOUT_MANIFEST
+  max_steps: 40
+  token_budget: 8192
+  command_timeout: 600
+  tools_hash: REPLACE_WITH_TOOLS_SHA256
+  evaluator_name: manifest
+  evaluator_version: manifest-evaluator-v1
+  evaluator_hash: REPLACE_WITH_EVALUATOR_CONTRACT_SHA256
+  temperature: 1.0
+  top_p: 0.95
+
+m0:
+  checkpoint: REPLACE_WITH_M0_CHECKPOINT
+  identity_manifest: REPLACE_WITH_M0_IDENTITY_MANIFEST
+trained_checkpoint: REPLACE_WITH_M2_CHECKPOINT
+ablations:
+  no_attribution: ""
+  similarity_only: ""
+  no_writing_distillation: ""
+  no_maintenance: ""
+  lexical_retrieval: ""
+  replay_d0_d1: ""
+
+numerical_reproduction:
+  enabled: false
+  training_tasks_total: 7000
+  source_revisions:
+    agent_world_model: REPLACE_WITH_IMMUTABLE_REVISION
+    nemotron_terminal_corpus: REPLACE_WITH_IMMUTABLE_REVISION
+    envscaler: REPLACE_WITH_IMMUTABLE_REVISION
+  model_revisions:
+    qwen3_4b: REPLACE_WITH_IMMUTABLE_REVISION
+    qwen3_5_9b: REPLACE_WITH_IMMUTABLE_REVISION
+    embedding: REPLACE_WITH_IMMUTABLE_REVISION
+  source_manifests:
+    agent_world_model: REPLACE_WITH_NORMALIZED_SOURCE_MANIFEST
+    nemotron_terminal_corpus: REPLACE_WITH_NORMALIZED_SOURCE_MANIFEST
+    envscaler: REPLACE_WITH_NORMALIZED_SOURCE_MANIFEST
+  model_artifacts:
+    qwen3_4b: REPLACE_WITH_LOCAL_POLICY_ARTIFACT
+    qwen3_5_9b: REPLACE_WITH_LOCAL_POLICY_ARTIFACT
+    embedding: REPLACE_WITH_LOCAL_EMBEDDING_ARTIFACT
+  source_manifest_hashes:
+    agent_world_model: REPLACE_WITH_SOURCE_MANIFEST_SHA256
+    nemotron_terminal_corpus: REPLACE_WITH_SOURCE_MANIFEST_SHA256
+    envscaler: REPLACE_WITH_SOURCE_MANIFEST_SHA256

@@ -103,6 +103,10 @@ class AgentConfig:
     memory_evolver_dataset_split: str = "train"
     memory_evolver_teacher_min_score: float = 0.01
     memory_evolver_writing_top_fraction: float = 0.30
+    opd_ablation: str = ""
+    memory_evolver_retrieval_backend: str = "embedding_cosine"
+    memory_evolver_selection_backend: str = "llm"
+    memory_evolver_maintenance_enabled: bool = True
     embedding_model: str = "Qwen/Qwen3-Embedding-0.6B"
     embedding_revision: str = ""
     policy_backend: str = "transformers"
@@ -370,6 +374,19 @@ class AgentConfig:
                 ),
                 8,
                 1,
+            ),
+            opd_ablation=str(values.get("AGENTCLI_OPD_ABLATION", "")).strip().lower(),
+            memory_evolver_retrieval_backend=str(values.get(
+                "AGENTCLI_MEMORY_EVOLVER_RETRIEVAL_BACKEND",
+                "embedding_cosine",
+            )).strip().lower(),
+            memory_evolver_selection_backend=str(values.get(
+                "AGENTCLI_MEMORY_EVOLVER_SELECTION_BACKEND",
+                "llm",
+            )).strip().lower(),
+            memory_evolver_maintenance_enabled=_as_bool(
+                values.get("AGENTCLI_MEMORY_EVOLVER_MAINTENANCE_ENABLED", ""),
+                default=True,
             ),
             memory_evolver_dataset_dir=_optional_path(
                 values.get(
@@ -765,6 +782,27 @@ def _validate_formal_evolver_config(
         raise ValueError("formal memory evolver requires policy and embedding model names")
     if config.policy_identity_manifest is None:
         raise ValueError("formal memory evolver requires policy_identity_manifest")
+    ablation_contracts = {
+        "": ("embedding_cosine", "llm", True),
+        "no_attribution": ("embedding_cosine", "llm", True),
+        "similarity_only": ("embedding_cosine", "similarity_ablation", True),
+        "no_writing_distillation": ("embedding_cosine", "llm", True),
+        "no_maintenance": ("embedding_cosine", "llm", False),
+        "lexical_retrieval": ("lexical_ablation", "llm", True),
+        "replay_d0_d1": ("embedding_cosine", "llm", True),
+    }
+    expected = ablation_contracts.get(config.opd_ablation)
+    if expected is None:
+        raise ValueError(f"unsupported OPD ablation: {config.opd_ablation!r}")
+    actual = (
+        config.memory_evolver_retrieval_backend,
+        config.memory_evolver_selection_backend,
+        config.memory_evolver_maintenance_enabled,
+    )
+    if actual != expected:
+        raise ValueError(
+            f"OPD ablation {config.opd_ablation or 'main'} runtime contract mismatch"
+        )
 
 
 def _as_ratio(value: str | None, default: float) -> float:

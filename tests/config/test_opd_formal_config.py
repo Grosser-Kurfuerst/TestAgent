@@ -79,6 +79,27 @@ class FormalConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "policy_identity_manifest"):
             AgentConfig.from_env(env, require_env_file=False)
 
+    def test_formal_ablation_requires_its_runtime_backend(self) -> None:
+        env = _formal_env()
+        env["AGENTCLI_OPD_ABLATION"] = "lexical_retrieval"
+        with self.assertRaisesRegex(ValueError, "runtime contract mismatch"):
+            AgentConfig.from_env(env, require_env_file=False)
+
+        env["AGENTCLI_MEMORY_EVOLVER_RETRIEVAL_BACKEND"] = "lexical_ablation"
+        config = AgentConfig.from_env(env, require_env_file=False)
+
+        self.assertEqual(config.opd_ablation, "lexical_retrieval")
+        self.assertEqual(config.memory_evolver_retrieval_backend, "lexical_ablation")
+
+    def test_no_maintenance_ablation_disables_maintainer_execution(self) -> None:
+        env = _formal_env()
+        env["AGENTCLI_OPD_ABLATION"] = "no_maintenance"
+        env["AGENTCLI_MEMORY_EVOLVER_MAINTENANCE_ENABLED"] = "0"
+
+        config = AgentConfig.from_env(env, require_env_file=False)
+
+        self.assertFalse(config.memory_evolver_maintenance_enabled)
+
 
 if __name__ == "__main__":
     unittest.main()

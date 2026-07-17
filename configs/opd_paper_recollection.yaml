@@ -1,0 +1,59 @@
+schema_version: opd-recollection-run-v1
+root: ../runs/opd-paper-recollection
+baseline_commit: REPLACE_WITH_BASELINE_COMMIT
+lockfile: ../uv.lock
+m0_checkpoint: REPLACE_WITH_M0_CHECKPOINT
+m0_identity_manifest: REPLACE_WITH_M0_IDENTITY_MANIFEST
+
+environment:
+  AGENTCLI_MEMORY_EVOLVER_MODE: formal
+  AGENTCLI_POLICY_DEVICE: auto
+  AGENTCLI_POLICY_DTYPE: bfloat16
+
+rounds:
+  0:
+    environment:
+      AGENTCLI_MEMORY_DIR: "{memory_dir}"
+      AGENTCLI_MEMORY_EVOLVER_DATASET_DIR: "{run_output}/evolver_datasets"
+      AGENTCLI_MEMORY_EVOLVER_COLLECTION_ROUND: "{collection_round}"
+      AGENTCLI_MEMORY_EVOLVER_DATASET_SPLIT: train
+    collection_commands:
+      - [uv, run, --extra, opd-train, my-agent, eval-manifest, --tasks, REPLACE_WITH_7000_TASK_MANIFEST, --output-dir, "{run_output}", --mode, react, --max-steps, "40", --checkpoint, "{checkpoint}", --identity-manifest, "{identity_manifest}"]
+      - [uv, run, my-agent, data, compute-opd-attribution, --run-dir, "{run_output}", --collection-round, "{collection_round}"]
+      - [uv, run, --extra, opd-train, my-agent, opd, build-round, --run-dir, "{run_output}", --checkpoint, "{checkpoint}", --identity-manifest, "{identity_manifest}", --output, "{dataset_dir}", --collection-round, "{collection_round}"]
+    training_command: [uv, run, --extra, opd-train, accelerate, launch, --config_file, configs/accelerate/opd_multi_gpu.yaml, scripts/train_opd_evolver.py, --config, configs/opd_paper_train.yaml, --checkpoint, "{checkpoint}", --identity-manifest, "{identity_manifest}", --learner-dataset, "{learner_dataset}", --export-manifest, "{export_manifest}", --output-dir, "{checkpoint_output}"]
+  1:
+    environment:
+      AGENTCLI_MEMORY_DIR: "{memory_dir}"
+      AGENTCLI_MEMORY_EVOLVER_DATASET_DIR: "{run_output}/evolver_datasets"
+      AGENTCLI_MEMORY_EVOLVER_COLLECTION_ROUND: "{collection_round}"
+      AGENTCLI_MEMORY_EVOLVER_DATASET_SPLIT: train
+    collection_commands:
+      - [uv, run, --extra, opd-train, my-agent, eval-manifest, --tasks, REPLACE_WITH_7000_TASK_MANIFEST, --output-dir, "{run_output}", --mode, react, --max-steps, "40", --checkpoint, "{checkpoint}", --identity-manifest, "{identity_manifest}"]
+      - [uv, run, my-agent, data, compute-opd-attribution, --run-dir, "{run_output}", --collection-round, "{collection_round}"]
+      - [uv, run, --extra, opd-train, my-agent, opd, build-round, --run-dir, "{run_output}", --checkpoint, "{checkpoint}", --identity-manifest, "{identity_manifest}", --output, "{dataset_dir}", --collection-round, "{collection_round}"]
+    training_command: [uv, run, --extra, opd-train, accelerate, launch, --config_file, configs/accelerate/opd_multi_gpu.yaml, scripts/train_opd_evolver.py, --config, configs/opd_paper_train.yaml, --checkpoint, "{checkpoint}", --identity-manifest, "{identity_manifest}", --learner-dataset, "{learner_dataset}", --export-manifest, "{export_manifest}", --output-dir, "{checkpoint_output}"]
+
+numerical_reproduction:
+  enabled: false
+  training_tasks_total: 7000
+  source_revisions:
+    agent_world_model: REPLACE_WITH_IMMUTABLE_REVISION
+    nemotron_terminal_corpus: REPLACE_WITH_IMMUTABLE_REVISION
+    envscaler: REPLACE_WITH_IMMUTABLE_REVISION
+  model_revisions:
+    qwen3_4b: REPLACE_WITH_IMMUTABLE_REVISION
+    qwen3_5_9b: REPLACE_WITH_IMMUTABLE_REVISION
+    embedding: REPLACE_WITH_IMMUTABLE_REVISION
+  source_manifests:
+    agent_world_model: REPLACE_WITH_NORMALIZED_SOURCE_MANIFEST
+    nemotron_terminal_corpus: REPLACE_WITH_NORMALIZED_SOURCE_MANIFEST
+    envscaler: REPLACE_WITH_NORMALIZED_SOURCE_MANIFEST
+  model_artifacts:
+    qwen3_4b: REPLACE_WITH_LOCAL_POLICY_ARTIFACT
+    qwen3_5_9b: REPLACE_WITH_LOCAL_POLICY_ARTIFACT
+    embedding: REPLACE_WITH_LOCAL_EMBEDDING_ARTIFACT
+  source_manifest_hashes:
+    agent_world_model: REPLACE_WITH_SOURCE_MANIFEST_SHA256
+    nemotron_terminal_corpus: REPLACE_WITH_SOURCE_MANIFEST_SHA256
+    envscaler: REPLACE_WITH_SOURCE_MANIFEST_SHA256

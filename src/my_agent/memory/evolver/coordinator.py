@@ -6,7 +6,6 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Protocol
 
-from my_agent.memory.embedding_retrieval import EmbeddingRetriever
 from my_agent.memory.evolver.task_session import (
     AgentEpisodeArtifact,
     EvolverFinalizeResult,
@@ -71,6 +70,31 @@ class EmptyTaskSelectionPolicy:
         return ()
 
 
+class SimilarityTaskSelectionPolicy:
+    """Paper-ablation selector that keeps highest retrieval scores without an LLM."""
+
+    def select(
+        self,
+        *,
+        task: str,
+        candidates: tuple[CandidateSnapshotEntry, ...],
+        token_budget: int,
+        max_items: int,
+        context: DecisionEventContext,
+    ) -> tuple[str, ...]:
+        del task, context
+        ordered = sorted(candidates, key=lambda item: (-item.retrieval_score, item.memory_id))
+        selected: list[str] = []
+        used_tokens = 0
+        for candidate in ordered:
+            candidate_tokens = candidate.token_count
+            if len(selected) >= max_items or used_tokens + candidate_tokens > token_budget:
+                continue
+            selected.append(candidate.memory_id)
+            used_tokens += candidate_tokens
+        return tuple(selected)
+
+
 class EvolverCoordinator:
     def __init__(
         self,
@@ -78,7 +102,7 @@ class EvolverCoordinator:
         store: ExperienceStore,
         project_key: str,
         policy_identity: PolicyIdentity,
-        retriever: EmbeddingRetriever | None = None,
+        retriever: Any | None = None,
         selector: TaskSelectionPolicy | None = None,
         writer: WriterCallback | None = None,
         policy: GenerationPolicy | None = None,
@@ -93,6 +117,7 @@ class EvolverCoordinator:
         ledger_path: str | Path | None = None,
         collection_round: int = 0,
         dataset_split: str = "train",
+        maintenance_enabled: bool = True,
     ) -> None:
         if not project_key:
             raise ValueError("evolver coordinator requires project_key")
@@ -171,6 +196,7 @@ class EvolverCoordinator:
         self.selection_token_budget = selection_token_budget
         self.maintenance_max_turns = maintenance_max_turns
         self.maintenance_interval_tasks = maintenance_interval_tasks
+        self.maintenance_enabled = maintenance_enabled
         self.ledger_path = (
             Path(ledger_path)
             if ledger_path is not None
@@ -196,10 +222,14 @@ class EvolverCoordinator:
         recorder = self.decision_recorder
         if recorder is None or recorder.policy is not policy:
             raise ValueError("formal coordinator decision recorder must use the shared policy")
-        if not isinstance(self.selector, LLMTaskSelectionPolicy):
-            raise ValueError("formal coordinator requires LLMTaskSelectionPolicy")
-        if self.selector.policy is not policy or self.selector.recorder is not recorder:
-            raise ValueError("formal selector must share the runtime policy and decision recorder")
+        if isinstance(self.selector, LLMTaskSelectionPolicy):
+            if self.selector.policy is not policy or self.selector.recorder is not recorder:
+                raise ValueError("formal selector must share the runtime policy and decision recorder")
+        elif not isinstance(self.selector, SimilarityTaskSelectionPolicy):
+            raise ValueError(
+                "formal coordinator selector must be LLMTaskSelectionPolicy "
+                "or the SimilarityTaskSelectionPolicy ablation"
+            )
         if not isinstance(self.writer, FormalExperienceWriter):
             raise ValueError("formal coordinator requires FormalExperienceWriter")
         if self.writer.policy is not policy or self.writer.recorder is not recorder:
@@ -475,6 +505,8 @@ class EvolverCoordinator:
             if advance.cadence is None:
                 return None, None
             return advance.cadence.cadence_id, advance.cadence.status
+        if not self.maintenance_enabled:
+            return due.cadence_id, "disabled_ablation"
         return due.cadence_id, self._run_or_reconcile_cadence(due)
 
     def _run_or_reconcile_cadence(
@@ -662,6 +694,7 @@ def _render_selected_context(
 
 __all__ = [
     "EmptyTaskSelectionPolicy",
+    "SimilarityTaskSelectionPolicy",
     "EvolverCoordinator",
     "TaskSelectionPolicy",
     "WriterCallback",

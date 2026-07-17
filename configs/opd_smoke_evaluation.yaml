@@ -1,0 +1,28 @@
+schema_version: opd-evaluation-plan-v1
+root: ../runs/opd-smoke-evaluation
+baseline_commit: REPLACE_WITH_BASELINE_COMMIT
+lockfile: ../uv.lock
+
+protocol:
+  tasks: REPLACE_WITH_HELDOUT_MANIFEST
+  max_steps: 8
+  token_budget: 4096
+  command_timeout: 120
+  tools_hash: REPLACE_WITH_TOOLS_SHA256
+  evaluator_name: manifest
+  evaluator_version: manifest-evaluator-v1
+  evaluator_hash: REPLACE_WITH_EVALUATOR_CONTRACT_SHA256
+  temperature: 1.0
+  top_p: 0.95
+
+m0:
+  checkpoint: ../runs/opd-smoke-m0
+  identity_manifest: ../runs/opd-smoke-m0/policy_identity_manifest.json
+trained_checkpoint: ../runs/opd-smoke-recollection/m2/checkpoint
+ablations: {}
+
+numerical_reproduction:
+  enabled: false
+  training_tasks_total: 0
+  source_revisions: {}
+  model_revisions: {}
