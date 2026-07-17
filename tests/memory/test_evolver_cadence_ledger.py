@@ -31,7 +31,7 @@ from my_agent.policy.contracts import DecisionResponse
 from my_agent.policy.identity import PolicyIdentity, canonical_json_bytes, canonical_sha256
 from my_agent.training.contracts import AuthoritativeTaskOutcome, EvaluatorIdentity
 from my_agent.training.decision_log import DecisionEventRecorder
-from my_agent.training.role_views import CanonicalToolCall
+from my_agent.training.role_views import CanonicalToolCall, TaskOutcomeRef
 from tests.memory.experience_fixtures import typed_experience
 
 
@@ -57,6 +57,15 @@ def _completion(
         outcome_finalized=True,
         writer_terminal_status="no_write",
         repository_revision_after_writer="rev-1",
+        outcome=TaskOutcomeRef(
+            task_id,
+            "group-a",
+            1.0,
+            True,
+            "pytest",
+            "8",
+            canonical_sha256({"evaluator": "pytest"}),
+        ),
     )
 
 
@@ -101,6 +110,92 @@ def _call(name: str, arguments: dict) -> CanonicalToolCall:
 
 
 class CadenceLedgerTests(unittest.TestCase):
+    def test_cadence_context_contains_the_complete_boundary_window(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = CadenceLedger(Path(tmp) / "evolver_state.sqlite3", interval_tasks=3)
+            advance = None
+            for ordinal in range(1, 4):
+                advance = _completion(
+                    ledger,
+                    stream_id="stream-a",
+                    project_key="project-a",
+                    task_id=f"task-{ordinal}",
+                )
+            assert advance is not None and advance.cadence is not None
+
+            task_group, history = ledger.cadence_context(advance.cadence)
+
+        self.assertEqual(task_group, "group-a")
+        self.assertEqual(tuple(item.task_id for item in history), (
+            "task-1", "task-2", "task-3",
+        ))
+
+    def test_duplicate_task_conflicting_terminal_evidence_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = CadenceLedger(Path(tmp) / "evolver_state.sqlite3", interval_tasks=30)
+            _completion(
+                ledger,
+                stream_id="stream-a",
+                project_key="project-a",
+                task_id="task-1",
+            )
+
+            with self.assertRaisesRegex(ValueError, "conflicts"):
+                ledger.record_task_completion(
+                    stream_id="stream-a",
+                    memory_project_key="project-a",
+                    task_id="task-1",
+                    task_valid=True,
+                    outcome_finalized=True,
+                    writer_terminal_status="committed",
+                    repository_revision_after_writer="rev-2",
+                    outcome=TaskOutcomeRef(
+                        "task-1",
+                        "group-a",
+                        1.0,
+                        True,
+                        "pytest",
+                        "8",
+                        canonical_sha256({"evaluator": "pytest"}),
+                    ),
+                )
+
+    def test_started_without_intent_retries_during_startup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ExperienceStore.from_dir(tmp)
+            seed = EvolverCoordinator(
+                store=store,
+                project_key="project-a",
+                policy_identity=_identity(),
+                writer=lambda episode, outcome: ExperienceWriteResult(),
+                maintenance_interval_tasks=1,
+            )
+            advance = _completion(
+                seed.cadence_ledger,
+                stream_id="stream-a",
+                project_key="project-a",
+                task_id="task-1",
+            )
+            assert advance.cadence is not None
+            seed.cadence_ledger.mark_started(advance.cadence.cadence_id)
+            policy = _Policy([_call("finish", {"summary": "recovered"})])
+
+            restarted = EvolverCoordinator(
+                store=store,
+                project_key="project-a",
+                policy_identity=_identity(),
+                policy=policy,
+                writer=lambda episode, outcome: ExperienceWriteResult(),
+                maintenance_interval_tasks=1,
+            )
+            records = restarted.cadence_ledger.cadence_records(
+                stream_id="stream-a",
+                memory_project_key="project-a",
+            )
+
+        self.assertEqual(policy.generated, 1)
+        self.assertEqual([record.status for record in records], ["committed"])
+
     def test_boundaries_duplicates_and_streams_are_isolated(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             ledger = CadenceLedger(Path(tmp) / "evolver_state.sqlite3", interval_tasks=30)
@@ -136,6 +231,15 @@ class CadenceLedgerTests(unittest.TestCase):
                 outcome_finalized=True,
                 writer_terminal_status="failed_no_write",
                 repository_revision_after_writer="rev-1",
+                outcome=TaskOutcomeRef(
+                    "invalid-task",
+                    "group-a",
+                    0.0,
+                    False,
+                    "pytest",
+                    "8",
+                    canonical_sha256({"evaluator": "pytest"}),
+                ),
             )
             stream_a = ledger.cadence_records(
                 stream_id="stream-a", memory_project_key="project-a"
@@ -426,11 +530,7 @@ class CadenceLedgerTests(unittest.TestCase):
             assert advance.cadence is not None
 
             def maintain(index: int):
-                return coordinators[index]._run_or_reconcile_cadence(
-                    advance.cadence,
-                    task_group="group-a",
-                    history_window=(),
-                )
+                return coordinators[index]._run_or_reconcile_cadence(advance.cadence)
 
             with ThreadPoolExecutor(max_workers=2) as executor:
                 results = tuple(executor.map(maintain, (0, 1)))

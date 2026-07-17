@@ -81,12 +81,15 @@ class FormalMaintenanceAgent:
         self,
         *,
         maintenance_id: str,
+        attempt_id: str,
         stream_id: str,
         task_group: str,
         history_window: tuple[TaskOutcomeRef, ...] = (),
     ) -> FormalMaintenanceResult:
-        if not maintenance_id or not stream_id or not task_group:
-            raise ValueError("formal maintenance requires maintenance_id, stream_id, and task_group")
+        if not maintenance_id or not attempt_id or not stream_id or not task_group:
+            raise ValueError(
+                "formal maintenance requires maintenance_id, attempt_id, stream_id, and task_group"
+            )
         snapshot = self.store.load_strict_snapshot()
         entries = snapshot.memories
         tools = formal_maintenance_tools()
@@ -129,7 +132,7 @@ class FormalMaintenanceAgent:
                 task_group=task_group,
                 stream_id=stream_id,
                 memory_project_key=self.project_key,
-                run_id=maintenance_id,
+                run_id=attempt_id,
                 repository_revision=snapshot.revision,
                 candidate_snapshot_hash=public.repository_snapshot.snapshot_hash,
             )

@@ -10,6 +10,7 @@ from my_agent.cli.common import CliContext
 from my_agent.config import AgentConfig
 from my_agent.opd_data.export import (
     load_learner_samples,
+    load_maintenance_attempts,
     load_maintenance_evidence,
     load_repository_evidence,
     load_runtime_exclusions,
@@ -104,6 +105,11 @@ def _build_round(args: argparse.Namespace) -> dict[str, object]:
         runtime_exclusions=(
             load_runtime_exclusions(source / "runtime_exclusions.jsonl")
             if (source / "runtime_exclusions.jsonl").exists()
+            else ()
+        ),
+        maintenance_attempts=(
+            load_maintenance_attempts(source / "maintenance_attempts.jsonl")
+            if (source / "maintenance_attempts.jsonl").exists()
             else ()
         ),
         writing_top_fraction=config.memory_evolver_writing_top_fraction,

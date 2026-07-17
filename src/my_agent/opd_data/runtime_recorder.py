@@ -4,16 +4,19 @@ from __future__ import annotations
 
 from collections.abc import Callable, Hashable, Mapping, Sequence
 from dataclasses import dataclass
+from itertools import combinations
 from pathlib import Path
 from threading import Lock
 from typing import Any
 import json
 
 from my_agent.memory.evolver.maintenance_prompt import repository_snapshot_ref
+from my_agent.memory.evolver.planner import redundancy_score
 from my_agent.memory.evolver.task_session import AgentEpisodeArtifact, TaskEvolverSession
 from my_agent.memory.experience_store import ExperienceStore
 from my_agent.opd_data.schema import (
     ActionDecisionEvidence,
+    MaintenanceAttemptEvidence,
     MaintenanceEvidence,
     RepositoryEvidence,
     RepositoryMemoryEvidence,
@@ -28,6 +31,7 @@ from my_agent.training.role_views import (
     CanonicalMessage,
     CanonicalTrajectoryStep,
     CanonicalToolCall,
+    RedundancyDiagnostic,
     TaskOutcomeRef,
     TrajectoryEvidence,
     without_selected_memory_context,
@@ -45,11 +49,14 @@ class _PendingTask:
 @dataclass(frozen=True)
 class _PendingMaintenance:
     cadence_id: str
+    attempt_id: str
+    attempt_index: int
     task_group: str
     stream_id: str
     repository_snapshot_hash: str
     as_of_task_ordinal: int
     outcome_ids: tuple[str, ...]
+    redundancy_diagnostics: tuple[RedundancyDiagnostic, ...]
 
 
 class _EvidenceStream:
@@ -132,6 +139,11 @@ class RuntimeEvidenceRecorder:
             loader=lambda path: _load_records(path, MaintenanceEvidence.from_dict),
             key=lambda item: item.cadence_id,
         )
+        self.maintenance_attempts = _EvidenceStream(
+            root / "maintenance_attempts.jsonl",
+            loader=lambda path: _load_records(path, MaintenanceAttemptEvidence.from_dict),
+            key=lambda item: item.attempt_event_id,
+        )
         self.exclusions = _EvidenceStream(
             root / "runtime_exclusions.jsonl",
             loader=lambda path: _load_records(path, RuntimeExclusionEvidence.from_dict),
@@ -149,11 +161,17 @@ class RuntimeEvidenceRecorder:
             *self.outcomes.records,
             *self.repositories.records,
             *self.maintenance.records,
+            *self.maintenance_attempts.records,
             *self.exclusions.records,
         ):
             if record.collection_round != collection_round:
                 raise ValueError("runtime evidence directory crosses collection rounds")
-        for record in (*self.tasks.records, *self.maintenance.records, *self.exclusions.records):
+        for record in (
+            *self.tasks.records,
+            *self.maintenance.records,
+            *self.maintenance_attempts.records,
+            *self.exclusions.records,
+        ):
             if record.split != split:
                 raise ValueError("runtime evidence directory crosses dataset splits")
         for record in sorted(
@@ -308,8 +326,36 @@ class RuntimeEvidenceRecorder:
         project_key: str,
         as_of_task_ordinal: int,
         history_window: Sequence[TaskOutcomeRef],
-    ) -> None:
+    ) -> str:
+        attempt_states = self._maintenance_attempt_states(cadence_id)
+        for started, terminal in attempt_states:
+            if terminal is not None:
+                continue
+            decision_ids = tuple(
+                event.decision_id
+                for event in self._maintenance_attempt_events(cadence_id, started.attempt_id)
+            )
+            self._record_exclusion(
+                role="maintenance",
+                reason="maintenance_attempt_abandoned_after_interruption",
+                task_id=cadence_id,
+                trajectory_id=cadence_id,
+                stream_id=started.stream_id,
+                project_key=started.memory_project_key,
+                task_ordinal=started.as_of_task_ordinal,
+                decision_ids=decision_ids,
+            )
+            self._append_maintenance_attempt_terminal(
+                started,
+                status="abandoned",
+                decision_ids=decision_ids,
+                reason="superseded_after_interrupted_attempt",
+            )
+
         repository = self.record_repository(stream_id=stream_id, project_key=project_key)
+        snapshot = self.store.load_strict_snapshot()
+        if snapshot.revision != repository.snapshot.repository_revision:
+            raise ValueError("repository changed while freezing maintenance diagnostics")
         outcome_ids: list[str] = []
         for outcome in history_window:
             stored = self._outcome_by_task.get(
@@ -318,27 +364,62 @@ class RuntimeEvidenceRecorder:
             if stored is None or stored.outcome != outcome:
                 raise ValueError("maintenance history outcome is absent from runtime evidence")
             outcome_ids.append(stored.outcome_id)
-        self._pending_maintenance[cadence_id] = _PendingMaintenance(
+        attempt_index = 1 + max(
+            (started.attempt_index for started, _terminal in attempt_states),
+            default=0,
+        )
+        started = MaintenanceAttemptEvidence(
+            collection_round=self.collection_round,
+            split=self.split,
             cadence_id=cadence_id,
+            attempt_index=attempt_index,
+            status="started",
             task_group=task_group,
             stream_id=stream_id,
+            memory_project_key=project_key,
             repository_snapshot_hash=repository.snapshot.snapshot_hash,
             as_of_task_ordinal=as_of_task_ordinal,
             outcome_ids=tuple(outcome_ids),
+            redundancy_diagnostics=_redundancy_diagnostics(
+                snapshot.memories,
+                project_key=project_key,
+            ),
         )
+        self.maintenance_attempts.append(started)
+        self._pending_maintenance[started.attempt_id] = _pending_maintenance(started)
+        return started.attempt_id
 
     def finish_maintenance(
         self,
         *,
         cadence_id: str,
+        attempt_id: str,
         project_key: str,
         status: str,
     ) -> None:
-        pending = self._pending_maintenance.get(cadence_id)
-        if pending is None:
-            raise ValueError("missing frozen maintenance evidence")
-        all_events = _role_events(self._events(cadence_id), "maintenance")
+        started, terminal = self._maintenance_attempt(attempt_id, cadence_id=cadence_id)
+        if terminal is not None:
+            if terminal.status != status:
+                raise ValueError("maintenance attempt terminal status conflicts with recovery")
+            return
+        pending = self._pending_maintenance.get(attempt_id) or _pending_maintenance(started)
+        self._pending_maintenance[attempt_id] = pending
+        all_events = self._maintenance_attempt_events(cadence_id, attempt_id)
         events = tuple(event for event in all_events if event.status == "success")
+        existing = next(
+            (item for item in self.maintenance.records if item.cadence_id == cadence_id),
+            None,
+        )
+        if existing is not None:
+            if existing.attempt_id != attempt_id:
+                raise ValueError("maintenance evidence belongs to another attempt")
+            self._append_maintenance_attempt_terminal(
+                started,
+                status=status,
+                decision_ids=tuple(event.decision_id for event in all_events),
+            )
+            self._pending_maintenance.pop(attempt_id, None)
+            return
         if status not in {"committed", "noop"} or not events:
             self._record_exclusion(
                 role="maintenance",
@@ -351,7 +432,13 @@ class RuntimeEvidenceRecorder:
                 decision_ids=tuple(event.decision_id for event in all_events),
             )
             self.record_repository(stream_id=pending.stream_id, project_key=project_key)
-            del self._pending_maintenance[cadence_id]
+            self._append_maintenance_attempt_terminal(
+                started,
+                status=status,
+                decision_ids=tuple(event.decision_id for event in all_events),
+                reason=f"maintenance_terminal_status:{status}",
+            )
+            self._pending_maintenance.pop(attempt_id, None)
             return
         tools = events[0].canonical_tools
         if any(event.canonical_tools != tools for event in events[1:]):
@@ -361,6 +448,7 @@ class RuntimeEvidenceRecorder:
             as_of_task_ordinal=pending.as_of_task_ordinal,
             split=self.split,
             cadence_id=cadence_id,
+            attempt_id=attempt_id,
             task_group=pending.task_group,
             stream_id=pending.stream_id,
             memory_project_key=project_key,
@@ -368,12 +456,120 @@ class RuntimeEvidenceRecorder:
             repository_snapshot_hash=pending.repository_snapshot_hash,
             outcome_ids=pending.outcome_ids,
             tools=tools,
-            redundancy_diagnostics=(),
+            redundancy_diagnostics=pending.redundancy_diagnostics,
             decision_ids=tuple(event.decision_id for event in events),
         )
         self.maintenance.append(record)
         self.record_repository(stream_id=pending.stream_id, project_key=project_key)
-        del self._pending_maintenance[cadence_id]
+        self._append_maintenance_attempt_terminal(
+            started,
+            status=status,
+            decision_ids=tuple(event.decision_id for event in all_events),
+        )
+        self._pending_maintenance.pop(attempt_id, None)
+
+    def recover_maintenance(
+        self,
+        *,
+        cadence_id: str,
+        project_key: str,
+        status: str,
+    ) -> None:
+        active = tuple(
+            started
+            for started, terminal in self._maintenance_attempt_states(cadence_id)
+            if terminal is None
+        )
+        if len(active) != 1:
+            existing = any(item.cadence_id == cadence_id for item in self.maintenance.records)
+            if existing and not active:
+                return
+            raise ValueError("maintenance recovery requires exactly one active attempt")
+        self.finish_maintenance(
+            cadence_id=cadence_id,
+            attempt_id=active[0].attempt_id,
+            project_key=project_key,
+            status=status,
+        )
+
+    def _maintenance_attempt_states(
+        self,
+        cadence_id: str,
+    ) -> tuple[tuple[MaintenanceAttemptEvidence, MaintenanceAttemptEvidence | None], ...]:
+        grouped: dict[str, list[MaintenanceAttemptEvidence]] = {}
+        for record in self.maintenance_attempts.records:
+            if record.cadence_id == cadence_id:
+                grouped.setdefault(record.attempt_id, []).append(record)
+        states: list[tuple[MaintenanceAttemptEvidence, MaintenanceAttemptEvidence | None]] = []
+        for records in grouped.values():
+            starts = [record for record in records if record.status == "started"]
+            terminals = [record for record in records if record.status != "started"]
+            if len(starts) != 1 or len(terminals) > 1:
+                raise ValueError("maintenance attempt history is inconsistent")
+            started = starts[0]
+            terminal = terminals[0] if terminals else None
+            if terminal is not None and _maintenance_attempt_context(terminal) != (
+                _maintenance_attempt_context(started)
+            ):
+                raise ValueError("maintenance attempt terminal context mismatch")
+            states.append((started, terminal))
+        states.sort(key=lambda item: item[0].attempt_index)
+        indexes = tuple(started.attempt_index for started, _terminal in states)
+        if indexes != tuple(range(1, len(states) + 1)):
+            raise ValueError("maintenance attempt indexes must be contiguous from one")
+        return tuple(states)
+
+    def _maintenance_attempt(
+        self,
+        attempt_id: str,
+        *,
+        cadence_id: str,
+    ) -> tuple[MaintenanceAttemptEvidence, MaintenanceAttemptEvidence | None]:
+        matches = tuple(
+            state
+            for state in self._maintenance_attempt_states(cadence_id)
+            if state[0].attempt_id == attempt_id
+        )
+        if len(matches) != 1:
+            raise ValueError("unknown maintenance attempt")
+        return matches[0]
+
+    def _append_maintenance_attempt_terminal(
+        self,
+        started: MaintenanceAttemptEvidence,
+        *,
+        status: str,
+        decision_ids: tuple[str, ...],
+        reason: str = "",
+    ) -> None:
+        terminal = MaintenanceAttemptEvidence(
+            collection_round=started.collection_round,
+            split=started.split,
+            cadence_id=started.cadence_id,
+            attempt_index=started.attempt_index,
+            status=status,
+            task_group=started.task_group,
+            stream_id=started.stream_id,
+            memory_project_key=started.memory_project_key,
+            repository_snapshot_hash=started.repository_snapshot_hash,
+            as_of_task_ordinal=started.as_of_task_ordinal,
+            outcome_ids=started.outcome_ids,
+            redundancy_diagnostics=started.redundancy_diagnostics,
+            decision_ids=decision_ids,
+            reason=reason,
+        )
+        self.maintenance_attempts.append(terminal)
+
+    def _maintenance_attempt_events(
+        self,
+        cadence_id: str,
+        attempt_id: str,
+    ) -> tuple[DecisionEvent, ...]:
+        return tuple(
+            event
+            for event in _role_events(self._events(cadence_id), "maintenance")
+            if event.run_id == attempt_id
+        )
 
     def record_repository(
         self,
@@ -509,8 +705,57 @@ def _observations_between(
     )
 
 
+def _pending_maintenance(started: MaintenanceAttemptEvidence) -> _PendingMaintenance:
+    return _PendingMaintenance(
+        cadence_id=started.cadence_id,
+        attempt_id=started.attempt_id,
+        attempt_index=started.attempt_index,
+        task_group=started.task_group,
+        stream_id=started.stream_id,
+        repository_snapshot_hash=started.repository_snapshot_hash,
+        as_of_task_ordinal=started.as_of_task_ordinal,
+        outcome_ids=started.outcome_ids,
+        redundancy_diagnostics=started.redundancy_diagnostics,
+    )
+
+
+def _maintenance_attempt_context(record: MaintenanceAttemptEvidence) -> tuple[Any, ...]:
+    return (
+        record.collection_round,
+        record.split,
+        record.cadence_id,
+        record.attempt_index,
+        record.task_group,
+        record.stream_id,
+        record.memory_project_key,
+        record.repository_snapshot_hash,
+        record.as_of_task_ordinal,
+        record.outcome_ids,
+        record.redundancy_diagnostics,
+    )
+
+
 def _task_key(stream_id: str, project_key: str, task_id: str) -> tuple[str, str, str]:
     return stream_id, project_key, task_id
+
+
+def _redundancy_diagnostics(
+    entries: Sequence[Any],
+    *,
+    project_key: str,
+) -> tuple[RedundancyDiagnostic, ...]:
+    visible = tuple(sorted(
+        (
+            entry
+            for entry in entries
+            if entry.scope.value == "global" or entry.project_key == project_key
+        ),
+        key=lambda entry: entry.id,
+    ))
+    return tuple(
+        RedundancyDiagnostic(left.id, right.id, redundancy_score(left, right))
+        for left, right in combinations(visible, 2)
+    )
 
 
 def _load_records(

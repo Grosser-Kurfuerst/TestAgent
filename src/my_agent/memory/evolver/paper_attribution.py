@@ -163,13 +163,23 @@ def compute_round_attribution(
     exposures: Sequence[CandidateExposure],
     *,
     collection_round: int,
-    as_of_ordinal: int,
+    valid_task_ordinals: Sequence[int],
     tier_priors: Mapping[str, float] | None = None,
 ) -> tuple[PaperAttributionRecord, ...]:
+    ordinals = tuple(valid_task_ordinals)
+    if any(
+        isinstance(ordinal, bool) or not isinstance(ordinal, int) or ordinal < 1
+        for ordinal in ordinals
+    ):
+        raise ValueError("valid task ordinals must be positive integers")
     if not exposures:
         return ()
-    if max(exposure.task_ordinal for exposure in exposures) > as_of_ordinal:
-        raise ValueError("candidate exposure cannot exceed the round as_of_ordinal")
+    if not ordinals:
+        raise ValueError("candidate exposures require authoritative valid task ordinals")
+    valid_ordinal_set = set(ordinals)
+    if any(exposure.task_ordinal not in valid_ordinal_set for exposure in exposures):
+        raise ValueError("candidate exposure does not reference an authoritative valid task")
+    as_of_ordinal = max(ordinals)
     priors = dict(DEFAULT_PAPER_TIER_PRIORS)
     if tier_priors is not None:
         priors.update({str(key): float(value) for key, value in tier_priors.items()})

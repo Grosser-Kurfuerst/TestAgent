@@ -15,6 +15,7 @@ from my_agent.opd_data.export import (
 )
 from my_agent.opd_data.schema import (
     ExportManifest,
+    MaintenanceAttemptEvidence,
     MaintenanceEvidence,
     RepositoryEvidence,
     RuntimeExclusionEvidence,
@@ -28,6 +29,7 @@ from my_agent.training.contracts import DecisionEvent
 from my_agent.training.opd_rollout import (
     generate_action_rollout_samples,
     generate_learner_sample,
+    generate_maintenance_rollout,
 )
 
 
@@ -54,6 +56,7 @@ def build_collection_round(
     attribution: Sequence[PaperAttributionRecord],
     output_dir: str | Path,
     runtime_exclusions: Sequence[RuntimeExclusionEvidence] = (),
+    maintenance_attempts: Sequence[MaintenanceAttemptEvidence] = (),
     writing_top_fraction: float = 0.30,
     teacher_minimum_score: float = 0.01,
     teacher_max_items: int = 20,
@@ -89,9 +92,13 @@ def build_collection_round(
     rollout_exclusions: list[Mapping[str, Any]] = []
     generation_index = 0
     action_groups: dict[str, list[Any]] = {}
+    maintenance_groups: dict[str, list[Any]] = {}
     for decision in decisions:
         if decision.role == "action":
             action_groups.setdefault(decision.action_rollout_id, []).append(decision)
+            continue
+        if decision.role == "maintenance":
+            maintenance_groups.setdefault(decision.maintenance_rollout_id, []).append(decision)
             continue
         samples_list.append(generate_learner_sample(
             decision,
@@ -119,6 +126,26 @@ def build_collection_round(
                 "role": "action",
                 "reason": "student_tool_call_diverged_from_replayable_observation",
                 "generated_turns": len(generated),
+                "available_turns": len(rollout),
+            })
+        generation_index += len(rollout)
+    for rollout_id in sorted(maintenance_groups):
+        rollout = maintenance_groups[rollout_id]
+        generated = generate_maintenance_rollout(
+            rollout,
+            policy=policy,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            seed=None if seed is None else seed + generation_index,
+        )
+        samples_list.extend(generated.samples)
+        if generated.diverged:
+            rollout_exclusions.append({
+                "evidence_id": rollout_id,
+                "role": "maintenance",
+                "reason": "student_tool_call_diverged_from_replayable_observation",
+                "generated_turns": len(generated.samples),
                 "available_turns": len(rollout),
             })
         generation_index += len(rollout)
@@ -160,6 +187,7 @@ def build_collection_round(
             "decision_events": _sequence_hash(decision_events),
             "attribution": _sequence_hash(attribution),
             "runtime_exclusions": _sequence_hash(runtime_exclusions),
+            "maintenance_attempts": _sequence_hash(maintenance_attempts),
         },
         writing_score_decisions=tuple(
             item.to_dict() for item in prepared.writing_score_decisions

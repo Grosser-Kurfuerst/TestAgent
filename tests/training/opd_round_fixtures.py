@@ -274,12 +274,14 @@ def round_fixture() -> RoundFixture:
         True,
     )
     cadence_id = canonical_sha256({"cadence": 1})
+    maintenance_attempt_id = canonical_sha256({"cadence": 1, "attempt": 1})
     maintenance_tool = tool("finish")
     maintenance = MaintenanceEvidence(
         collection_round=0,
         as_of_task_ordinal=4,
         split="train",
         cadence_id=cadence_id,
+        attempt_id=maintenance_attempt_id,
         task_group="group-a",
         stream_id="stream-a",
         memory_project_key="project-a",
@@ -332,7 +334,11 @@ def round_fixture() -> RoundFixture:
         _exposure("mem-write", "tip", 3, True, 1.0, written_candidate_hash),
         _exposure("mem-write", "tip", 4, False, 0.0, written_candidate_hash),
     )
-    attribution = compute_round_attribution(exposures, collection_round=0, as_of_ordinal=4)
+    attribution = compute_round_attribution(
+        exposures,
+        collection_round=0,
+        valid_task_ordinals=(1, 2, 3, 4),
+    )
     return RoundFixture(
         tasks=(task_one, task_two, task_three, task_four),
         outcomes=(outcome_one, outcome_two, outcome_three, outcome_four),
@@ -433,7 +439,11 @@ def _decision(
         task_group="group-a",
         stream_id="stream-a",
         memory_project_key="project-a",
-        run_id="round-0",
+        run_id=(
+            canonical_sha256({"cadence": 1, "attempt": 1})
+            if role == "maintenance"
+            else "round-0"
+        ),
         policy_identity=identity(),
         repository_revision=repository_revision,
         candidate_snapshot_hash=candidate_snapshot_hash,
@@ -448,7 +458,17 @@ def _decision(
         raw_completion="done",
         completion_token_ids=(2,),
         assistant_loss_mask=(1,),
-        parsed_output={},
+        parsed_output=(
+            {
+                "tool_call": {
+                    "call_id": "maintenance-finish",
+                    "name": "finish",
+                    "arguments": {"summary": "done"},
+                }
+            }
+            if role == "maintenance"
+            else {}
+        ),
         retry_of=None,
         status="success",
     )

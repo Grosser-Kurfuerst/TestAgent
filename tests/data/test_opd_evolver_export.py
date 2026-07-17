@@ -5,6 +5,11 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 
+from my_agent.memory.evolver.attribution_export import (
+    load_attribution_events,
+    load_candidate_exposures,
+)
+from my_agent.opd_data.attribution import build_round_attribution
 from my_agent.opd_data.export import (
     load_maintenance_evidence,
     load_repository_evidence,
@@ -14,10 +19,34 @@ from my_agent.opd_data.export import (
     write_evidence_jsonl,
 )
 from my_agent.training.role_views import CanonicalMessage, CanonicalToolCall
-from tests.training.opd_round_fixtures import identity, round_fixture
+from tests.training.opd_round_fixtures import identity, round_fixture, tool
 
 
 class OpdEvolverExportTests(unittest.TestCase):
+    def test_build_round_attribution_from_authoritative_runtime_evidence(self) -> None:
+        fixture = round_fixture()
+        final_outcome = replace(
+            fixture.outcomes[-1],
+            task_ordinal=5,
+            trajectory_id="traj-5",
+            outcome=replace(fixture.outcomes[-1].outcome, task_id="task-5"),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            result = build_round_attribution(
+                collection_round=0,
+                tasks=fixture.tasks,
+                outcomes=(*fixture.outcomes, final_outcome),
+                repositories=fixture.repositories,
+                output_dir=tmp,
+            )
+            exposures = load_candidate_exposures(result.candidate_exposures_path)
+            records = load_attribution_events(result.attribution_events_path)
+
+        self.assertEqual(result.as_of_ordinal, 5)
+        self.assertEqual(len(exposures), 4)
+        self.assertEqual({record.as_of_ordinal for record in records}, {5})
+        self.assertEqual({record.memory_id for record in records}, {"mem-a", "mem-write"})
+
     def test_evidence_round_trip_and_four_role_join(self) -> None:
         fixture = round_fixture()
         with tempfile.TemporaryDirectory() as tmp:
@@ -202,6 +231,69 @@ class OpdEvolverExportTests(unittest.TestCase):
         self.assertEqual(actions[1].public_view.prefix_messages, first_action.prefix_messages)
         self.assertEqual(actions[0].action_expected_tool_calls, (fast_call,))
         self.assertEqual(actions[0].action_observation_messages, (observation,))
+
+    def test_maintenance_decisions_are_exported_per_assistant_turn(self) -> None:
+        fixture = round_fixture()
+        first_event = next(
+            item for item in fixture.decisions if item.decision_id == "dec-maintenance-1"
+        )
+        lookup = CanonicalToolCall("lookup-1", "lookup", '{"query":"duplicate"}')
+        observation = CanonicalMessage("tool", '{"hits":[]}', tool_call_id=lookup.call_id)
+        first_event = replace(
+            first_event,
+            canonical_tools=(tool("lookup"), tool("finish")),
+            parsed_output={
+                "tool_call": {
+                    "call_id": lookup.call_id,
+                    "name": lookup.name,
+                    "arguments": {"query": "duplicate"},
+                }
+            },
+        )
+        second_event = replace(
+            first_event,
+            decision_id="dec-maintenance-2",
+            turn_index=1,
+            step_index=1,
+            canonical_messages=(
+                *first_event.canonical_messages,
+                CanonicalMessage("assistant", "", tool_calls=(lookup,)),
+                observation,
+            ),
+            parsed_output={
+                "tool_call": {
+                    "call_id": "finish-1",
+                    "name": "finish",
+                    "arguments": {"summary": "done"},
+                }
+            },
+        )
+        maintenance = replace(
+            fixture.maintenance[0],
+            tools=first_event.canonical_tools,
+            decision_ids=(first_event.decision_id, second_event.decision_id),
+        )
+        decisions = tuple(
+            first_event if item.decision_id == first_event.decision_id else item
+            for item in fixture.decisions
+        ) + (second_event,)
+
+        prepared = prepare_round_decisions(
+            collection_round=0,
+            trainer_identity=identity(),
+            tasks=fixture.tasks,
+            outcomes=fixture.outcomes,
+            repositories=fixture.repositories,
+            maintenance=(maintenance,),
+            decision_events=decisions,
+            attribution=fixture.attribution,
+        )
+        turns = [item for item in prepared.decisions if item.role == "maintenance"]
+
+        self.assertEqual(len(turns), 2)
+        self.assertEqual(turns[0].maintenance_expected_tool_calls, (lookup,))
+        self.assertEqual(turns[0].maintenance_observation_messages, (observation,))
+        self.assertEqual(turns[1].maintenance_turn_index, 1)
 
 if __name__ == "__main__":
     unittest.main()

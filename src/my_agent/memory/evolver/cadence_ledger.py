@@ -18,6 +18,7 @@ from my_agent.json_safety import loads_json_strict
 from my_agent.memory.evolver.artifacts import _history_lock_path
 from my_agent.memory.evolver.cadence_schema import LEDGER_DDL
 from my_agent.policy.identity import canonical_json_bytes, canonical_sha256, require_sha256
+from my_agent.training.role_views import TaskOutcomeRef
 
 
 CADENCE_SCHEMA_VERSION = "opd-maintenance-cadence-v1"
@@ -86,6 +87,7 @@ class CadenceLedger:
         outcome_finalized: bool,
         writer_terminal_status: str,
         repository_revision_after_writer: str,
+        outcome: TaskOutcomeRef,
     ) -> CadenceAdvanceResult:
         _require_nonblank(stream_id, "stream_id")
         _require_nonblank(memory_project_key, "memory_project_key")
@@ -95,22 +97,45 @@ class CadenceLedger:
             raise ValueError("task_valid and outcome_finalized must be booleans")
         if writer_terminal_status not in WRITER_TERMINAL_STATUSES:
             raise ValueError("writer status is not terminal for the cadence ledger")
+        if not isinstance(outcome, TaskOutcomeRef) or outcome.task_id != task_id:
+            raise ValueError("cadence ledger requires the matching authoritative task outcome")
         if not task_valid or not outcome_finalized:
             return CadenceAdvanceResult(False, None, None)
+
+        outcome_json = canonical_json_bytes(outcome.to_dict()).decode("utf-8")
 
         with self._locked():
             with self._connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
                 existing = connection.execute(
                     """
-                    SELECT task_ordinal
-                    FROM task_completion
-                    WHERE stream_id = ? AND memory_project_key = ? AND task_id = ?
+                    SELECT completion.task_ordinal,
+                           completion.outcome_finalized,
+                           completion.writer_terminal_status,
+                           completion.repository_revision_after_writer,
+                           evidence.outcome_json
+                    FROM task_completion AS completion
+                    LEFT JOIN task_outcome_evidence AS evidence
+                      ON evidence.stream_id = completion.stream_id
+                     AND evidence.memory_project_key = completion.memory_project_key
+                     AND evidence.task_id = completion.task_id
+                    WHERE completion.stream_id = ?
+                      AND completion.memory_project_key = ?
+                      AND completion.task_id = ?
                     """,
                     (stream_id, memory_project_key, task_id),
                 ).fetchone()
                 if existing is not None:
                     ordinal = int(existing[0])
+                    expected_existing = (
+                        1,
+                        writer_terminal_status,
+                        repository_revision_after_writer,
+                        outcome_json,
+                    )
+                    if tuple(existing[1:]) != expected_existing:
+                        connection.rollback()
+                        raise ValueError("duplicate task completion conflicts with persisted terminal evidence")
                     cadence = self._cadence_at_boundary(
                         connection,
                         stream_id=stream_id,
@@ -144,6 +169,23 @@ class CadenceLedger:
                         ordinal,
                         writer_terminal_status,
                         repository_revision_after_writer,
+                        now,
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO task_outcome_evidence (
+                      stream_id, memory_project_key, task_id, task_ordinal,
+                      task_group, outcome_json, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        stream_id,
+                        memory_project_key,
+                        task_id,
+                        ordinal,
+                        outcome.task_group,
+                        outcome_json,
                         now,
                     ),
                 )
@@ -183,6 +225,46 @@ class CadenceLedger:
                     )
                 connection.commit()
                 return CadenceAdvanceResult(True, ordinal, cadence)
+
+    def cadence_context(
+        self,
+        cadence: CadenceRecord,
+    ) -> tuple[str, tuple[TaskOutcomeRef, ...]]:
+        if not isinstance(cadence, CadenceRecord):
+            raise ValueError("cadence context requires CadenceRecord")
+        first_ordinal = cadence.boundary_ordinal - self.interval_tasks + 1
+        with self._locked():
+            with self._connect() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT task_ordinal, task_group, outcome_json
+                    FROM task_outcome_evidence
+                    WHERE stream_id = ? AND memory_project_key = ?
+                      AND task_ordinal BETWEEN ? AND ?
+                    ORDER BY task_ordinal
+                    """,
+                    (
+                        cadence.stream_id,
+                        cadence.memory_project_key,
+                        first_ordinal,
+                        cadence.boundary_ordinal,
+                    ),
+                ).fetchall()
+        expected_ordinals = tuple(range(first_ordinal, cadence.boundary_ordinal + 1))
+        if tuple(int(row[0]) for row in rows) != expected_ordinals:
+            raise ValueError("cadence outcome history is incomplete")
+        history: list[TaskOutcomeRef] = []
+        for _ordinal, task_group, outcome_json in rows:
+            payload = loads_json_strict(str(outcome_json))
+            if not isinstance(payload, Mapping):
+                raise ValueError("cadence outcome history must contain JSON objects")
+            outcome = TaskOutcomeRef.from_dict(payload)
+            if outcome.task_group != str(task_group):
+                raise ValueError("cadence outcome task group does not match persisted context")
+            history.append(outcome)
+        if not history:
+            raise ValueError("cadence outcome history is empty")
+        return history[-1].task_group, tuple(history)
 
     def oldest_open_cadence(
         self,

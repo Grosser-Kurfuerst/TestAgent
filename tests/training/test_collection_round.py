@@ -61,8 +61,17 @@ class CollectionRoundTests(unittest.TestCase):
             "0",
         ])
         verify = parser.parse_args(["opd", "verify-run", "--run-dir", "/tmp/output"])
+        attribution = parser.parse_args([
+            "data",
+            "compute-opd-attribution",
+            "--run-dir",
+            "/tmp/run",
+            "--collection-round",
+            "0",
+        ])
         self.assertEqual(build.opd_command, "build-round")
         self.assertEqual(verify.opd_command, "verify-run")
+        self.assertEqual(attribution.data_command, "compute-opd-attribution")
 
     def test_empty_completion_is_rejected_from_formal_dataset(self) -> None:
         fixture = round_fixture()

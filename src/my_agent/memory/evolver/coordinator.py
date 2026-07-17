@@ -219,6 +219,7 @@ class EvolverCoordinator:
         self,
         *,
         maintenance_id: str,
+        attempt_id: str,
         stream_id: str,
         task_group: str,
         history_window: tuple[TaskOutcomeRef, ...] = (),
@@ -227,6 +228,7 @@ class EvolverCoordinator:
             raise RuntimeError("formal maintenance agent is unavailable")
         return self.maintainer.run(
             maintenance_id=maintenance_id,
+            attempt_id=attempt_id,
             stream_id=stream_id,
             task_group=task_group,
             history_window=history_window,
@@ -443,6 +445,7 @@ class EvolverCoordinator:
             outcome_finalized=outcome.outcome_finalized,
             writer_terminal_status=writer_status,
             repository_revision_after_writer=repository_revision_after,
+            outcome=outcome.to_ref(),
         )
         self._trace("memory.evolver_cadence_advanced", {
             "task_id": session.task_id,
@@ -472,42 +475,30 @@ class EvolverCoordinator:
             if advance.cadence is None:
                 return None, None
             return advance.cadence.cadence_id, advance.cadence.status
-        return due.cadence_id, self._run_or_reconcile_cadence(
-            due,
-            task_group=session.task_group,
-            history_window=(outcome.to_ref(),),
-            allow_new_decision=advance.counted,
-        )
+        return due.cadence_id, self._run_or_reconcile_cadence(due)
 
     def _run_or_reconcile_cadence(
         self,
         cadence: CadenceRecord,
-        *,
-        task_group: str,
-        history_window: tuple[TaskOutcomeRef, ...],
-        allow_new_decision: bool = True,
     ) -> str:
         with self.store.exclusive_process_lock():
-            return self._run_or_reconcile_cadence_locked(
-                cadence,
-                task_group=task_group,
-                history_window=history_window,
-                allow_new_decision=allow_new_decision,
-            )
+            return self._run_or_reconcile_cadence_locked(cadence)
 
     def _run_or_reconcile_cadence_locked(
         self,
         cadence: CadenceRecord,
-        *,
-        task_group: str,
-        history_window: tuple[TaskOutcomeRef, ...],
-        allow_new_decision: bool,
     ) -> str:
         history = load_formal_maintenance_history(
             self.maintenance_history_path,
             cadence_id=cadence.cadence_id,
         )
         if history.completion is not None:
+            if self.runtime_evidence_recorder is not None:
+                self.runtime_evidence_recorder.recover_maintenance(
+                    cadence_id=cadence.cadence_id,
+                    project_key=cadence.memory_project_key,
+                    status=str(history.completion["status"]),
+                )
             committed = self.cadence_ledger.mark_committed(
                 cadence.cadence_id,
                 maintenance_plan_id=str(history.completion["plan_id"]),
@@ -529,17 +520,32 @@ class EvolverCoordinator:
                 history_path=self.maintenance_history_path,
             )
             if applied.status in {"committed", "noop"}:
+                if self.runtime_evidence_recorder is not None:
+                    self.runtime_evidence_recorder.recover_maintenance(
+                        cadence_id=cadence.cadence_id,
+                        project_key=cadence.memory_project_key,
+                        status=applied.status,
+                    )
                 self.cadence_ledger.mark_committed(
                     cadence.cadence_id,
                     maintenance_plan_id=applied.plan_id,
                     repository_revision_after=applied.after_revision,
                 )
             return applied.status
-        if self.maintainer is None or not allow_new_decision:
+        if self.maintainer is None:
             return cadence.status
-        self.cadence_ledger.mark_started(cadence.cadence_id)
+        task_group, history_window = self.cadence_ledger.cadence_context(cadence)
+        attempt_id = canonical_sha256({
+            "schema_version": "opd-maintenance-attempt-runtime-v1",
+            "cadence_id": cadence.cadence_id,
+            "event_count": len(
+                self.decision_recorder.events_for(cadence.cadence_id)
+                if self.decision_recorder is not None
+                else ()
+            ),
+        })
         if self.runtime_evidence_recorder is not None:
-            self.runtime_evidence_recorder.begin_maintenance(
+            attempt_id = self.runtime_evidence_recorder.begin_maintenance(
                 cadence_id=cadence.cadence_id,
                 task_group=task_group,
                 stream_id=cadence.stream_id,
@@ -547,8 +553,10 @@ class EvolverCoordinator:
                 as_of_task_ordinal=cadence.boundary_ordinal,
                 history_window=history_window,
             )
+        self.cadence_ledger.mark_started(cadence.cadence_id)
         result = self.run_maintenance(
             maintenance_id=cadence.cadence_id,
+            attempt_id=attempt_id,
             stream_id=cadence.stream_id,
             task_group=task_group,
             history_window=history_window,
@@ -556,6 +564,7 @@ class EvolverCoordinator:
         if self.runtime_evidence_recorder is not None:
             self.runtime_evidence_recorder.finish_maintenance(
                 cadence_id=cadence.cadence_id,
+                attempt_id=attempt_id,
                 project_key=cadence.memory_project_key,
                 status=result.status,
             )
@@ -577,43 +586,12 @@ class EvolverCoordinator:
         return result.status
 
     def _reconcile_persisted_cadences(self) -> None:
-        """Finish durable intent/completion recovery without making new LLM decisions."""
+        """Recover every open cadence with its persisted boundary context."""
 
         for cadence in self.cadence_ledger.open_cadences(
             memory_project_key=self.project_key,
         ):
-            history = load_formal_maintenance_history(
-                self.maintenance_history_path,
-                cadence_id=cadence.cadence_id,
-            )
-            if history.completion is not None:
-                self.cadence_ledger.mark_committed(
-                    cadence.cadence_id,
-                    maintenance_plan_id=str(history.completion["plan_id"]),
-                    repository_revision_after=str(history.completion["after_revision"]),
-                )
-                continue
-            if history.intent is None:
-                continue
-            operations = tuple(
-                MaintenanceOperation.from_dict(item)
-                for item in history.intent["operations"]
-            )
-            applied = apply_formal_maintenance_operations(
-                store=self.store,
-                cadence_id=cadence.cadence_id,
-                stream_id=cadence.stream_id,
-                expected_revision=str(history.intent["before_revision"]),
-                project_key=cadence.memory_project_key,
-                operations=operations,
-                history_path=self.maintenance_history_path,
-            )
-            if applied.status in {"committed", "noop"}:
-                self.cadence_ledger.mark_committed(
-                    cadence.cadence_id,
-                    maintenance_plan_id=applied.plan_id,
-                    repository_revision_after=applied.after_revision,
-                )
+            self._run_or_reconcile_cadence(cadence)
 
     def _trace(self, event: str, payload: dict[str, Any]) -> None:
         if self.trace_sink is not None:

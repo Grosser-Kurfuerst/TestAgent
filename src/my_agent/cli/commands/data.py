@@ -33,6 +33,12 @@ from my_agent.memory.evolver import (
     write_dataset_summary_json,
 )
 from my_agent.memory.experience_store import ExperienceStore
+from my_agent.opd_data.attribution import build_round_attribution
+from my_agent.opd_data.export import (
+    load_repository_evidence,
+    load_task_evidence,
+    load_task_outcomes,
+)
 
 DATA_COMMANDS = {
     "build-mbpp",
@@ -45,6 +51,7 @@ DATA_COMMANDS = {
     "build-memory-usage-log",
     "score-memory-attribution",
     "score-memory-datasets",
+    "compute-opd-attribution",
     "data",
 }
 
@@ -130,6 +137,18 @@ def add_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) 
 
 
 def _add_memory_attribution_parsers(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    opd_attribution_parser = subparsers.add_parser(
+        "compute-opd-attribution",
+        help="Build strict paper Eq. 11-12 attribution artifacts from one OPD run.",
+    )
+    opd_attribution_parser.add_argument("--run-dir", required=True)
+    opd_attribution_parser.add_argument("--collection-round", type=int, required=True)
+    opd_attribution_parser.add_argument(
+        "--output",
+        help="Output directory (default: the run's evolver evidence directory).",
+    )
+    opd_attribution_parser.set_defaults(_handler=handle)
+
     usage_parser = subparsers.add_parser(
         "build-memory-usage-log",
         help="Build OPD-Evolver memory usage logs from manifest results and traces.",
@@ -222,6 +241,8 @@ def handle(args: argparse.Namespace, ctx: CliContext) -> int:
             result = _score_memory_attribution(args)
         elif command == "score-memory-datasets":
             result = _score_memory_datasets(args)
+        elif command == "compute-opd-attribution":
+            result = _compute_opd_attribution(args)
         else:
             raise ValueError(f"Unknown data command: {command}")
     except RuntimeError as exc:
@@ -243,6 +264,25 @@ class _RenderedResult:
 
     def render(self) -> str:
         return self._text
+
+
+def _compute_opd_attribution(args: argparse.Namespace) -> _RenderedResult:
+    source = _opd_evidence_dir(Path(args.run_dir))
+    output = Path(args.output).expanduser().resolve() if args.output else source
+    result = build_round_attribution(
+        collection_round=args.collection_round,
+        tasks=load_task_evidence(source / "task_evidence.jsonl"),
+        outcomes=load_task_outcomes(source / "task_outcomes.jsonl"),
+        repositories=load_repository_evidence(source / "repository_events.jsonl"),
+        output_dir=output,
+    )
+    return _RenderedResult(json.dumps({
+        "as_of_ordinal": result.as_of_ordinal,
+        "attribution_count": result.attribution_count,
+        "attribution_events_path": str(result.attribution_events_path),
+        "candidate_exposures_path": str(result.candidate_exposures_path),
+        "exposure_count": result.exposure_count,
+    }, ensure_ascii=False, sort_keys=True))
 
 
 def _build_memory_usage_log(args: argparse.Namespace) -> _RenderedResult:
@@ -399,6 +439,12 @@ def _nonempty_text(value: str) -> str:
     if not normalized:
         raise argparse.ArgumentTypeError("value must not be empty")
     return normalized
+
+
+def _opd_evidence_dir(run_dir: Path) -> Path:
+    root = run_dir.expanduser().resolve()
+    nested = root / "evolver_datasets"
+    return nested if nested.is_dir() else root
 
 
 def _unit_interval_float(value: str) -> float:

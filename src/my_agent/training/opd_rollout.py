@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any
 
 from my_agent.opd_data.export import PreparedLearnerDecision
@@ -37,6 +37,12 @@ _FORBIDDEN_PUBLIC_MARKERS = (
 )
 
 
+@dataclass(frozen=True)
+class LearnerRolloutResult:
+    samples: tuple[LearnerSample, ...]
+    diverged: bool
+
+
 def generate_learner_sample(
     prepared: PreparedLearnerDecision,
     *,
@@ -65,11 +71,16 @@ def _generate_learner_sample_with_response(
     temperature: float = 1.0,
     top_p: float = 0.95,
     seed: int | None = None,
+    student_messages_override: tuple[CanonicalMessage, ...] | None = None,
 ) -> tuple[LearnerSample, DecisionResponse]:
     if not isinstance(policy, TrainablePolicy):
         raise ValueError("learner regeneration requires a local TrainablePolicy")
     identity = policy.identity()
-    student_messages = render_public_messages(prepared)
+    student_messages = (
+        student_messages_override
+        if student_messages_override is not None
+        else render_public_messages(prepared)
+    )
     teacher_messages = render_teacher_messages(prepared, public_messages=student_messages)
     tools = _tools_for_public(prepared.public_view)
     _validate_public_safety(prepared, student_messages=student_messages, tools=tools)
@@ -201,6 +212,96 @@ def generate_action_rollout_samples(
     return tuple(samples)
 
 
+def generate_maintenance_rollout(
+    decisions: Sequence[PreparedLearnerDecision],
+    *,
+    policy: TrainablePolicy,
+    max_new_tokens: int = 1_024,
+    temperature: float = 1.0,
+    top_p: float = 0.95,
+    seed: int | None = None,
+) -> LearnerRolloutResult:
+    ordered = tuple(sorted(decisions, key=lambda item: item.maintenance_turn_index))
+    if not ordered or any(item.role != "maintenance" for item in ordered):
+        raise ValueError("maintenance rollout requires maintenance learner decisions")
+    rollout_id = ordered[0].maintenance_rollout_id
+    if not rollout_id or any(item.maintenance_rollout_id != rollout_id for item in ordered):
+        raise ValueError("maintenance rollout decisions must share one rollout ID")
+    if tuple(item.maintenance_turn_index for item in ordered) != tuple(range(len(ordered))):
+        raise ValueError("maintenance rollout turn indexes must be contiguous from zero")
+    if not isinstance(ordered[0].public_view, MaintenancePublic):
+        raise ValueError("maintenance rollout requires MaintenancePublic")
+
+    current_messages = render_public_messages(ordered[0])
+    samples: list[LearnerSample] = []
+    diverged = False
+    for index, decision in enumerate(ordered):
+        if not isinstance(decision.public_view, MaintenancePublic):
+            raise ValueError("maintenance rollout requires MaintenancePublic")
+        sample, response = _generate_learner_sample_with_response(
+            decision,
+            policy=policy,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            seed=None if seed is None else seed + index,
+            student_messages_override=current_messages,
+        )
+        samples.append(sample)
+        expected_calls = decision.maintenance_expected_tool_calls
+        if len(expected_calls) != 1 or not _same_tool_calls(
+            expected_calls,
+            response.parsed_tool_calls,
+        ):
+            diverged = True
+            break
+        if expected_calls[0].name == "finish":
+            if index + 1 != len(ordered):
+                raise ValueError("maintenance finish decision must be the final turn")
+            break
+        observations = _remap_observations(
+            decision.maintenance_observation_messages,
+            expected_calls=expected_calls,
+            actual_calls=response.parsed_tool_calls,
+        )
+        if not observations:
+            diverged = True
+            break
+        chat_response = policy.chat_response_from_decision(response)
+        content = getattr(chat_response, "content", None)
+        if not isinstance(content, str):
+            raise ValueError("maintenance learner response conversion did not produce text content")
+        current_messages = (
+            *current_messages,
+            CanonicalMessage(
+                "assistant",
+                content,
+                tool_calls=response.parsed_tool_calls,
+            ),
+            *observations,
+        )
+    return LearnerRolloutResult(tuple(samples), diverged)
+
+
+def generate_maintenance_rollout_samples(
+    decisions: Sequence[PreparedLearnerDecision],
+    *,
+    policy: TrainablePolicy,
+    max_new_tokens: int = 1_024,
+    temperature: float = 1.0,
+    top_p: float = 0.95,
+    seed: int | None = None,
+) -> tuple[LearnerSample, ...]:
+    return generate_maintenance_rollout(
+        decisions,
+        policy=policy,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        seed=seed,
+    ).samples
+
+
 def render_public_messages(
     prepared: PreparedLearnerDecision,
 ) -> tuple[CanonicalMessage, ...]:
@@ -311,8 +412,11 @@ def _remap_observations(
 
 
 __all__ = [
+    "LearnerRolloutResult",
     "generate_learner_sample",
     "generate_action_rollout_samples",
+    "generate_maintenance_rollout",
+    "generate_maintenance_rollout_samples",
     "render_public_messages",
     "render_teacher_messages",
 ]

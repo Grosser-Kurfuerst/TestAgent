@@ -116,6 +116,7 @@ class FormalMaintenanceAgentTests(unittest.TestCase):
 
             result = agent.run(
                 maintenance_id=_cadence_id(),
+                attempt_id="attempt-a",
                 stream_id="stream-a",
                 task_group="group-a",
             )
@@ -152,6 +153,7 @@ class FormalMaintenanceAgentTests(unittest.TestCase):
 
             result = agent.run(
                 maintenance_id=_cadence_id(),
+                attempt_id="attempt-a",
                 stream_id="stream-a",
                 task_group="group-a",
             )
@@ -185,6 +187,7 @@ class FormalMaintenanceAgentTests(unittest.TestCase):
 
             result = agent.run(
                 maintenance_id=_cadence_id(),
+                attempt_id="attempt-a",
                 stream_id="stream-a",
                 task_group="group-a",
             )

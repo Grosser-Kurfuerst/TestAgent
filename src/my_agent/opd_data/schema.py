@@ -19,6 +19,7 @@ from my_agent.training.role_views import (
 
 
 OPD_EVIDENCE_SCHEMA_VERSION = "opd-round-evidence-v1"
+OPD_MAINTENANCE_ATTEMPT_SCHEMA_VERSION = "opd-maintenance-attempt-v1"
 OPD_LEARNER_SCHEMA_VERSION = "opd-learner-sample-v1"
 OPD_EXPORT_MANIFEST_SCHEMA_VERSION = "opd-export-manifest-v1"
 DATASET_SPLITS = frozenset({"train", "validation", "test"})
@@ -425,11 +426,124 @@ class RepositoryEvidence:
 
 
 @dataclass(frozen=True)
+class MaintenanceAttemptEvidence:
+    collection_round: int
+    split: str
+    cadence_id: str
+    attempt_index: int
+    status: str
+    task_group: str
+    stream_id: str
+    memory_project_key: str
+    repository_snapshot_hash: str
+    as_of_task_ordinal: int
+    outcome_ids: tuple[str, ...]
+    redundancy_diagnostics: tuple[RedundancyDiagnostic, ...]
+    decision_ids: tuple[str, ...] = ()
+    reason: str = ""
+    schema_version: str = OPD_MAINTENANCE_ATTEMPT_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if self.schema_version != OPD_MAINTENANCE_ATTEMPT_SCHEMA_VERSION:
+            raise ValueError("unsupported maintenance attempt schema")
+        if self.collection_round < 0 or self.attempt_index < 1 or self.as_of_task_ordinal < 1:
+            raise ValueError("maintenance attempt indexes must be positive")
+        _require_split(self.split)
+        for field_name in ("cadence_id", "task_group", "stream_id", "memory_project_key"):
+            _require_nonblank(getattr(self, field_name), field_name)
+        require_sha256(self.cadence_id, field_name="cadence_id")
+        require_sha256(self.repository_snapshot_hash, field_name="repository_snapshot_hash")
+        if self.status not in {
+            "started", "committed", "noop", "aborted", "stale", "abandoned",
+        }:
+            raise ValueError("unsupported maintenance attempt status")
+        _require_unique_strings(self.outcome_ids, "outcome_ids")
+        _require_unique_strings(self.decision_ids, "decision_ids")
+        if self.status == "started" and (self.decision_ids or self.reason):
+            raise ValueError("started maintenance attempt cannot be terminal")
+
+    @property
+    def attempt_id(self) -> str:
+        return canonical_sha256({
+            "schema_version": self.schema_version,
+            "cadence_id": self.cadence_id,
+            "attempt_index": self.attempt_index,
+        })
+
+    @property
+    def attempt_event_id(self) -> str:
+        return canonical_sha256(self._payload())
+
+    def _payload(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "collection_round": self.collection_round,
+            "split": self.split,
+            "cadence_id": self.cadence_id,
+            "attempt_id": self.attempt_id,
+            "attempt_index": self.attempt_index,
+            "status": self.status,
+            "task_group": self.task_group,
+            "stream_id": self.stream_id,
+            "memory_project_key": self.memory_project_key,
+            "repository_snapshot_hash": self.repository_snapshot_hash,
+            "as_of_task_ordinal": self.as_of_task_ordinal,
+            "outcome_ids": list(self.outcome_ids),
+            "redundancy_diagnostics": [item.to_dict() for item in self.redundancy_diagnostics],
+            "decision_ids": list(self.decision_ids),
+            "reason": self.reason,
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"attempt_event_id": self.attempt_event_id, **self._payload()}
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "MaintenanceAttemptEvidence":
+        expected = {
+            "attempt_event_id", "schema_version", "collection_round", "split",
+            "cadence_id", "attempt_id", "attempt_index", "status", "task_group",
+            "stream_id", "memory_project_key", "repository_snapshot_hash",
+            "as_of_task_ordinal", "outcome_ids", "redundancy_diagnostics",
+            "decision_ids", "reason",
+        }
+        _require_exact(data, expected, "maintenance attempt evidence")
+        record = cls(
+            collection_round=_int(data["collection_round"], "collection_round"),
+            split=_string(data["split"], "split"),
+            cadence_id=_string(data["cadence_id"], "cadence_id"),
+            attempt_index=_int(data["attempt_index"], "attempt_index"),
+            status=_string(data["status"], "status"),
+            task_group=_string(data["task_group"], "task_group"),
+            stream_id=_string(data["stream_id"], "stream_id"),
+            memory_project_key=_string(data["memory_project_key"], "memory_project_key"),
+            repository_snapshot_hash=_string(
+                data["repository_snapshot_hash"], "repository_snapshot_hash"
+            ),
+            as_of_task_ordinal=_int(data["as_of_task_ordinal"], "as_of_task_ordinal"),
+            outcome_ids=_strings(data["outcome_ids"], "outcome_ids"),
+            redundancy_diagnostics=_objects(
+                data["redundancy_diagnostics"],
+                RedundancyDiagnostic.from_dict,
+                "redundancy_diagnostics",
+            ),
+            decision_ids=_strings(data["decision_ids"], "decision_ids"),
+            reason=_string(data["reason"], "reason"),
+            schema_version=_string(data["schema_version"], "schema_version"),
+        )
+        if data["attempt_id"] != record.attempt_id:
+            raise ValueError("maintenance attempt_id mismatch")
+        if data["attempt_event_id"] != record.attempt_event_id:
+            raise ValueError("maintenance attempt_event_id mismatch")
+        return record
+
+
+@dataclass(frozen=True)
 class MaintenanceEvidence:
     collection_round: int
     as_of_task_ordinal: int
     split: str
     cadence_id: str
+    attempt_id: str
     task_group: str
     stream_id: str
     memory_project_key: str
@@ -448,9 +562,12 @@ class MaintenanceEvidence:
         if self.as_of_task_ordinal < 1:
             raise ValueError("maintenance as_of_task_ordinal must be positive")
         _require_split(self.split)
-        for field_name in ("cadence_id", "task_group", "stream_id", "memory_project_key"):
+        for field_name in (
+            "cadence_id", "attempt_id", "task_group", "stream_id", "memory_project_key",
+        ):
             _require_nonblank(getattr(self, field_name), field_name)
         require_sha256(self.cadence_id, field_name="cadence_id")
+        require_sha256(self.attempt_id, field_name="attempt_id")
         require_sha256(self.repository_snapshot_hash, field_name="repository_snapshot_hash")
         _require_unique_strings(self.outcome_ids, "outcome_ids")
         _require_unique_strings(self.decision_ids, "decision_ids", allow_empty=False)
@@ -466,6 +583,7 @@ class MaintenanceEvidence:
             "as_of_task_ordinal": self.as_of_task_ordinal,
             "split": self.split,
             "cadence_id": self.cadence_id,
+            "attempt_id": self.attempt_id,
             "task_group": self.task_group,
             "stream_id": self.stream_id,
             "memory_project_key": self.memory_project_key,
@@ -485,7 +603,8 @@ class MaintenanceEvidence:
     def from_dict(cls, data: Mapping[str, Any]) -> "MaintenanceEvidence":
         expected = {
             "evidence_id", "schema_version", "collection_round", "as_of_task_ordinal",
-            "split", "cadence_id", "task_group", "stream_id", "memory_project_key", "policy_identity",
+            "split", "cadence_id", "attempt_id", "task_group", "stream_id",
+            "memory_project_key", "policy_identity",
             "policy_identity_hash", "repository_snapshot_hash", "outcome_ids", "tools",
             "redundancy_diagnostics", "decision_ids",
         }
@@ -495,6 +614,7 @@ class MaintenanceEvidence:
             as_of_task_ordinal=_int(data["as_of_task_ordinal"], "as_of_task_ordinal"),
             split=_string(data["split"], "split"),
             cadence_id=_string(data["cadence_id"], "cadence_id"),
+            attempt_id=_string(data["attempt_id"], "attempt_id"),
             task_group=_string(data["task_group"], "task_group"),
             stream_id=_string(data["stream_id"], "stream_id"),
             memory_project_key=_string(data["memory_project_key"], "memory_project_key"),

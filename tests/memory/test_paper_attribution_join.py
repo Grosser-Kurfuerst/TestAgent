@@ -63,7 +63,9 @@ class PaperAttributionJoinTests(unittest.TestCase):
             _exposure("mem-a", "skill", 1, True, 1.0),
             _exposure("mem-a", "skill", 2, False, 0.0),
         )
-        records = compute_round_attribution(exposures, collection_round=0, as_of_ordinal=2)
+        records = compute_round_attribution(
+            exposures, collection_round=0, valid_task_ordinals=(1, 2),
+        )
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             exposure_path = write_candidate_exposures(exposures, root / "exposures.jsonl")
@@ -84,7 +86,7 @@ class PaperAttributionJoinTests(unittest.TestCase):
             _exposure("mem-a", "skill", 2, False, 0.0),
         )
         record = compute_round_attribution(
-            exposures, collection_round=0, as_of_ordinal=2,
+            exposures, collection_round=0, valid_task_ordinals=(1, 2),
         )[0]
         payload = record.to_dict()
         payload["groups"]["group-a"]["n_plus"] = 0
@@ -102,7 +104,7 @@ class PaperAttributionJoinTests(unittest.TestCase):
             _exposure("mem-a", "skill", 2, False, 0.0),
         )
         payload = compute_round_attribution(
-            exposures, collection_round=0, as_of_ordinal=2,
+            exposures, collection_round=0, valid_task_ordinals=(1, 2),
         )[0].to_dict()
         payload["evidence_refs"][0]["candidate_snapshot_hash"] = canonical_sha256("tampered")
         with tempfile.TemporaryDirectory() as tmp:
@@ -118,11 +120,13 @@ class PaperAttributionJoinTests(unittest.TestCase):
             _exposure("mem-a", "skill", 2, False, 0.0),
         )
         record = compute_round_attribution(
-            exposures, collection_round=0, as_of_ordinal=3,
+            exposures, collection_round=0, valid_task_ordinals=(1, 2, 3),
         )[0]
         self.assertEqual(record.as_of_ordinal, 3)
-        with self.assertRaisesRegex(ValueError, "exceed"):
-            compute_round_attribution(exposures, collection_round=0, as_of_ordinal=1)
+        with self.assertRaisesRegex(ValueError, "authoritative valid task"):
+            compute_round_attribution(
+                exposures, collection_round=0, valid_task_ordinals=(1,),
+            )
 
     def test_positive_teacher_filter_and_writer_top_thirty_percent(self) -> None:
         exposures = []
@@ -132,7 +136,7 @@ class PaperAttributionJoinTests(unittest.TestCase):
                 _exposure(memory_id, "skill", index * 2, False, 0.0),
             ))
         records = compute_round_attribution(
-            tuple(exposures), collection_round=0, as_of_ordinal=8,
+            tuple(exposures), collection_round=0, valid_task_ordinals=tuple(range(1, 9)),
         )
         by_id = {record.memory_id: record for record in records}
 
@@ -160,10 +164,10 @@ class PaperAttributionJoinTests(unittest.TestCase):
         round_zero = compute_round_attribution((
             _exposure("mem-a", "skill", 1, True, 1.0),
             _exposure("mem-a", "skill", 2, False, 0.0),
-        ), collection_round=0, as_of_ordinal=2)[0]
+        ), collection_round=0, valid_task_ordinals=(1, 2))[0]
         round_one = compute_round_attribution((
             _exposure("mem-b", "skill", 1, True, 1.0, collection_round=1),
-        ), collection_round=1, as_of_ordinal=1)[0]
+        ), collection_round=1, valid_task_ordinals=(1,))[0]
         self.assertEqual(round_one.status, "insufficient_counterfactual_evidence")
 
         with self.assertRaisesRegex(ValueError, "collection_round"):
@@ -177,7 +181,7 @@ class PaperAttributionJoinTests(unittest.TestCase):
         record = compute_round_attribution((
             _exposure("mem-b", "skill", 1, True, 1.0),
             _exposure("mem-b", "skill", 2, False, 0.0),
-        ), collection_round=0, as_of_ordinal=2)[0]
+        ), collection_round=0, valid_task_ordinals=(1, 2))[0]
         mismatched = {"mem-a": record}
 
         with self.assertRaisesRegex(ValueError, "mapping key"):

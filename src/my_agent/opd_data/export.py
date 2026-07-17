@@ -11,6 +11,7 @@ import json
 
 from my_agent.opd_data.schema import (
     LearnerSample,
+    MaintenanceAttemptEvidence,
     MaintenanceEvidence,
     RepositoryEvidence,
     RuntimeExclusionEvidence,
@@ -64,6 +65,10 @@ class PreparedLearnerDecision:
     action_turn_index: int = 0
     action_expected_tool_calls: tuple[CanonicalToolCall, ...] = ()
     action_observation_messages: tuple[CanonicalMessage, ...] = ()
+    maintenance_rollout_id: str = ""
+    maintenance_turn_index: int = 0
+    maintenance_expected_tool_calls: tuple[CanonicalToolCall, ...] = ()
+    maintenance_observation_messages: tuple[CanonicalMessage, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -295,32 +300,49 @@ def prepare_round_decisions(
             )
             for record in teacher_records
         )
-        prepared.append(PreparedLearnerDecision(
-            role="maintenance",
-            collection_round=collection_round,
-            split=item.split,
-            task_group=item.task_group,
-            stream_id=item.stream_id,
-            memory_project_key=item.memory_project_key,
-            source_evidence_ids=(
-                item.evidence_id,
-                repository.repository_event_id,
-                *(outcome.outcome_id for outcome in joined_outcomes),
-            ),
-            evidence_refs=(
-                *item.decision_ids,
-                *(_attribution_ref(record.memory_id, attribution_by_id) for record in teacher_records),
-            ),
-            public_view=MaintenancePublic(
-                repository_snapshot=repository.snapshot,
-                history_window=tuple(outcome.outcome for outcome in joined_outcomes),
-                tools=item.tools,
-            ),
-            hindsight_view=MaintenanceHindsight(
-                memory_diagnostics=diagnostics,
-                redundancy_diagnostics=item.redundancy_diagnostics,
-            ),
-        ))
+        events = tuple(
+            _required(decision_by_id, decision_id, "maintenance decision")
+            for decision_id in item.decision_ids
+        )
+        indexes = tuple((event.turn_index, event.step_index) for event in events)
+        if indexes != tuple((index, index) for index in range(len(events))):
+            raise ValueError("maintenance decision indexes must be contiguous from zero")
+        public_view = MaintenancePublic(
+            repository_snapshot=repository.snapshot,
+            history_window=tuple(outcome.outcome for outcome in joined_outcomes),
+            tools=item.tools,
+        )
+        hindsight_view = MaintenanceHindsight(
+            memory_diagnostics=diagnostics,
+            redundancy_diagnostics=item.redundancy_diagnostics,
+        )
+        source_evidence_ids = (
+            item.evidence_id,
+            repository.repository_event_id,
+            *(outcome.outcome_id for outcome in joined_outcomes),
+        )
+        attribution_refs = tuple(
+            _attribution_ref(record.memory_id, attribution_by_id)
+            for record in teacher_records
+        )
+        for turn_index, event in enumerate(events):
+            following = events[turn_index + 1] if turn_index + 1 < len(events) else None
+            prepared.append(PreparedLearnerDecision(
+                role="maintenance",
+                collection_round=collection_round,
+                split=item.split,
+                task_group=item.task_group,
+                stream_id=item.stream_id,
+                memory_project_key=item.memory_project_key,
+                source_evidence_ids=source_evidence_ids,
+                evidence_refs=(event.decision_id, *attribution_refs),
+                public_view=public_view,
+                hindsight_view=hindsight_view,
+                maintenance_rollout_id=item.cadence_id,
+                maintenance_turn_index=turn_index,
+                maintenance_expected_tool_calls=_maintenance_event_tool_calls(event),
+                maintenance_observation_messages=_observations_between(event, following),
+            ))
 
     return PreparedRound(
         decisions=tuple(prepared),
@@ -370,6 +392,10 @@ def load_repository_evidence(path: str | Path) -> tuple[RepositoryEvidence, ...]
 
 def load_maintenance_evidence(path: str | Path) -> tuple[MaintenanceEvidence, ...]:
     return _load_jsonl(path, MaintenanceEvidence.from_dict)
+
+
+def load_maintenance_attempts(path: str | Path) -> tuple[MaintenanceAttemptEvidence, ...]:
+    return _load_jsonl(path, MaintenanceAttemptEvidence.from_dict)
 
 
 def load_runtime_exclusions(path: str | Path) -> tuple[RuntimeExclusionEvidence, ...]:
@@ -607,6 +633,8 @@ def _validate_maintenance_join(
             repository_revision=repository.snapshot.repository_revision,
             candidate_snapshot_hash=repository.snapshot.snapshot_hash,
         )
+        if event.run_id != maintenance.attempt_id:
+            raise ValueError("maintenance decision attempt does not match evidence")
         if event.canonical_tools != maintenance.tools:
             raise ValueError("maintenance tool schema does not match decision evidence")
 
@@ -680,6 +708,28 @@ def _event_tool_calls(event: DecisionEvent) -> tuple[CanonicalToolCall, ...]:
     if not isinstance(raw, list) or any(not isinstance(item, Mapping) for item in raw):
         raise ValueError("action decision parsed tool_calls must be an array of objects")
     return tuple(CanonicalToolCall.from_dict(item) for item in raw)
+
+
+def _maintenance_event_tool_calls(event: DecisionEvent) -> tuple[CanonicalToolCall, ...]:
+    raw = event.parsed_output.get("tool_call")
+    if not isinstance(raw, Mapping):
+        raise ValueError("maintenance decision requires one parsed tool_call")
+    arguments = raw.get("arguments")
+    if not isinstance(arguments, Mapping):
+        raise ValueError("maintenance tool_call arguments must be an object")
+    call_id = raw.get("call_id")
+    name = raw.get("name")
+    if not isinstance(call_id, str) or not call_id.strip():
+        raise ValueError("maintenance tool_call requires call_id")
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("maintenance tool_call requires name")
+    return (
+        CanonicalToolCall(
+            call_id,
+            name,
+            canonical_json_bytes(arguments).decode("utf-8"),
+        ),
+    )
 
 
 def _observations_between(
@@ -799,6 +849,7 @@ __all__ = [
     "PreparedRound",
     "load_learner_samples",
     "load_maintenance_evidence",
+    "load_maintenance_attempts",
     "load_repository_evidence",
     "load_runtime_exclusions",
     "load_task_evidence",

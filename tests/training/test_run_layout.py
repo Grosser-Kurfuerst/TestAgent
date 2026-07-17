@@ -57,7 +57,11 @@ class ReproductionRunLayoutTests(unittest.TestCase):
                             "SELECT name FROM sqlite_master WHERE type='table'"
                         )
                     }
-                self.assertEqual(tables, {"task_completion", "maintenance_cadence"})
+                self.assertEqual(tables, {
+                    "task_completion",
+                    "maintenance_cadence",
+                    "task_outcome_evidence",
+                })
 
     def test_existing_run_artifacts_are_not_reused_or_cleared(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
