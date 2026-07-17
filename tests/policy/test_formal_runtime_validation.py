@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from my_agent.config import AgentConfig
 from my_agent.llm import FakeLLM
 from my_agent.memory import ExperienceStore, MemoryManager
+from my_agent.memory.evolver.coordinator import EvolverCoordinator
 from my_agent.policy.identity import PolicyIdentity, policy_identity_manifest_payload
 from my_agent.policy.identity import canonical_sha256
 from my_agent.runtime import CodingAgentRuntime
@@ -164,14 +165,17 @@ class FormalRuntimeValidationTests(unittest.TestCase):
             store = ExperienceStore.from_dir(config.memory_dir)
             manager = object.__new__(MemoryManager)
             manager.config = config
+            policy = _TrainablePolicyStub(identity)
+            manager.llm = policy
             manager.experience_store = store
             manager.project_key = str(repo.resolve())
             manager.embedding_retriever = object()
-            manager.evolver_coordinator = SimpleNamespace(
+            manager.evolver_coordinator = EvolverCoordinator(
                 store=store,
                 project_key=manager.project_key,
                 policy_identity=identity,
                 retriever=manager.embedding_retriever,
+                policy=policy,
                 top_k_per_tier=config.memory_evolver_candidate_top_k_per_tier,
                 selected_max_items=config.memory_evolver_selected_max_items,
                 selection_token_budget=config.memory_evolver_selection_prompt_tokens,
@@ -184,6 +188,45 @@ class FormalRuntimeValidationTests(unittest.TestCase):
             )
             manager.evolver_coordinator.policy_identity = _identity(revision="other-revision")
             with self.assertRaisesRegex(ValueError, "identity mismatch"):
+                manager.require_formal_runtime_binding(
+                    config=config,
+                    policy_identity=identity,
+                    repo_path=repo,
+                )
+
+    def test_injected_formal_manager_cannot_replace_llm_roles_with_rule_callbacks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            manifest_path = root / "identity.json"
+            identity = _identity()
+            manifest_path.write_text(
+                json.dumps(policy_identity_manifest_payload(identity)),
+                encoding="utf-8",
+            )
+            config = _formal_config(manifest_path)
+            store = ExperienceStore.from_dir(config.memory_dir)
+            policy = _TrainablePolicyStub(identity)
+            manager = object.__new__(MemoryManager)
+            manager.config = config
+            manager.llm = policy
+            manager.experience_store = store
+            manager.project_key = str(repo.resolve())
+            manager.embedding_retriever = object()
+            manager.evolver_coordinator = EvolverCoordinator(
+                store=store,
+                project_key=manager.project_key,
+                policy_identity=identity,
+                retriever=manager.embedding_retriever,
+                policy=policy,
+                top_k_per_tier=config.memory_evolver_candidate_top_k_per_tier,
+                selected_max_items=config.memory_evolver_selected_max_items,
+                selection_token_budget=config.memory_evolver_selection_prompt_tokens,
+            )
+            manager.evolver_coordinator.selector = SimpleNamespace(select=lambda **kwargs: ())
+
+            with self.assertRaisesRegex(ValueError, "LLMTaskSelectionPolicy"):
                 manager.require_formal_runtime_binding(
                     config=config,
                     policy_identity=identity,

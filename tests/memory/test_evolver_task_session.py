@@ -28,8 +28,8 @@ class _Selector:
     def __init__(self) -> None:
         self.calls = 0
 
-    def select(self, *, task, candidates, token_budget, max_items):
-        del task, token_budget, max_items
+    def select(self, *, task, candidates, token_budget, max_items, context):
+        del task, token_budget, max_items, context
         self.calls += 1
         return (candidates[0].memory_id,) if candidates else ()
 

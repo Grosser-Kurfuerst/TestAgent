@@ -731,14 +731,26 @@ def _run_manifest_task(
                 final_store = ExperienceStore.from_dir(task_config.memory_dir)
                 final_store.load()
                 finalize_writer = TraceWriter(episode.trace_path)
-                finalize_result = EvolverCoordinator(
-                    store=final_store,
-                    project_key=episode.session.memory_project_key,
-                    policy_identity=episode.session.policy_identity,
-                    trace_sink=lambda event, payload: finalize_writer.append(
-                        TraceEvent(event=event, payload=payload, run_id=str(getattr(state, "run_id", task_id)))
-                    ),
-                ).finalize_task(
+                def trace_sink(event, payload):
+                    finalize_writer.append(
+                        TraceEvent(
+                            event=event,
+                            payload=payload,
+                            run_id=str(getattr(state, "run_id", task_id)),
+                        )
+                    )
+                active_coordinator = getattr(state, "evolver_coordinator", None)
+                if isinstance(active_coordinator, EvolverCoordinator):
+                    active_coordinator.set_trace_sink(trace_sink)
+                    coordinator = active_coordinator
+                else:
+                    coordinator = EvolverCoordinator(
+                        store=final_store,
+                        project_key=episode.session.memory_project_key,
+                        policy_identity=episode.session.policy_identity,
+                        trace_sink=trace_sink,
+                    )
+                finalize_result = coordinator.finalize_task(
                     episode,
                     AuthoritativeTaskOutcome(
                         task_id=task_id,

@@ -55,6 +55,7 @@ class AgentEpisodeArtifact:
     stop_reason: str
     final_answer: str
     tool_history: tuple[ExperienceWriteStep, ...]
+    task: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.session, TaskEvolverSession):

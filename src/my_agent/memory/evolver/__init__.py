@@ -10,6 +10,7 @@ from my_agent.memory.evolver.selector import (
     selection_score,
     selection_tier_counts,
 )
+from my_agent.memory.evolver.selector_prompt import LLMTaskSelectionPolicy
 from my_agent.memory.evolver.serialization import (
     EXPERIENCE_SCHEMA_VERSION,
     experience_canonical_json,
@@ -156,6 +157,7 @@ __all__ = [
     "SelectionSnapshot",
     "SelectedExperience",
     "SelectionResult",
+    "LLMTaskSelectionPolicy",
     "SCORING_SOURCE",
     "UsageLogEntry",
     "UsageLogger",

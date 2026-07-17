@@ -21,6 +21,7 @@ from my_agent.training.contracts import DecisionEvent
 
 
 TraceSink = Callable[[str, dict[str, Any]], None]
+ResponseParser = Callable[[DecisionResponse], Mapping[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -87,6 +88,7 @@ class DecisionEventRecorder:
         *,
         context: DecisionEventContext,
         retry_of: str | None = None,
+        parse_response: ResponseParser | None = None,
     ) -> LoggedDecision:
         decision_id = f"dec-{uuid4().hex}"
         rendered_prompt_hash = self._rendered_prompt_hash(request)
@@ -124,6 +126,28 @@ class DecisionEventRecorder:
             self._append(event)
             raise DecisionAttemptError(decision_id, exc) from exc
 
+        try:
+            parsed_output = (
+                parse_response(response)
+                if parse_response is not None
+                else {"tool_calls": [item.to_dict() for item in response.parsed_tool_calls]}
+            )
+            if not isinstance(parsed_output, Mapping):
+                raise ValueError("decision response parser must return a mapping")
+        except Exception as exc:  # noqa: BLE001 - role schema failures retain exact generation data
+            event = self._event(
+                request=request,
+                context=context,
+                decision_id=decision_id,
+                retry_of=retry_of,
+                rendered_prompt_hash=rendered_prompt_hash,
+                response=response,
+                parsed_output={"error_type": type(exc).__name__, "error": str(exc)},
+                status="invalid_output",
+            )
+            self._append(event)
+            raise DecisionAttemptError(decision_id, exc) from exc
+
         event = self._event(
             request=request,
             context=context,
@@ -131,9 +155,7 @@ class DecisionEventRecorder:
             retry_of=retry_of,
             rendered_prompt_hash=rendered_prompt_hash,
             response=response,
-            parsed_output={
-                "tool_calls": [item.to_dict() for item in response.parsed_tool_calls],
-            },
+            parsed_output=parsed_output,
             status="success",
         )
         self._append(event)

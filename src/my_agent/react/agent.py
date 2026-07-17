@@ -143,18 +143,9 @@ class ReActAgent(AgentBase):
                         trajectory_id=state.run_id,
                         stream_id=stream_id,
                     )
-                    dataset_path = (
-                        self.config.memory_evolver_dataset_dir / "decision_events.jsonl"
-                        if self.config.memory_evolver_dataset_dir is not None
-                        else None
-                    )
-                    decision_recorder = DecisionEventRecorder(
-                        policy=self.llm,
-                        dataset_path=dataset_path,
-                        trace_sink=lambda event, payload: self._emit(
-                            writer,
-                            state.trace_event(event, payload),
-                        ),
+                    coordinator = memory.evolver_coordinator
+                    decision_recorder = (
+                        coordinator.decision_recorder if coordinator is not None else None
                     )
                 else:
                     self._emit(
@@ -268,7 +259,9 @@ class ReActAgent(AgentBase):
                     stop_reason=state.stop_reason,
                     final_answer=state.final_answer,
                     tool_history=build_write_steps_from_tool_history(tool_history),
+                    task=state.task,
                 )
+                state.evolver_coordinator = memory.evolver_coordinator
             elif self.config.memory_evolver_mode != "formal":
                 memory.write_experiences_from_run(
                     task=state.task,

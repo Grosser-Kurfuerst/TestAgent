@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any, Protocol
 
 from my_agent.memory.embedding_retrieval import EmbeddingRetriever
@@ -11,13 +12,18 @@ from my_agent.memory.evolver.task_session import (
     EvolverFinalizeResult,
     TaskEvolverSession,
 )
+from my_agent.memory.evolver.formal_writer import FormalExperienceWriter
+from my_agent.memory.evolver.selector_prompt import LLMTaskSelectionPolicy
 from my_agent.memory.evolver.types import ExperienceMemory, ExperienceTier
 from my_agent.memory.evolver.writer import ExperienceWriteResult
 from my_agent.memory.experience_store import ExperienceStore
+from my_agent.memory.store_errors import MemoryStorePostCommitError
 from my_agent.memory.token import estimate_tokens
 from my_agent.memory.types import MemoryContext, RetrievalHit
 from my_agent.policy.identity import PolicyIdentity, canonical_sha256, require_matching_policy_identity
+from my_agent.policy.contracts import GenerationPolicy
 from my_agent.training.contracts import AuthoritativeTaskOutcome
+from my_agent.training.decision_log import DecisionEventContext, DecisionEventRecorder
 from my_agent.training.role_views import CandidateSnapshotEntry
 
 
@@ -33,6 +39,7 @@ class TaskSelectionPolicy(Protocol):
         candidates: tuple[CandidateSnapshotEntry, ...],
         token_budget: int,
         max_items: int,
+        context: DecisionEventContext,
     ) -> tuple[str, ...]: ...
 
 
@@ -46,8 +53,9 @@ class EmptyTaskSelectionPolicy:
         candidates: tuple[CandidateSnapshotEntry, ...],
         token_budget: int,
         max_items: int,
+        context: DecisionEventContext,
     ) -> tuple[str, ...]:
-        del task, candidates, token_budget, max_items
+        del task, candidates, token_budget, max_items, context
         return ()
 
 
@@ -61,6 +69,9 @@ class EvolverCoordinator:
         retriever: EmbeddingRetriever | None = None,
         selector: TaskSelectionPolicy | None = None,
         writer: WriterCallback | None = None,
+        policy: GenerationPolicy | None = None,
+        decision_recorder: DecisionEventRecorder | None = None,
+        dataset_dir: str | Path | None = None,
         trace_sink: TraceSink | None = None,
         top_k_per_tier: int = 50,
         selected_max_items: int = 20,
@@ -70,17 +81,67 @@ class EvolverCoordinator:
             raise ValueError("evolver coordinator requires project_key")
         if not isinstance(policy_identity, PolicyIdentity):
             raise ValueError("evolver coordinator requires PolicyIdentity")
+        if policy is not None:
+            require_matching_policy_identity(policy_identity, policy.identity())
+        if decision_recorder is not None:
+            require_matching_policy_identity(policy_identity, decision_recorder.policy.identity())
         self.store = store
         self.project_key = project_key
         self.policy_identity = policy_identity
+        self.policy = policy
         self.retriever = retriever
-        self.selector = selector or EmptyTaskSelectionPolicy()
-        self.writer = writer
+        self.decision_recorder = decision_recorder
+        if self.decision_recorder is None and policy is not None:
+            dataset_path = Path(dataset_dir) / "decision_events.jsonl" if dataset_dir is not None else None
+            self.decision_recorder = DecisionEventRecorder(
+                policy=policy,
+                dataset_path=dataset_path,
+                trace_sink=trace_sink,
+            )
+        if selector is not None:
+            self.selector = selector
+        elif policy is not None and self.decision_recorder is not None:
+            self.selector = LLMTaskSelectionPolicy(policy=policy, recorder=self.decision_recorder)
+        else:
+            self.selector = EmptyTaskSelectionPolicy()
+        if writer is not None:
+            self.writer = writer
+        elif policy is not None and self.decision_recorder is not None:
+            self.writer = FormalExperienceWriter(
+                policy=policy,
+                recorder=self.decision_recorder,
+                store=store,
+                project_key=project_key,
+            )
+        else:
+            self.writer = None
         self.trace_sink = trace_sink
         self.top_k_per_tier = top_k_per_tier
         self.selected_max_items = selected_max_items
         self.selection_token_budget = selection_token_budget
         self._finalized_trajectories: set[str] = set()
+
+    def set_trace_sink(self, trace_sink: TraceSink | None) -> None:
+        self.trace_sink = trace_sink
+        if self.decision_recorder is not None:
+            self.decision_recorder.trace_sink = trace_sink
+
+    def require_formal_role_bindings(self, policy: GenerationPolicy) -> None:
+        if self.policy is not policy:
+            raise ValueError("formal coordinator must retain the shared runtime policy handle")
+        recorder = self.decision_recorder
+        if recorder is None or recorder.policy is not policy:
+            raise ValueError("formal coordinator decision recorder must use the shared policy")
+        if not isinstance(self.selector, LLMTaskSelectionPolicy):
+            raise ValueError("formal coordinator requires LLMTaskSelectionPolicy")
+        if self.selector.policy is not policy or self.selector.recorder is not recorder:
+            raise ValueError("formal selector must share the runtime policy and decision recorder")
+        if not isinstance(self.writer, FormalExperienceWriter):
+            raise ValueError("formal coordinator requires FormalExperienceWriter")
+        if self.writer.policy is not policy or self.writer.recorder is not recorder:
+            raise ValueError("formal writer must share the runtime policy and decision recorder")
+        if self.writer.store is not self.store or self.writer.project_key != self.project_key:
+            raise ValueError("formal writer repository binding mismatch")
 
     def begin_task(
         self,
@@ -102,11 +163,24 @@ class EvolverCoordinator:
         repository_revision = self.retriever.last_metrics.repository_revision
         candidates = _candidate_snapshot(hits)
         candidate_snapshot_hash = canonical_sha256([item.to_dict() for item in candidates])
+        decision_context = DecisionEventContext(
+            trajectory_id=trajectory_id,
+            turn_index=0,
+            step_index=0,
+            task_id=task_id,
+            task_group=task_group,
+            stream_id=stream_id,
+            memory_project_key=self.project_key,
+            run_id=trajectory_id,
+            repository_revision=repository_revision,
+            candidate_snapshot_hash=candidate_snapshot_hash,
+        )
         selected_ids = self.selector.select(
             task=task,
             candidates=candidates,
             token_budget=self.selection_token_budget,
             max_items=self.selected_max_items,
+            context=decision_context,
         )
         selected_ids = _validate_and_clip_selection(
             selected_ids,
@@ -205,6 +279,8 @@ class EvolverCoordinator:
                 )
             try:
                 writer_result = self.writer(episode, outcome)
+            except MemoryStorePostCommitError:
+                raise
             except Exception as exc:  # noqa: BLE001 - formal writer failures are audited no-write outcomes
                 writer_result = ExperienceWriteResult(error=f"{type(exc).__name__}: {exc}")
             if writer_result.error:

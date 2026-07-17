@@ -158,12 +158,16 @@ class MemoryManager:
             getattr(self.experience_store, "_trace_sink", None),
         )
         self._trace_sink = trace_sink
+        if self.evolver_coordinator is not None:
+            self.evolver_coordinator.set_trace_sink(trace_sink)
         if hasattr(self.experience_store, "_trace_sink"):
             self.experience_store._trace_sink = trace_sink
         return previous
 
     def restore_trace_sink(self, snapshot: tuple[Any | None, Any | None]) -> None:
         self._trace_sink = snapshot[0]
+        if self.evolver_coordinator is not None:
+            self.evolver_coordinator.set_trace_sink(snapshot[0])
         if hasattr(self.experience_store, "_trace_sink"):
             self.experience_store._trace_sink = snapshot[1]
 
@@ -210,6 +214,8 @@ class MemoryManager:
                 project_key=project_key,
                 policy_identity=policy_identity,
                 retriever=embedding_retriever,
+                policy=llm,
+                dataset_dir=config.memory_evolver_dataset_dir,
                 trace_sink=trace_sink,
                 top_k_per_tier=config.memory_evolver_candidate_top_k_per_tier,
                 selected_max_items=config.memory_evolver_selected_max_items,
@@ -248,6 +254,9 @@ class MemoryManager:
         if coordinator is None:
             raise ValueError("formal OPD runtime requires MemoryManager.evolver_coordinator")
         require_matching_policy_identity(policy_identity, coordinator.policy_identity)
+        if self.llm is None:
+            raise ValueError("formal MemoryManager requires the shared runtime policy")
+        coordinator.require_formal_role_bindings(self.llm)
         if coordinator.store is not self.experience_store:
             raise ValueError("formal MemoryManager coordinator must use the manager experience store")
         if coordinator.project_key != self.project_key:
