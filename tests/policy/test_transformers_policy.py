@@ -3,7 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 import unittest
 
-from my_agent.policy.contracts import DecisionRequest
+from my_agent.policy.contracts import DecisionOutputError, DecisionRequest
 from my_agent.policy.identity import PolicyIdentity, canonical_sha256
 from my_agent.policy.transformers_policy import TransformersPolicy, parse_tool_calls
 from my_agent.training.role_views import CanonicalMessage
@@ -27,6 +27,18 @@ class _TinyTokenizer:
     def decode(self, token_ids: list[int], *, skip_special_tokens: bool) -> str:
         self.last_decode = (token_ids, skip_special_tokens)
         return RAW_TOOL_CALL
+
+
+class _MalformedTokenizer(_TinyTokenizer):
+    def decode(self, token_ids: list[int], *, skip_special_tokens: bool) -> str:
+        self.last_decode = (token_ids, skip_special_tokens)
+        return '<tool_call>{"name":"read_file","arguments":</tool_call>'
+
+
+class _TruncatedToolTokenizer(_TinyTokenizer):
+    def decode(self, token_ids: list[int], *, skip_special_tokens: bool) -> str:
+        self.last_decode = (token_ids, skip_special_tokens)
+        return '<tool_call>{"name":"read_file","arguments":'
 
 
 class _TinyModel:
@@ -110,6 +122,9 @@ class TransformersPolicyTests(unittest.TestCase):
         self.assertEqual(response.tool_calls[0].arguments, {"path": "src/a.py"})
         self.assertEqual(response.usage.prompt_tokens, 2)
         self.assertEqual(response.usage.completion_tokens, 2)
+        self.assertEqual(response.raw["raw_completion"], RAW_TOOL_CALL)
+        self.assertEqual(response.raw["assistant_loss_mask"], [1, 1])
+        self.assertEqual(response.raw["policy_identity_hash"], self.policy.identity().identity_hash)
 
     def test_tokenize_and_forward_logits_expose_white_box_interface(self) -> None:
         request = DecisionRequest(
@@ -132,6 +147,54 @@ class TransformersPolicyTests(unittest.TestCase):
         calls = parse_tool_calls(RAW_TOOL_CALL)
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0].arguments_json, '{"path":"src/a.py"}')
+
+    def test_invalid_tool_output_retains_exact_generated_token_span(self) -> None:
+        tokenizer = _MalformedTokenizer()
+        policy = TransformersPolicy(
+            model=_TinyModel(),
+            tokenizer=tokenizer,
+            identity=_identity(tokenizer),
+        )
+        request = DecisionRequest(
+            role="action",
+            purpose="fast_loop_evidence",
+            messages=(CanonicalMessage("user", "task"),),
+            tools=(),
+            max_new_tokens=8,
+            temperature=0.0,
+            top_p=1.0,
+        )
+
+        with self.assertRaises(DecisionOutputError) as captured:
+            policy.generate_decision(request)
+
+        self.assertEqual(captured.exception.response.prompt_token_ids, (101, 102))
+        self.assertEqual(captured.exception.response.completion_token_ids, (201, 202))
+        self.assertEqual(captured.exception.response.assistant_loss_mask, (1, 1))
+        self.assertIn("<tool_call>", captured.exception.response.raw_completion)
+
+    def test_unclosed_tool_marker_is_invalid_and_retains_generated_tokens(self) -> None:
+        tokenizer = _TruncatedToolTokenizer()
+        policy = TransformersPolicy(
+            model=_TinyModel(),
+            tokenizer=tokenizer,
+            identity=_identity(tokenizer),
+        )
+        request = DecisionRequest(
+            role="action",
+            purpose="fast_loop_evidence",
+            messages=(CanonicalMessage("user", "task"),),
+            tools=(),
+            max_new_tokens=8,
+            temperature=0.0,
+            top_p=1.0,
+        )
+
+        with self.assertRaises(DecisionOutputError) as captured:
+            policy.generate_decision(request)
+
+        self.assertEqual(captured.exception.response.completion_token_ids, (201, 202))
+        self.assertIn("unmatched marker", str(captured.exception.cause))
 
 
 if __name__ == "__main__":

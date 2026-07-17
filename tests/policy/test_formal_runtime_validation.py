@@ -11,6 +11,7 @@ from my_agent.config import AgentConfig
 from my_agent.llm import FakeLLM
 from my_agent.memory import ExperienceStore, MemoryManager
 from my_agent.policy.identity import PolicyIdentity, policy_identity_manifest_payload
+from my_agent.policy.identity import canonical_sha256
 from my_agent.runtime import CodingAgentRuntime
 
 
@@ -68,6 +69,33 @@ class _TrainablePolicyStub:
         del batch
         raise AssertionError("not used")
 
+    def render_prompt_hash(self, request):
+        del request
+        return canonical_sha256("prompt")
+
+    def chat_response_from_decision(self, response):
+        return response
+
+
+class _IncompleteTrainablePolicyStub:
+    def __init__(self, identity: PolicyIdentity) -> None:
+        self._identity = identity
+
+    def chat(self, *args, **kwargs):
+        del args, kwargs
+
+    def generate_decision(self, request):
+        del request
+
+    def identity(self):
+        return self._identity
+
+    def tokenize(self, request):
+        del request
+
+    def forward_logits(self, batch):
+        del batch
+
 
 class FormalRuntimeValidationTests(unittest.TestCase):
     def test_direct_formal_config_is_revalidated_at_runtime_startup(self) -> None:
@@ -92,6 +120,20 @@ class FormalRuntimeValidationTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "TrainablePolicy"):
                 CodingAgentRuntime(config=_formal_config(manifest_path), llm=FakeLLM())
+
+    def test_incomplete_exact_logging_policy_is_rejected_at_startup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_path = Path(tmp) / "identity.json"
+            manifest_path.write_text(
+                json.dumps(policy_identity_manifest_payload(_identity())),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "TrainablePolicy"):
+                CodingAgentRuntime(
+                    config=_formal_config(manifest_path),
+                    llm=_IncompleteTrainablePolicyStub(_identity()),
+                )
 
     def test_injected_trainable_policy_must_match_identity_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

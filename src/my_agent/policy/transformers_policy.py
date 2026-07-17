@@ -15,8 +15,19 @@ from my_agent.policy.chat_template import (
     canonicalize_messages,
     canonicalize_tools,
 )
-from my_agent.policy.contracts import DecisionRequest, DecisionResponse, TokenBatch
-from my_agent.policy.identity import PolicyIdentity, canonical_json_bytes, canonical_sha256, hash_artifact_path
+from my_agent.policy.contracts import (
+    DecisionOutputError,
+    DecisionRequest,
+    DecisionResponse,
+    TokenBatch,
+)
+from my_agent.policy.identity import (
+    PolicyIdentity,
+    canonical_json_bytes,
+    canonical_sha256,
+    hash_artifact_path,
+    require_matching_policy_identity,
+)
 from my_agent.training.role_views import CanonicalToolCall
 
 
@@ -141,6 +152,9 @@ class TransformersPolicy:
     def identity(self) -> PolicyIdentity:
         return self._identity
 
+    def render_prompt_hash(self, request: DecisionRequest) -> str:
+        return self.chat_template.render(request.messages, request.tools).prompt_hash
+
     def chat(
         self,
         messages: list[MessageLike],
@@ -156,6 +170,10 @@ class TransformersPolicy:
             top_p=self.default_top_p,
         )
         response = self.generate_decision(request)
+        return self.chat_response_from_decision(response)
+
+    def chat_response_from_decision(self, response: DecisionResponse) -> ChatResponse:
+        require_matching_policy_identity(self._identity, response.identity)
         tool_calls = [_to_llm_tool_call(call) for call in response.parsed_tool_calls]
         decoded_content = self.tokenizer.decode(
             list(response.completion_token_ids),
@@ -175,8 +193,12 @@ class TransformersPolicy:
             ),
             raw={
                 "policy_identity": response.identity.to_dict(),
+                "policy_identity_hash": response.identity.identity_hash,
+                "raw_completion": response.raw_completion,
                 "prompt_token_ids": list(response.prompt_token_ids),
                 "completion_token_ids": list(response.completion_token_ids),
+                "assistant_loss_mask": list(response.assistant_loss_mask),
+                "parsed_tool_calls": [call.to_dict() for call in response.parsed_tool_calls],
             },
         )
 
@@ -214,7 +236,18 @@ class TransformersPolicy:
         )
         if not isinstance(raw_completion, str):
             raise TypeError("tokenizer.decode must return a string")
-        parsed_calls = parse_tool_calls(raw_completion)
+        try:
+            parsed_calls = parse_tool_calls(raw_completion)
+        except ValueError as exc:
+            response = DecisionResponse(
+                raw_completion=raw_completion,
+                prompt_token_ids=prompt_ids,
+                completion_token_ids=completion_ids,
+                assistant_loss_mask=(1,) * len(completion_ids),
+                parsed_tool_calls=(),
+                identity=self._identity,
+            )
+            raise DecisionOutputError(response, exc) from exc
         return DecisionResponse(
             raw_completion=raw_completion,
             prompt_token_ids=prompt_ids,
@@ -261,8 +294,13 @@ def parse_tool_calls(raw_completion: str) -> tuple[CanonicalToolCall, ...]:
     if matches:
         for match in matches:
             payloads.append(_tool_call_mapping(match))
+        residual = _TOOL_CALL_RE.sub("", raw_completion)
+        if "<tool_call" in residual or "</tool_call" in residual:
+            raise ValueError("generated tool call contains an unmatched marker")
     else:
         stripped = raw_completion.strip()
+        if "<tool_call" in stripped or "</tool_call" in stripped:
+            raise ValueError("generated tool call contains an unmatched marker")
         if stripped.startswith("{"):
             try:
                 parsed = json.loads(stripped)

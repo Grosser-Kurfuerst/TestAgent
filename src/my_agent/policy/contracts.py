@@ -60,6 +60,15 @@ class DecisionResponse:
             )
 
 
+class DecisionOutputError(ValueError):
+    """Invalid structured output after exact generation data was captured."""
+
+    def __init__(self, response: DecisionResponse, cause: Exception) -> None:
+        super().__init__(str(cause))
+        self.response = response
+        self.cause = cause
+
+
 @dataclass(frozen=True)
 class TokenBatch:
     input_ids: Any
@@ -95,6 +104,10 @@ class GenerationPolicy(Protocol):
 
     def identity(self) -> PolicyIdentity: ...
 
+    def render_prompt_hash(self, request: DecisionRequest) -> str: ...
+
+    def chat_response_from_decision(self, response: DecisionResponse) -> Any: ...
+
 
 @runtime_checkable
 class TrainablePolicy(GenerationPolicy, Protocol):
@@ -125,6 +138,7 @@ __all__ = [
     "EVOLVER_ROLES",
     "DecisionRequest",
     "DecisionResponse",
+    "DecisionOutputError",
     "GenerationPolicy",
     "TokenBatch",
     "TrainablePolicy",

@@ -17,9 +17,16 @@ from my_agent.memory.evolver import build_write_steps_from_tool_history, runtime
 from my_agent.memory.evolver.task_session import AgentEpisodeArtifact
 from my_agent.memory.token import estimate_tokens
 from my_agent.agent_base import AgentBase
+from my_agent.policy.chat_template import canonicalize_messages, canonicalize_tools
+from my_agent.policy.contracts import DecisionRequest
 from my_agent.schema import AgentState, ToolCall, ToolRecord, ToolResult
 from my_agent.tools import RepoTools, ToolExecutionResult, ToolInvocation
 from my_agent.observability.tracing import TraceWriter, append_agent_completed
+from my_agent.training.decision_log import (
+    DecisionAttemptError,
+    DecisionEventContext,
+    DecisionEventRecorder,
+)
 from my_agent.utils.answers import append_trace_to_answer
 
 EventSink = Callable[[Any], None]
@@ -122,6 +129,7 @@ class ReActAgent(AgentBase):
 
             base_messages = self._initial_messages(state)
             formal_session = None
+            decision_recorder = None
             if self.config.memory_evolver_mode == "formal":
                 metadata = dict(getattr(state, "metadata", {}) or {})
                 task_id = str(metadata.get("task_id") or metadata.get("source_task") or "").strip()
@@ -134,6 +142,19 @@ class ReActAgent(AgentBase):
                         task_group=task_group,
                         trajectory_id=state.run_id,
                         stream_id=stream_id,
+                    )
+                    dataset_path = (
+                        self.config.memory_evolver_dataset_dir / "decision_events.jsonl"
+                        if self.config.memory_evolver_dataset_dir is not None
+                        else None
+                    )
+                    decision_recorder = DecisionEventRecorder(
+                        policy=self.llm,
+                        dataset_path=dataset_path,
+                        trace_sink=lambda event, payload: self._emit(
+                            writer,
+                            state.trace_event(event, payload),
+                        ),
                     )
                 else:
                     self._emit(
@@ -191,6 +212,9 @@ class ReActAgent(AgentBase):
                     context_manager=context_manager,
                     base_messages=base_messages,
                     tool_budget=tool_budget,
+                    formal_session=formal_session,
+                    decision_recorder=decision_recorder,
+                    turn_index=budget.iterations - 1,
                 )
                 if response is None:
                     break
@@ -290,7 +314,26 @@ class ReActAgent(AgentBase):
         context_manager: AgentContextManager,
         base_messages: list[MessageLike],
         tool_budget: ToolSchemaBudget,
+        formal_session: Any | None,
+        decision_recorder: DecisionEventRecorder | None,
+        turn_index: int,
     ) -> ChatResponse | None:
+        if formal_session is not None:
+            if decision_recorder is None:
+                raise RuntimeError("formal ReAct generation requires a decision recorder")
+            return self._formal_chat(
+                messages,
+                tool_definitions,
+                writer,
+                state,
+                memory=memory,
+                context_manager=context_manager,
+                base_messages=base_messages,
+                tool_budget=tool_budget,
+                formal_session=formal_session,
+                recorder=decision_recorder,
+                turn_index=turn_index,
+            )
         try:
             return self.llm.chat(messages, tools=tool_definitions)
         except RuntimeError as exc:
@@ -322,6 +365,81 @@ class ReActAgent(AgentBase):
                     return None
             self._stop_by_llm_failure(state, writer, exc)
             return None
+
+    def _formal_chat(
+        self,
+        messages: list[MessageLike],
+        tool_definitions: list[dict[str, Any]],
+        writer: TraceWriter,
+        state: AgentState,
+        *,
+        memory: MemoryManager,
+        context_manager: AgentContextManager,
+        base_messages: list[MessageLike],
+        tool_budget: ToolSchemaBudget,
+        formal_session: Any,
+        recorder: DecisionEventRecorder,
+        turn_index: int,
+    ) -> ChatResponse | None:
+        retry_of: str | None = None
+        active_messages = messages
+        for attempt in range(2):
+            request = DecisionRequest(
+                role="action",
+                purpose="fast_loop_evidence",
+                messages=canonicalize_messages(active_messages),
+                tools=canonicalize_tools(tool_definitions),
+                max_new_tokens=int(getattr(self.llm, "default_max_new_tokens", 1_024)),
+                temperature=float(self.config.temperature),
+                top_p=float(getattr(self.llm, "default_top_p", 0.95)),
+            )
+            context = DecisionEventContext(
+                trajectory_id=formal_session.trajectory_id,
+                turn_index=turn_index,
+                step_index=state.steps,
+                task_id=formal_session.task_id,
+                task_group=formal_session.task_group,
+                stream_id=formal_session.stream_id,
+                memory_project_key=formal_session.memory_project_key,
+                run_id=state.run_id,
+                repository_revision=formal_session.repository_revision,
+                candidate_snapshot_hash=formal_session.candidate_snapshot_hash,
+            )
+            try:
+                logged = recorder.generate(request, context=context, retry_of=retry_of)
+                converter = getattr(self.llm, "chat_response_from_decision", None)
+                if not callable(converter):
+                    raise RuntimeError(
+                        "formal policy must convert its exact DecisionResponse to ChatResponse"
+                    )
+                return converter(logged.response)
+            except DecisionAttemptError as exc:
+                if attempt == 0 and _looks_like_context_error(str(exc)):
+                    retry_of = exc.decision_id
+                    try:
+                        active_messages, _, _ = context_manager.prepare_messages(
+                            base_messages=base_messages,
+                            query=state.task,
+                            tools=tool_definitions,
+                            memory=memory,
+                            force_compact=True,
+                            focus="Retry after context length error.",
+                            tool_budget=tool_budget,
+                        )
+                    except ContextOverBudgetError as budget_exc:
+                        self._stop_by_context_over_budget(state, writer, budget_exc)
+                        return None
+                    self._emit(
+                        writer,
+                        state.trace_event(
+                            "memory.compaction_retry",
+                            {"reason": "context_length_error", "message_count": len(active_messages)},
+                        ),
+                    )
+                    continue
+                self._stop_by_llm_failure(state, writer, exc.cause)
+                return None
+        return None
 
     def _execute_tool_calls(
         self,
