@@ -99,6 +99,8 @@ class ManifestEvalResult:
     evolver_writer_status: str = ""
     written_memory_ids: list[str] = field(default_factory=list)
     repository_revision_after_writer: str = ""
+    evolver_cadence_id: str = ""
+    evolver_maintenance_status: str = ""
     mode: str = "auto"
     tags: list[str] = field(default_factory=list)
     env_overrides: dict[str, str] = field(default_factory=dict)
@@ -147,6 +149,8 @@ class ManifestEvalResult:
             "evolver_writer_status": self.evolver_writer_status,
             "written_memory_ids": list(self.written_memory_ids),
             "repository_revision_after_writer": self.repository_revision_after_writer,
+            "evolver_cadence_id": self.evolver_cadence_id,
+            "evolver_maintenance_status": self.evolver_maintenance_status,
             "mode": self.mode,
             "tags": list(self.tags),
             "env_overrides": dict(self.env_overrides),
@@ -720,6 +724,8 @@ def _run_manifest_task(
     evolver_writer_status = ""
     written_memory_ids: list[str] = []
     repository_revision_after_writer = ""
+    evolver_cadence_id = ""
+    evolver_maintenance_status = ""
     if task_config.memory_evolver_mode == "formal":
         episode = getattr(state, "evolver_episode", None) if state is not None else None
         if not isinstance(episode, AgentEpisodeArtifact):
@@ -769,6 +775,8 @@ def _run_manifest_task(
                 evolver_writer_status = finalize_result.writer_status
                 written_memory_ids = list(finalize_result.written_memory_ids)
                 repository_revision_after_writer = finalize_result.repository_revision_after
+                evolver_cadence_id = finalize_result.cadence_id or ""
+                evolver_maintenance_status = finalize_result.maintenance_status or ""
             except Exception as exc:  # noqa: BLE001 - formal collection must fail closed
                 error = f"{type(exc).__name__}: {exc}"
                 resolved = False
@@ -799,6 +807,8 @@ def _run_manifest_task(
         evolver_writer_status=evolver_writer_status,
         written_memory_ids=written_memory_ids,
         repository_revision_after_writer=repository_revision_after_writer,
+        evolver_cadence_id=evolver_cadence_id,
+        evolver_maintenance_status=evolver_maintenance_status,
         mode=mode,
         tags=tags,
         env_overrides=env_overrides,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from my_agent.memory.evolver.maintenance_prompt import (
@@ -11,6 +12,7 @@ from my_agent.memory.evolver.maintenance_prompt import (
     maintenance_initial_messages,
     maintenance_public_view,
 )
+from my_agent.memory.evolver.cadence_ledger import MAINTENANCE_HISTORY_FILENAME
 from my_agent.memory.evolver.maintenance_tools import (
     MaintenanceToolCommand,
     build_delete_operation,
@@ -37,6 +39,8 @@ from my_agent.training.role_views import CanonicalMessage, TaskOutcomeRef
 class FormalMaintenanceResult:
     status: str
     maintenance_id: str
+    plan_id: str
+    transaction_id: str
     turns: int
     operation_ids: tuple[str, ...]
     before_revision: str
@@ -57,6 +61,7 @@ class FormalMaintenanceAgent:
         max_new_tokens: int = 1_024,
         temperature: float = 1.0,
         top_p: float = 0.95,
+        history_path: str | Path | None = None,
     ) -> None:
         self.policy = policy
         self.recorder = recorder
@@ -66,6 +71,11 @@ class FormalMaintenanceAgent:
         self.max_new_tokens = max(1, int(max_new_tokens))
         self.temperature = float(temperature)
         self.top_p = float(top_p)
+        self.history_path = (
+            Path(history_path)
+            if history_path is not None
+            else store.path.parent / MAINTENANCE_HISTORY_FILENAME
+        )
 
     def run(
         self,
@@ -148,13 +158,18 @@ class FormalMaintenanceAgent:
                     summary = str(command.arguments["summary"])
                     applied = apply_formal_maintenance_operations(
                         store=self.store,
+                        cadence_id=maintenance_id,
+                        stream_id=stream_id,
                         expected_revision=snapshot.revision,
                         project_key=self.project_key,
                         operations=tuple(staged),
+                        history_path=self.history_path,
                     )
                     return FormalMaintenanceResult(
                         status=applied.status,
                         maintenance_id=maintenance_id,
+                        plan_id=applied.plan_id,
+                        transaction_id=applied.transaction_id,
                         turns=turn_index + 1,
                         operation_ids=applied.operation_ids,
                         before_revision=applied.before_revision,
@@ -171,6 +186,8 @@ class FormalMaintenanceAgent:
                 return FormalMaintenanceResult(
                     status="aborted",
                     maintenance_id=maintenance_id,
+                    plan_id="",
+                    transaction_id="",
                     turns=turn_index + 1,
                     operation_ids=tuple(operation.operation_id for operation in staged),
                     before_revision=snapshot.revision,
@@ -180,6 +197,8 @@ class FormalMaintenanceAgent:
         return FormalMaintenanceResult(
             status="aborted",
             maintenance_id=maintenance_id,
+            plan_id="",
+            transaction_id="",
             turns=self.max_turns,
             operation_ids=tuple(operation.operation_id for operation in staged),
             before_revision=snapshot.revision,

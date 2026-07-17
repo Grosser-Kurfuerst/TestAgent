@@ -212,6 +212,7 @@ class ResetAndLegacyCutoverTests(unittest.TestCase):
                 "maintenance_plan.json.summary.json",
                 "maintenance_history.jsonl",
                 "maintenance_trace.jsonl",
+                "evolver_state.sqlite3",
             ):
                 (memory_dir / name).write_text("old-id\n", encoding="utf-8")
             backup_dir = memory_dir / "maintenance_backups"
@@ -241,6 +242,7 @@ class ResetAndLegacyCutoverTests(unittest.TestCase):
                 "maintenance_plan.json.summary.json",
                 "maintenance_history.jsonl",
                 "maintenance_trace.jsonl",
+                "evolver_state.sqlite3",
                 "maintenance_backups",
             ):
                 self.assertFalse((memory_dir / name).exists(), name)

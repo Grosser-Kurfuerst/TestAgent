@@ -4,6 +4,7 @@ import tempfile
 import unittest
 
 from my_agent.llm.types import ChatResponse
+from my_agent.memory.evolver.cadence_ledger import stable_cadence_id
 from my_agent.memory.evolver.maintenance_agent import FormalMaintenanceAgent
 from my_agent.memory.evolver.maintenance_tools import formal_maintenance_tools
 from my_agent.memory.evolver.types import ExperienceCreatedBy, ExperienceTier
@@ -27,6 +28,15 @@ def _call(name: str, arguments: dict) -> CanonicalToolCall:
         f"call-{name}",
         name,
         canonical_json_bytes(arguments).decode("utf-8"),
+    )
+
+
+def _cadence_id() -> str:
+    return stable_cadence_id(
+        stream_id="stream-a",
+        memory_project_key="project-a",
+        interval_tasks=30,
+        cadence_index=1,
     )
 
 
@@ -105,7 +115,7 @@ class FormalMaintenanceAgentTests(unittest.TestCase):
             )
 
             result = agent.run(
-                maintenance_id="cadence-1",
+                maintenance_id=_cadence_id(),
                 stream_id="stream-a",
                 task_group="group-a",
             )
@@ -141,7 +151,7 @@ class FormalMaintenanceAgentTests(unittest.TestCase):
             )
 
             result = agent.run(
-                maintenance_id="cadence-1",
+                maintenance_id=_cadence_id(),
                 stream_id="stream-a",
                 task_group="group-a",
             )
@@ -174,7 +184,7 @@ class FormalMaintenanceAgentTests(unittest.TestCase):
             )
 
             result = agent.run(
-                maintenance_id="cadence-1",
+                maintenance_id=_cadence_id(),
                 stream_id="stream-a",
                 task_group="group-a",
             )

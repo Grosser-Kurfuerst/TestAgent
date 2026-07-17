@@ -15,6 +15,7 @@ from my_agent.memory.experience_store import (
     EXPERIENCE_STORAGE_FILE,
     LEGACY_LONG_TERM_STORAGE_FILE,
 )
+from my_agent.memory.evolver.cadence_schema import EVOLVER_STATE_FILENAME
 from my_agent.memory.store_errors import MemoryStoreLockTimeout
 
 
@@ -31,6 +32,7 @@ _RESET_FILES = (
     "maintenance_summary.json",
     "maintenance_trace.jsonl",
     "maintenance_history.jsonl",
+    EVOLVER_STATE_FILENAME,
 )
 _RESET_DIRECTORIES = ("maintenance_backups",)
 

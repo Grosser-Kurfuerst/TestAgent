@@ -220,6 +220,7 @@ class MemoryManager:
                 top_k_per_tier=config.memory_evolver_candidate_top_k_per_tier,
                 selected_max_items=config.memory_evolver_selected_max_items,
                 selection_token_budget=config.memory_evolver_selection_prompt_tokens,
+                maintenance_interval_tasks=config.memory_evolver_maintenance_interval_tasks,
                 maintenance_max_turns=config.memory_evolver_maintenance_max_turns,
             )
         return cls(

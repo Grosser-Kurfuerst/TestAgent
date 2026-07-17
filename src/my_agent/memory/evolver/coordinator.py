@@ -12,11 +12,20 @@ from my_agent.memory.evolver.task_session import (
     EvolverFinalizeResult,
     TaskEvolverSession,
 )
+from my_agent.memory.evolver.cadence_ledger import (
+    MAINTENANCE_HISTORY_FILENAME,
+    CadenceLedger,
+    CadenceRecord,
+    load_formal_maintenance_history,
+)
+from my_agent.memory.evolver.cadence_schema import EVOLVER_STATE_FILENAME
+from my_agent.memory.evolver.contracts import MaintenanceOperation
 from my_agent.memory.evolver.formal_writer import FormalExperienceWriter
 from my_agent.memory.evolver.maintenance_agent import FormalMaintenanceAgent, FormalMaintenanceResult
 from my_agent.memory.evolver.selector_prompt import LLMTaskSelectionPolicy
 from my_agent.memory.evolver.types import ExperienceMemory, ExperienceTier
 from my_agent.memory.evolver.writer import ExperienceWriteResult
+from my_agent.memory.evolver.transaction import apply_formal_maintenance_operations
 from my_agent.memory.experience_store import ExperienceStore
 from my_agent.memory.store_errors import MemoryStorePostCommitError
 from my_agent.memory.token import estimate_tokens
@@ -79,6 +88,8 @@ class EvolverCoordinator:
         selected_max_items: int = 20,
         selection_token_budget: int = 1_800,
         maintenance_max_turns: int = 8,
+        maintenance_interval_tasks: int = 30,
+        ledger_path: str | Path | None = None,
     ) -> None:
         if not project_key:
             raise ValueError("evolver coordinator requires project_key")
@@ -134,7 +145,20 @@ class EvolverCoordinator:
         self.selected_max_items = selected_max_items
         self.selection_token_budget = selection_token_budget
         self.maintenance_max_turns = maintenance_max_turns
+        self.maintenance_interval_tasks = maintenance_interval_tasks
+        self.ledger_path = (
+            Path(ledger_path)
+            if ledger_path is not None
+            else self.store.path.parent / EVOLVER_STATE_FILENAME
+        )
+        self.maintenance_history_path = self.store.path.parent / MAINTENANCE_HISTORY_FILENAME
+        self.cadence_ledger = CadenceLedger(
+            self.ledger_path,
+            interval_tasks=maintenance_interval_tasks,
+            process_lock=self.store.exclusive_process_lock,
+        )
         self._finalized_trajectories: set[str] = set()
+        self._reconcile_persisted_cadences()
 
     def set_trace_sink(self, trace_sink: TraceSink | None) -> None:
         self.trace_sink = trace_sink
@@ -312,10 +336,18 @@ class EvolverCoordinator:
                     "repository_revision_after": current_revision,
                     "written_memory_ids": [],
                 })
+                cadence_id, maintenance_status = self._advance_cadence(
+                    episode=episode,
+                    outcome=outcome,
+                    writer_status="failed_no_write",
+                    repository_revision_after=current_revision,
+                )
                 return EvolverFinalizeResult(
                     writer_status="failed_no_write",
                     written_memory_ids=(),
                     repository_revision_after=current_revision,
+                    cadence_id=cadence_id,
+                    maintenance_status=maintenance_status,
                 )
             try:
                 writer_result = self.writer(episode, outcome)
@@ -346,11 +378,181 @@ class EvolverCoordinator:
             "written_memory_ids": list(written_ids),
             "repository_revision_after": revision_after,
         })
+        cadence_id, maintenance_status = self._advance_cadence(
+            episode=episode,
+            outcome=outcome,
+            writer_status=writer_status,
+            repository_revision_after=revision_after,
+        )
         return EvolverFinalizeResult(
             writer_status=writer_status,
             written_memory_ids=written_ids,
             repository_revision_after=revision_after,
+            cadence_id=cadence_id,
+            maintenance_status=maintenance_status,
         )
+
+    def _advance_cadence(
+        self,
+        *,
+        episode: AgentEpisodeArtifact,
+        outcome: AuthoritativeTaskOutcome,
+        writer_status: str,
+        repository_revision_after: str,
+    ) -> tuple[str | None, str | None]:
+        session = episode.session
+        advance = self.cadence_ledger.record_task_completion(
+            stream_id=session.stream_id,
+            memory_project_key=session.memory_project_key,
+            task_id=session.task_id,
+            task_valid=outcome.task_valid,
+            outcome_finalized=outcome.outcome_finalized,
+            writer_terminal_status=writer_status,
+            repository_revision_after_writer=repository_revision_after,
+        )
+        self._trace("memory.evolver_cadence_advanced", {
+            "task_id": session.task_id,
+            "stream_id": session.stream_id,
+            "memory_project_key": session.memory_project_key,
+            "counted": advance.counted,
+            "task_ordinal": advance.task_ordinal,
+            "cadence_id": advance.cadence.cadence_id if advance.cadence else None,
+        })
+        due = self.cadence_ledger.oldest_open_cadence(
+            stream_id=session.stream_id,
+            memory_project_key=session.memory_project_key,
+        )
+        if due is None:
+            if advance.cadence is None:
+                return None, None
+            return advance.cadence.cadence_id, advance.cadence.status
+        return due.cadence_id, self._run_or_reconcile_cadence(
+            due,
+            task_group=session.task_group,
+            history_window=(outcome.to_ref(),),
+            allow_new_decision=advance.counted,
+        )
+
+    def _run_or_reconcile_cadence(
+        self,
+        cadence: CadenceRecord,
+        *,
+        task_group: str,
+        history_window: tuple[TaskOutcomeRef, ...],
+        allow_new_decision: bool = True,
+    ) -> str:
+        with self.store.exclusive_process_lock():
+            return self._run_or_reconcile_cadence_locked(
+                cadence,
+                task_group=task_group,
+                history_window=history_window,
+                allow_new_decision=allow_new_decision,
+            )
+
+    def _run_or_reconcile_cadence_locked(
+        self,
+        cadence: CadenceRecord,
+        *,
+        task_group: str,
+        history_window: tuple[TaskOutcomeRef, ...],
+        allow_new_decision: bool,
+    ) -> str:
+        history = load_formal_maintenance_history(
+            self.maintenance_history_path,
+            cadence_id=cadence.cadence_id,
+        )
+        if history.completion is not None:
+            committed = self.cadence_ledger.mark_committed(
+                cadence.cadence_id,
+                maintenance_plan_id=str(history.completion["plan_id"]),
+                repository_revision_after=str(history.completion["after_revision"]),
+            )
+            return committed.status
+        if history.intent is not None:
+            operations = tuple(
+                MaintenanceOperation.from_dict(item)
+                for item in history.intent["operations"]
+            )
+            applied = apply_formal_maintenance_operations(
+                store=self.store,
+                cadence_id=cadence.cadence_id,
+                stream_id=cadence.stream_id,
+                expected_revision=str(history.intent["before_revision"]),
+                project_key=cadence.memory_project_key,
+                operations=operations,
+                history_path=self.maintenance_history_path,
+            )
+            if applied.status in {"committed", "noop"}:
+                self.cadence_ledger.mark_committed(
+                    cadence.cadence_id,
+                    maintenance_plan_id=applied.plan_id,
+                    repository_revision_after=applied.after_revision,
+                )
+            return applied.status
+        if self.maintainer is None or not allow_new_decision:
+            return cadence.status
+        self.cadence_ledger.mark_started(cadence.cadence_id)
+        result = self.run_maintenance(
+            maintenance_id=cadence.cadence_id,
+            stream_id=cadence.stream_id,
+            task_group=task_group,
+            history_window=history_window,
+        )
+        if result.status in {"committed", "noop"}:
+            self.cadence_ledger.mark_committed(
+                cadence.cadence_id,
+                maintenance_plan_id=result.plan_id,
+                repository_revision_after=result.after_revision,
+            )
+        self._trace("memory.evolver_maintenance_cadence", {
+            "cadence_id": cadence.cadence_id,
+            "cadence_index": cadence.cadence_index,
+            "boundary_ordinal": cadence.boundary_ordinal,
+            "status": result.status,
+            "maintenance_plan_id": result.plan_id or None,
+            "maintenance_transaction_id": result.transaction_id or None,
+            "repository_revision_after": result.after_revision,
+        })
+        return result.status
+
+    def _reconcile_persisted_cadences(self) -> None:
+        """Finish durable intent/completion recovery without making new LLM decisions."""
+
+        for cadence in self.cadence_ledger.open_cadences(
+            memory_project_key=self.project_key,
+        ):
+            history = load_formal_maintenance_history(
+                self.maintenance_history_path,
+                cadence_id=cadence.cadence_id,
+            )
+            if history.completion is not None:
+                self.cadence_ledger.mark_committed(
+                    cadence.cadence_id,
+                    maintenance_plan_id=str(history.completion["plan_id"]),
+                    repository_revision_after=str(history.completion["after_revision"]),
+                )
+                continue
+            if history.intent is None:
+                continue
+            operations = tuple(
+                MaintenanceOperation.from_dict(item)
+                for item in history.intent["operations"]
+            )
+            applied = apply_formal_maintenance_operations(
+                store=self.store,
+                cadence_id=cadence.cadence_id,
+                stream_id=cadence.stream_id,
+                expected_revision=str(history.intent["before_revision"]),
+                project_key=cadence.memory_project_key,
+                operations=operations,
+                history_path=self.maintenance_history_path,
+            )
+            if applied.status in {"committed", "noop"}:
+                self.cadence_ledger.mark_committed(
+                    cadence.cadence_id,
+                    maintenance_plan_id=applied.plan_id,
+                    repository_revision_after=applied.after_revision,
+                )
 
     def _trace(self, event: str, payload: dict[str, Any]) -> None:
         if self.trace_sink is not None:

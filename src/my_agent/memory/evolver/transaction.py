@@ -22,6 +22,15 @@ from my_agent.memory.evolver.artifacts import (
     _resolve_maintenance_artifact_graph,
     _validate_maintenance_artifact_graph,
 )
+from my_agent.memory.evolver.cadence_ledger import (
+    FORMAL_MAINTENANCE_HISTORY_SCHEMA_VERSION,
+    append_formal_maintenance_history,
+    formal_completion_record,
+    formal_intent_record,
+    formal_maintenance_plan_id,
+    formal_maintenance_transaction_id,
+    load_formal_maintenance_history,
+)
 from my_agent.memory.evolver.contracts import (
     MAINTENANCE_POLICY,
     MAINTENANCE_SCHEMA_VERSION,
@@ -72,6 +81,9 @@ class _MaintenanceHistoryState:
 @dataclass(frozen=True)
 class FormalMaintenanceApplyResult:
     status: str
+    cadence_id: str
+    plan_id: str
+    transaction_id: str
     before_revision: str
     after_revision: str
     operation_ids: tuple[str, ...]
@@ -81,24 +93,160 @@ class FormalMaintenanceApplyResult:
 def apply_formal_maintenance_operations(
     *,
     store: ExperienceStore,
+    cadence_id: str,
+    stream_id: str,
     expected_revision: str,
     project_key: str,
     operations: Sequence[MaintenanceOperation],
+    history_path: str | Path,
+) -> FormalMaintenanceApplyResult:
+    with store.exclusive_process_lock():
+        return _apply_formal_maintenance_operations_locked(
+            store=store,
+            cadence_id=cadence_id,
+            stream_id=stream_id,
+            expected_revision=expected_revision,
+            project_key=project_key,
+            operations=operations,
+            history_path=history_path,
+        )
+
+
+def _apply_formal_maintenance_operations_locked(
+    *,
+    store: ExperienceStore,
+    cadence_id: str,
+    stream_id: str,
+    expected_revision: str,
+    project_key: str,
+    operations: Sequence[MaintenanceOperation],
+    history_path: str | Path,
 ) -> FormalMaintenanceApplyResult:
     snapshot = store.load_strict_snapshot()
     operation_ids = tuple(operation.operation_id for operation in operations)
-    if snapshot.revision != expected_revision:
+    operation_payloads = tuple(operation.to_dict() for operation in operations)
+    history = load_formal_maintenance_history(history_path, cadence_id=cadence_id)
+    history_record = history.completion or history.intent
+    if history_record is not None:
+        expected_after = str(
+            history_record.get("after_revision")
+            or history_record.get("expected_after_revision")
+            or ""
+        )
+    elif snapshot.revision != expected_revision:
+        plan_id = formal_maintenance_plan_id(
+            cadence_id=cadence_id,
+            before_revision=expected_revision,
+            expected_after_revision=expected_revision,
+            operations=operation_payloads,
+        )
         return FormalMaintenanceApplyResult(
-            "stale", snapshot.revision, snapshot.revision, operation_ids,
+            "stale", cadence_id, plan_id,
+            formal_maintenance_transaction_id(cadence_id=cadence_id, plan_id=plan_id),
+            snapshot.revision, snapshot.revision, operation_ids,
+            "repository_revision_changed",
+        )
+    else:
+        validate_formal_operations(snapshot.memories, operations, project_key=project_key)
+        next_entries = reduce_repository(snapshot.memories, operations, validate=False)
+        expected_after = experience_memories_revision(next_entries)
+    plan_id = formal_maintenance_plan_id(
+        cadence_id=cadence_id,
+        before_revision=expected_revision,
+        expected_after_revision=expected_after,
+        operations=operation_payloads,
+    )
+    transaction_id = formal_maintenance_transaction_id(
+        cadence_id=cadence_id,
+        plan_id=plan_id,
+    )
+    if history_record is not None:
+        _validate_formal_history_identity(
+            history_record,
+            plan_id=plan_id,
+            stream_id=stream_id,
+            project_key=project_key,
+            transaction_id=transaction_id,
+            expected_revision=expected_revision,
+            expected_after=expected_after,
+            operation_payloads=operation_payloads,
+        )
+    if history.completion is not None:
+        return FormalMaintenanceApplyResult(
+            str(history.completion["status"]),
+            cadence_id,
+            plan_id,
+            transaction_id,
+            expected_revision,
+            str(history.completion["after_revision"]),
+            operation_ids,
+        )
+    if snapshot.revision != expected_revision:
+        if history.intent is not None and snapshot.revision == expected_after:
+            append_formal_maintenance_history(
+                history_path,
+                formal_completion_record(
+                    cadence_id=cadence_id,
+                    plan_id=plan_id,
+                    transaction_id=transaction_id,
+                    stream_id=stream_id,
+                    memory_project_key=project_key,
+                    status="committed",
+                    before_revision=expected_revision,
+                    after_revision=expected_after,
+                    operations=operation_payloads,
+                ),
+            )
+            return FormalMaintenanceApplyResult(
+                "committed", cadence_id, plan_id, transaction_id,
+                expected_revision, expected_after, operation_ids,
+            )
+        return FormalMaintenanceApplyResult(
+            "stale", cadence_id, plan_id, transaction_id,
+            snapshot.revision, snapshot.revision, operation_ids,
             "repository_revision_changed",
         )
     validate_formal_operations(snapshot.memories, operations, project_key=project_key)
     next_entries = reduce_repository(snapshot.memories, operations, validate=False)
-    if tuple(next_entries) == tuple(sorted(snapshot.memories, key=lambda entry: entry.id)):
-        return FormalMaintenanceApplyResult(
-            "noop", snapshot.revision, snapshot.revision, operation_ids,
+    if experience_memories_revision(next_entries) != expected_after:
+        raise MaintenancePlanError(
+            "formal maintenance recovery operations do not match the recorded revision"
         )
-    expected_after = experience_memories_revision(next_entries)
+    if tuple(next_entries) == tuple(sorted(snapshot.memories, key=lambda entry: entry.id)):
+        if history.intent is not None:
+            raise MaintenancePlanError("noop maintenance cannot reuse a mutation intent")
+        append_formal_maintenance_history(
+            history_path,
+            formal_completion_record(
+                cadence_id=cadence_id,
+                plan_id=plan_id,
+                transaction_id=transaction_id,
+                stream_id=stream_id,
+                memory_project_key=project_key,
+                status="noop",
+                before_revision=expected_revision,
+                after_revision=expected_revision,
+                operations=operation_payloads,
+            ),
+        )
+        return FormalMaintenanceApplyResult(
+            "noop", cadence_id, plan_id, transaction_id,
+            snapshot.revision, snapshot.revision, operation_ids,
+        )
+    if history.intent is None:
+        append_formal_maintenance_history(
+            history_path,
+            formal_intent_record(
+                cadence_id=cadence_id,
+                plan_id=plan_id,
+                transaction_id=transaction_id,
+                stream_id=stream_id,
+                memory_project_key=project_key,
+                before_revision=expected_revision,
+                expected_after_revision=expected_after,
+                operations=operation_payloads,
+            ),
+        )
     try:
         after_revision = store.replace_all_atomically(
             next_entries,
@@ -107,7 +255,8 @@ def apply_formal_maintenance_operations(
     except MemoryStoreRevisionConflict:
         current_revision = store.revision()
         return FormalMaintenanceApplyResult(
-            "stale", expected_revision, current_revision, operation_ids,
+            "stale", cadence_id, plan_id, transaction_id,
+            expected_revision, current_revision, operation_ids,
             "repository_revision_changed",
         )
     except MemoryStorePostCommitError as exc:
@@ -118,9 +267,59 @@ def apply_formal_maintenance_operations(
         if recovered.revision != exc.expected_revision or recovered.revision != expected_after:
             raise exc
         after_revision = recovered.revision
-    return FormalMaintenanceApplyResult(
-        "committed", expected_revision, after_revision, operation_ids,
+    append_formal_maintenance_history(
+        history_path,
+        formal_completion_record(
+            cadence_id=cadence_id,
+            plan_id=plan_id,
+            transaction_id=transaction_id,
+            stream_id=stream_id,
+            memory_project_key=project_key,
+            status="committed",
+            before_revision=expected_revision,
+            after_revision=after_revision,
+            operations=operation_payloads,
+        ),
     )
+    return FormalMaintenanceApplyResult(
+        "committed", cadence_id, plan_id, transaction_id,
+        expected_revision, after_revision, operation_ids,
+    )
+
+
+def _validate_formal_history_identity(
+    record: Mapping[str, Any],
+    *,
+    plan_id: str,
+    stream_id: str,
+    project_key: str,
+    transaction_id: str,
+    expected_revision: str,
+    expected_after: str,
+    operation_payloads: tuple[Mapping[str, Any], ...],
+) -> None:
+    expected = {
+        "plan_id": plan_id,
+        "transaction_id": transaction_id,
+        "stream_id": stream_id,
+        "memory_project_key": project_key,
+        "before_revision": expected_revision,
+        "operations": list(operation_payloads),
+    }
+    for field_name, value in expected.items():
+        if record[field_name] != value:
+            raise MaintenancePlanError(
+                f"formal maintenance history {field_name} does not match the staged plan"
+            )
+    recorded_after = (
+        record["expected_after_revision"]
+        if record["record_type"] == "intent"
+        else record["after_revision"]
+    )
+    if recorded_after != expected_after:
+        raise MaintenancePlanError(
+            "formal maintenance history after revision does not match the staged plan"
+        )
 
 
 def apply_maintenance_plan(
@@ -695,8 +894,10 @@ def _parse_maintenance_history_record(
     *,
     line_no: int,
     plan: MaintenancePlan | None = None,
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
     record = dict(payload)
+    if record.get("schema_version") == FORMAL_MAINTENANCE_HISTORY_SCHEMA_VERSION:
+        return None
     try:
         _validate_maintenance_history_record(record)
         if plan is not None:
@@ -1167,6 +1368,8 @@ def _load_maintenance_history_state(
                         line_no=line_no,
                         plan=plan,
                     )
+                    if parsed is None:
+                        continue
                     if parsed["plan_id"] != plan.plan_id:
                         continue
                     record_type = parsed["record_type"]
