@@ -55,6 +55,8 @@ from my_agent.memory.types import (
     RetrievalHit,
     content_fingerprint,
 )
+from my_agent.policy.identity import PolicyIdentity, require_matching_policy_identity
+from my_agent.policy.runtime_validation import require_formal_policy
 from my_agent.tools import ToolExecutionResult
 
 WRITER_METADATA_STRING_CHARS = 1_000
@@ -197,16 +199,16 @@ class MemoryManager:
         embedding_retriever: EmbeddingRetriever | None = None
         evolver_coordinator: EvolverCoordinator | None = None
         if config.memory_evolver_mode == "formal":
-            identity_method = getattr(llm, "identity", None)
-            if not callable(identity_method):
-                raise ValueError("formal memory evolver requires a policy with identity()")
+            policy_identity = require_formal_policy(config, llm)
+            if policy_identity is None:
+                raise ValueError("formal memory evolver requires a validated policy identity")
             embedding_retriever = EmbeddingRetriever(
                 TransformersEmbeddingEncoder.from_config(config)
             )
             evolver_coordinator = EvolverCoordinator(
                 store=experience_store,
                 project_key=project_key,
-                policy_identity=identity_method(),
+                policy_identity=policy_identity,
                 retriever=embedding_retriever,
                 trace_sink=trace_sink,
                 top_k_per_tier=config.memory_evolver_candidate_top_k_per_tier,
@@ -228,6 +230,52 @@ class MemoryManager:
             trace_sink=trace_sink,
             context_profile=context_profile,
         )
+
+    def require_formal_runtime_binding(
+        self,
+        *,
+        config: AgentConfig,
+        policy_identity: PolicyIdentity,
+        repo_path: Path | None,
+    ) -> None:
+        """Validate an injected manager against the active formal runtime."""
+
+        if config.memory_evolver_mode != "formal":
+            return
+        if self.config.memory_evolver_mode != "formal":
+            raise ValueError("formal OPD runtime cannot use a non-formal MemoryManager")
+        coordinator = self.evolver_coordinator
+        if coordinator is None:
+            raise ValueError("formal OPD runtime requires MemoryManager.evolver_coordinator")
+        require_matching_policy_identity(policy_identity, coordinator.policy_identity)
+        if coordinator.store is not self.experience_store:
+            raise ValueError("formal MemoryManager coordinator must use the manager experience store")
+        if coordinator.project_key != self.project_key:
+            raise ValueError("formal MemoryManager coordinator project_key mismatch")
+        if self.embedding_retriever is None or coordinator.retriever is not self.embedding_retriever:
+            raise ValueError("formal MemoryManager embedding retriever binding mismatch")
+        expected_limits = (
+            config.memory_evolver_candidate_top_k_per_tier,
+            config.memory_evolver_selected_max_items,
+            config.memory_evolver_selection_prompt_tokens,
+        )
+        actual_limits = (
+            coordinator.top_k_per_tier,
+            coordinator.selected_max_items,
+            coordinator.selection_token_budget,
+        )
+        if actual_limits != expected_limits:
+            raise ValueError("formal MemoryManager coordinator limits do not match runtime config")
+        expected_memory_dir = Path(config.memory_dir).expanduser().resolve()
+        actual_memory_dir = self.experience_store.path.parent.expanduser().resolve()
+        if actual_memory_dir != expected_memory_dir:
+            raise ValueError("formal MemoryManager memory_dir does not match runtime config")
+        if repo_path is not None:
+            expected_project_key = str(config.memory_project_key or "").strip()
+            if not expected_project_key:
+                expected_project_key = _normalize_project_key(repo_path)
+            if self.project_key != expected_project_key:
+                raise ValueError("formal MemoryManager project_key does not match runtime repository")
 
     # ------------------------------------------------------------------ writes
 

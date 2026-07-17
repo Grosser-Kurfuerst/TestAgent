@@ -114,6 +114,52 @@ class EvolverTaskSessionTests(unittest.TestCase):
         self.assertEqual(result.writer_status, "committed")
         self.assertEqual(result.written_memory_ids, ("tip-a",))
 
+    def test_finalized_outcome_event_is_persisted_before_writer_event(self) -> None:
+        events: list[tuple[str, dict[str, object]]] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ExperienceStore.from_dir(tmp)
+            coordinator = EvolverCoordinator(
+                store=store,
+                project_key="/repo",
+                policy_identity=_identity(),
+                retriever=EmbeddingRetriever(_Encoder()),
+                writer=lambda episode, outcome: (
+                    events.append((
+                        "memory.writer_decision",
+                        {
+                            "trajectory_id": episode.session.trajectory_id,
+                            "outcome_finalized": outcome.outcome_finalized,
+                        },
+                    ))
+                    or ExperienceWriteResult()
+                ),
+                trace_sink=lambda event, payload: events.append((event, payload)),
+            )
+            session = coordinator.begin_task(
+                task="task",
+                task_id="task-1",
+                task_group="group-a",
+                trajectory_id="traj-1",
+                stream_id="stream-a",
+            )
+            episode = AgentEpisodeArtifact(session, store.path, "finish", "done", ())
+            outcome = AuthoritativeTaskOutcome(
+                "task-1", "group-a", True, True, 1.0,
+                EvaluatorIdentity("pytest", "8", canonical_sha256({"command": "pytest"})),
+            )
+
+            coordinator.finalize_task(episode, outcome)
+
+        event_names = [event for event, _payload in events]
+        outcome_index = event_names.index("memory.task_outcome_finalized")
+        writer_index = event_names.index("memory.writer_decision")
+        finalized_index = event_names.index("memory.evolver_task_finalized")
+        self.assertLess(outcome_index, writer_index)
+        self.assertLess(writer_index, finalized_index)
+        outcome_payload = events[outcome_index][1]
+        finalized_payload = events[finalized_index][1]
+        self.assertEqual(finalized_payload["outcome_event_id"], outcome_payload["outcome_event_id"])
+
     def test_unfinalized_outcome_is_rejected_before_writer(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = ExperienceStore.from_dir(tmp)

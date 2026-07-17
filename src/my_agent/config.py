@@ -612,6 +612,11 @@ class AgentConfig:
             supported = ", ".join(sorted(SUPPORTED_PROVIDERS))
             raise RuntimeError(f"Unsupported MY_AGENT_LLM_PROVIDER={self.provider!r}. Supported providers: {supported}.")
 
+    def require_valid_formal_evolver(self) -> None:
+        """Validate intrinsic formal-mode requirements for every runtime entry point."""
+
+        _validate_formal_evolver_config(self, {})
+
     def require_api_key(self) -> None:
         self.require_valid_provider()
         if self.use_fake_llm:
@@ -703,7 +708,10 @@ def _validate_formal_evolver_config(
 ) -> None:
     if config.memory_evolver_mode != "formal":
         return
-    from my_agent.training.formal_contract import FORMAL_FORBIDDEN_LEGACY_CONFIG_KEYS
+    from my_agent.training.formal_contract import (
+        FORMAL_FORBIDDEN_LEGACY_CONFIG_KEYS,
+        FORMAL_LEGACY_CONFIG_DEFAULTS,
+    )
 
     forbidden = sorted(
         key for key in FORMAL_FORBIDDEN_LEGACY_CONFIG_KEYS if _has_value(values, key)
@@ -712,6 +720,16 @@ def _validate_formal_evolver_config(
         raise ValueError(
             "formal memory evolver configuration rejects legacy rule fields: "
             + ", ".join(forbidden)
+        )
+    non_default_legacy_fields = sorted(
+        field_name
+        for field_name, default_value in FORMAL_LEGACY_CONFIG_DEFAULTS.items()
+        if getattr(config, field_name) != default_value
+    )
+    if non_default_legacy_fields:
+        raise ValueError(
+            "formal memory evolver configuration rejects non-default legacy rule fields: "
+            + ", ".join(non_default_legacy_fields)
         )
     if config.policy_backend != "transformers":
         raise ValueError("formal memory evolver requires policy_backend=transformers")

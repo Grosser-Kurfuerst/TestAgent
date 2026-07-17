@@ -12,6 +12,7 @@ from my_agent.hitl.handler import HitlHandler
 from my_agent.llm import AgentLLM
 from my_agent.memory import MemoryManager, NoopMemoryManager
 from my_agent.observability.tracing import TraceWriter
+from my_agent.policy.runtime_validation import require_formal_policy
 from my_agent.repo import RepoContextRender, RepoIndexer
 from my_agent.runtime.cancellation import CancellationToken
 from my_agent.schema import AgentState, TraceEvent
@@ -119,7 +120,9 @@ class AgentBase(ABC):
         *,
         memory_manager: MemoryManager | None = None,
     ) -> tuple[MemoryManager, MemoryTraceSnapshot | None]:
-        trace_sink = lambda event, payload: self._emit_trace(writer, state, event, payload)
+        def trace_sink(event: str, payload: dict[str, object]) -> None:
+            self._emit_trace(writer, state, event, payload)
+
         if not self.config.memory_enabled:
             return (
                 NoopMemoryManager(
@@ -132,6 +135,15 @@ class AgentBase(ABC):
             )
         active_memory = memory_manager if memory_manager is not None else self.memory_manager
         if active_memory is not None:
+            if self.config.memory_evolver_mode == "formal":
+                policy_identity = require_formal_policy(self.config, self.llm)
+                if policy_identity is None:
+                    raise ValueError("formal OPD runtime requires a validated policy identity")
+                active_memory.require_formal_runtime_binding(
+                    config=self.config,
+                    policy_identity=policy_identity,
+                    repo_path=Path(repo).resolve(),
+                )
             snapshot = active_memory.set_trace_sink(trace_sink)
             return active_memory, snapshot
         return (

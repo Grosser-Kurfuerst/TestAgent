@@ -25,18 +25,13 @@ def build_llm(config: AgentConfig) -> AgentLLM:
 
 
 def build_policy(config: AgentConfig) -> AgentLLM:
+    config.require_valid_formal_evolver()
     if config.memory_evolver_mode == "formal":
-        from my_agent.policy.identity import (
-            load_policy_identity_manifest,
-            require_matching_policy_identity,
-        )
+        from my_agent.policy.runtime_validation import require_formal_policy
         from my_agent.policy.transformers_policy import TransformersPolicy
 
-        if config.policy_identity_manifest is None:
-            raise ValueError("formal policy requires policy_identity_manifest")
         policy = TransformersPolicy.from_config(config)
-        expected_identity = load_policy_identity_manifest(config.policy_identity_manifest)
-        require_matching_policy_identity(expected_identity, policy.identity())
+        require_formal_policy(config, policy)
         return policy
     config.require_valid_provider()
     if config.use_fake_llm:

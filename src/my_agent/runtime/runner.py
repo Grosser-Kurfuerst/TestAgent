@@ -10,6 +10,7 @@ from my_agent.llm import AgentLLM, build_llm
 from my_agent.memory import MemoryManager
 from my_agent.observability.tracing import TraceWriter, append_agent_completed
 from my_agent.plan import AgentMode, resolve_mode
+from my_agent.policy.runtime_validation import require_formal_policy
 from my_agent.runtime.cancellation import CancelledError, CancellationToken
 from my_agent.runtime.factory import AgentFactory
 from my_agent.schema import AgentState, TraceEvent
@@ -30,6 +31,16 @@ class CodingAgentRuntime:
     ):
         self.config = config or AgentConfig.from_env()
         self.llm = llm or build_llm(self.config)
+        policy_identity = require_formal_policy(self.config, self.llm)
+        if policy_identity is not None and memory_manager is not None:
+            validator = getattr(memory_manager, "require_formal_runtime_binding", None)
+            if not callable(validator):
+                raise ValueError("formal OPD runtime requires a formal MemoryManager binding")
+            validator(
+                config=self.config,
+                policy_identity=policy_identity,
+                repo_path=None,
+            )
         self.trace_dir = Path(trace_dir) if trace_dir is not None else self.config.trace_dir
         self.command_timeout = command_timeout or self.config.command_timeout
         self.event_sink = event_sink

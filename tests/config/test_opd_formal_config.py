@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+from pathlib import Path
 import unittest
 
 from my_agent.config import AgentConfig
@@ -31,6 +33,28 @@ class FormalConfigTests(unittest.TestCase):
         env["AGENTCLI_MEMORY_EVOLVER_WRITER_MODE"] = "llm"
         with self.assertRaisesRegex(ValueError, "legacy rule fields"):
             AgentConfig.from_env(env, require_env_file=False)
+
+    def test_direct_formal_config_rejects_non_default_legacy_rule_fields(self) -> None:
+        config = AgentConfig.from_env(_formal_env(), require_env_file=False)
+        cases = {
+            "memory_evolver_top_k_per_tier": 7,
+            "memory_evolver_min_score": 0.8,
+            "memory_evolver_min_experience_entries": 2,
+            "memory_evolver_tier_caps": {"trajectory": 2, "tip": 2, "skill": 2, "tool": 2},
+            "memory_evolver_tier_weights": {"trajectory": 1.0, "tip": 1.0, "skill": 1.0, "tool": 1.0},
+            "memory_evolver_writer_enabled": True,
+            "memory_evolver_writer_mode": "llm",
+            "memory_evolver_writer_min_confidence": 0.9,
+            "memory_evolver_writer_max_records": 2,
+            "memory_evolver_writer_max_input_chars": 1_000,
+            "memory_evolver_writer_max_content_chars": 100,
+            "memory_evolver_writer_dataset_path": Path("/tmp/formal-writer.jsonl"),
+        }
+        for field_name, value in cases.items():
+            with self.subTest(field_name=field_name):
+                invalid = replace(config, **{field_name: value})
+                with self.assertRaisesRegex(ValueError, field_name):
+                    invalid.require_valid_formal_evolver()
 
     def test_formal_config_rejects_floating_or_missing_revisions(self) -> None:
         env = _formal_env()

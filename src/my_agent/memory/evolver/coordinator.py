@@ -164,6 +164,16 @@ class EvolverCoordinator:
         if trajectory_id in self._finalized_trajectories:
             raise ValueError(f"evolver episode already finalized: {trajectory_id}")
         self._finalized_trajectories.add(trajectory_id)
+        outcome_event_id = canonical_sha256({
+            "schema_version": "opd-task-outcome-event-v1",
+            "trajectory_id": trajectory_id,
+            **outcome.to_dict(),
+        })
+        self._trace("memory.task_outcome_finalized", {
+            "outcome_event_id": outcome_event_id,
+            "trajectory_id": trajectory_id,
+            **outcome.to_dict(),
+        })
 
         if self.writer is None:
             writer_result = ExperienceWriteResult()
@@ -175,6 +185,7 @@ class EvolverCoordinator:
                     "task_id": outcome.task_id,
                     "task_group": outcome.task_group,
                     "trajectory_id": trajectory_id,
+                    "outcome_event_id": outcome_event_id,
                     "outcome_finalized": outcome.outcome_finalized,
                     "evaluator_name": outcome.evaluator.name,
                     "evaluator_version": outcome.evaluator.version,
@@ -208,6 +219,7 @@ class EvolverCoordinator:
             "task_id": outcome.task_id,
             "task_group": outcome.task_group,
             "trajectory_id": trajectory_id,
+            "outcome_event_id": outcome_event_id,
             "outcome_finalized": outcome.outcome_finalized,
             "evaluator_name": outcome.evaluator.name,
             "evaluator_version": outcome.evaluator.version,

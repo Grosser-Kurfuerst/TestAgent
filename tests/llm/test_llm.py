@@ -15,6 +15,7 @@ add_src_to_path()
 from my_agent.config import AgentConfig
 from my_agent.llm import ChatResponse, FakeLLM, OpenAICompatibleLLM, build_llm, build_policy
 from my_agent.policy.identity import PolicyIdentity, policy_identity_manifest_payload
+from my_agent.policy.transformers_policy import TransformersPolicy
 
 
 class _FakeResponse:
@@ -53,6 +54,7 @@ def _formal_config(manifest_path: Path) -> AgentConfig:
             "AGENTCLI_POLICY_IDENTITY_MANIFEST": str(manifest_path),
             "AGENTCLI_EMBEDDING_REVISION": "embedding-revision-1",
         },
+        env_file=manifest_path.parent / ".env.test",
         require_env_file=False,
     )
 
@@ -77,7 +79,7 @@ class LLMTests(unittest.TestCase):
                 encoding="utf-8",
             )
             config = _formal_config(manifest_path)
-            sentinel = mock.Mock()
+            sentinel = mock.create_autospec(TransformersPolicy, instance=True)
             sentinel.identity.return_value = identity
             with mock.patch(
                 "my_agent.policy.transformers_policy.TransformersPolicy.from_config",
@@ -98,7 +100,7 @@ class LLMTests(unittest.TestCase):
                 encoding="utf-8",
             )
             config = _formal_config(manifest_path)
-            policy = mock.Mock()
+            policy = mock.create_autospec(TransformersPolicy, instance=True)
             policy.identity.return_value = actual
             with mock.patch(
                 "my_agent.policy.transformers_policy.TransformersPolicy.from_config",
