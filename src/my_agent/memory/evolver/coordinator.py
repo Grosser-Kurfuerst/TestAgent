@@ -30,11 +30,12 @@ from my_agent.memory.experience_store import ExperienceStore
 from my_agent.memory.store_errors import MemoryStorePostCommitError
 from my_agent.memory.token import estimate_tokens
 from my_agent.memory.types import MemoryContext, RetrievalHit
+from my_agent.opd_data.runtime_recorder import RuntimeEvidenceRecorder
 from my_agent.policy.identity import PolicyIdentity, canonical_sha256, require_matching_policy_identity
 from my_agent.policy.contracts import GenerationPolicy
 from my_agent.training.contracts import AuthoritativeTaskOutcome
 from my_agent.training.decision_log import DecisionEventContext, DecisionEventRecorder
-from my_agent.training.role_views import CandidateSnapshotEntry
+from my_agent.training.role_views import CandidateSnapshotEntry, SELECTED_MEMORY_CONTEXT_HEADER
 from my_agent.training.role_views import TaskOutcomeRef
 
 
@@ -90,6 +91,8 @@ class EvolverCoordinator:
         maintenance_max_turns: int = 8,
         maintenance_interval_tasks: int = 30,
         ledger_path: str | Path | None = None,
+        collection_round: int = 0,
+        dataset_split: str = "train",
     ) -> None:
         if not project_key:
             raise ValueError("evolver coordinator requires project_key")
@@ -104,14 +107,36 @@ class EvolverCoordinator:
         self.policy_identity = policy_identity
         self.policy = policy
         self.retriever = retriever
+        self.dataset_dir = Path(dataset_dir) if dataset_dir is not None else None
+        self.collection_round = collection_round
+        self.dataset_split = dataset_split
         self.decision_recorder = decision_recorder
+        dataset_path = (
+            self.dataset_dir / "decision_events.jsonl"
+            if self.dataset_dir is not None
+            else None
+        )
         if self.decision_recorder is None and policy is not None:
-            dataset_path = Path(dataset_dir) / "decision_events.jsonl" if dataset_dir is not None else None
             self.decision_recorder = DecisionEventRecorder(
                 policy=policy,
                 dataset_path=dataset_path,
                 trace_sink=trace_sink,
             )
+        elif self.decision_recorder is not None and dataset_path is not None:
+            self.decision_recorder.bind_dataset_path(dataset_path)
+        if dataset_dir is not None and self.decision_recorder is None:
+            raise ValueError("formal dataset recording requires a decision recorder")
+        self.runtime_evidence_recorder = (
+            RuntimeEvidenceRecorder(
+                dataset_dir=self.dataset_dir,
+                store=store,
+                decision_recorder=self.decision_recorder,
+                collection_round=collection_round,
+                split=dataset_split,
+            )
+            if self.dataset_dir is not None and self.decision_recorder is not None
+            else None
+        )
         if selector is not None:
             self.selector = selector
         elif policy is not None and self.decision_recorder is not None:
@@ -266,6 +291,12 @@ class EvolverCoordinator:
             rendered_memory_context=context.injected_text,
             candidate_snapshot=candidates,
         )
+        if self.runtime_evidence_recorder is not None:
+            self.runtime_evidence_recorder.begin_task(
+                task=task,
+                session=session,
+                selection_token_budget=self.selection_token_budget,
+            )
         self._trace("memory.evolver_session_started", {
             "task_id": task_id,
             "task_group": task_group,
@@ -341,6 +372,7 @@ class EvolverCoordinator:
                     outcome=outcome,
                     writer_status="failed_no_write",
                     repository_revision_after=current_revision,
+                    written_memory_ids=(),
                 )
                 return EvolverFinalizeResult(
                     writer_status="failed_no_write",
@@ -383,6 +415,7 @@ class EvolverCoordinator:
             outcome=outcome,
             writer_status=writer_status,
             repository_revision_after=revision_after,
+            written_memory_ids=written_ids,
         )
         return EvolverFinalizeResult(
             writer_status=writer_status,
@@ -399,6 +432,7 @@ class EvolverCoordinator:
         outcome: AuthoritativeTaskOutcome,
         writer_status: str,
         repository_revision_after: str,
+        written_memory_ids: tuple[str, ...],
     ) -> tuple[str | None, str | None]:
         session = episode.session
         advance = self.cadence_ledger.record_task_completion(
@@ -418,6 +452,18 @@ class EvolverCoordinator:
             "task_ordinal": advance.task_ordinal,
             "cadence_id": advance.cadence.cadence_id if advance.cadence else None,
         })
+        if (
+            self.runtime_evidence_recorder is not None
+            and advance.task_ordinal is not None
+            and outcome.task_valid
+            and outcome.outcome_finalized
+        ):
+            self.runtime_evidence_recorder.finish_task(
+                episode=episode,
+                outcome=outcome,
+                task_ordinal=advance.task_ordinal,
+                written_memory_ids=written_memory_ids,
+            )
         due = self.cadence_ledger.oldest_open_cadence(
             stream_id=session.stream_id,
             memory_project_key=session.memory_project_key,
@@ -492,12 +538,27 @@ class EvolverCoordinator:
         if self.maintainer is None or not allow_new_decision:
             return cadence.status
         self.cadence_ledger.mark_started(cadence.cadence_id)
+        if self.runtime_evidence_recorder is not None:
+            self.runtime_evidence_recorder.begin_maintenance(
+                cadence_id=cadence.cadence_id,
+                task_group=task_group,
+                stream_id=cadence.stream_id,
+                project_key=cadence.memory_project_key,
+                as_of_task_ordinal=cadence.boundary_ordinal,
+                history_window=history_window,
+            )
         result = self.run_maintenance(
             maintenance_id=cadence.cadence_id,
             stream_id=cadence.stream_id,
             task_group=task_group,
             history_window=history_window,
         )
+        if self.runtime_evidence_recorder is not None:
+            self.runtime_evidence_recorder.finish_maintenance(
+                cadence_id=cadence.cadence_id,
+                project_key=cadence.memory_project_key,
+                status=result.status,
+            )
         if result.status in {"committed", "noop"}:
             self.cadence_ledger.mark_committed(
                 cadence.cadence_id,
@@ -614,7 +675,7 @@ def _render_selected_context(
     selected_hits = [by_id[memory_id] for memory_id in selected_ids]
     if not selected_hits:
         return MemoryContext(injected_text="", hits=[], estimated_tokens=0)
-    blocks = ["[Selected evolver memory - frozen for this task]"]
+    blocks = [SELECTED_MEMORY_CONTEXT_HEADER]
     for hit in selected_hits:
         blocks.append(f"[{hit.entry.id} | {hit.entry.tier.value}]\n{hit.entry.content}")
     rendered = "\n\n".join(blocks)

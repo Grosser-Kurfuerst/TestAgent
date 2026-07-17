@@ -115,6 +115,8 @@ class TrainablePolicy(GenerationPolicy, Protocol):
 
     def forward_logits(self, batch: TokenBatch) -> Any: ...
 
+    def verify_completion_round_trip(self, response: DecisionResponse) -> bool: ...
+
 
 def _validate_token_ids(values: tuple[int, ...], *, field_name: str) -> None:
     if any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in values):

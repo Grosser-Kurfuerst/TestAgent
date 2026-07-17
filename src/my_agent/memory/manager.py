@@ -222,6 +222,8 @@ class MemoryManager:
                 selection_token_budget=config.memory_evolver_selection_prompt_tokens,
                 maintenance_interval_tasks=config.memory_evolver_maintenance_interval_tasks,
                 maintenance_max_turns=config.memory_evolver_maintenance_max_turns,
+                collection_round=config.memory_evolver_collection_round,
+                dataset_split=config.memory_evolver_dataset_split,
             )
         return cls(
             config=config,
@@ -279,6 +281,22 @@ class MemoryManager:
         )
         if actual_limits != expected_limits:
             raise ValueError("formal MemoryManager coordinator limits do not match runtime config")
+        if coordinator.collection_round != config.memory_evolver_collection_round:
+            raise ValueError("formal MemoryManager collection round does not match runtime config")
+        if coordinator.dataset_split != config.memory_evolver_dataset_split:
+            raise ValueError("formal MemoryManager dataset split does not match runtime config")
+        expected_dataset_dir = (
+            Path(config.memory_evolver_dataset_dir).expanduser().resolve()
+            if config.memory_evolver_dataset_dir is not None
+            else None
+        )
+        actual_dataset_dir = (
+            coordinator.dataset_dir.expanduser().resolve()
+            if coordinator.dataset_dir is not None
+            else None
+        )
+        if actual_dataset_dir != expected_dataset_dir:
+            raise ValueError("formal MemoryManager dataset directory does not match runtime config")
         expected_memory_dir = Path(config.memory_dir).expanduser().resolve()
         actual_memory_dir = self.experience_store.path.parent.expanduser().resolve()
         if actual_memory_dir != expected_memory_dir:

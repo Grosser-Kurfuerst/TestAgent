@@ -81,6 +81,42 @@ class DecisionEventRecorder:
         self.policy = policy
         self.trace_sink = trace_sink
         self.writer = DecisionEventWriter(dataset_path) if dataset_path is not None else None
+        self._events_lock = Lock()
+        self._events = list(
+            load_decision_events(dataset_path)
+            if dataset_path is not None and Path(dataset_path).exists()
+            else ()
+        )
+
+    def bind_dataset_path(self, path: str | Path) -> None:
+        target = Path(path)
+        if self.writer is not None:
+            if self.writer.path != target:
+                raise ValueError("decision recorder is already bound to another dataset path")
+            return
+        with self._events_lock:
+            if self._events:
+                raise ValueError("cannot bind a populated in-memory decision recorder")
+            self._events = list(load_decision_events(target) if target.exists() else ())
+            self.writer = DecisionEventWriter(target)
+
+    def events_for(
+        self,
+        trajectory_id: str,
+        *,
+        role: str | None = None,
+        status: str | None = None,
+        purpose: str | None = None,
+    ) -> tuple[DecisionEvent, ...]:
+        with self._events_lock:
+            return tuple(
+                event
+                for event in self._events
+                if event.trajectory_id == trajectory_id
+                and (role is None or event.role == role)
+                and (status is None or event.status == status)
+                and (purpose is None or event.purpose == purpose)
+            )
 
     def generate(
         self,
@@ -210,6 +246,8 @@ class DecisionEventRecorder:
     def _append(self, event: DecisionEvent) -> None:
         if self.writer is not None:
             self.writer.append(event)
+        with self._events_lock:
+            self._events.append(event)
         if self.trace_sink is not None:
             self.trace_sink("opd.decision", event.to_dict())
 

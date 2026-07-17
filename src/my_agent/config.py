@@ -99,6 +99,8 @@ class AgentConfig:
     memory_evolver_maintenance_interval_tasks: int = 30
     memory_evolver_maintenance_max_turns: int = 8
     memory_evolver_dataset_dir: Path | None = None
+    memory_evolver_collection_round: int = 0
+    memory_evolver_dataset_split: str = "train"
     memory_evolver_teacher_min_score: float = 0.01
     memory_evolver_writing_top_fraction: float = 0.30
     embedding_model: str = "Qwen/Qwen3-Embedding-0.6B"
@@ -373,6 +375,19 @@ class AgentConfig:
                 values.get(
                     "AGENTCLI_MEMORY_EVOLVER_DATASET_DIR",
                     values.get("MY_AGENT_MEMORY_EVOLVER_DATASET_DIR"),
+                )
+            ),
+            memory_evolver_collection_round=_as_nonnegative_int(
+                values.get(
+                    "AGENTCLI_MEMORY_EVOLVER_COLLECTION_ROUND",
+                    values.get("MY_AGENT_MEMORY_EVOLVER_COLLECTION_ROUND"),
+                ),
+                0,
+            ),
+            memory_evolver_dataset_split=_opd_dataset_split(
+                values.get(
+                    "AGENTCLI_MEMORY_EVOLVER_DATASET_SPLIT",
+                    values.get("MY_AGENT_MEMORY_EVOLVER_DATASET_SPLIT"),
                 )
             ),
             memory_evolver_teacher_min_score=_as_min_float(
@@ -699,6 +714,13 @@ def _memory_evolver_writer_mode(values: Mapping[str, str]) -> str:
         raise ValueError(
             f"Unsupported AGENTCLI_MEMORY_EVOLVER_WRITER_MODE={raw_mode!r}. Supported modes: {supported}."
         )
+    return normalized
+
+
+def _opd_dataset_split(value: str | None) -> str:
+    normalized = (value or "train").strip().lower()
+    if normalized not in {"train", "validation", "test"}:
+        raise ValueError("OPD dataset split must be train, validation, or test")
     return normalized
 
 

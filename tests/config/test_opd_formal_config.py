@@ -21,12 +21,23 @@ def _formal_env() -> dict[str, str]:
 
 class FormalConfigTests(unittest.TestCase):
     def test_formal_config_loads_new_contract_fields(self) -> None:
-        config = AgentConfig.from_env(_formal_env(), require_env_file=False)
+        env = _formal_env()
+        env["AGENTCLI_MEMORY_EVOLVER_COLLECTION_ROUND"] = "2"
+        env["AGENTCLI_MEMORY_EVOLVER_DATASET_SPLIT"] = "validation"
+        config = AgentConfig.from_env(env, require_env_file=False)
 
         self.assertEqual(config.memory_evolver_mode, "formal")
         self.assertEqual(config.memory_evolver_candidate_top_k_per_tier, 50)
         self.assertEqual(config.memory_evolver_maintenance_interval_tasks, 30)
         self.assertEqual(config.memory_evolver_writing_top_fraction, 0.30)
+        self.assertEqual(config.memory_evolver_collection_round, 2)
+        self.assertEqual(config.memory_evolver_dataset_split, "validation")
+
+    def test_formal_config_rejects_unknown_dataset_split(self) -> None:
+        env = _formal_env()
+        env["AGENTCLI_MEMORY_EVOLVER_DATASET_SPLIT"] = "holdout"
+        with self.assertRaisesRegex(ValueError, "dataset split"):
+            AgentConfig.from_env(env, require_env_file=False)
 
     def test_formal_config_rejects_legacy_rule_fields(self) -> None:
         env = _formal_env()

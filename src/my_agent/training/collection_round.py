@@ -1,0 +1,225 @@
+"""Build one strict current-checkpoint OPD learner collection round."""
+
+from __future__ import annotations
+
+from collections import Counter
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Mapping, Sequence
+
+from my_agent.opd_data.export import (
+    load_learner_samples,
+    prepare_round_decisions,
+    sample_statistics,
+    write_learner_samples,
+)
+from my_agent.opd_data.schema import (
+    ExportManifest,
+    MaintenanceEvidence,
+    RepositoryEvidence,
+    RuntimeExclusionEvidence,
+    TaskEvidence,
+    TaskOutcomeEvidence,
+)
+from my_agent.memory.evolver.attribution_schema import PaperAttributionRecord
+from my_agent.policy.contracts import TrainablePolicy
+from my_agent.policy.identity import canonical_json_bytes, canonical_sha256
+from my_agent.training.contracts import DecisionEvent
+from my_agent.training.opd_rollout import (
+    generate_action_rollout_samples,
+    generate_learner_sample,
+)
+
+
+LEARNER_EVENTS_FILENAME = "learner_events.jsonl"
+EXPORT_MANIFEST_FILENAME = "export_manifest.json"
+
+
+@dataclass(frozen=True)
+class CollectionRoundResult:
+    learner_path: Path
+    manifest_path: Path
+    manifest: ExportManifest
+
+
+def build_collection_round(
+    *,
+    collection_round: int,
+    policy: TrainablePolicy,
+    tasks: Sequence[TaskEvidence],
+    outcomes: Sequence[TaskOutcomeEvidence],
+    repositories: Sequence[RepositoryEvidence],
+    maintenance: Sequence[MaintenanceEvidence],
+    decision_events: Sequence[DecisionEvent],
+    attribution: Sequence[PaperAttributionRecord],
+    output_dir: str | Path,
+    runtime_exclusions: Sequence[RuntimeExclusionEvidence] = (),
+    writing_top_fraction: float = 0.30,
+    teacher_minimum_score: float = 0.01,
+    teacher_max_items: int = 20,
+    max_new_tokens: int = 1_024,
+    temperature: float = 1.0,
+    top_p: float = 0.95,
+    seed: int | None = None,
+) -> CollectionRoundResult:
+    identity = policy.identity()
+    prepared = prepare_round_decisions(
+        collection_round=collection_round,
+        trainer_identity=identity,
+        tasks=tasks,
+        outcomes=outcomes,
+        repositories=repositories,
+        maintenance=maintenance,
+        decision_events=decision_events,
+        attribution=attribution,
+        writing_top_fraction_value=writing_top_fraction,
+        teacher_minimum_score=teacher_minimum_score,
+        teacher_max_items=teacher_max_items,
+    )
+    decisions = sorted(
+        prepared.decisions,
+        key=lambda item: (
+            item.role,
+            item.stream_id,
+            item.task_group,
+            item.source_evidence_ids,
+        ),
+    )
+    samples_list: list[Any] = []
+    rollout_exclusions: list[Mapping[str, Any]] = []
+    generation_index = 0
+    action_groups: dict[str, list[Any]] = {}
+    for decision in decisions:
+        if decision.role == "action":
+            action_groups.setdefault(decision.action_rollout_id, []).append(decision)
+            continue
+        samples_list.append(generate_learner_sample(
+            decision,
+            policy=policy,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            seed=None if seed is None else seed + generation_index,
+        ))
+        generation_index += 1
+    for rollout_id in sorted(action_groups):
+        rollout = action_groups[rollout_id]
+        generated = generate_action_rollout_samples(
+            rollout,
+            policy=policy,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            seed=None if seed is None else seed + generation_index,
+        )
+        samples_list.extend(generated)
+        if len(generated) < len(rollout):
+            rollout_exclusions.append({
+                "evidence_id": rollout_id,
+                "role": "action",
+                "reason": "student_tool_call_diverged_from_replayable_observation",
+                "generated_turns": len(generated),
+                "available_turns": len(rollout),
+            })
+        generation_index += len(rollout)
+    samples = tuple(samples_list)
+    if policy.identity() != identity:
+        raise ValueError("collection policy identity changed during learner regeneration")
+    validate_learner_samples(
+        samples,
+        collection_round=collection_round,
+        trainer_identity_hash=identity.identity_hash,
+    )
+    root = Path(output_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    learner_path = write_learner_samples(samples, root / LEARNER_EVENTS_FILENAME)
+    loaded = load_learner_samples(learner_path)
+    if loaded != tuple(sorted(samples, key=lambda item: (item.role, item.task_group, item.sample_id))):
+        raise ValueError("learner dataset round-trip mismatch")
+    dataset_hash = canonical_sha256([sample.to_dict() for sample in loaded])
+    stats = sample_statistics(loaded)
+    outcome_counts = Counter(
+        "resolved" if item.outcome.resolved else "failed"
+        for item in outcomes
+        if item.task_valid and item.outcome_finalized
+    )
+    manifest = ExportManifest(
+        collection_round=collection_round,
+        trainer_initialization_identity=identity,
+        learner_dataset_hash=dataset_hash,
+        sample_count=len(loaded),
+        role_counts=stats["role_counts"],
+        split_counts=stats["split_counts"],
+        task_group_counts=stats["task_group_counts"],
+        outcome_counts=dict(outcome_counts),
+        source_hashes={
+            "task_evidence": _sequence_hash(tasks),
+            "task_outcomes": _sequence_hash(outcomes),
+            "repository_evidence": _sequence_hash(repositories),
+            "maintenance_evidence": _sequence_hash(maintenance),
+            "decision_events": _sequence_hash(decision_events),
+            "attribution": _sequence_hash(attribution),
+            "runtime_exclusions": _sequence_hash(runtime_exclusions),
+        },
+        writing_score_decisions=tuple(
+            item.to_dict() for item in prepared.writing_score_decisions
+        ),
+        exclusions=tuple((
+            *prepared.exclusions,
+            *rollout_exclusions,
+            *(item.to_dict() for item in runtime_exclusions),
+        )),
+    )
+    manifest_path = root / EXPORT_MANIFEST_FILENAME
+    manifest_path.write_bytes(canonical_json_bytes(manifest.to_dict()) + b"\n")
+    return CollectionRoundResult(learner_path, manifest_path, manifest)
+
+
+def validate_learner_samples(
+    samples: Sequence[Any],
+    *,
+    collection_round: int,
+    trainer_identity_hash: str,
+) -> None:
+    sample_ids: set[str] = set()
+    expected_views = {
+        "selection": ("selection_public", "selection_hindsight"),
+        "action": ("action_public", "action_hindsight"),
+        "writing": ("writing_public", "writing_hindsight"),
+        "maintenance": ("maintenance_public", "maintenance_hindsight"),
+    }
+    for sample in samples:
+        if sample.sample_id in sample_ids:
+            raise ValueError(f"duplicate learner sample_id: {sample.sample_id}")
+        sample_ids.add(sample.sample_id)
+        if sample.collection_round != collection_round:
+            raise ValueError("learner sample crosses collection rounds")
+        if sample.policy_identity.identity_hash != trainer_identity_hash:
+            raise ValueError("learner sample is not from trainer initialization checkpoint")
+        public_type, hindsight_type = expected_views[sample.role]
+        if sample.student_public_view.get("view_type") != public_type:
+            raise ValueError("learner public view does not match role")
+        if sample.teacher_hindsight_view.get("view_type") != hindsight_type:
+            raise ValueError("learner hindsight view does not match role")
+        if not sample.student_completion_token_ids or not any(sample.assistant_loss_mask):
+            raise ValueError("learner sample requires a non-empty trainable completion")
+
+
+def _sequence_hash(values: Sequence[Any]) -> str:
+    payloads: list[Mapping[str, Any]] = []
+    for value in values:
+        payload = value.to_dict()
+        if not isinstance(payload, Mapping):
+            raise ValueError("round source to_dict() must return an object")
+        payloads.append(payload)
+    payloads.sort(key=canonical_sha256)
+    return canonical_sha256(payloads)
+
+
+__all__ = [
+    "EXPORT_MANIFEST_FILENAME",
+    "LEARNER_EVENTS_FILENAME",
+    "CollectionRoundResult",
+    "build_collection_round",
+    "validate_learner_samples",
+]

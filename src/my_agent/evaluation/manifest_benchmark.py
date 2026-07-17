@@ -609,6 +609,16 @@ def _run_manifest_task(
         memory_project_key=memory_stream.memory_project_key,
         command_timeout=command_timeout,
     )
+    if task_config.memory_evolver_mode == "formal":
+        task_config = replace(
+            task_config,
+            memory_evolver_collection_round=int(
+                task.get("collection_round", task_config.memory_evolver_collection_round)
+            ),
+            memory_evolver_dataset_split=str(
+                task.get("split") or task_config.memory_evolver_dataset_split
+            ).strip().lower(),
+        )
     before_counts = _memory_counts(task_config.memory_dir, project_key=task_config.memory_project_key)
     agent_test_command = task.get("agent_test_command") or task.get("test_command")
     visible_command = task.get("visible_test_command") or agent_test_command
@@ -1278,6 +1288,10 @@ def _config_env_values(config: AgentConfig) -> dict[str, str]:
             "AGENTCLI_MEMORY_EVOLVER_DATASET_DIR": (
                 str(config.memory_evolver_dataset_dir) if config.memory_evolver_dataset_dir else ""
             ),
+            "AGENTCLI_MEMORY_EVOLVER_COLLECTION_ROUND": str(
+                config.memory_evolver_collection_round
+            ),
+            "AGENTCLI_MEMORY_EVOLVER_DATASET_SPLIT": config.memory_evolver_dataset_split,
             "AGENTCLI_MEMORY_EVOLVER_TEACHER_MIN_SCORE": str(
                 config.memory_evolver_teacher_min_score
             ),

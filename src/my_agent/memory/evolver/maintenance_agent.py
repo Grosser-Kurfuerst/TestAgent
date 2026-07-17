@@ -94,6 +94,7 @@ class FormalMaintenanceAgent:
             entries,
             repository_revision=snapshot.revision,
             project_key=self.project_key,
+            stream_id=stream_id,
             history_window=history_window,
             tools=tools,
         )

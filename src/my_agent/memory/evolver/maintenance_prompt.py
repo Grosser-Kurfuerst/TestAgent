@@ -22,13 +22,20 @@ def repository_snapshot_ref(
     *,
     repository_revision: str,
     project_key: str,
+    stream_id: str = "",
 ) -> RepositorySnapshotRef:
     visible = tuple(sorted(entries, key=lambda entry: entry.id))
+    serialized = [experience_to_dict(entry) for entry in visible]
     return RepositorySnapshotRef(
         repository_revision=repository_revision,
         memory_project_key=project_key,
         memory_ids=tuple(entry.id for entry in visible),
-        snapshot_hash=canonical_sha256([experience_to_dict(entry) for entry in visible]),
+        snapshot_hash=canonical_sha256({
+            "repository_revision": repository_revision,
+            "memory_project_key": project_key,
+            "stream_id": stream_id,
+            "memories": serialized,
+        }),
     )
 
 
@@ -70,6 +77,7 @@ def maintenance_public_view(
     *,
     repository_revision: str,
     project_key: str,
+    stream_id: str = "",
     history_window: tuple[TaskOutcomeRef, ...],
     tools: tuple[CanonicalTool, ...],
 ) -> MaintenancePublic:
@@ -78,6 +86,7 @@ def maintenance_public_view(
             entries,
             repository_revision=repository_revision,
             project_key=project_key,
+            stream_id=stream_id,
         ),
         history_window=history_window,
         tools=tools,

@@ -1,0 +1,537 @@
+"""Append strict OPD evidence produced by the formal runtime."""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Hashable, Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from threading import Lock
+from typing import Any
+import json
+
+from my_agent.memory.evolver.maintenance_prompt import repository_snapshot_ref
+from my_agent.memory.evolver.task_session import AgentEpisodeArtifact, TaskEvolverSession
+from my_agent.memory.experience_store import ExperienceStore
+from my_agent.opd_data.schema import (
+    ActionDecisionEvidence,
+    MaintenanceEvidence,
+    RepositoryEvidence,
+    RepositoryMemoryEvidence,
+    RuntimeExclusionEvidence,
+    TaskEvidence,
+    TaskOutcomeEvidence,
+)
+from my_agent.policy.identity import canonical_json_bytes
+from my_agent.training.contracts import AuthoritativeTaskOutcome, DecisionEvent
+from my_agent.training.decision_log import DecisionEventRecorder
+from my_agent.training.role_views import (
+    CanonicalMessage,
+    CanonicalTrajectoryStep,
+    CanonicalToolCall,
+    TaskOutcomeRef,
+    TrajectoryEvidence,
+    without_selected_memory_context,
+)
+
+
+@dataclass(frozen=True)
+class _PendingTask:
+    task: str
+    session: TaskEvolverSession
+    repository_snapshot_hash: str
+    selection_token_budget: int
+
+
+@dataclass(frozen=True)
+class _PendingMaintenance:
+    cadence_id: str
+    task_group: str
+    stream_id: str
+    repository_snapshot_hash: str
+    as_of_task_ordinal: int
+    outcome_ids: tuple[str, ...]
+
+
+class _EvidenceStream:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        loader: Callable[[str | Path], tuple[Any, ...]],
+        key: Callable[[Any], Hashable],
+    ) -> None:
+        self.path = path
+        self._key = key
+        self._lock = Lock()
+        self.records = list(loader(path) if path.exists() else ())
+        self._keys = {key(record) for record in self.records}
+        self._by_key = {key(record): record for record in self.records}
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.touch(exist_ok=True)
+
+    def append(self, record: Any) -> bool:
+        record_key = self._key(record)
+        payload = canonical_json_bytes(record.to_dict()).decode("utf-8")
+        with self._lock:
+            if record_key in self._keys:
+                existing = self._by_key[record_key]
+                if existing != record:
+                    raise ValueError("runtime evidence idempotency key has conflicting payloads")
+                return False
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with self.path.open("a", encoding="utf-8") as handle:
+                handle.write(payload + "\n")
+            self.records.append(record)
+            self._keys.add(record_key)
+            self._by_key[record_key] = record
+            return True
+
+
+class RuntimeEvidenceRecorder:
+    """Join formal task lifecycle state into the four exporter evidence streams."""
+
+    def __init__(
+        self,
+        *,
+        dataset_dir: str | Path,
+        store: ExperienceStore,
+        decision_recorder: DecisionEventRecorder,
+        collection_round: int = 0,
+        split: str = "train",
+    ) -> None:
+        if collection_round < 0:
+            raise ValueError("collection_round must be non-negative")
+        if split not in {"train", "validation", "test"}:
+            raise ValueError("dataset split must be train, validation, or test")
+        root = Path(dataset_dir)
+        self.store = store
+        self.decision_recorder = decision_recorder
+        self.collection_round = collection_round
+        self.split = split
+        self.tasks = _EvidenceStream(
+            root / "task_evidence.jsonl",
+            loader=lambda path: _load_records(path, TaskEvidence.from_dict),
+            key=lambda item: _task_key(
+                item.stream_id, item.memory_project_key, item.task_id
+            ),
+        )
+        self.outcomes = _EvidenceStream(
+            root / "task_outcomes.jsonl",
+            loader=lambda path: _load_records(path, TaskOutcomeEvidence.from_dict),
+            key=lambda item: _task_key(
+                item.stream_id, item.memory_project_key, item.outcome.task_id
+            ),
+        )
+        self.repositories = _EvidenceStream(
+            root / "repository_events.jsonl",
+            loader=lambda path: _load_records(path, RepositoryEvidence.from_dict),
+            key=lambda item: item.snapshot.snapshot_hash,
+        )
+        self.maintenance = _EvidenceStream(
+            root / "maintenance_evidence.jsonl",
+            loader=lambda path: _load_records(path, MaintenanceEvidence.from_dict),
+            key=lambda item: item.cadence_id,
+        )
+        self.exclusions = _EvidenceStream(
+            root / "runtime_exclusions.jsonl",
+            loader=lambda path: _load_records(path, RuntimeExclusionEvidence.from_dict),
+            key=lambda item: item.exclusion_id,
+        )
+        self._pending_tasks: dict[str, _PendingTask] = {}
+        self._pending_maintenance: dict[str, _PendingMaintenance] = {}
+        self._outcome_by_task = {
+            _task_key(item.stream_id, item.memory_project_key, item.outcome.task_id): item
+            for item in self.outcomes.records
+        }
+        self._repository_state: dict[tuple[str, str], tuple[int, str]] = {}
+        for record in (
+            *self.tasks.records,
+            *self.outcomes.records,
+            *self.repositories.records,
+            *self.maintenance.records,
+            *self.exclusions.records,
+        ):
+            if record.collection_round != collection_round:
+                raise ValueError("runtime evidence directory crosses collection rounds")
+        for record in (*self.tasks.records, *self.maintenance.records, *self.exclusions.records):
+            if record.split != split:
+                raise ValueError("runtime evidence directory crosses dataset splits")
+        for record in sorted(
+            self.repositories.records,
+            key=lambda item: (item.stream_id, item.snapshot.memory_project_key, item.event_ordinal),
+        ):
+            self._repository_state[
+                (record.stream_id, record.snapshot.memory_project_key)
+            ] = (record.event_ordinal + 1, record.snapshot.repository_revision)
+
+    def begin_task(
+        self,
+        *,
+        task: str,
+        session: TaskEvolverSession,
+        selection_token_budget: int,
+    ) -> None:
+        if session.trajectory_id in self._pending_tasks:
+            raise ValueError("task evidence is already pending for this trajectory")
+        repository = self.record_repository(
+            stream_id=session.stream_id,
+            project_key=session.memory_project_key,
+            expected_revision=session.repository_revision,
+        )
+        self._pending_tasks[session.trajectory_id] = _PendingTask(
+            task=task,
+            session=session,
+            repository_snapshot_hash=repository.snapshot.snapshot_hash,
+            selection_token_budget=selection_token_budget,
+        )
+
+    def finish_task(
+        self,
+        *,
+        episode: AgentEpisodeArtifact,
+        outcome: AuthoritativeTaskOutcome,
+        task_ordinal: int,
+        written_memory_ids: tuple[str, ...],
+    ) -> None:
+        pending = self._pending_tasks.get(episode.session.trajectory_id)
+        if pending is None or pending.session != episode.session:
+            raise ValueError("missing frozen task evidence for finalized trajectory")
+        all_events = self._events(episode.session.trajectory_id)
+        successful = tuple(event for event in all_events if event.status == "success")
+        selections = _role_events(successful, "selection")
+        actions = _role_events(successful, "action")
+        writing = _role_events(successful, "writing")
+
+        outcome_record = TaskOutcomeEvidence(
+            collection_round=self.collection_round,
+            task_ordinal=task_ordinal,
+            trajectory_id=episode.session.trajectory_id,
+            stream_id=episode.session.stream_id,
+            memory_project_key=episode.session.memory_project_key,
+            outcome=outcome.to_ref(),
+            task_valid=outcome.task_valid,
+            outcome_finalized=outcome.outcome_finalized,
+        )
+        invalid_roles: list[tuple[str, str]] = []
+        if len(selections) != 1:
+            invalid_roles.append(("selection", "missing_successful_selection_decision"))
+        if not actions:
+            invalid_roles.append(("action", "missing_successful_action_decision"))
+        if len(writing) > 1 or (written_memory_ids and not writing):
+            invalid_roles.append(("writing", "inconsistent_writing_decision_evidence"))
+        if invalid_roles:
+            for role, reason in invalid_roles:
+                self._record_exclusion(
+                    role=role,
+                    reason=reason,
+                    task_id=episode.session.task_id,
+                    trajectory_id=episode.session.trajectory_id,
+                    stream_id=episode.session.stream_id,
+                    project_key=episode.session.memory_project_key,
+                    task_ordinal=task_ordinal,
+                    decision_ids=tuple(
+                        event.decision_id for event in _role_events(all_events, role)
+                    ),
+                )
+            self._finish_task_streams(
+                episode=episode,
+                outcome_record=outcome_record,
+            )
+            del self._pending_tasks[episode.session.trajectory_id]
+            return
+
+        selection = selections[0]
+
+        trajectory = TrajectoryEvidence(
+            trajectory_id=episode.session.trajectory_id,
+            task_group=episode.session.task_group,
+            outcome="success" if outcome.resolved else "failure",
+            reward=outcome.reward,
+            steps=tuple(
+                CanonicalTrajectoryStep(
+                    step_index=index,
+                    observation="",
+                    action=step.tool,
+                    arguments_json=canonical_json_bytes(step.arguments).decode("utf-8"),
+                    result=step.output,
+                    reward=None,
+                )
+                for index, step in enumerate(episode.tool_history)
+            ),
+        )
+        task_record = TaskEvidence(
+            collection_round=self.collection_round,
+            task_ordinal=task_ordinal,
+            split=self.split,
+            task=pending.task,
+            task_id=episode.session.task_id,
+            task_group=episode.session.task_group,
+            trajectory_id=episode.session.trajectory_id,
+            stream_id=episode.session.stream_id,
+            memory_project_key=episode.session.memory_project_key,
+            policy_identity=episode.session.policy_identity,
+            repository_snapshot_hash=pending.repository_snapshot_hash,
+            candidate_snapshot_hash=episode.session.candidate_snapshot_hash,
+            candidates=episode.session.candidate_snapshot,
+            selected_memory_ids=episode.session.selected_memory_ids,
+            trajectory=trajectory,
+            written_memory_ids=written_memory_ids,
+            selection_decision_id=selection.decision_id,
+            action_decisions=tuple(
+                ActionDecisionEvidence(
+                    decision_id=event.decision_id,
+                    turn_index=event.turn_index,
+                    step_index=event.step_index,
+                    prefix_messages=without_selected_memory_context(event.canonical_messages),
+                    tools=event.canonical_tools,
+                    expected_tool_calls=_event_tool_calls(event),
+                    observation_messages=_observations_between(
+                        event,
+                        actions[index + 1] if index + 1 < len(actions) else None,
+                    ),
+                )
+                for index, event in enumerate(actions)
+            ),
+            writing_decision_id=writing[0].decision_id if writing else None,
+            selection_token_budget=pending.selection_token_budget,
+        )
+        self.tasks.append(task_record)
+        self._finish_task_streams(episode=episode, outcome_record=outcome_record)
+        del self._pending_tasks[episode.session.trajectory_id]
+
+    def begin_maintenance(
+        self,
+        *,
+        cadence_id: str,
+        task_group: str,
+        stream_id: str,
+        project_key: str,
+        as_of_task_ordinal: int,
+        history_window: Sequence[TaskOutcomeRef],
+    ) -> None:
+        repository = self.record_repository(stream_id=stream_id, project_key=project_key)
+        outcome_ids: list[str] = []
+        for outcome in history_window:
+            stored = self._outcome_by_task.get(
+                _task_key(stream_id, project_key, outcome.task_id)
+            )
+            if stored is None or stored.outcome != outcome:
+                raise ValueError("maintenance history outcome is absent from runtime evidence")
+            outcome_ids.append(stored.outcome_id)
+        self._pending_maintenance[cadence_id] = _PendingMaintenance(
+            cadence_id=cadence_id,
+            task_group=task_group,
+            stream_id=stream_id,
+            repository_snapshot_hash=repository.snapshot.snapshot_hash,
+            as_of_task_ordinal=as_of_task_ordinal,
+            outcome_ids=tuple(outcome_ids),
+        )
+
+    def finish_maintenance(
+        self,
+        *,
+        cadence_id: str,
+        project_key: str,
+        status: str,
+    ) -> None:
+        pending = self._pending_maintenance.get(cadence_id)
+        if pending is None:
+            raise ValueError("missing frozen maintenance evidence")
+        all_events = _role_events(self._events(cadence_id), "maintenance")
+        events = tuple(event for event in all_events if event.status == "success")
+        if status not in {"committed", "noop"} or not events:
+            self._record_exclusion(
+                role="maintenance",
+                reason=f"maintenance_terminal_status:{status}",
+                task_id=cadence_id,
+                trajectory_id=cadence_id,
+                stream_id=pending.stream_id,
+                project_key=project_key,
+                task_ordinal=pending.as_of_task_ordinal,
+                decision_ids=tuple(event.decision_id for event in all_events),
+            )
+            self.record_repository(stream_id=pending.stream_id, project_key=project_key)
+            del self._pending_maintenance[cadence_id]
+            return
+        tools = events[0].canonical_tools
+        if any(event.canonical_tools != tools for event in events[1:]):
+            raise ValueError("formal maintenance tool schema changed within one cadence")
+        record = MaintenanceEvidence(
+            collection_round=self.collection_round,
+            as_of_task_ordinal=pending.as_of_task_ordinal,
+            split=self.split,
+            cadence_id=cadence_id,
+            task_group=pending.task_group,
+            stream_id=pending.stream_id,
+            memory_project_key=project_key,
+            policy_identity=self.decision_recorder.policy.identity(),
+            repository_snapshot_hash=pending.repository_snapshot_hash,
+            outcome_ids=pending.outcome_ids,
+            tools=tools,
+            redundancy_diagnostics=(),
+            decision_ids=tuple(event.decision_id for event in events),
+        )
+        self.maintenance.append(record)
+        self.record_repository(stream_id=pending.stream_id, project_key=project_key)
+        del self._pending_maintenance[cadence_id]
+
+    def record_repository(
+        self,
+        *,
+        stream_id: str,
+        project_key: str,
+        expected_revision: str | None = None,
+    ) -> RepositoryEvidence:
+        snapshot = self.store.load_strict_snapshot()
+        if expected_revision is not None and snapshot.revision != expected_revision:
+            raise ValueError("repository changed while freezing runtime evidence")
+        entries = tuple(sorted(snapshot.memories, key=lambda item: item.id))
+        snapshot_ref = repository_snapshot_ref(
+            entries,
+            repository_revision=snapshot.revision,
+            project_key=project_key,
+            stream_id=stream_id,
+        )
+        existing = next(
+            (
+                item
+                for item in self.repositories.records
+                if item.snapshot.snapshot_hash == snapshot_ref.snapshot_hash
+            ),
+            None,
+        )
+        state_key = (stream_id, project_key)
+        next_ordinal, previous_revision = self._repository_state.get(state_key, (0, ""))
+        if existing is not None:
+            self._repository_state[state_key] = (next_ordinal, snapshot.revision)
+            return existing
+        record = RepositoryEvidence(
+            collection_round=self.collection_round,
+            event_ordinal=next_ordinal,
+            stream_id=stream_id,
+            previous_revision=previous_revision or None,
+            snapshot=snapshot_ref,
+            memories=tuple(
+                RepositoryMemoryEvidence(
+                    memory_id=entry.id,
+                    tier=entry.tier.value,
+                    content=entry.content,
+                    candidate_count=entry.candidate_count,
+                    selected_count=entry.selected_count,
+                    last_used=entry.last_used.isoformat() if entry.last_used is not None else "",
+                )
+                for entry in entries
+            ),
+        )
+        self.repositories.append(record)
+        self._repository_state[state_key] = (next_ordinal + 1, snapshot.revision)
+        return record
+
+    def _finish_task_streams(
+        self,
+        *,
+        episode: AgentEpisodeArtifact,
+        outcome_record: TaskOutcomeEvidence,
+    ) -> None:
+        self.outcomes.append(outcome_record)
+        self._outcome_by_task[
+            _task_key(
+                episode.session.stream_id,
+                episode.session.memory_project_key,
+                outcome_record.outcome.task_id,
+            )
+        ] = outcome_record
+        self.record_repository(
+            stream_id=episode.session.stream_id,
+            project_key=episode.session.memory_project_key,
+        )
+
+    def _record_exclusion(
+        self,
+        *,
+        role: str,
+        reason: str,
+        task_id: str,
+        trajectory_id: str,
+        stream_id: str,
+        project_key: str,
+        task_ordinal: int,
+        decision_ids: tuple[str, ...],
+    ) -> None:
+        self.exclusions.append(RuntimeExclusionEvidence(
+            collection_round=self.collection_round,
+            task_ordinal=task_ordinal,
+            split=self.split,
+            role=role,
+            reason=reason,
+            task_id=task_id,
+            trajectory_id=trajectory_id,
+            stream_id=stream_id,
+            memory_project_key=project_key,
+            decision_ids=decision_ids,
+        ))
+
+    def _events(self, trajectory_id: str) -> tuple[DecisionEvent, ...]:
+        events = self.decision_recorder.events_for(
+            trajectory_id,
+            purpose="fast_loop_evidence",
+        )
+        return tuple(sorted(events, key=lambda item: (item.turn_index, item.step_index, item.decision_id)))
+
+
+def _role_events(events: Sequence[DecisionEvent], role: str) -> tuple[DecisionEvent, ...]:
+    return tuple(event for event in events if event.role == role)
+
+
+def _event_tool_calls(event: DecisionEvent) -> tuple[CanonicalToolCall, ...]:
+    raw = event.parsed_output.get("tool_calls", ())
+    if raw in (None, ()):
+        return ()
+    if not isinstance(raw, list) or any(not isinstance(item, Mapping) for item in raw):
+        raise ValueError("action decision parsed tool_calls must be an array of objects")
+    return tuple(CanonicalToolCall.from_dict(item) for item in raw)
+
+
+def _observations_between(
+    current: DecisionEvent,
+    following: DecisionEvent | None,
+) -> tuple[CanonicalMessage, ...]:
+    if following is None:
+        return ()
+    current_prefix = without_selected_memory_context(current.canonical_messages)
+    following_prefix = without_selected_memory_context(following.canonical_messages)
+    if following_prefix[: len(current_prefix)] != current_prefix:
+        return ()
+    return tuple(
+        message
+        for message in following_prefix[len(current_prefix):]
+        if message.role == "tool"
+    )
+
+
+def _task_key(stream_id: str, project_key: str, task_id: str) -> tuple[str, str, str]:
+    return stream_id, project_key, task_id
+
+
+def _load_records(
+    path: str | Path,
+    loader: Callable[[Mapping[str, Any]], Any],
+) -> tuple[Any, ...]:
+    records: list[Any] = []
+    with Path(path).open("r", encoding="utf-8") as handle:
+        for line_number, raw in enumerate(handle, 1):
+            if not raw.strip():
+                continue
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"invalid runtime evidence JSON at line {line_number}"
+                ) from exc
+            if not isinstance(payload, Mapping):
+                raise ValueError("runtime evidence lines must be JSON objects")
+            records.append(loader(payload))
+    return tuple(records)
+
+
+__all__ = ["RuntimeEvidenceRecorder"]

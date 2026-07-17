@@ -11,6 +11,7 @@ from my_agent.policy.identity import canonical_sha256, require_sha256
 
 
 ROLE_VIEW_SCHEMA_VERSION = "opd-role-view-v1"
+SELECTED_MEMORY_CONTEXT_HEADER = "[Selected evolver memory - frozen for this task]"
 _T = TypeVar("_T")
 
 
@@ -83,6 +84,19 @@ class CanonicalMessage:
             tool_call_id=_string(data["tool_call_id"], "tool_call_id"),
             tool_calls=_tuple_from(data["tool_calls"], CanonicalToolCall.from_dict, "tool_calls"),
         )
+
+
+def without_selected_memory_context(
+    messages: tuple[CanonicalMessage, ...],
+) -> tuple[CanonicalMessage, ...]:
+    return tuple(
+        message
+        for message in messages
+        if not (
+            message.role == "system"
+            and message.content.startswith(SELECTED_MEMORY_CONTEXT_HEADER)
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -756,6 +770,7 @@ def _require_canonical_json(value: str, *, field_name: str) -> None:
 
 __all__ = [
     "ROLE_VIEW_SCHEMA_VERSION",
+    "SELECTED_MEMORY_CONTEXT_HEADER",
     "ActionHindsight",
     "ActionPublic",
     "CandidateSnapshotEntry",
@@ -776,4 +791,5 @@ __all__ = [
     "WritingHindsight",
     "WritingPublic",
     "role_view_hash",
+    "without_selected_memory_context",
 ]

@@ -70,6 +70,10 @@ class _TrainablePolicyStub:
         del batch
         raise AssertionError("not used")
 
+    def verify_completion_round_trip(self, response):
+        del response
+        return True
+
     def render_prompt_hash(self, request):
         del request
         return canonical_sha256("prompt")

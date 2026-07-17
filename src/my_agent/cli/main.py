@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable, Sequence
-from typing import Any
 
 from my_agent.cli.commands import (
     chat,
@@ -11,6 +10,7 @@ from my_agent.cli.commands import (
     eval as eval_manifest,
     mcp,
     memory,
+    opd,
     repo,
     run,
     stats,
@@ -33,6 +33,7 @@ COMMAND_MODULES = (
     mcp,
     memory,
     data,
+    opd,
 )
 
 
