@@ -96,7 +96,7 @@ def load_maintenance_plan(
     return parse_maintenance_plan(payload, repository_entries=repository_entries)
 
 
-def validate_plan_semantics(
+def validate_legacy_plan_semantics(
     plan: MaintenancePlan,
     *,
     repository_entries: Sequence[ExperienceMemory] | None = None,
@@ -182,6 +182,53 @@ def validate_plan_semantics(
         raise MaintenancePlanError(
             "plan operations do not match deterministic snapshot decisions"
         )
+
+
+def validate_plan_semantics(
+    plan: MaintenancePlan,
+    *,
+    repository_entries: Sequence[ExperienceMemory] | None = None,
+) -> None:
+    """Validate only shape, safety, references, preconditions, and conflicts."""
+
+    as_of = _parse_datetime(plan.as_of)
+    if as_of is None or as_of.astimezone(timezone.utc).isoformat() != plan.as_of:
+        raise MaintenancePlanError("as_of must be a canonical timezone-aware UTC datetime")
+    if plan.summary != _operation_summary(plan.operations):
+        raise MaintenancePlanError("plan summary does not match its operations")
+    MaintenanceConfig.from_dict(plan.config)
+    for operation in plan.operations:
+        for source_id in operation.source_ids:
+            precondition = operation.source_preconditions[source_id]
+            scope = MemoryScope(precondition["scope"])
+            if scope == MemoryScope.GLOBAL and operation.action != MaintenanceAction.KEEP:
+                raise MaintenancePlanError("global experience may only be kept")
+            if scope == MemoryScope.PROJECT and precondition["project_key"] != plan.memory_project_key:
+                raise MaintenancePlanError("operation crosses memory project boundary")
+        for payload in operation.replacements + operation.additions:
+            entry = _validated_payload_entry(payload, "mutation")
+            if entry.scope == MemoryScope.GLOBAL:
+                raise MaintenancePlanError("maintenance cannot mutate global experience")
+            if entry.project_key != plan.memory_project_key:
+                raise MaintenancePlanError("mutation payload crosses memory project boundary")
+
+    _validate_operation_conflicts(plan.operations, repository_entries=repository_entries)
+    repository_by_id = (
+        {entry.id: entry for entry in repository_entries}
+        if repository_entries is not None
+        else None
+    )
+    for operation in plan.operations:
+        evidence_by_id = _validated_operation_evidence(operation)
+        if operation.action != MaintenanceAction.KEEP:
+            for evidence in evidence_by_id.values():
+                if not _automatic_maintenance_provenance(evidence.created_by):
+                    raise MaintenancePlanError(
+                        f"destructive action has protected provenance: {evidence.memory_id}"
+                    )
+        if repository_by_id is not None:
+            for source_id, evidence in evidence_by_id.items():
+                _validate_snapshot_evidence(repository_by_id[source_id], evidence)
 
 
 def _validate_snapshot_evidence(
@@ -341,5 +388,6 @@ def _canonical_json(payload: Mapping[str, Any]) -> str:
 __all__ = [
     "load_maintenance_plan",
     "parse_maintenance_plan",
+    "validate_legacy_plan_semantics",
     "validate_plan_semantics",
 ]

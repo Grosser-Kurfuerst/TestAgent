@@ -18,7 +18,7 @@ from my_agent.memory.evolver.artifacts import (
     _MaintenanceArtifactGraph,
     _artifact_paths_alias,
     _history_lock_path,
-    _maintenance_backup_path,
+    _maintenance_backup_path,  # noqa: F401 - compatibility for maintenance fault tests
     _resolve_maintenance_artifact_graph,
     _validate_maintenance_artifact_graph,
 )
@@ -29,15 +29,14 @@ from my_agent.memory.evolver.contracts import (
     MaintenanceAction,
     MaintenanceApplyResult,
     MaintenanceApplyStatus,
+    MaintenanceOperation,
     MaintenancePlan,
     MaintenancePlanError,
     _operation_summary,
     _validated_payload_entry,
     maintenance_plan_json,
 )
-from my_agent.memory.evolver.planner import (
-    _repository_after_operations,
-)
+from my_agent.memory.evolver.repository_reducer import reduce_repository, validate_formal_operations
 from my_agent.memory.evolver.repository_rules import experience_memories_revision
 from my_agent.memory.evolver.validation import (
     parse_maintenance_plan,
@@ -68,6 +67,60 @@ class _MaintenanceHistoryState:
     intent: dict[str, Any] | None = None
     completion: dict[str, Any] | None = None
     audit_error: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class FormalMaintenanceApplyResult:
+    status: str
+    before_revision: str
+    after_revision: str
+    operation_ids: tuple[str, ...]
+    error: str = ""
+
+
+def apply_formal_maintenance_operations(
+    *,
+    store: ExperienceStore,
+    expected_revision: str,
+    project_key: str,
+    operations: Sequence[MaintenanceOperation],
+) -> FormalMaintenanceApplyResult:
+    snapshot = store.load_strict_snapshot()
+    operation_ids = tuple(operation.operation_id for operation in operations)
+    if snapshot.revision != expected_revision:
+        return FormalMaintenanceApplyResult(
+            "stale", snapshot.revision, snapshot.revision, operation_ids,
+            "repository_revision_changed",
+        )
+    validate_formal_operations(snapshot.memories, operations, project_key=project_key)
+    next_entries = reduce_repository(snapshot.memories, operations, validate=False)
+    if tuple(next_entries) == tuple(sorted(snapshot.memories, key=lambda entry: entry.id)):
+        return FormalMaintenanceApplyResult(
+            "noop", snapshot.revision, snapshot.revision, operation_ids,
+        )
+    expected_after = experience_memories_revision(next_entries)
+    try:
+        after_revision = store.replace_all_atomically(
+            next_entries,
+            expected_revision=expected_revision,
+        )
+    except MemoryStoreRevisionConflict:
+        current_revision = store.revision()
+        return FormalMaintenanceApplyResult(
+            "stale", expected_revision, current_revision, operation_ids,
+            "repository_revision_changed",
+        )
+    except MemoryStorePostCommitError as exc:
+        try:
+            recovered = store.load_strict_snapshot()
+        except Exception:
+            raise exc
+        if recovered.revision != exc.expected_revision or recovered.revision != expected_after:
+            raise exc
+        after_revision = recovered.revision
+    return FormalMaintenanceApplyResult(
+        "committed", expected_revision, after_revision, operation_ids,
+    )
 
 
 def apply_maintenance_plan(
@@ -210,7 +263,7 @@ def _apply_maintenance_plan(
 
                 validate_plan_semantics(plan, repository_entries=snapshot.memories)
                 _validate_apply_project_boundaries(plan, snapshot.memories)
-                next_entries = _repository_after_operations(snapshot.memories, plan.operations)
+                next_entries = reduce_repository(snapshot.memories, plan.operations, validate=False)
                 after_count = len(next_entries)
 
                 has_mutation = any(

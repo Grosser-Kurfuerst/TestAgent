@@ -13,7 +13,7 @@ from my_agent.memory.evolver.contracts import (
 )
 from my_agent.memory.evolver.planner import _build_maintenance_plan
 from my_agent.memory.evolver.types import ExperienceMemory
-from my_agent.memory.evolver.validation import validate_plan_semantics
+from my_agent.memory.evolver.validation import validate_legacy_plan_semantics
 
 
 def build_maintenance_plan(
@@ -33,7 +33,7 @@ def build_maintenance_plan(
         as_of=as_of,
         config=config,
     )
-    validate_plan_semantics(plan, repository_entries=entries)
+    validate_legacy_plan_semantics(plan, repository_entries=entries)
     return plan
 
 

@@ -220,6 +220,7 @@ class MemoryManager:
                 top_k_per_tier=config.memory_evolver_candidate_top_k_per_tier,
                 selected_max_items=config.memory_evolver_selected_max_items,
                 selection_token_budget=config.memory_evolver_selection_prompt_tokens,
+                maintenance_max_turns=config.memory_evolver_maintenance_max_turns,
             )
         return cls(
             config=config,
@@ -267,11 +268,13 @@ class MemoryManager:
             config.memory_evolver_candidate_top_k_per_tier,
             config.memory_evolver_selected_max_items,
             config.memory_evolver_selection_prompt_tokens,
+            config.memory_evolver_maintenance_max_turns,
         )
         actual_limits = (
             coordinator.top_k_per_tier,
             coordinator.selected_max_items,
             coordinator.selection_token_budget,
+            coordinator.maintenance_max_turns,
         )
         if actual_limits != expected_limits:
             raise ValueError("formal MemoryManager coordinator limits do not match runtime config")

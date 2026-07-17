@@ -13,6 +13,7 @@ from my_agent.memory.evolver.task_session import (
     TaskEvolverSession,
 )
 from my_agent.memory.evolver.formal_writer import FormalExperienceWriter
+from my_agent.memory.evolver.maintenance_agent import FormalMaintenanceAgent, FormalMaintenanceResult
 from my_agent.memory.evolver.selector_prompt import LLMTaskSelectionPolicy
 from my_agent.memory.evolver.types import ExperienceMemory, ExperienceTier
 from my_agent.memory.evolver.writer import ExperienceWriteResult
@@ -25,6 +26,7 @@ from my_agent.policy.contracts import GenerationPolicy
 from my_agent.training.contracts import AuthoritativeTaskOutcome
 from my_agent.training.decision_log import DecisionEventContext, DecisionEventRecorder
 from my_agent.training.role_views import CandidateSnapshotEntry
+from my_agent.training.role_views import TaskOutcomeRef
 
 
 TraceSink = Callable[[str, dict[str, Any]], None]
@@ -76,6 +78,7 @@ class EvolverCoordinator:
         top_k_per_tier: int = 50,
         selected_max_items: int = 20,
         selection_token_budget: int = 1_800,
+        maintenance_max_turns: int = 8,
     ) -> None:
         if not project_key:
             raise ValueError("evolver coordinator requires project_key")
@@ -115,10 +118,22 @@ class EvolverCoordinator:
             )
         else:
             self.writer = None
+        self.maintainer = (
+            FormalMaintenanceAgent(
+                policy=policy,
+                recorder=self.decision_recorder,
+                store=store,
+                project_key=project_key,
+                max_turns=maintenance_max_turns,
+            )
+            if policy is not None and self.decision_recorder is not None
+            else None
+        )
         self.trace_sink = trace_sink
         self.top_k_per_tier = top_k_per_tier
         self.selected_max_items = selected_max_items
         self.selection_token_budget = selection_token_budget
+        self.maintenance_max_turns = maintenance_max_turns
         self._finalized_trajectories: set[str] = set()
 
     def set_trace_sink(self, trace_sink: TraceSink | None) -> None:
@@ -142,6 +157,31 @@ class EvolverCoordinator:
             raise ValueError("formal writer must share the runtime policy and decision recorder")
         if self.writer.store is not self.store or self.writer.project_key != self.project_key:
             raise ValueError("formal writer repository binding mismatch")
+        if not isinstance(self.maintainer, FormalMaintenanceAgent):
+            raise ValueError("formal coordinator requires FormalMaintenanceAgent")
+        if self.maintainer.policy is not policy or self.maintainer.recorder is not recorder:
+            raise ValueError("formal maintainer must share the runtime policy and decision recorder")
+        if self.maintainer.store is not self.store or self.maintainer.project_key != self.project_key:
+            raise ValueError("formal maintainer repository binding mismatch")
+        if self.maintainer.max_turns != self.maintenance_max_turns:
+            raise ValueError("formal maintainer max-turn binding mismatch")
+
+    def run_maintenance(
+        self,
+        *,
+        maintenance_id: str,
+        stream_id: str,
+        task_group: str,
+        history_window: tuple[TaskOutcomeRef, ...] = (),
+    ) -> FormalMaintenanceResult:
+        if self.maintainer is None:
+            raise RuntimeError("formal maintenance agent is unavailable")
+        return self.maintainer.run(
+            maintenance_id=maintenance_id,
+            stream_id=stream_id,
+            task_group=task_group,
+            history_window=history_window,
+        )
 
     def begin_task(
         self,
