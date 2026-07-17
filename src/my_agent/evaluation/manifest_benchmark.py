@@ -22,10 +22,15 @@ from my_agent.context import (
     DEFAULT_TOOL_RESULT_CHARS,
 )
 from my_agent.evaluation.agent_benchmark import record_benchmark_result
+from my_agent.memory.evolver.coordinator import EvolverCoordinator
+from my_agent.memory.evolver.task_session import AgentEpisodeArtifact
 from my_agent.memory.experience_store import ExperienceStore
 from my_agent.observability.trace_metrics import collect_trace_metrics
+from my_agent.observability.tracing import TraceWriter
 from my_agent.policy.identity import canonical_sha256
 from my_agent.runtime import run_agent
+from my_agent.schema import TraceEvent
+from my_agent.training.contracts import AuthoritativeTaskOutcome, EvaluatorIdentity
 
 
 AgentRunnerFn = Callable[..., Any]
@@ -91,6 +96,9 @@ class ManifestEvalResult:
     evaluator_version: str = ""
     evaluator_hash: str = ""
     outcome_finalized: bool = True
+    evolver_writer_status: str = ""
+    written_memory_ids: list[str] = field(default_factory=list)
+    repository_revision_after_writer: str = ""
     mode: str = "auto"
     tags: list[str] = field(default_factory=list)
     env_overrides: dict[str, str] = field(default_factory=dict)
@@ -136,6 +144,9 @@ class ManifestEvalResult:
             "evaluator_version": self.evaluator_version,
             "evaluator_hash": self.evaluator_hash,
             "outcome_finalized": self.outcome_finalized,
+            "evolver_writer_status": self.evolver_writer_status,
+            "written_memory_ids": list(self.written_memory_ids),
+            "repository_revision_after_writer": self.repository_revision_after_writer,
             "mode": self.mode,
             "tags": list(self.tags),
             "env_overrides": dict(self.env_overrides),
@@ -204,6 +215,7 @@ def run_manifest_benchmark(
 ) -> ManifestBenchmarkResult:
     manifest_path = Path(tasks_path)
     tasks, manifest_settings = _load_manifest(manifest_path)
+    resolved_mode = _formal_manifest_mode(mode, formal=config.memory_evolver_mode == "formal")
     tasks = _prepare_manifest_tasks(
         tasks,
         settings=manifest_settings,
@@ -240,7 +252,7 @@ def run_manifest_benchmark(
             memory_root=memory_root,
             manifest_settings=manifest_settings,
             config=run_config,
-            mode=mode,
+            mode=resolved_mode,
             max_steps=max_steps,
             command_timeout=timeout,
             cli_env=cli_env,
@@ -259,6 +271,17 @@ def run_manifest_benchmark(
         results_path=results_path,
         summary_path=summary_path,
     )
+
+
+def _formal_manifest_mode(mode: str, *, formal: bool) -> str:
+    normalized = str(getattr(mode, "value", mode) or "auto").strip().lower()
+    if not formal:
+        return normalized
+    if normalized == "auto":
+        return "react"
+    if normalized != "react":
+        raise ValueError("formal OPD manifest collection currently requires mode=react")
+    return normalized
 
 
 def load_manifest_tasks(path: str | Path) -> list[dict[str, Any]]:
@@ -693,6 +716,51 @@ def _run_manifest_task(
         hidden_ok=hidden_ok,
         has_hidden=hidden_command is not None,
     )
+    authoritative_resolved = resolved
+    evolver_writer_status = ""
+    written_memory_ids: list[str] = []
+    repository_revision_after_writer = ""
+    if task_config.memory_evolver_mode == "formal":
+        episode = getattr(state, "evolver_episode", None) if state is not None else None
+        if not isinstance(episode, AgentEpisodeArtifact):
+            error = error or "RuntimeError: formal task did not produce AgentEpisodeArtifact"
+            resolved = False
+            failure_type = "evolver_finalize_failed"
+        else:
+            try:
+                final_store = ExperienceStore.from_dir(task_config.memory_dir)
+                final_store.load()
+                finalize_writer = TraceWriter(episode.trace_path)
+                finalize_result = EvolverCoordinator(
+                    store=final_store,
+                    project_key=episode.session.memory_project_key,
+                    policy_identity=episode.session.policy_identity,
+                    trace_sink=lambda event, payload: finalize_writer.append(
+                        TraceEvent(event=event, payload=payload, run_id=str(getattr(state, "run_id", task_id)))
+                    ),
+                ).finalize_task(
+                    episode,
+                    AuthoritativeTaskOutcome(
+                        task_id=task_id,
+                        task_group=task_group,
+                        task_valid=True,
+                        resolved=authoritative_resolved,
+                        reward=1.0 if authoritative_resolved else 0.0,
+                        evaluator=EvaluatorIdentity(
+                            evaluator_name,
+                            evaluator_version,
+                            evaluator_hash,
+                        ),
+                        outcome_finalized=True,
+                    ),
+                )
+                evolver_writer_status = finalize_result.writer_status
+                written_memory_ids = list(finalize_result.written_memory_ids)
+                repository_revision_after_writer = finalize_result.repository_revision_after
+            except Exception as exc:  # noqa: BLE001 - formal collection must fail closed
+                error = f"{type(exc).__name__}: {exc}"
+                resolved = False
+                failure_type = "evolver_finalize_failed"
     trace_path = str(getattr(state, "trace_path", "") or "")
     metrics = _metrics_for_trace(trace_path, task_trace_dir)
     after_counts = _memory_counts(task_config.memory_dir, project_key=task_config.memory_project_key)
@@ -712,10 +780,13 @@ def _run_manifest_task(
         initial_visible=initial_visible,
         source=source,
         task_group=task_group,
-        reward=1.0 if resolved else 0.0,
+        reward=1.0 if authoritative_resolved else 0.0,
         evaluator_name=evaluator_name,
         evaluator_version=evaluator_version,
         evaluator_hash=evaluator_hash,
+        evolver_writer_status=evolver_writer_status,
+        written_memory_ids=written_memory_ids,
+        repository_revision_after_writer=repository_revision_after_writer,
         mode=mode,
         tags=tags,
         env_overrides=env_overrides,

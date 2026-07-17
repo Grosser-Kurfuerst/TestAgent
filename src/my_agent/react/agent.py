@@ -13,7 +13,8 @@ from my_agent.hitl.types import ApprovalEvent
 from my_agent.llm import AgentLLM
 from my_agent.llm.types import ChatResponse, LLMToolCall, Message, MessageLike, messages_to_openai
 from my_agent.memory import MemoryManager
-from my_agent.memory.evolver import runtime_outcome_from_tool_records
+from my_agent.memory.evolver import build_write_steps_from_tool_history, runtime_outcome_from_tool_records
+from my_agent.memory.evolver.task_session import AgentEpisodeArtifact
 from my_agent.memory.token import estimate_tokens
 from my_agent.agent_base import AgentBase
 from my_agent.schema import AgentState, ToolCall, ToolRecord, ToolResult
@@ -120,6 +121,31 @@ class ReActAgent(AgentBase):
             state.plan = "Use native ReAct tool calls to inspect, edit, verify, and finish the task."
 
             base_messages = self._initial_messages(state)
+            formal_session = None
+            if self.config.memory_evolver_mode == "formal":
+                metadata = dict(getattr(state, "metadata", {}) or {})
+                task_id = str(metadata.get("task_id") or metadata.get("source_task") or "").strip()
+                task_group = str(metadata.get("task_group") or "").strip()
+                stream_id = str(metadata.get("stream_id") or "").strip()
+                if task_id and task_group and stream_id:
+                    formal_session = memory.begin_formal_evolver_task(
+                        task=state.task,
+                        task_id=task_id,
+                        task_group=task_group,
+                        trajectory_id=state.run_id,
+                        stream_id=stream_id,
+                    )
+                else:
+                    self._emit(
+                        writer,
+                        state.trace_event(
+                            "memory.evolver_session_skipped",
+                            {
+                                "reason": "missing_authoritative_task_metadata",
+                                "interactive": True,
+                            },
+                        ),
+                    )
             memory.append_task_goal(state.task, run_id=state.run_id)
             while not state.done:
                 if _is_cancelled(state):
@@ -211,20 +237,29 @@ class ReActAgent(AgentBase):
 
             tool_history = [record.to_dict() for record in state.tool_history]
             writer_metadata = dict(getattr(state, "metadata", {}) or {})
-            memory.write_experiences_from_run(
-                task=state.task,
-                run_id=state.run_id,
-                trace_path=state.trace_path,
-                stop_reason=state.stop_reason,
-                final_answer=state.final_answer,
-                tool_history=tool_history,
-                outcome=runtime_outcome_from_tool_records(state.stop_reason, tool_history),
-                outcome_source="runtime",
-                source_task=str(writer_metadata.get("source_task") or writer_metadata.get("task_id") or ""),
-                stream_id=str(writer_metadata.get("stream_id") or ""),
-                task_type=str(writer_metadata.get("task_type") or ""),
-                memory_mode=str(writer_metadata.get("memory_mode") or ""),
-            )
+            if formal_session is not None and state.trace_path is not None:
+                state.evolver_episode = AgentEpisodeArtifact(
+                    session=formal_session,
+                    trace_path=Path(state.trace_path),
+                    stop_reason=state.stop_reason,
+                    final_answer=state.final_answer,
+                    tool_history=build_write_steps_from_tool_history(tool_history),
+                )
+            elif self.config.memory_evolver_mode != "formal":
+                memory.write_experiences_from_run(
+                    task=state.task,
+                    run_id=state.run_id,
+                    trace_path=state.trace_path,
+                    stop_reason=state.stop_reason,
+                    final_answer=state.final_answer,
+                    tool_history=tool_history,
+                    outcome=runtime_outcome_from_tool_records(state.stop_reason, tool_history),
+                    outcome_source="runtime",
+                    source_task=str(writer_metadata.get("source_task") or writer_metadata.get("task_id") or ""),
+                    stream_id=str(writer_metadata.get("stream_id") or ""),
+                    task_type=str(writer_metadata.get("task_type") or ""),
+                    memory_mode=str(writer_metadata.get("memory_mode") or ""),
+                )
             self._finalize(state, writer, budget)
             return state
 

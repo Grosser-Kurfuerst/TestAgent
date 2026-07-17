@@ -13,6 +13,10 @@ from my_agent.context import ContextProfile
 from my_agent.llm import AgentLLM
 from my_agent.llm.types import ChatResponse, LLMToolCall, Message, MessageLike, messages_to_openai
 from my_agent.memory.compression import MemoryCompressor
+from my_agent.memory.embedding_retrieval import (
+    EmbeddingRetriever,
+    TransformersEmbeddingEncoder,
+)
 from my_agent.memory.evolver import (
     ExperienceCreatedBy,
     ExperienceMemory,
@@ -31,6 +35,8 @@ from my_agent.memory.evolver import (
     selection_tier_counts,
     writer_policy_for_result,
 )
+from my_agent.memory.evolver.coordinator import EvolverCoordinator
+from my_agent.memory.evolver.task_session import TaskEvolverSession
 from my_agent.memory.evolver.attribution import MemoryAttributionRecord
 from my_agent.memory.experience_retrieval import (
     ExperienceRetrievalMetrics,
@@ -108,6 +114,8 @@ class MemoryManager:
         experience_retriever: ExperienceRetriever,
         compressor: MemoryCompressor,
         project_key: str,
+        embedding_retriever: EmbeddingRetriever | None = None,
+        evolver_coordinator: EvolverCoordinator | None = None,
         session_id: str = "",
         trace_sink: Any | None = None,
         context_profile: ContextProfile | None = None,
@@ -119,17 +127,19 @@ class MemoryManager:
         self.short_term = short_term
         self.experience_store = experience_store
         self.experience_retriever = experience_retriever
+        self.embedding_retriever = embedding_retriever
+        self.evolver_coordinator = evolver_coordinator
         self.compressor = compressor
         self.project_key = project_key
         self.session_id = session_id
         self._trace_sink = trace_sink
-        self.evolver_selector = ExperienceSelector(
+        self.evolver_selector = None if self.config.memory_evolver_mode == "formal" else ExperienceSelector(
             tier_weights=self.config.memory_evolver_tier_weights,
             tier_caps=self.config.memory_evolver_tier_caps,
             selected_max_items=self.config.memory_evolver_selected_max_items,
             min_score=self.config.memory_evolver_min_score,
         )
-        self.evolver_writer = ExperienceWriter(
+        self.evolver_writer = None if self.config.memory_evolver_mode == "formal" else ExperienceWriter(
             llm=self.llm,
             min_confidence=self.config.memory_evolver_writer_min_confidence,
             max_records=self.config.memory_evolver_writer_max_records,
@@ -137,6 +147,8 @@ class MemoryManager:
             max_content_chars=self.config.memory_evolver_writer_max_content_chars,
         )
         self.last_evolver_selection: SelectionResult | None = None
+        self._formal_session: TaskEvolverSession | None = None
+        self._formal_context: MemoryContext[ExperienceMemory] | None = None
 
     def set_trace_sink(self, trace_sink: Any | None) -> tuple[Any | None, Any | None]:
         previous = (
@@ -182,6 +194,25 @@ class MemoryManager:
         project_key = str(getattr(config, "memory_project_key", "") or "").strip()
         if not project_key:
             project_key = _normalize_project_key(repo_path)
+        embedding_retriever: EmbeddingRetriever | None = None
+        evolver_coordinator: EvolverCoordinator | None = None
+        if config.memory_evolver_mode == "formal":
+            identity_method = getattr(llm, "identity", None)
+            if not callable(identity_method):
+                raise ValueError("formal memory evolver requires a policy with identity()")
+            embedding_retriever = EmbeddingRetriever(
+                TransformersEmbeddingEncoder.from_config(config)
+            )
+            evolver_coordinator = EvolverCoordinator(
+                store=experience_store,
+                project_key=project_key,
+                policy_identity=identity_method(),
+                retriever=embedding_retriever,
+                trace_sink=trace_sink,
+                top_k_per_tier=config.memory_evolver_candidate_top_k_per_tier,
+                selected_max_items=config.memory_evolver_selected_max_items,
+                selection_token_budget=config.memory_evolver_selection_prompt_tokens,
+            )
         return cls(
             config=config,
             llm=llm,
@@ -191,6 +222,8 @@ class MemoryManager:
             experience_retriever=experience_retriever,
             compressor=compressor,
             project_key=project_key,
+            embedding_retriever=embedding_retriever,
+            evolver_coordinator=evolver_coordinator,
             session_id=session_id or "",
             trace_sink=trace_sink,
             context_profile=context_profile,
@@ -365,6 +398,10 @@ class MemoryManager:
         limit: int | None = None,
         include_short_term: bool = False,
     ) -> MemoryContext:
+        if self.config.memory_evolver_mode == "formal":
+            if self._formal_context is None:
+                return MemoryContext(injected_text="", hits=[], estimated_tokens=0)
+            return self._formal_context
         if self.config.memory_evolver_mode in {"retrieve_select", "full"}:
             return self.build_evolver_context_for_query(
                 query,
@@ -387,6 +424,30 @@ class MemoryManager:
             },
         )
         return context
+
+    def begin_formal_evolver_task(
+        self,
+        *,
+        task: str,
+        task_id: str,
+        task_group: str,
+        trajectory_id: str,
+        stream_id: str,
+    ) -> TaskEvolverSession:
+        if self.config.memory_evolver_mode != "formal" or self.evolver_coordinator is None:
+            raise RuntimeError("formal evolver task session is unavailable")
+        if self._formal_session is not None:
+            raise RuntimeError("formal evolver selection already ran for this task manager")
+        session = self.evolver_coordinator.begin_task(
+            task=task,
+            task_id=task_id,
+            task_group=task_group,
+            trajectory_id=trajectory_id,
+            stream_id=stream_id,
+        )
+        self._formal_session = session
+        self._formal_context = self.evolver_coordinator.context_for_session(session)
+        return session
 
     def retrieve_evolver_candidates(
         self,
@@ -470,6 +531,8 @@ class MemoryManager:
 
         candidates = self.retrieve_evolver_candidates(query, top_k_per_tier=resolved_top_k)
         try:
+            if self.evolver_selector is None:
+                raise RuntimeError("legacy rule selector is unavailable in formal mode")
             result = self.evolver_selector.select(
                 query=query,
                 hits=candidates,
@@ -669,6 +732,8 @@ class MemoryManager:
         )
         context_payload = _writer_dataset_context_payload(request)
         try:
+            if self.evolver_writer is None:
+                raise RuntimeError("legacy writer is unavailable in formal mode")
             self._trace(
                 "memory.evolver_writer_started",
                 {
@@ -803,6 +868,8 @@ class MemoryManager:
                 max_input_chars=self.config.max_summary_input_chars,
             ),
             project_key=self.project_key,
+            embedding_retriever=self.embedding_retriever,
+            evolver_coordinator=self.evolver_coordinator,
             session_id=session_id,
             trace_sink=self._trace_sink,
             context_profile=self.context_profile,

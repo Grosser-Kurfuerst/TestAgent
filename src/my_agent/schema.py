@@ -96,6 +96,7 @@ class AgentState:
     done: bool = False
     stop_reason: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
+    evolver_episode: Any | None = None
     cancellation_token: CancellationToken | None = field(default=None, repr=False, compare=False)
 
     @classmethod
