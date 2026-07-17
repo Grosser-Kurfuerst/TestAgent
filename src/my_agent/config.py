@@ -11,7 +11,7 @@ from dotenv import dotenv_values
 TRUE_VALUES = {"1", "true", "yes", "on"}
 SUPPORTED_PROVIDERS = {"openai", "fake"}
 SUPPORTED_AGENT_MODES = {"react", "plan", "team", "auto"}
-SUPPORTED_MEMORY_EVOLVER_MODES = {"off", "retrieve_select", "full"}
+SUPPORTED_MEMORY_EVOLVER_MODES = {"off", "formal", "retrieve_select", "full"}
 SUPPORTED_MEMORY_EVOLVER_WRITER_MODES = {"fallback", "llm"}
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_ENV_FILE = PROJECT_ROOT / ".env"
@@ -92,6 +92,25 @@ class AgentConfig:
     memory_context_tokens_explicit: bool = False
     memory_tool_result_chars_explicit: bool = False
     memory_evolver_mode: str = "off"
+    # Formal OPD fields. The older selector/writer fields below remain only for
+    # the pinned legacy baseline and are rejected when formal mode is loaded.
+    memory_evolver_candidate_top_k_per_tier: int = 50
+    memory_evolver_selection_prompt_tokens: int = 1_800
+    memory_evolver_maintenance_interval_tasks: int = 30
+    memory_evolver_maintenance_max_turns: int = 8
+    memory_evolver_dataset_dir: Path | None = None
+    memory_evolver_teacher_min_score: float = 0.01
+    memory_evolver_writing_top_fraction: float = 0.30
+    embedding_model: str = "Qwen/Qwen3-Embedding-0.6B"
+    embedding_revision: str = ""
+    policy_backend: str = "transformers"
+    policy_base_model: str = "Qwen/Qwen3-4B-Instruct-2507"
+    policy_base_revision: str = ""
+    policy_adapter_path: Path | None = None
+    policy_tokenizer_revision: str = ""
+    policy_chat_template: str = "model_default"
+    policy_dtype: str = "bfloat16"
+    policy_device: str = "auto"
     memory_evolver_top_k_per_tier: int = 50
     memory_evolver_selected_max_items: int = 20
     memory_evolver_min_score: float = 0.0
@@ -165,7 +184,7 @@ class AgentConfig:
         provider = values.get("MY_AGENT_LLM_PROVIDER", "openai").strip().lower()
         use_fake_llm = _as_bool(values.get("MY_AGENT_USE_FAKE_LLM", "")) or provider == "fake"
 
-        return cls(
+        config = cls(
             provider=provider,
             api_key=values.get("MY_AGENT_API_KEY") or values.get("OPENAI_API_KEY", ""),
             base_url=values.get("MY_AGENT_BASE_URL") or values.get("OPENAI_BASE_URL") or None,
@@ -317,6 +336,107 @@ class AgentConfig:
                 "MY_AGENT_MEMORY_TOOL_RESULT_CHARS",
             ),
             memory_evolver_mode=_memory_evolver_mode(values),
+            memory_evolver_candidate_top_k_per_tier=_as_min_int(
+                values.get(
+                    "AGENTCLI_MEMORY_EVOLVER_CANDIDATE_TOP_K_PER_TIER",
+                    values.get("MY_AGENT_MEMORY_EVOLVER_CANDIDATE_TOP_K_PER_TIER"),
+                ),
+                50,
+                1,
+            ),
+            memory_evolver_selection_prompt_tokens=_as_min_int(
+                values.get(
+                    "AGENTCLI_MEMORY_EVOLVER_SELECTION_PROMPT_TOKENS",
+                    values.get("MY_AGENT_MEMORY_EVOLVER_SELECTION_PROMPT_TOKENS"),
+                ),
+                1_800,
+                1,
+            ),
+            memory_evolver_maintenance_interval_tasks=_as_min_int(
+                values.get(
+                    "AGENTCLI_MEMORY_EVOLVER_MAINTENANCE_INTERVAL_TASKS",
+                    values.get("MY_AGENT_MEMORY_EVOLVER_MAINTENANCE_INTERVAL_TASKS"),
+                ),
+                30,
+                1,
+            ),
+            memory_evolver_maintenance_max_turns=_as_min_int(
+                values.get(
+                    "AGENTCLI_MEMORY_EVOLVER_MAINTENANCE_MAX_TURNS",
+                    values.get("MY_AGENT_MEMORY_EVOLVER_MAINTENANCE_MAX_TURNS"),
+                ),
+                8,
+                1,
+            ),
+            memory_evolver_dataset_dir=_optional_path(
+                values.get(
+                    "AGENTCLI_MEMORY_EVOLVER_DATASET_DIR",
+                    values.get("MY_AGENT_MEMORY_EVOLVER_DATASET_DIR"),
+                )
+            ),
+            memory_evolver_teacher_min_score=_as_min_float(
+                values.get(
+                    "AGENTCLI_MEMORY_EVOLVER_TEACHER_MIN_SCORE",
+                    values.get("MY_AGENT_MEMORY_EVOLVER_TEACHER_MIN_SCORE"),
+                ),
+                0.01,
+                0.0,
+            ),
+            memory_evolver_writing_top_fraction=_as_ratio(
+                values.get(
+                    "AGENTCLI_MEMORY_EVOLVER_WRITING_TOP_FRACTION",
+                    values.get("MY_AGENT_MEMORY_EVOLVER_WRITING_TOP_FRACTION"),
+                ),
+                0.30,
+            ),
+            embedding_model=str(
+                values.get("AGENTCLI_EMBEDDING_MODEL")
+                or values.get("MY_AGENT_EMBEDDING_MODEL")
+                or "Qwen/Qwen3-Embedding-0.6B"
+            ).strip(),
+            embedding_revision=str(
+                values.get("AGENTCLI_EMBEDDING_REVISION")
+                or values.get("MY_AGENT_EMBEDDING_REVISION")
+                or ""
+            ).strip(),
+            policy_backend=str(
+                values.get("AGENTCLI_POLICY_BACKEND")
+                or values.get("MY_AGENT_POLICY_BACKEND")
+                or "transformers"
+            ).strip().lower(),
+            policy_base_model=str(
+                values.get("AGENTCLI_POLICY_BASE_MODEL")
+                or values.get("MY_AGENT_POLICY_BASE_MODEL")
+                or "Qwen/Qwen3-4B-Instruct-2507"
+            ).strip(),
+            policy_base_revision=str(
+                values.get("AGENTCLI_POLICY_BASE_REVISION")
+                or values.get("MY_AGENT_POLICY_BASE_REVISION")
+                or ""
+            ).strip(),
+            policy_adapter_path=_optional_path(
+                values.get("AGENTCLI_POLICY_ADAPTER_PATH", values.get("MY_AGENT_POLICY_ADAPTER_PATH"))
+            ),
+            policy_tokenizer_revision=str(
+                values.get("AGENTCLI_POLICY_TOKENIZER_REVISION")
+                or values.get("MY_AGENT_POLICY_TOKENIZER_REVISION")
+                or ""
+            ).strip(),
+            policy_chat_template=str(
+                values.get("AGENTCLI_POLICY_CHAT_TEMPLATE")
+                or values.get("MY_AGENT_POLICY_CHAT_TEMPLATE")
+                or "model_default"
+            ).strip(),
+            policy_dtype=str(
+                values.get("AGENTCLI_POLICY_DTYPE")
+                or values.get("MY_AGENT_POLICY_DTYPE")
+                or "bfloat16"
+            ).strip().lower(),
+            policy_device=str(
+                values.get("AGENTCLI_POLICY_DEVICE")
+                or values.get("MY_AGENT_POLICY_DEVICE")
+                or "auto"
+            ).strip(),
             memory_evolver_top_k_per_tier=_as_min_int(
                 values.get(
                     "AGENTCLI_MEMORY_EVOLVER_TOP_K_PER_TIER",
@@ -477,6 +597,8 @@ class AgentConfig:
                 default=True,
             ),
         )
+        _validate_formal_evolver_config(config, values)
+        return config
 
     def require_valid_provider(self) -> None:
         if self.provider not in SUPPORTED_PROVIDERS:
@@ -566,6 +688,34 @@ def _memory_evolver_writer_mode(values: Mapping[str, str]) -> str:
             f"Unsupported AGENTCLI_MEMORY_EVOLVER_WRITER_MODE={raw_mode!r}. Supported modes: {supported}."
         )
     return normalized
+
+
+def _validate_formal_evolver_config(
+    config: AgentConfig,
+    values: Mapping[str, str],
+) -> None:
+    if config.memory_evolver_mode != "formal":
+        return
+    from my_agent.training.formal_contract import FORMAL_FORBIDDEN_LEGACY_CONFIG_KEYS
+
+    forbidden = sorted(
+        key for key in FORMAL_FORBIDDEN_LEGACY_CONFIG_KEYS if _has_value(values, key)
+    )
+    if forbidden:
+        raise ValueError(
+            "formal memory evolver configuration rejects legacy rule fields: "
+            + ", ".join(forbidden)
+        )
+    if config.policy_backend != "transformers":
+        raise ValueError("formal memory evolver requires policy_backend=transformers")
+    for field_name in ("policy_base_revision", "policy_tokenizer_revision", "embedding_revision"):
+        value = str(getattr(config, field_name)).strip()
+        if not value:
+            raise ValueError(f"formal memory evolver requires {field_name}")
+        if value.lower() in {"main", "master", "head", "latest"}:
+            raise ValueError(f"formal memory evolver requires an immutable {field_name}")
+    if not config.policy_base_model or not config.embedding_model:
+        raise ValueError("formal memory evolver requires policy and embedding model names")
 
 
 def _as_ratio(value: str | None, default: float) -> float:

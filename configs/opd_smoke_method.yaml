@@ -1,0 +1,38 @@
+schema_version: opd-preset-v1
+reproduction_goal: method_smoke
+reproduction_status: in_progress
+legacy_baseline_commit: 6c501c4f99b26a62e024d4d5c9aae3d7acd05159
+legacy_memory_migration: false
+
+memory_evolver_mode: formal
+memory_evolver_candidate_top_k_per_tier: 50
+memory_evolver_selected_max_items: 20
+memory_evolver_selection_prompt_tokens: 1800
+memory_evolver_maintenance_interval_tasks: 30
+memory_evolver_maintenance_max_turns: 8
+memory_evolver_teacher_min_score: 0.01
+memory_evolver_writing_top_fraction: 0.30
+
+policy_backend: transformers
+policy_base_model: hf-internal-testing/tiny-random-gpt2
+policy_base_revision: REPLACE_WITH_IMMUTABLE_REVISION
+policy_adapter_path: null
+policy_tokenizer_revision: REPLACE_WITH_IMMUTABLE_REVISION
+policy_chat_template: model_default
+policy_dtype: float32
+policy_device: cpu
+
+embedding_model: Qwen/Qwen3-Embedding-0.6B
+embedding_revision: REPLACE_WITH_IMMUTABLE_REVISION
+
+task_group_fallback: source
+max_prompt_tokens: 2048
+temperature: 1.0
+top_p: 0.95
+max_agent_steps: 8
+train_epochs_per_round: 1
+tier_priors:
+  trajectory: 1.0
+  tip: 1.0
+  skill: 1.0
+  tool: 1.0

@@ -24,6 +24,7 @@ from my_agent.context import (
 from my_agent.evaluation.agent_benchmark import record_benchmark_result
 from my_agent.memory.experience_store import ExperienceStore
 from my_agent.observability.trace_metrics import collect_trace_metrics
+from my_agent.policy.identity import canonical_sha256
 from my_agent.runtime import run_agent
 
 
@@ -44,6 +45,7 @@ MEMORY_MODES = {
 class ManifestSettings:
     memory_mode: str = MEMORY_MODE_PER_TASK
     stream_id: str = ""
+    task_group_fallback: str = ""
 
 
 @dataclass(frozen=True)
@@ -83,6 +85,12 @@ class ManifestEvalResult:
     failure_type: str
     initial_visible: CommandResult
     source: str = "local"
+    task_group: str = ""
+    reward: float = 0.0
+    evaluator_name: str = ""
+    evaluator_version: str = ""
+    evaluator_hash: str = ""
+    outcome_finalized: bool = True
     mode: str = "auto"
     tags: list[str] = field(default_factory=list)
     env_overrides: dict[str, str] = field(default_factory=dict)
@@ -122,6 +130,12 @@ class ManifestEvalResult:
             "task_valid": self.task_valid,
             "failure_type": self.failure_type,
             "source": self.source,
+            "task_group": self.task_group,
+            "reward": self.reward,
+            "evaluator_name": self.evaluator_name,
+            "evaluator_version": self.evaluator_version,
+            "evaluator_hash": self.evaluator_hash,
+            "outcome_finalized": self.outcome_finalized,
             "mode": self.mode,
             "tags": list(self.tags),
             "env_overrides": dict(self.env_overrides),
@@ -190,6 +204,11 @@ def run_manifest_benchmark(
 ) -> ManifestBenchmarkResult:
     manifest_path = Path(tasks_path)
     tasks, manifest_settings = _load_manifest(manifest_path)
+    tasks = _prepare_manifest_tasks(
+        tasks,
+        settings=manifest_settings,
+        formal=config.memory_evolver_mode == "formal",
+    )
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     results_path = output / "results.jsonl"
@@ -268,11 +287,42 @@ def _load_manifest(path: str | Path) -> tuple[list[dict[str, Any]], ManifestSett
         settings = ManifestSettings(
             memory_mode=_memory_mode_value(payload.get("memory_mode"), default=MEMORY_MODE_PER_TASK),
             stream_id=str(payload.get("stream_id") or "").strip(),
+            task_group_fallback=_task_group_fallback(payload.get("task_group_fallback")),
         )
         return [dict(item) for item in payload["tasks"] if isinstance(item, dict)], settings
     if isinstance(payload, dict):
         return [dict(payload)], ManifestSettings()
     raise ValueError("Manifest must be a JSON object, JSON array, or JSONL objects.")
+
+
+def _prepare_manifest_tasks(
+    tasks: Sequence[Mapping[str, Any]],
+    *,
+    settings: ManifestSettings,
+    formal: bool,
+) -> list[dict[str, Any]]:
+    prepared: list[dict[str, Any]] = []
+    for index, task in enumerate(tasks, start=1):
+        item = dict(task)
+        task_group = str(item.get("task_group") or "").strip()
+        if not task_group and settings.task_group_fallback == "source":
+            task_group = str(item.get("source") or "").strip()
+        if formal and not task_group:
+            task_id = str(item.get("id") or f"task_{index}")
+            raise ValueError(
+                f"formal manifest task {task_id!r} requires a non-empty task_group; "
+                "smoke manifests may explicitly set task_group_fallback=source"
+            )
+        item["task_group"] = task_group
+        prepared.append(item)
+    return prepared
+
+
+def _task_group_fallback(value: object) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized not in {"", "source"}:
+        raise ValueError("task_group_fallback must be empty or 'source'")
+    return normalized
 
 
 def _resolve_memory_stream(
@@ -496,6 +546,7 @@ def _run_manifest_task(
     started = time.monotonic()
     task_id = str(task.get("id") or f"task_{index}")
     source = str(task.get("source") or "local")
+    task_group = str(task.get("task_group") or "").strip()
     tags = _string_list(task.get("tags"))
     expected_changed_files = _string_list(task.get("expected_changed_files"))
     safe_id = _safe_id(task_id)
@@ -535,6 +586,13 @@ def _run_manifest_task(
     agent_test_command = task.get("agent_test_command") or task.get("test_command")
     visible_command = task.get("visible_test_command") or agent_test_command
     hidden_command = task.get("hidden_test_command")
+    evaluator_name = "manifest"
+    evaluator_version = "manifest-evaluator-v1"
+    evaluator_hash = canonical_sha256({
+        "visible_test_command": _command_label(visible_command),
+        "hidden_test_command": _command_label(hidden_command),
+        "expected_changed_files": expected_changed_files,
+    })
     initial_visible = run_test_command(visible_command, cwd=initial_repo, timeout=command_timeout, env=command_env)
     initial_hidden = (
         run_test_command(hidden_command, cwd=initial_repo, timeout=command_timeout, env=command_env)
@@ -560,6 +618,11 @@ def _run_manifest_task(
             failure_type="invalid_initial_pass",
             initial_visible=initial_visible,
             source=source,
+            task_group=task_group,
+            reward=0.0,
+            evaluator_name=evaluator_name,
+            evaluator_version=evaluator_version,
+            evaluator_hash=evaluator_hash,
             mode=mode,
             tags=tags,
             env_overrides=env_overrides,
@@ -586,6 +649,7 @@ def _run_manifest_task(
                 "source_task": task_id,
                 "task_id": task_id,
                 "task_type": source or mode,
+                "task_group": task_group,
                 "stream_id": memory_stream.stream_id,
                 "memory_mode": memory_stream.memory_mode,
                 "memory_project_key": task_config.memory_project_key,
@@ -647,6 +711,11 @@ def _run_manifest_task(
         failure_type=failure_type,
         initial_visible=initial_visible,
         source=source,
+        task_group=task_group,
+        reward=1.0 if resolved else 0.0,
+        evaluator_name=evaluator_name,
+        evaluator_version=evaluator_version,
+        evaluator_hash=evaluator_hash,
         mode=mode,
         tags=tags,
         env_overrides=env_overrides,
@@ -931,6 +1000,41 @@ def _config_for_eval_env(
         values["AGENTCLI_MEMORY_PROJECT_KEY"] = memory_project_key
     _normalize_evolver_mode_overrides(values, overrides)
     for agentcli_key, my_agent_key in (
+        (
+            "AGENTCLI_MEMORY_EVOLVER_CANDIDATE_TOP_K_PER_TIER",
+            "MY_AGENT_MEMORY_EVOLVER_CANDIDATE_TOP_K_PER_TIER",
+        ),
+        (
+            "AGENTCLI_MEMORY_EVOLVER_SELECTION_PROMPT_TOKENS",
+            "MY_AGENT_MEMORY_EVOLVER_SELECTION_PROMPT_TOKENS",
+        ),
+        (
+            "AGENTCLI_MEMORY_EVOLVER_MAINTENANCE_INTERVAL_TASKS",
+            "MY_AGENT_MEMORY_EVOLVER_MAINTENANCE_INTERVAL_TASKS",
+        ),
+        (
+            "AGENTCLI_MEMORY_EVOLVER_MAINTENANCE_MAX_TURNS",
+            "MY_AGENT_MEMORY_EVOLVER_MAINTENANCE_MAX_TURNS",
+        ),
+        ("AGENTCLI_MEMORY_EVOLVER_DATASET_DIR", "MY_AGENT_MEMORY_EVOLVER_DATASET_DIR"),
+        (
+            "AGENTCLI_MEMORY_EVOLVER_TEACHER_MIN_SCORE",
+            "MY_AGENT_MEMORY_EVOLVER_TEACHER_MIN_SCORE",
+        ),
+        (
+            "AGENTCLI_MEMORY_EVOLVER_WRITING_TOP_FRACTION",
+            "MY_AGENT_MEMORY_EVOLVER_WRITING_TOP_FRACTION",
+        ),
+        ("AGENTCLI_EMBEDDING_MODEL", "MY_AGENT_EMBEDDING_MODEL"),
+        ("AGENTCLI_EMBEDDING_REVISION", "MY_AGENT_EMBEDDING_REVISION"),
+        ("AGENTCLI_POLICY_BACKEND", "MY_AGENT_POLICY_BACKEND"),
+        ("AGENTCLI_POLICY_BASE_MODEL", "MY_AGENT_POLICY_BASE_MODEL"),
+        ("AGENTCLI_POLICY_BASE_REVISION", "MY_AGENT_POLICY_BASE_REVISION"),
+        ("AGENTCLI_POLICY_ADAPTER_PATH", "MY_AGENT_POLICY_ADAPTER_PATH"),
+        ("AGENTCLI_POLICY_TOKENIZER_REVISION", "MY_AGENT_POLICY_TOKENIZER_REVISION"),
+        ("AGENTCLI_POLICY_CHAT_TEMPLATE", "MY_AGENT_POLICY_CHAT_TEMPLATE"),
+        ("AGENTCLI_POLICY_DTYPE", "MY_AGENT_POLICY_DTYPE"),
+        ("AGENTCLI_POLICY_DEVICE", "MY_AGENT_POLICY_DEVICE"),
         ("AGENTCLI_MEMORY_EVOLVER_TOP_K_PER_TIER", "MY_AGENT_MEMORY_EVOLVER_TOP_K_PER_TIER"),
         ("AGENTCLI_MEMORY_EVOLVER_SELECTED_MAX_ITEMS", "MY_AGENT_MEMORY_EVOLVER_SELECTED_MAX_ITEMS"),
         ("AGENTCLI_MEMORY_EVOLVER_MIN_SCORE", "MY_AGENT_MEMORY_EVOLVER_MIN_SCORE"),
@@ -1039,19 +1143,7 @@ def _config_env_values(config: AgentConfig) -> dict[str, str]:
         "AGENTCLI_MEMORY_RETAIN_RECENT_TURNS": str(config.memory_retain_recent_turns),
         "AGENTCLI_MEMORY_MAP_CHUNK_SIZE": str(config.memory_map_chunk_size),
         "AGENTCLI_MEMORY_EVOLVER_MODE": config.memory_evolver_mode,
-        "AGENTCLI_MEMORY_EVOLVER_TOP_K_PER_TIER": str(config.memory_evolver_top_k_per_tier),
         "AGENTCLI_MEMORY_EVOLVER_SELECTED_MAX_ITEMS": str(config.memory_evolver_selected_max_items),
-        "AGENTCLI_MEMORY_EVOLVER_MIN_SCORE": str(config.memory_evolver_min_score),
-        "AGENTCLI_MEMORY_EVOLVER_MIN_EXPERIENCE_ENTRIES": str(config.memory_evolver_min_experience_entries),
-        "AGENTCLI_MEMORY_EVOLVER_WRITER": _bool_env(config.memory_evolver_writer_enabled),
-        "AGENTCLI_MEMORY_EVOLVER_WRITER_MODE": config.memory_evolver_writer_mode,
-        "AGENTCLI_MEMORY_EVOLVER_WRITER_MIN_CONFIDENCE": str(config.memory_evolver_writer_min_confidence),
-        "AGENTCLI_MEMORY_EVOLVER_WRITER_MAX_RECORDS": str(config.memory_evolver_writer_max_records),
-        "AGENTCLI_MEMORY_EVOLVER_WRITER_MAX_INPUT_CHARS": str(config.memory_evolver_writer_max_input_chars),
-        "AGENTCLI_MEMORY_EVOLVER_WRITER_MAX_CONTENT_CHARS": str(config.memory_evolver_writer_max_content_chars),
-        "AGENTCLI_MEMORY_EVOLVER_WRITER_DATASET_PATH": (
-            str(config.memory_evolver_writer_dataset_path) if config.memory_evolver_writer_dataset_path else ""
-        ),
         "AGENTCLI_HITL": _bool_env(config.hitl_enabled),
         "AGENTCLI_HITL_AUDIT_DIR": str(config.hitl_audit_dir),
         "AGENTCLI_HITL_NON_INTERACTIVE": config.hitl_non_interactive,
@@ -1075,6 +1167,69 @@ def _config_env_values(config: AgentConfig) -> dict[str, str]:
     }
     if config.base_url:
         values["MY_AGENT_BASE_URL"] = config.base_url
+    if config.memory_evolver_mode == "formal":
+        values.update({
+            "AGENTCLI_MEMORY_EVOLVER_CANDIDATE_TOP_K_PER_TIER": str(
+                config.memory_evolver_candidate_top_k_per_tier
+            ),
+            "AGENTCLI_MEMORY_EVOLVER_SELECTION_PROMPT_TOKENS": str(
+                config.memory_evolver_selection_prompt_tokens
+            ),
+            "AGENTCLI_MEMORY_EVOLVER_MAINTENANCE_INTERVAL_TASKS": str(
+                config.memory_evolver_maintenance_interval_tasks
+            ),
+            "AGENTCLI_MEMORY_EVOLVER_MAINTENANCE_MAX_TURNS": str(
+                config.memory_evolver_maintenance_max_turns
+            ),
+            "AGENTCLI_MEMORY_EVOLVER_DATASET_DIR": (
+                str(config.memory_evolver_dataset_dir) if config.memory_evolver_dataset_dir else ""
+            ),
+            "AGENTCLI_MEMORY_EVOLVER_TEACHER_MIN_SCORE": str(
+                config.memory_evolver_teacher_min_score
+            ),
+            "AGENTCLI_MEMORY_EVOLVER_WRITING_TOP_FRACTION": str(
+                config.memory_evolver_writing_top_fraction
+            ),
+            "AGENTCLI_EMBEDDING_MODEL": config.embedding_model,
+            "AGENTCLI_EMBEDDING_REVISION": config.embedding_revision,
+            "AGENTCLI_POLICY_BACKEND": config.policy_backend,
+            "AGENTCLI_POLICY_BASE_MODEL": config.policy_base_model,
+            "AGENTCLI_POLICY_BASE_REVISION": config.policy_base_revision,
+            "AGENTCLI_POLICY_ADAPTER_PATH": (
+                str(config.policy_adapter_path) if config.policy_adapter_path else ""
+            ),
+            "AGENTCLI_POLICY_TOKENIZER_REVISION": config.policy_tokenizer_revision,
+            "AGENTCLI_POLICY_CHAT_TEMPLATE": config.policy_chat_template,
+            "AGENTCLI_POLICY_DTYPE": config.policy_dtype,
+            "AGENTCLI_POLICY_DEVICE": config.policy_device,
+        })
+    else:
+        values.update({
+            "AGENTCLI_MEMORY_EVOLVER_TOP_K_PER_TIER": str(config.memory_evolver_top_k_per_tier),
+            "AGENTCLI_MEMORY_EVOLVER_MIN_SCORE": str(config.memory_evolver_min_score),
+            "AGENTCLI_MEMORY_EVOLVER_MIN_EXPERIENCE_ENTRIES": str(
+                config.memory_evolver_min_experience_entries
+            ),
+            "AGENTCLI_MEMORY_EVOLVER_WRITER": _bool_env(config.memory_evolver_writer_enabled),
+            "AGENTCLI_MEMORY_EVOLVER_WRITER_MODE": config.memory_evolver_writer_mode,
+            "AGENTCLI_MEMORY_EVOLVER_WRITER_MIN_CONFIDENCE": str(
+                config.memory_evolver_writer_min_confidence
+            ),
+            "AGENTCLI_MEMORY_EVOLVER_WRITER_MAX_RECORDS": str(
+                config.memory_evolver_writer_max_records
+            ),
+            "AGENTCLI_MEMORY_EVOLVER_WRITER_MAX_INPUT_CHARS": str(
+                config.memory_evolver_writer_max_input_chars
+            ),
+            "AGENTCLI_MEMORY_EVOLVER_WRITER_MAX_CONTENT_CHARS": str(
+                config.memory_evolver_writer_max_content_chars
+            ),
+            "AGENTCLI_MEMORY_EVOLVER_WRITER_DATASET_PATH": (
+                str(config.memory_evolver_writer_dataset_path)
+                if config.memory_evolver_writer_dataset_path
+                else ""
+            ),
+        })
     if config.token_budget is not None:
         values["MY_AGENT_TOKEN_BUDGET"] = str(config.token_budget)
     if config.tool_config_paths:
