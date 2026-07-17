@@ -19,6 +19,25 @@ class AgentLLM(Protocol):
 
 
 def build_llm(config: AgentConfig) -> AgentLLM:
+    """Backward-compatible alias for the shared policy builder."""
+
+    return build_policy(config)
+
+
+def build_policy(config: AgentConfig) -> AgentLLM:
+    if config.memory_evolver_mode == "formal":
+        from my_agent.policy.identity import (
+            load_policy_identity_manifest,
+            require_matching_policy_identity,
+        )
+        from my_agent.policy.transformers_policy import TransformersPolicy
+
+        if config.policy_identity_manifest is None:
+            raise ValueError("formal policy requires policy_identity_manifest")
+        policy = TransformersPolicy.from_config(config)
+        expected_identity = load_policy_identity_manifest(config.policy_identity_manifest)
+        require_matching_policy_identity(expected_identity, policy.identity())
+        return policy
     config.require_valid_provider()
     if config.use_fake_llm:
         return FakeLLM()
@@ -388,4 +407,5 @@ __all__ = [
     "MessageLike",
     "OpenAICompatibleLLM",
     "build_llm",
+    "build_policy",
 ]

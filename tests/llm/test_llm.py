@@ -13,7 +13,8 @@ from tests._path import add_src_to_path
 add_src_to_path()
 
 from my_agent.config import AgentConfig
-from my_agent.llm import ChatResponse, FakeLLM, OpenAICompatibleLLM, build_llm
+from my_agent.llm import ChatResponse, FakeLLM, OpenAICompatibleLLM, build_llm, build_policy
+from my_agent.policy.identity import PolicyIdentity, policy_identity_manifest_payload
 
 
 class _FakeResponse:
@@ -30,6 +31,32 @@ class _FakeResponse:
         return self.body
 
 
+def _policy_identity(base_revision: str) -> PolicyIdentity:
+    return PolicyIdentity(
+        base_model="model",
+        base_revision=base_revision,
+        checkpoint_hash="sha256:" + "1" * 64,
+        adapter_hash=None,
+        tokenizer_revision="tokenizer-revision-1",
+        tokenizer_hash="sha256:" + "2" * 64,
+        chat_template_hash="sha256:" + "3" * 64,
+    )
+
+
+def _formal_config(manifest_path: Path) -> AgentConfig:
+    return AgentConfig.from_env(
+        {
+            "MY_AGENT_LLM_PROVIDER": "fake",
+            "AGENTCLI_MEMORY_EVOLVER_MODE": "formal",
+            "AGENTCLI_POLICY_BASE_REVISION": "model-revision-1",
+            "AGENTCLI_POLICY_TOKENIZER_REVISION": "tokenizer-revision-1",
+            "AGENTCLI_POLICY_IDENTITY_MANIFEST": str(manifest_path),
+            "AGENTCLI_EMBEDDING_REVISION": "embedding-revision-1",
+        },
+        require_env_file=False,
+    )
+
+
 class LLMTests(unittest.TestCase):
     def test_build_llm_uses_fake_provider_without_api_key(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -39,6 +66,46 @@ class LLMTests(unittest.TestCase):
             config = AgentConfig.from_env(env_file=env_file)
 
         self.assertIsInstance(build_llm(config), FakeLLM)
+        self.assertIsInstance(build_policy(config), FakeLLM)
+
+    def test_build_llm_delegates_formal_mode_to_transformers_policy(self) -> None:
+        identity = _policy_identity("model-revision-1")
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_path = Path(tmp) / "identity.json"
+            manifest_path.write_text(
+                json.dumps(policy_identity_manifest_payload(identity)),
+                encoding="utf-8",
+            )
+            config = _formal_config(manifest_path)
+            sentinel = mock.Mock()
+            sentinel.identity.return_value = identity
+            with mock.patch(
+                "my_agent.policy.transformers_policy.TransformersPolicy.from_config",
+                return_value=sentinel,
+            ) as from_config:
+                built = build_llm(config)
+
+        self.assertIs(built, sentinel)
+        from_config.assert_called_once_with(config)
+
+    def test_formal_builder_rejects_checkpoint_identity_mismatch(self) -> None:
+        expected = _policy_identity("expected-revision")
+        actual = _policy_identity("actual-revision")
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_path = Path(tmp) / "identity.json"
+            manifest_path.write_text(
+                json.dumps(policy_identity_manifest_payload(expected)),
+                encoding="utf-8",
+            )
+            config = _formal_config(manifest_path)
+            policy = mock.Mock()
+            policy.identity.return_value = actual
+            with mock.patch(
+                "my_agent.policy.transformers_policy.TransformersPolicy.from_config",
+                return_value=policy,
+            ):
+                with self.assertRaisesRegex(ValueError, "identity mismatch"):
+                    build_policy(config)
 
     def test_openai_compatible_client_posts_chat_completion(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

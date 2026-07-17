@@ -12,6 +12,7 @@ def _formal_env() -> dict[str, str]:
         "AGENTCLI_POLICY_BACKEND": "transformers",
         "AGENTCLI_POLICY_BASE_REVISION": "model-revision-1",
         "AGENTCLI_POLICY_TOKENIZER_REVISION": "tokenizer-revision-1",
+        "AGENTCLI_POLICY_IDENTITY_MANIFEST": "/tmp/policy-identity.json",
         "AGENTCLI_EMBEDDING_REVISION": "embedding-revision-1",
     }
 
@@ -35,6 +36,12 @@ class FormalConfigTests(unittest.TestCase):
         env = _formal_env()
         env["AGENTCLI_POLICY_BASE_REVISION"] = "main"
         with self.assertRaisesRegex(ValueError, "immutable"):
+            AgentConfig.from_env(env, require_env_file=False)
+
+    def test_formal_config_requires_identity_manifest(self) -> None:
+        env = _formal_env()
+        del env["AGENTCLI_POLICY_IDENTITY_MANIFEST"]
+        with self.assertRaisesRegex(ValueError, "policy_identity_manifest"):
             AgentConfig.from_env(env, require_env_file=False)
 
 

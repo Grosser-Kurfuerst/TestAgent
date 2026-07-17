@@ -107,6 +107,7 @@ class AgentConfig:
     policy_base_model: str = "Qwen/Qwen3-4B-Instruct-2507"
     policy_base_revision: str = ""
     policy_adapter_path: Path | None = None
+    policy_identity_manifest: Path | None = None
     policy_tokenizer_revision: str = ""
     policy_chat_template: str = "model_default"
     policy_dtype: str = "bfloat16"
@@ -417,6 +418,12 @@ class AgentConfig:
             policy_adapter_path=_optional_path(
                 values.get("AGENTCLI_POLICY_ADAPTER_PATH", values.get("MY_AGENT_POLICY_ADAPTER_PATH"))
             ),
+            policy_identity_manifest=_optional_path(
+                values.get(
+                    "AGENTCLI_POLICY_IDENTITY_MANIFEST",
+                    values.get("MY_AGENT_POLICY_IDENTITY_MANIFEST"),
+                )
+            ),
             policy_tokenizer_revision=str(
                 values.get("AGENTCLI_POLICY_TOKENIZER_REVISION")
                 or values.get("MY_AGENT_POLICY_TOKENIZER_REVISION")
@@ -716,6 +723,8 @@ def _validate_formal_evolver_config(
             raise ValueError(f"formal memory evolver requires an immutable {field_name}")
     if not config.policy_base_model or not config.embedding_model:
         raise ValueError("formal memory evolver requires policy and embedding model names")
+    if config.policy_identity_manifest is None:
+        raise ValueError("formal memory evolver requires policy_identity_manifest")
 
 
 def _as_ratio(value: str | None, default: float) -> float:

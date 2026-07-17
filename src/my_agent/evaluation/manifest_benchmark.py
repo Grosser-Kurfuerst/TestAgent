@@ -1031,6 +1031,7 @@ def _config_for_eval_env(
         ("AGENTCLI_POLICY_BASE_MODEL", "MY_AGENT_POLICY_BASE_MODEL"),
         ("AGENTCLI_POLICY_BASE_REVISION", "MY_AGENT_POLICY_BASE_REVISION"),
         ("AGENTCLI_POLICY_ADAPTER_PATH", "MY_AGENT_POLICY_ADAPTER_PATH"),
+        ("AGENTCLI_POLICY_IDENTITY_MANIFEST", "MY_AGENT_POLICY_IDENTITY_MANIFEST"),
         ("AGENTCLI_POLICY_TOKENIZER_REVISION", "MY_AGENT_POLICY_TOKENIZER_REVISION"),
         ("AGENTCLI_POLICY_CHAT_TEMPLATE", "MY_AGENT_POLICY_CHAT_TEMPLATE"),
         ("AGENTCLI_POLICY_DTYPE", "MY_AGENT_POLICY_DTYPE"),
@@ -1197,6 +1198,9 @@ def _config_env_values(config: AgentConfig) -> dict[str, str]:
             "AGENTCLI_POLICY_BASE_REVISION": config.policy_base_revision,
             "AGENTCLI_POLICY_ADAPTER_PATH": (
                 str(config.policy_adapter_path) if config.policy_adapter_path else ""
+            ),
+            "AGENTCLI_POLICY_IDENTITY_MANIFEST": (
+                str(config.policy_identity_manifest) if config.policy_identity_manifest else ""
             ),
             "AGENTCLI_POLICY_TOKENIZER_REVISION": config.policy_tokenizer_revision,
             "AGENTCLI_POLICY_CHAT_TEMPLATE": config.policy_chat_template,

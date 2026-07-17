@@ -4,12 +4,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from hashlib import sha256
+from collections.abc import Callable
+from pathlib import Path
 from typing import Any, Mapping
 import json
 import re
 
 
 _SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+POLICY_IDENTITY_MANIFEST_SCHEMA_VERSION = "opd-policy-identity-v1"
 _IDENTITY_FIELDS = (
     "base_model",
     "base_revision",
@@ -35,6 +38,86 @@ def canonical_json_bytes(value: Any) -> bytes:
 
 def canonical_sha256(value: Any) -> str:
     return f"sha256:{sha256(canonical_json_bytes(value)).hexdigest()}"
+
+
+def hash_artifact_path(
+    path: str | Path,
+    *,
+    include: Callable[[Path], bool] | None = None,
+) -> str:
+    """Hash a file or a deterministic set of files without loading them at once."""
+
+    root = Path(path)
+    if not root.exists():
+        raise FileNotFoundError(f"artifact path does not exist: {root}")
+    if root.is_file():
+        files = (root,)
+        base = root.parent
+    else:
+        files = tuple(
+            item for item in sorted(root.rglob("*"))
+            if item.is_file() and (include is None or include(item))
+        )
+        base = root
+    if not files:
+        raise ValueError(f"artifact path contains no hashable files: {root}")
+    digest = sha256()
+    for file_path in files:
+        relative = file_path.relative_to(base).as_posix().encode("utf-8")
+        digest.update(len(relative).to_bytes(8, "big"))
+        digest.update(relative)
+        with file_path.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(len(chunk).to_bytes(8, "big"))
+                digest.update(chunk)
+    return f"sha256:{digest.hexdigest()}"
+
+
+def require_matching_policy_identity(
+    expected: PolicyIdentity,
+    actual: PolicyIdentity,
+) -> None:
+    if not isinstance(expected, PolicyIdentity) or not isinstance(actual, PolicyIdentity):
+        raise ValueError("policy identity comparison requires PolicyIdentity values")
+    if expected != actual:
+        raise ValueError(
+            "policy identity mismatch: "
+            f"expected={expected.identity_hash}, actual={actual.identity_hash}"
+        )
+
+
+def policy_identity_manifest_payload(identity: PolicyIdentity) -> dict[str, Any]:
+    if not isinstance(identity, PolicyIdentity):
+        raise ValueError("identity manifest requires PolicyIdentity")
+    return {
+        "schema_version": POLICY_IDENTITY_MANIFEST_SCHEMA_VERSION,
+        "policy_identity": identity.to_dict(),
+        "policy_identity_hash": identity.identity_hash,
+    }
+
+
+def load_policy_identity_manifest(path: str | Path) -> PolicyIdentity:
+    manifest_path = Path(path)
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid policy identity manifest JSON: {manifest_path}") from exc
+    if not isinstance(payload, Mapping):
+        raise ValueError("policy identity manifest must be a JSON object")
+    expected_fields = {"schema_version", "policy_identity", "policy_identity_hash"}
+    if set(payload) != expected_fields:
+        raise ValueError("policy identity manifest fields do not match the versioned schema")
+    if payload["schema_version"] != POLICY_IDENTITY_MANIFEST_SCHEMA_VERSION:
+        raise ValueError(f"unsupported policy identity manifest schema: {payload['schema_version']!r}")
+    identity_payload = payload["policy_identity"]
+    if not isinstance(identity_payload, Mapping):
+        raise ValueError("policy_identity manifest field must be an object")
+    identity = PolicyIdentity.from_dict(identity_payload)
+    if payload["policy_identity_hash"] != identity.identity_hash:
+        raise ValueError("policy identity manifest hash does not match its identity payload")
+    return identity
 
 
 def require_sha256(value: str, *, field_name: str) -> None:
@@ -120,7 +203,12 @@ def _require_exact_fields(
 
 __all__ = [
     "PolicyIdentity",
+    "POLICY_IDENTITY_MANIFEST_SCHEMA_VERSION",
     "canonical_json_bytes",
     "canonical_sha256",
+    "hash_artifact_path",
+    "load_policy_identity_manifest",
+    "policy_identity_manifest_payload",
+    "require_matching_policy_identity",
     "require_sha256",
 ]

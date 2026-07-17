@@ -17,6 +17,7 @@ policy_backend: transformers
 policy_base_model: Qwen/Qwen3-4B-Instruct-2507
 policy_base_revision: REPLACE_WITH_IMMUTABLE_REVISION
 policy_adapter_path: null
+policy_identity_manifest: REPLACE_WITH_CHECKPOINT_IDENTITY_MANIFEST
 policy_tokenizer_revision: REPLACE_WITH_IMMUTABLE_REVISION
 policy_chat_template: model_default
 policy_dtype: bfloat16

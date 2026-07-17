@@ -37,6 +37,7 @@ class OpdManifestContractTests(unittest.TestCase):
                 "AGENTCLI_MEMORY_EVOLVER_MODE": "formal",
                 "AGENTCLI_POLICY_BASE_REVISION": "model-revision-1",
                 "AGENTCLI_POLICY_TOKENIZER_REVISION": "tokenizer-revision-1",
+                "AGENTCLI_POLICY_IDENTITY_MANIFEST": "/tmp/policy-identity.json",
                 "AGENTCLI_EMBEDDING_REVISION": "embedding-revision-1",
             },
             require_env_file=False,
@@ -46,6 +47,7 @@ class OpdManifestContractTests(unittest.TestCase):
         self.assertNotIn("AGENTCLI_MEMORY_EVOLVER_MIN_SCORE", values)
         self.assertNotIn("AGENTCLI_MEMORY_EVOLVER_WRITER_MODE", values)
         self.assertEqual(values["AGENTCLI_POLICY_BASE_REVISION"], "model-revision-1")
+        self.assertEqual(values["AGENTCLI_POLICY_IDENTITY_MANIFEST"], "/tmp/policy-identity.json")
         self.assertEqual(values["AGENTCLI_EMBEDDING_REVISION"], "embedding-revision-1")
 
         with tempfile.TemporaryDirectory() as tmp:
