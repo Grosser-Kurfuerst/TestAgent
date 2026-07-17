@@ -118,6 +118,13 @@ class TrainablePolicy(GenerationPolicy, Protocol):
     def verify_completion_round_trip(self, response: DecisionResponse) -> bool: ...
 
 
+@runtime_checkable
+class ChunkedKLPolicy(TrainablePolicy, Protocol):
+    def forward_hidden_states(self, batch: TokenBatch, *, model: Any | None = None) -> Any: ...
+
+    def output_projection(self, *, model: Any | None = None) -> tuple[Any, Any | None]: ...
+
+
 def _validate_token_ids(values: tuple[int, ...], *, field_name: str) -> None:
     if any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in values):
         raise ValueError(f"{field_name} must contain non-negative integer token IDs")
@@ -142,6 +149,7 @@ __all__ = [
     "DecisionResponse",
     "DecisionOutputError",
     "GenerationPolicy",
+    "ChunkedKLPolicy",
     "TokenBatch",
     "TrainablePolicy",
     "completion_mask_to_full_sequence",

@@ -1,0 +1,35 @@
+schema_version: opd-train-run-v1
+checkpoint: null
+identity_manifest: ../runs/opd-smoke/m0/policy_identity_manifest.json
+learner_dataset: ../runs/opd-smoke/m0/output/round-0/learner_events.jsonl
+export_manifest: ../runs/opd-smoke/m0/output/round-0/export_manifest.json
+output_dir: ../runs/opd-smoke/m1/checkpoint
+
+policy:
+  chat_template: model_default
+  dtype: float32
+  device: cpu
+
+trainer:
+  schema_version: opd-train-config-v1
+  epochs: 1
+  batch_size: 1
+  gradient_accumulation_steps: 1
+  learning_rate: 0.0002
+  weight_decay: 0.0
+  warmup_steps: 0
+  max_gradient_norm: 1.0
+  vocab_chunk_size: 1024
+  mixed_precision: "no"
+  seed: 7
+  role_sampling_weights:
+    selection: 1.0
+    action: 1.0
+    writing: 1.0
+    maintenance: 1.0
+  shared_adapter:
+    name: shared
+    rank: 8
+    alpha: 16
+    dropout: 0.0
+    target_modules: [c_attn, c_proj]

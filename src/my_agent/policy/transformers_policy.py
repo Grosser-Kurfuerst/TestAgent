@@ -39,6 +39,11 @@ _MODEL_ARTIFACT_NAMES = frozenset({
     "pytorch_model.bin.index.json",
 })
 _MODEL_ARTIFACT_SUFFIXES = (".safetensors", ".bin")
+_ADAPTER_ARTIFACT_NAMES = frozenset({
+    "adapter_config.json",
+    "adapter_model.bin",
+    "adapter_model.safetensors",
+})
 _TOKENIZER_PREFIXES = (
     "tokenizer",
     "special_tokens_map",
@@ -123,8 +128,12 @@ class TransformersPolicy:
                 from peft import PeftModel
             except ImportError as exc:
                 raise RuntimeError("policy adapters require the 'opd-train' extra") from exc
-            model = PeftModel.from_pretrained(model, adapter_path, is_trainable=True)
-            adapter_hash = hash_artifact_path(adapter_path)
+            model = PeftModel.from_pretrained(
+                model,
+                _adapter_load_path(adapter_path),
+                is_trainable=True,
+            )
+            adapter_hash = hash_adapter_artifacts(adapter_path)
 
         identity = PolicyIdentity(
             base_model=config.policy_base_model,
@@ -280,6 +289,39 @@ class TransformersPolicy:
             raise RuntimeError("transformers model forward did not return logits")
         return logits
 
+    def forward_hidden_states(
+        self,
+        batch: TokenBatch,
+        *,
+        model: Any | None = None,
+    ) -> Any:
+        causal_model = _causal_lm_model(self.model if model is None else model)
+        prefix = getattr(causal_model, "base_model_prefix", None)
+        backbone = getattr(causal_model, prefix, None) if isinstance(prefix, str) else None
+        if backbone is None or backbone is causal_model:
+            raise RuntimeError("causal LM does not expose a separate hidden-state backbone")
+        output = backbone(
+            input_ids=batch.input_ids,
+            attention_mask=batch.attention_mask,
+            return_dict=True,
+        )
+        hidden = getattr(output, "last_hidden_state", None)
+        if hidden is None:
+            raise RuntimeError("transformers backbone did not return last_hidden_state")
+        return hidden
+
+    def output_projection(
+        self,
+        *,
+        model: Any | None = None,
+    ) -> tuple[Any, Any | None]:
+        causal_model = _causal_lm_model(self.model if model is None else model)
+        projection = causal_model.get_output_embeddings()
+        weight = getattr(projection, "weight", None)
+        if weight is None:
+            raise RuntimeError("causal LM output projection does not expose weight")
+        return weight, getattr(projection, "bias", None)
+
     def verify_completion_round_trip(self, response: DecisionResponse) -> bool:
         decoded = self.tokenizer.decode(
             list(response.completion_token_ids),
@@ -370,6 +412,33 @@ def _is_model_artifact(path: Path) -> bool:
     return path.name in _MODEL_ARTIFACT_NAMES or path.name.endswith(_MODEL_ARTIFACT_SUFFIXES)
 
 
+def _is_adapter_artifact(path: Path) -> bool:
+    return path.name in _ADAPTER_ARTIFACT_NAMES
+
+
+def hash_adapter_artifacts(path: str | Path) -> str:
+    """Hash deployable adapter files without including trainer/checkpoint metadata."""
+
+    return hash_artifact_path(path, include=_is_adapter_artifact)
+
+
+def _adapter_load_path(path: Path) -> Path:
+    if (path / "adapter_config.json").is_file():
+        return path
+    candidates = tuple(sorted(
+        item.parent for item in path.rglob("adapter_config.json") if item.is_file()
+    ))
+    if len(candidates) != 1:
+        raise ValueError(
+            "adapter checkpoint must contain exactly one loadable shared adapter directory"
+        )
+    return candidates[0]
+
+
+def _causal_lm_model(model: Any) -> Any:
+    return model.get_base_model() if hasattr(model, "get_base_model") else model
+
+
 def _is_tokenizer_artifact(path: Path) -> bool:
     return path.name.startswith(_TOKENIZER_PREFIXES) or path.name == "chat_template.jinja"
 
@@ -451,4 +520,4 @@ def _content_without_tool_calls(raw_completion: str) -> str:
     return _TOOL_CALL_RE.sub("", raw_completion)
 
 
-__all__ = ["TransformersPolicy", "parse_tool_calls"]
+__all__ = ["TransformersPolicy", "hash_adapter_artifacts", "parse_tool_calls"]

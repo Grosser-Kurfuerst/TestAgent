@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from pathlib import Path
+import tempfile
 import unittest
 
 from my_agent.policy.contracts import DecisionOutputError, DecisionRequest
 from my_agent.policy.identity import PolicyIdentity, canonical_sha256
-from my_agent.policy.transformers_policy import TransformersPolicy, parse_tool_calls
+from my_agent.policy import transformers_policy
+from my_agent.policy.transformers_policy import (
+    TransformersPolicy,
+    hash_adapter_artifacts,
+    parse_tool_calls,
+)
 from my_agent.training.role_views import CanonicalMessage
 
 
@@ -195,6 +202,22 @@ class TransformersPolicyTests(unittest.TestCase):
 
         self.assertEqual(captured.exception.response.completion_token_ids, (201, 202))
         self.assertIn("unmatched marker", str(captured.exception.cause))
+
+    def test_nested_shared_adapter_hash_excludes_trainer_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            adapter = root / "shared"
+            adapter.mkdir()
+            (adapter / "adapter_config.json").write_text("{}", encoding="utf-8")
+            (adapter / "adapter_model.safetensors").write_bytes(b"weights")
+            first = hash_adapter_artifacts(root)
+            (root / "optimizer.pt").write_bytes(b"optimizer")
+            (root / "opd_checkpoint_manifest.json").write_text("{}", encoding="utf-8")
+            second = hash_adapter_artifacts(root)
+            load_path = transformers_policy._adapter_load_path(root)
+
+        self.assertEqual(first, second)
+        self.assertEqual(load_path.name, "shared")
 
 
 if __name__ == "__main__":
