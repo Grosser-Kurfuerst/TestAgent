@@ -10,7 +10,7 @@ from my_agent.cancellation import CancellationToken
 from my_agent.config import AgentConfig
 from my_agent.events import BufferedEventSink
 from my_agent.hitl.handler import HitlHandler
-from my_agent.memory import MemoryManager
+from my_agent.memory import MemoryService
 from my_agent.parallel import create_bounded_executor, shutdown_executor
 from my_agent.plan.graph import TaskGraph
 from my_agent.plan.store import InMemoryPlanStore, PlanStore
@@ -398,7 +398,7 @@ class ReActTaskRunner:
         default_max_steps: int | None = None,
         plan_task_max_steps: int | None = None,
         event_sink: Callable[[object], None] | None = None,
-        memory_manager: MemoryManager | None = None,
+        memory_manager: MemoryService | None = None,
         hitl_handler: HitlHandler | None = None,
     ) -> None:
         self.repo_path = Path(repo_path).resolve()

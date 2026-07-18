@@ -18,6 +18,7 @@ add_src_to_path()
 
 import my_agent.memory as memory_api
 import my_agent.memory.compression as legacy_compression_api
+import my_agent.memory.disabled as disabled_memory_api
 import my_agent.memory.embedding_cache as legacy_embedding_cache_api
 import my_agent.memory.embedding_index as legacy_embedding_index_api
 import my_agent.memory.embedding_retrieval as legacy_embedding_retrieval_api
@@ -25,6 +26,7 @@ import my_agent.memory.experience as experience_api
 import my_agent.memory.experience_attribution as legacy_attribution_api
 import my_agent.memory.experience_retrieval as legacy_retrieval_api
 import my_agent.memory.experience_store as legacy_repository_api
+import my_agent.memory.noop as legacy_noop_api
 import my_agent.memory.short_term as short_term_api
 import my_agent.memory.evolver as evolver_api
 import my_agent.memory.evolver.repository_rules as legacy_repository_rules_api
@@ -194,6 +196,11 @@ class MemoryPublicContractTests(unittest.TestCase):
         self.assertIs(
             short_term_api.MemoryCompressor,
             short_term_compression_api.MemoryCompressor,
+        )
+        self.assertIs(legacy_noop_api, disabled_memory_api)
+        self.assertIs(
+            legacy_noop_api.NoopMemoryManager,
+            disabled_memory_api.DisabledMemoryManager,
         )
 
     def test_maintenance_facade_preserves_contract_identity(self) -> None:

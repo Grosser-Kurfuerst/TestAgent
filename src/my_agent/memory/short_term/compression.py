@@ -99,6 +99,14 @@ class MemoryCompressor:
                 pass
         return str(fallback()).strip(), True
 
+    def fork(self) -> "MemoryCompressor":
+        return MemoryCompressor(
+            llm=self.llm,
+            chunk_size=self.chunk_size,
+            retain_recent_turns=self.retain_recent_turns,
+            max_input_chars=self.max_input_chars,
+        )
+
 
 def _chunk_turn_groups(
     entries: list[MemoryEntry],

@@ -1,52 +1,29 @@
 from __future__ import annotations
 
-import hashlib
 import json
-import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 from uuid import uuid4
 
 from my_agent.config import AgentConfig
 from my_agent.context import ContextProfile
 from my_agent.llm import AgentLLM
 from my_agent.llm.types import ChatResponse, MessageLike
-from my_agent.memory.experience.retrieval.contracts import ExperienceRetriever
-from my_agent.memory.experience.retrieval.embedding import (
-    EmbeddingRetriever,
-    TransformersEmbeddingEncoder,
-)
 from my_agent.memory.experience.models import (
     ExperienceCreatedBy,
     ExperienceMemory,
     ExperiencePayload,
     ExperienceTier,
 )
-from my_agent.memory.experience.serialization import experience_payload_to_dict
-from my_agent.memory.evolver import (
-    ExperienceWriteRequest,
-    ExperienceWriteResult,
-    ExperienceWriter,
-    MemoryWriterDatasetLogger,
-    ExperienceSelector,
-    SelectionResult,
-    build_write_steps_from_tool_history,
-    proposal_tier_counts,
-    selection_candidate_summary,
-    selection_tier_counts,
-    writer_policy_for_result,
+from my_agent.memory.evolver import ExperienceWriteResult, SelectionResult
+from my_agent.memory.evolver.runtime.contracts import EvolverRuntime
+from my_agent.memory.evolver.task_session import (
+    AgentEpisodeArtifact,
+    EvolverFinalizeResult,
+    TaskEvolverSession,
 )
-from my_agent.memory.evolver.coordinator import (
-    EvolverCoordinator,
-    SimilarityTaskSelectionPolicy,
-)
-from my_agent.memory.evolver.task_session import TaskEvolverSession
 from my_agent.memory.evolver.attribution import MemoryAttributionRecord
-from my_agent.memory.experience.retrieval.lexical import (
-    ExperienceRetrievalMetrics,
-    LexicalExperienceRetriever,
-)
 from my_agent.memory.experience.repository import ExperienceStore
 from my_agent.memory.short_term import (
     MemoryCompressor,
@@ -64,37 +41,9 @@ from my_agent.memory.types import (
     RetrievalHit,
     content_fingerprint,
 )
-from my_agent.policy.identity import PolicyIdentity, require_matching_policy_identity
-from my_agent.policy.runtime_validation import require_formal_policy
+from my_agent.policy.identity import PolicyIdentity
 from my_agent.tools import ToolExecutionResult
-
-WRITER_METADATA_STRING_CHARS = 1_000
-WRITER_DATASET_TASK_CHARS = 2_000
-WRITER_DATASET_CONTENT_CHARS = 1_200
-WRITER_DATASET_OUTPUT_CHARS = 1_000
-WRITER_DATASET_FORBIDDEN_MARKERS = (
-    "hidden_test_output",
-    "hidden_ok",
-    "official_solution",
-    "ground_truth",
-    "expected_patch",
-    "private_key",
-    "api_key",
-    "apikey",
-    "access_key",
-    "bearer",
-    "cookie",
-    "credential",
-    "github_pat_",
-    "ghp_",
-    "glpat-",
-    "password",
-    "secret",
-    "token",
-)
-WRITER_DATASET_SECRET_PREFIX_RE = re.compile(
-    r"(?i)(?:github_pat_|ghp_|glpat-|sk-[A-Za-z0-9_-]{16,}|xox[baprs]-|AKIA|ASIA|AIza|ya29\.|eyJ[A-Za-z0-9_-]{8,})"
-)
+from my_agent.training.contracts import AuthoritativeTaskOutcome
 
 
 class MemoryManager:
@@ -122,11 +71,9 @@ class MemoryManager:
         repo_path: Path,
         short_term: ShortTermMemory,
         experience_store: ExperienceStore,
-        experience_retriever: ExperienceRetriever,
         compressor: MemoryCompressor,
+        evolver_runtime: EvolverRuntime,
         project_key: str,
-        embedding_retriever: Any | None = None,
-        evolver_coordinator: EvolverCoordinator | None = None,
         session_id: str = "",
         trace_sink: Any | None = None,
         context_profile: ContextProfile | None = None,
@@ -137,29 +84,63 @@ class MemoryManager:
         self.repo_path = Path(repo_path)
         self.short_term = short_term
         self.experience_store = experience_store
-        self.experience_retriever = experience_retriever
-        self.embedding_retriever = embedding_retriever
-        self.evolver_coordinator = evolver_coordinator
         self.compressor = compressor
+        self._evolver_runtime = evolver_runtime
         self.project_key = project_key
         self.session_id = session_id
         self._trace_sink = trace_sink
-        self.evolver_selector = None if self.config.memory_evolver_mode == "formal" else ExperienceSelector(
-            tier_weights=self.config.memory_evolver_tier_weights,
-            tier_caps=self.config.memory_evolver_tier_caps,
-            selected_max_items=self.config.memory_evolver_selected_max_items,
-            min_score=self.config.memory_evolver_min_score,
-        )
-        self.evolver_writer = None if self.config.memory_evolver_mode == "formal" else ExperienceWriter(
-            llm=self.llm,
-            min_confidence=self.config.memory_evolver_writer_min_confidence,
-            max_records=self.config.memory_evolver_writer_max_records,
-            max_input_chars=self.config.memory_evolver_writer_max_input_chars,
-            max_content_chars=self.config.memory_evolver_writer_max_content_chars,
-        )
-        self.last_evolver_selection: SelectionResult | None = None
-        self._formal_session: TaskEvolverSession | None = None
-        self._formal_context: MemoryContext[ExperienceMemory] | None = None
+
+    @property
+    def evolver_runtime(self) -> EvolverRuntime:
+        return self._evolver_runtime
+
+    @property
+    def evolver_coordinator(self) -> Any | None:
+        return self._evolver_runtime.coordinator
+
+    @evolver_coordinator.setter
+    def evolver_coordinator(self, value: Any | None) -> None:
+        self._evolver_runtime.coordinator = value
+
+    @property
+    def embedding_retriever(self) -> Any | None:
+        return self._evolver_runtime.embedding_retriever
+
+    @embedding_retriever.setter
+    def embedding_retriever(self, value: Any | None) -> None:
+        self._evolver_runtime.embedding_retriever = value
+
+    @property
+    def experience_retriever(self) -> Any | None:
+        return self._evolver_runtime.experience_retriever
+
+    @experience_retriever.setter
+    def experience_retriever(self, value: Any | None) -> None:
+        self._evolver_runtime.experience_retriever = value
+
+    @property
+    def evolver_selector(self) -> Any | None:
+        return self._evolver_runtime.selector
+
+    @evolver_selector.setter
+    def evolver_selector(self, value: Any | None) -> None:
+        self._evolver_runtime.selector = value
+
+    @property
+    def evolver_writer(self) -> Any | None:
+        return self._evolver_runtime.writer
+
+    @evolver_writer.setter
+    def evolver_writer(self, value: Any | None) -> None:
+        self._evolver_runtime.writer = value
+
+    @property
+    def last_evolver_selection(self) -> SelectionResult | None:
+        return self._evolver_runtime.last_selection
+
+    @last_evolver_selection.setter
+    def last_evolver_selection(self, value: SelectionResult | None) -> None:
+        self._evolver_runtime.last_selection = value
 
     def set_trace_sink(self, trace_sink: Any | None) -> tuple[Any | None, Any | None]:
         previous = (
@@ -167,16 +148,14 @@ class MemoryManager:
             getattr(self.experience_store, "_trace_sink", None),
         )
         self._trace_sink = trace_sink
-        if self.evolver_coordinator is not None:
-            self.evolver_coordinator.set_trace_sink(trace_sink)
+        self._evolver_runtime.set_trace_sink(trace_sink)
         if hasattr(self.experience_store, "_trace_sink"):
             self.experience_store._trace_sink = trace_sink
         return previous
 
     def restore_trace_sink(self, snapshot: tuple[Any | None, Any | None]) -> None:
         self._trace_sink = snapshot[0]
-        if self.evolver_coordinator is not None:
-            self.evolver_coordinator.set_trace_sink(snapshot[0])
+        self._evolver_runtime.set_trace_sink(snapshot[0])
         if hasattr(self.experience_store, "_trace_sink"):
             self.experience_store._trace_sink = snapshot[1]
 
@@ -190,72 +169,15 @@ class MemoryManager:
         session_id: str | None = None,
         trace_sink: Any | None = None,
     ) -> "MemoryManager":
-        memory_dir = Path(config.memory_dir)
-        memory_dir.mkdir(parents=True, exist_ok=True)
-        experience_store = ExperienceStore.from_dir(memory_dir, trace_sink=trace_sink)
-        experience_store.load()
-        context_profile = ContextProfile.resolve(config, _model_name(llm, config))
-        short_term = ShortTermMemory(
-            max_tokens=context_profile.short_term_storage_token_limit,
-            max_entries=config.memory_short_term_entries,
-        )
-        experience_retriever = LexicalExperienceRetriever()
-        compressor = MemoryCompressor(
-            llm=llm,
-            chunk_size=config.memory_map_chunk_size,
-            retain_recent_turns=config.memory_retain_recent_turns,
-            max_input_chars=config.max_summary_input_chars,
-        )
-        project_key = str(getattr(config, "memory_project_key", "") or "").strip()
-        if not project_key:
-            project_key = _normalize_project_key(repo_path)
-        embedding_retriever: Any | None = None
-        evolver_coordinator: EvolverCoordinator | None = None
-        if config.memory_evolver_mode == "formal":
-            policy_identity = require_formal_policy(config, llm)
-            if policy_identity is None:
-                raise ValueError("formal memory evolver requires a validated policy identity")
-            embedding_retriever = (
-                LexicalExperienceRetriever()
-                if config.memory_evolver_retrieval_backend == "lexical_ablation"
-                else EmbeddingRetriever(TransformersEmbeddingEncoder.from_config(config))
-            )
-            evolver_coordinator = EvolverCoordinator(
-                store=experience_store,
-                project_key=project_key,
-                policy_identity=policy_identity,
-                retriever=embedding_retriever,
-                selector=(
-                    SimilarityTaskSelectionPolicy()
-                    if config.memory_evolver_selection_backend == "similarity_ablation"
-                    else None
-                ),
-                policy=llm,
-                dataset_dir=config.memory_evolver_dataset_dir,
-                trace_sink=trace_sink,
-                top_k_per_tier=config.memory_evolver_candidate_top_k_per_tier,
-                selected_max_items=config.memory_evolver_selected_max_items,
-                selection_token_budget=config.memory_evolver_selection_prompt_tokens,
-                maintenance_interval_tasks=config.memory_evolver_maintenance_interval_tasks,
-                maintenance_max_turns=config.memory_evolver_maintenance_max_turns,
-                collection_round=config.memory_evolver_collection_round,
-                dataset_split=config.memory_evolver_dataset_split,
-                maintenance_enabled=config.memory_evolver_maintenance_enabled,
-            )
-        return cls(
+        from my_agent.memory.factory import build_memory_manager
+
+        return build_memory_manager(
+            cls,
             config=config,
             llm=llm,
-            repo_path=Path(repo_path),
-            short_term=short_term,
-            experience_store=experience_store,
-            experience_retriever=experience_retriever,
-            compressor=compressor,
-            project_key=project_key,
-            embedding_retriever=embedding_retriever,
-            evolver_coordinator=evolver_coordinator,
-            session_id=session_id or "",
+            repo_path=repo_path,
+            session_id=session_id,
             trace_sink=trace_sink,
-            context_profile=context_profile,
         )
 
     def require_formal_runtime_binding(
@@ -267,63 +189,14 @@ class MemoryManager:
     ) -> None:
         """Validate an injected manager against the active formal runtime."""
 
-        if config.memory_evolver_mode != "formal":
-            return
-        if self.config.memory_evolver_mode != "formal":
-            raise ValueError("formal OPD runtime cannot use a non-formal MemoryManager")
-        coordinator = self.evolver_coordinator
-        if coordinator is None:
-            raise ValueError("formal OPD runtime requires MemoryManager.evolver_coordinator")
-        require_matching_policy_identity(policy_identity, coordinator.policy_identity)
-        if self.llm is None:
-            raise ValueError("formal MemoryManager requires the shared runtime policy")
-        coordinator.require_formal_role_bindings(self.llm)
-        if coordinator.store is not self.experience_store:
-            raise ValueError("formal MemoryManager coordinator must use the manager experience store")
-        if coordinator.project_key != self.project_key:
-            raise ValueError("formal MemoryManager coordinator project_key mismatch")
-        if self.embedding_retriever is None or coordinator.retriever is not self.embedding_retriever:
-            raise ValueError("formal MemoryManager candidate retriever binding mismatch")
-        expected_limits = (
-            config.memory_evolver_candidate_top_k_per_tier,
-            config.memory_evolver_selected_max_items,
-            config.memory_evolver_selection_prompt_tokens,
-            config.memory_evolver_maintenance_max_turns,
+        self._evolver_runtime.require_formal_binding(
+            config=config,
+            policy_identity=policy_identity,
+            repo_path=repo_path,
+            manager_llm=self.llm,
+            manager_store=self.experience_store,
+            manager_project_key=self.project_key,
         )
-        actual_limits = (
-            coordinator.top_k_per_tier,
-            coordinator.selected_max_items,
-            coordinator.selection_token_budget,
-            coordinator.maintenance_max_turns,
-        )
-        if actual_limits != expected_limits:
-            raise ValueError("formal MemoryManager coordinator limits do not match runtime config")
-        if coordinator.collection_round != config.memory_evolver_collection_round:
-            raise ValueError("formal MemoryManager collection round does not match runtime config")
-        if coordinator.dataset_split != config.memory_evolver_dataset_split:
-            raise ValueError("formal MemoryManager dataset split does not match runtime config")
-        expected_dataset_dir = (
-            Path(config.memory_evolver_dataset_dir).expanduser().resolve()
-            if config.memory_evolver_dataset_dir is not None
-            else None
-        )
-        actual_dataset_dir = (
-            coordinator.dataset_dir.expanduser().resolve()
-            if coordinator.dataset_dir is not None
-            else None
-        )
-        if actual_dataset_dir != expected_dataset_dir:
-            raise ValueError("formal MemoryManager dataset directory does not match runtime config")
-        expected_memory_dir = Path(config.memory_dir).expanduser().resolve()
-        actual_memory_dir = self.experience_store.path.parent.expanduser().resolve()
-        if actual_memory_dir != expected_memory_dir:
-            raise ValueError("formal MemoryManager memory_dir does not match runtime config")
-        if repo_path is not None:
-            expected_project_key = str(config.memory_project_key or "").strip()
-            if not expected_project_key:
-                expected_project_key = _normalize_project_key(repo_path)
-            if self.project_key != expected_project_key:
-                raise ValueError("formal MemoryManager project_key does not match runtime repository")
 
     # ------------------------------------------------------------------ writes
 
@@ -494,32 +367,12 @@ class MemoryManager:
         limit: int | None = None,
         include_short_term: bool = False,
     ) -> MemoryContext:
-        if self.config.memory_evolver_mode == "formal":
-            if self._formal_context is None:
-                return MemoryContext(injected_text="", hits=[], estimated_tokens=0)
-            return self._formal_context
-        if self.config.memory_evolver_mode in {"retrieve_select", "full"}:
-            return self.build_evolver_context_for_query(
-                query,
-                max_tokens=max_tokens,
-                top_k_per_tier=limit,
-            )
-        context: MemoryContext[ExperienceMemory] = MemoryContext(
-            injected_text="",
-            hits=[],
-            estimated_tokens=0,
+        del include_short_term
+        return self._evolver_runtime.build_context(
+            query,
+            max_tokens=max_tokens,
+            top_k_per_tier=limit,
         )
-        self._trace(
-            "memory.retrieved",
-            {
-                "query_chars": len(query),
-                "hits": 0,
-                "tokens": 0,
-                "include_short_term": False,
-                "mode": "off",
-            },
-        )
-        return context
 
     def begin_formal_evolver_task(
         self,
@@ -530,20 +383,20 @@ class MemoryManager:
         trajectory_id: str,
         stream_id: str,
     ) -> TaskEvolverSession:
-        if self.config.memory_evolver_mode != "formal" or self.evolver_coordinator is None:
-            raise RuntimeError("formal evolver task session is unavailable")
-        if self._formal_session is not None:
-            raise RuntimeError("formal evolver selection already ran for this task manager")
-        session = self.evolver_coordinator.begin_task(
+        return self._evolver_runtime.begin_task(
             task=task,
             task_id=task_id,
             task_group=task_group,
             trajectory_id=trajectory_id,
             stream_id=stream_id,
         )
-        self._formal_session = session
-        self._formal_context = self.evolver_coordinator.context_for_session(session)
-        return session
+
+    def finalize_formal_evolver_task(
+        self,
+        episode: AgentEpisodeArtifact,
+        outcome: AuthoritativeTaskOutcome,
+    ) -> EvolverFinalizeResult | None:
+        return self._evolver_runtime.finalize_task(episode, outcome)
 
     def retrieve_evolver_candidates(
         self,
@@ -551,14 +404,10 @@ class MemoryManager:
         *,
         top_k_per_tier: int | None = None,
     ) -> list[RetrievalHit[ExperienceMemory]]:
-        resolved_top_k = top_k_per_tier if top_k_per_tier is not None else self.config.memory_evolver_top_k_per_tier
-        resolved_top_k = max(1, int(resolved_top_k))
-        return list(self.experience_retriever.retrieve_candidates(
+        return self._evolver_runtime.retrieve_candidates(
             query,
-            store=self.experience_store,
-            project_key=self.project_key,
-            top_k_per_tier=resolved_top_k,
-        ))
+            top_k_per_tier=top_k_per_tier,
+        )
 
     def count_visible_experiences(self) -> int:
         return len(self.experience_store.all(project_key=self.project_key))
@@ -571,192 +420,11 @@ class MemoryManager:
         top_k_per_tier: int | None = None,
         max_items: int | None = None,
     ) -> MemoryContext:
-        resolved_tokens = max_tokens if max_tokens is not None else self.context_profile.memory_context_tokens
-        resolved_top_k = top_k_per_tier if top_k_per_tier is not None else self.config.memory_evolver_top_k_per_tier
-        resolved_top_k = max(1, int(resolved_top_k))
-        visible_count = self.count_visible_experiences()
-        if resolved_tokens <= 0 or visible_count < self.config.memory_evolver_min_experience_entries:
-            index = self.experience_store.index_snapshot()
-            visible_entries = self.experience_store.all(project_key=self.project_key)
-            tier_metrics = {
-                tier.value: {
-                    "visible_count": sum(1 for entry in visible_entries if entry.tier == tier),
-                    "indexed_count": sum(
-                        1 for entry in visible_entries if entry.tier == tier and not entry.invalidated
-                    ),
-                    "posting_candidate_count": 0,
-                    "scored_count": 0,
-                    "matched_count": 0,
-                    "returned_count": 0,
-                }
-                for tier in ExperienceTier
-            }
-            self.experience_retriever.last_metrics = ExperienceRetrievalMetrics(
-                repository_revision=index.revision,
-                visible_count=len(visible_entries),
-                indexed_count=sum(1 for entry in visible_entries if not entry.invalidated),
-                per_tier=tier_metrics,
-            )
-            result = SelectionResult(
-                candidates=(),
-                selected=(),
-                context=MemoryContext(injected_text="", hits=[], estimated_tokens=0),
-                policy="rule_tier_weighted_v1",
-                estimated_tokens=0,
-                metadata={
-                    "query_chars": len(query),
-                    "candidate_count": 0,
-                    "selected_count": 0,
-                    "candidate_tier_counts": {},
-                    "selected_tier_counts": {},
-                    "insufficient_experience_entries": visible_count < self.config.memory_evolver_min_experience_entries,
-                },
-            )
-            self.last_evolver_selection = result
-            self._trace_evolver_selection(
-                query=query,
-                result=result,
-                candidates=[],
-                max_tokens=resolved_tokens,
-                top_k_per_tier=resolved_top_k,
-                max_items=max_items,
-                visible_experience_count=visible_count,
-                insufficient_experience_entries=visible_count < self.config.memory_evolver_min_experience_entries,
-            )
-            return result.context
-
-        candidates = self.retrieve_evolver_candidates(query, top_k_per_tier=resolved_top_k)
-        try:
-            if self.evolver_selector is None:
-                raise RuntimeError("legacy rule selector is unavailable in formal mode")
-            result = self.evolver_selector.select(
-                query=query,
-                hits=candidates,
-                max_tokens=resolved_tokens,
-                max_items=max_items,
-            )
-        except Exception as exc:  # noqa: BLE001 - selector failures must not fall back to unselected legacy memory
-            error = f"{type(exc).__name__}: {exc}"
-            result = SelectionResult(
-                candidates=(),
-                selected=(),
-                context=MemoryContext(injected_text="", hits=[], estimated_tokens=0),
-                policy="rule_tier_weighted_v1",
-                estimated_tokens=0,
-                metadata={
-                    "query_chars": len(query),
-                    "candidate_count": 0,
-                    "selected_count": 0,
-                    "candidate_tier_counts": {},
-                    "selected_tier_counts": {},
-                    "fallback": True,
-                    "error": error,
-                },
-            )
-            self.last_evolver_selection = result
-            self._trace(
-                "memory.evolver_selection_failed",
-                {
-                    "query_chars": len(query),
-                    "candidate_count": len(candidates),
-                    "error": error,
-                    "fallback": "empty_context",
-                    "mode": self.config.memory_evolver_mode,
-                    "memory_project_key": self.project_key,
-                },
-            )
-            self._trace_evolver_selection(
-                query=query,
-                result=result,
-                candidates=candidates,
-                max_tokens=resolved_tokens,
-                top_k_per_tier=resolved_top_k,
-                max_items=max_items,
-                visible_experience_count=visible_count,
-                insufficient_experience_entries=False,
-                fallback=True,
-            )
-            return result.context
-        self.last_evolver_selection = result
-        self._trace_evolver_selection(
+        return self._evolver_runtime.build_context(
             query=query,
-            result=result,
-            candidates=candidates,
-            max_tokens=resolved_tokens,
-            top_k_per_tier=resolved_top_k,
+            max_tokens=max_tokens,
+            top_k_per_tier=top_k_per_tier,
             max_items=max_items,
-            visible_experience_count=visible_count,
-            insufficient_experience_entries=False,
-        )
-        return result.context
-
-    def _trace_evolver_selection(
-        self,
-        *,
-        query: str,
-        result: SelectionResult,
-        candidates: list,
-        max_tokens: int,
-        top_k_per_tier: int,
-        max_items: int | None,
-        visible_experience_count: int,
-        insufficient_experience_entries: bool,
-        fallback: bool = False,
-    ) -> None:
-        retrieved_tiers = _hit_tier_counts(candidates)
-        candidate_tiers = selection_tier_counts(result.candidates)
-        selected_candidates = [item.candidate for item in result.selected]
-        selected_tiers = selection_tier_counts(selected_candidates)
-        candidate_payload = {
-            "query_chars": len(query),
-            "candidate_count": len(result.candidates),
-            "top_k_per_tier": top_k_per_tier,
-            "tiers": candidate_tiers,
-            "retrieved_candidate_count": len(candidates),
-            "retrieved_tiers": retrieved_tiers,
-            "candidate_ids": [candidate.id for candidate in result.candidates],
-            "candidate_summaries": [selection_candidate_summary(candidate) for candidate in result.candidates],
-            "selection_policy": result.policy,
-            "mode": self.config.memory_evolver_mode,
-            "insufficient_experience_entries": insufficient_experience_entries,
-            "visible_experience_count": visible_experience_count,
-            "memory_project_key": self.project_key,
-            **self.experience_retriever.last_metrics.to_trace_payload(),
-        }
-        selected_payload = {
-            "selected_count": len(result.selected),
-            "selected_ids": [item.candidate.id for item in result.selected],
-            "omitted_ids": list(result.omitted_ids),
-            "tiers": selected_tiers,
-            "estimated_tokens": result.context.estimated_tokens,
-            "max_tokens": max_tokens,
-            "max_items": max_items if max_items is not None else self.config.memory_evolver_selected_max_items,
-            "selection_policy": result.policy,
-            "selection_reasons": [
-                {
-                    "id": item.candidate.id,
-                    "reason": f"selected: score={item.candidate.selection_score:.2f} "
-                    f"tier={item.candidate.tier.value} "
-                    f"rank={item.rank}",
-                }
-                for item in result.selected
-            ],
-            "fallback": fallback,
-            "memory_project_key": self.project_key,
-        }
-        self._trace("memory.evolver_candidates", candidate_payload)
-        self._trace("memory.evolver_selected", selected_payload)
-        self._trace(
-            "memory.retrieved",
-            {
-                "query_chars": len(query),
-                "hits": len(result.context.hits),
-                "tokens": result.context.estimated_tokens,
-                "include_short_term": False,
-                "mode": self.config.memory_evolver_mode,
-                "selection_policy": result.policy,
-                **self.experience_retriever.last_metrics.to_trace_payload(),
-            },
         )
 
     # ------------------------------------------------------------------ status
@@ -796,176 +464,33 @@ class MemoryManager:
         task_type: str = "",
         memory_mode: str = "",
     ) -> ExperienceWriteResult:
-        if (
-            self.config.memory_evolver_mode != "full"
-            or not self.config.memory_evolver_writer_enabled
-        ):
-            return ExperienceWriteResult()
-
-        steps = build_write_steps_from_tool_history(
-            tool_history,
-            max_output_chars=min(1_000, max(0, self.config.memory_evolver_writer_max_input_chars)),
+        return self._evolver_runtime.write_legacy_run(
+            save_experience=self.save_experience,
+            task=task,
+            run_id=run_id,
+            trace_path=trace_path,
+            stop_reason=stop_reason,
+            final_answer=final_answer,
+            tool_history=tool_history,
+            outcome=outcome,
+            outcome_source=outcome_source,
+            source_task=source_task,
+            stream_id=stream_id,
+            task_type=task_type,
+            memory_mode=memory_mode,
         )
-        resolved_source_task = str(source_task or "").strip() or _task_ref(task)
-        selected_ids = _selection_selected_ids(self.last_evolver_selection)
-        candidate_ids = _selection_candidate_ids(self.last_evolver_selection)
-        request = ExperienceWriteRequest(
-            task=str(task or ""),
-            run_id=str(run_id or ""),
-            trace_path=Path(trace_path) if trace_path is not None else None,
-            stop_reason=str(stop_reason or ""),
-            outcome=str(outcome or "unknown"),
-            outcome_source=str(outcome_source or "runtime"),
-            final_answer=str(final_answer or ""),
-            selected_memory_ids=selected_ids,
-            candidate_memory_ids=candidate_ids,
-            steps=steps,
-            source_task=resolved_source_task,
-            stream_id=str(stream_id or ""),
-            task_type=str(task_type or ""),
-            project_key=self.project_key,
-            memory_mode=str(memory_mode or ""),
-        )
-        context_payload = _writer_dataset_context_payload(request)
-        try:
-            if self.evolver_writer is None:
-                raise RuntimeError("legacy writer is unavailable in formal mode")
-            self._trace(
-                "memory.evolver_writer_started",
-                {
-                    **context_payload,
-                    "mode": self.config.memory_evolver_writer_mode,
-                    "task_chars": len(request.task),
-                    "tool_steps": len(request.steps),
-                    "outcome": request.outcome,
-                    "outcome_source": request.outcome_source,
-                    "selected_count": len(request.selected_memory_ids),
-                    "candidate_count": len(request.candidate_memory_ids),
-                },
-            )
-            proposed = self.evolver_writer.propose(request, mode=self.config.memory_evolver_writer_mode)
-            self._trace(
-                "memory.evolver_writer_proposed",
-                {
-                    "proposal_count": len(proposed.proposals),
-                    "tiers": proposal_tier_counts(proposed.proposals),
-                    "llm_used": proposed.llm_used,
-                    "fallback_used": proposed.fallback_used,
-                    "rejected_count": len(proposed.rejected),
-                    "rejected_reasons": _rejected_reason_counts(proposed.rejected),
-                },
-            )
-            if not proposed.proposals:
-                self._trace(
-                    "memory.evolver_writer_skipped",
-                    {
-                        **context_payload,
-                        "reason": "no_valid_proposals",
-                        "outcome": request.outcome,
-                        "tool_steps": len(request.steps),
-                    },
-                )
-                self._append_writer_dataset(request, proposed)
-                return proposed
-
-            saved: list[ExperienceMemory] = []
-            duplicate_ids: list[str] = []
-            safe_source_task = _safe_dataset_join_text(request.source_task)
-            writer_policy = writer_policy_for_result(
-                llm_used=proposed.llm_used,
-                fallback_used=proposed.fallback_used,
-            )
-            for proposal in proposed.proposals:
-                entry, created = self.save_experience(
-                    tier=proposal.tier,
-                    content=proposal.content,
-                    payload=proposal.payload,
-                    source_task=safe_source_task,
-                    created_by=ExperienceCreatedBy.WRITER,
-                    run_id=request.run_id,
-                    stream_id=request.stream_id,
-                    writer_confidence=proposal.confidence,
-                )
-                if created:
-                    saved.append(entry)
-                else:
-                    duplicate_ids.append(entry.id)
-
-            result = ExperienceWriteResult(
-                proposals=proposed.proposals,
-                saved=tuple(saved),
-                duplicate_ids=tuple(duplicate_ids),
-                rejected=proposed.rejected,
-                llm_used=proposed.llm_used,
-                fallback_used=proposed.fallback_used,
-            )
-            saved_records = _saved_records(saved)
-            self._trace(
-                "memory.evolver_writer_saved",
-                {
-                    **context_payload,
-                    "saved_count": len(saved),
-                    "duplicate_count": len(duplicate_ids),
-                    "saved_ids": [entry.id for entry in saved],
-                    "saved_records": saved_records,
-                    "tiers": _saved_tier_counts(saved),
-                    "writer_policy": writer_policy,
-                },
-            )
-            self._append_writer_dataset(request, result)
-            return result
-        except Exception as exc:  # noqa: BLE001 - writer must not affect the agent loop
-            error = f"{type(exc).__name__}: {exc}"
-            self._trace(
-                "memory.evolver_writer_failed",
-                {
-                    **context_payload,
-                    "error": _safe_error_text(error),
-                    "phase": "unknown",
-                    "fallback_attempted": True,
-                },
-            )
-            return ExperienceWriteResult(error=error)
-
-    def _append_writer_dataset(self, request: ExperienceWriteRequest, result: ExperienceWriteResult) -> None:
-        dataset_path = self.config.memory_evolver_writer_dataset_path
-        if dataset_path is None:
-            return
-        try:
-            MemoryWriterDatasetLogger(dataset_path).append(
-                _writer_dataset_record(request=request, result=result, selection=self.last_evolver_selection)
-            )
-        except Exception as exc:  # noqa: BLE001 - dataset logging must not affect memory writes
-            self._trace(
-                "memory.evolver_writer_failed",
-                {
-                    **_writer_dataset_context_payload(request),
-                    "error": _safe_error_text(f"{type(exc).__name__}: {exc}"),
-                    "phase": "dataset",
-                    "fallback_attempted": result.fallback_used,
-                },
-            )
 
     def fork_for_task(self, *, session_id: str, run_id: str = "") -> "MemoryManager":
+        del run_id
         return MemoryManager(
             config=self.config,
             llm=self.llm,
             repo_path=self.repo_path,
-            short_term=ShortTermMemory(
-                max_tokens=self.context_profile.short_term_storage_token_limit,
-                max_entries=self.config.memory_short_term_entries,
-            ),
+            short_term=self.short_term.fork(),
             experience_store=self.experience_store,
-            experience_retriever=self.experience_retriever.fork(),
-            compressor=MemoryCompressor(
-                llm=self.llm,
-                chunk_size=self.config.memory_map_chunk_size,
-                retain_recent_turns=self.config.memory_retain_recent_turns,
-                max_input_chars=self.config.max_summary_input_chars,
-            ),
+            compressor=self.compressor.fork(),
+            evolver_runtime=self._evolver_runtime.fork(),
             project_key=self.project_key,
-            embedding_retriever=self.embedding_retriever,
-            evolver_coordinator=self.evolver_coordinator,
             session_id=session_id,
             trace_sink=self._trace_sink,
             context_profile=self.context_profile,
@@ -1108,224 +633,8 @@ class MemoryManager:
             pass
 
 
-def _task_ref(task: str) -> str:
-    return f"task_ref_{hashlib.sha256(str(task or '').encode('utf-8')).hexdigest()[:12]}"
-
-
-def _selection_candidate_ids(selection: SelectionResult | None) -> tuple[str, ...]:
-    if selection is None:
-        return ()
-    return tuple(candidate.id for candidate in selection.candidates)
-
-
-def _selection_selected_ids(selection: SelectionResult | None) -> tuple[str, ...]:
-    if selection is None:
-        return ()
-    return tuple(item.candidate.id for item in selection.selected)
-
-
-def _writer_context_payload(request: ExperienceWriteRequest) -> dict[str, Any]:
-    return {
-        "source_task": request.source_task,
-        "stream_id": request.stream_id,
-        "task_type": request.task_type,
-        "memory_project_key": request.project_key,
-    }
-
-
-def _writer_dataset_context_payload(request: ExperienceWriteRequest) -> dict[str, Any]:
-    return {
-        "source_task": _safe_dataset_join_text(request.source_task),
-        "stream_id": _safe_dataset_join_text(request.stream_id),
-        "task_type": _safe_dataset_join_text(request.task_type),
-        "memory_project_key": _safe_dataset_join_text(request.project_key),
-        "memory_mode": _safe_dataset_join_text(request.memory_mode),
-    }
-
-
-def _writer_dataset_record(
-    *,
-    request: ExperienceWriteRequest,
-    result: ExperienceWriteResult,
-    selection: SelectionResult | None,
-) -> dict[str, Any]:
-    record: dict[str, Any] = {
-        "schema_version": 1,
-        "task": _safe_dataset_text(request.task, WRITER_DATASET_TASK_CHARS),
-        "run_id": request.run_id,
-        "trace_path": _safe_dataset_join_text(str(request.trace_path or "")),
-        "source_task": _safe_dataset_join_text(request.source_task),
-        "task_id": _safe_dataset_join_text(request.source_task),
-        "task_type": _safe_dataset_join_text(request.task_type),
-        "stream_id": _safe_dataset_join_text(request.stream_id),
-        "memory_project_key": _safe_dataset_join_text(request.project_key),
-        "memory_mode": _safe_dataset_join_text(request.memory_mode),
-        "outcome": request.outcome,
-        "outcome_source": request.outcome_source,
-        "stop_reason": request.stop_reason,
-        "selected_memory_ids": list(request.selected_memory_ids),
-        "candidate_memory_ids": list(request.candidate_memory_ids),
-        "selected_memory_ids_by_tier": _selection_selected_ids_by_tier(selection),
-        "candidate_memory_ids_by_tier": _selection_candidate_ids_by_tier(selection),
-        "steps": [_writer_dataset_step(step) for step in request.steps],
-        "proposals": [_writer_dataset_proposal(proposal) for proposal in result.proposals],
-        "saved_ids": [entry.id for entry in result.saved],
-        "saved_records": _saved_records(list(result.saved)),
-        "duplicate_ids": list(result.duplicate_ids),
-        "rejected": [_safe_dataset_value(dict(item)) for item in result.rejected],
-        "llm_used": result.llm_used,
-        "fallback_used": result.fallback_used,
-    }
-    if result.error:
-        record["error"] = _safe_error_text(result.error)
-    return record
-
-
-def _writer_dataset_step(step: Any) -> dict[str, Any]:
-    output = str(getattr(step, "output", "") or "")
-    redacted = _unsafe_dataset_text(output)
-    return {
-        "step_num": int(getattr(step, "step_num", 0) or 0),
-        "tool": str(getattr(step, "tool", "") or ""),
-        "arguments": _safe_dataset_value(dict(getattr(step, "arguments", {}) or {})),
-        "ok": bool(getattr(step, "ok", False)),
-        "output": "" if redacted else _safe_dataset_text(output, WRITER_DATASET_OUTPUT_CHARS),
-        "output_redacted": redacted,
-        "blocked": bool(getattr(step, "blocked", False)),
-        "error_code": str(getattr(step, "error_code", "") or ""),
-    }
-
-
-def _writer_dataset_proposal(proposal: Any) -> dict[str, Any]:
-    tier = getattr(proposal, "tier", "")
-    payload = getattr(proposal, "payload", None)
-    try:
-        serialized_payload = experience_payload_to_dict(payload)
-    except (TypeError, ValueError):
-        serialized_payload = {}
-    return {
-        "tier": tier.value if isinstance(tier, ExperienceTier) else str(tier),
-        "content": _safe_dataset_text(str(getattr(proposal, "content", "") or ""), WRITER_DATASET_CONTENT_CHARS),
-        "payload": _safe_dataset_value(serialized_payload),
-        "confidence": float(getattr(proposal, "confidence", 0.0) or 0.0),
-        "reason": _safe_dataset_text(str(getattr(proposal, "reason", "") or ""), WRITER_METADATA_STRING_CHARS),
-    }
-
-
-def _safe_dataset_value(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        safe_items: dict[str, Any] = {}
-        for key, item in value.items():
-            raw_key = str(key)
-            if _unsafe_dataset_text(raw_key):
-                safe_items[_safe_dataset_redaction(raw_key)] = ""
-                continue
-            safe_items[_safe_dataset_text(raw_key, WRITER_METADATA_STRING_CHARS)] = _safe_dataset_value(item)
-        return safe_items
-    if isinstance(value, list):
-        return [_safe_dataset_value(item) for item in value]
-    if isinstance(value, tuple):
-        return [_safe_dataset_value(item) for item in value]
-    if isinstance(value, str):
-        return _safe_dataset_text(value, WRITER_METADATA_STRING_CHARS)
-    return value
-
-
-def _safe_dataset_text(value: str, max_chars: int) -> str:
-    text = str(value or "")
-    if _unsafe_dataset_text(text):
-        return ""
-    if len(text) <= max_chars:
-        return text
-    if max_chars <= 3:
-        return "." * max_chars
-    return text[: max_chars - 3].rstrip() + "..."
-
-
-def _safe_dataset_join_text(value: str) -> str:
-    text = str(value or "")
-    if _unsafe_dataset_text(text):
-        return _safe_dataset_redaction(text)
-    return _safe_dataset_text(text, WRITER_METADATA_STRING_CHARS)
-
-
-def _safe_error_text(value: str) -> str:
-    text = str(value or "")
-    if _unsafe_dataset_text(text):
-        return _safe_dataset_redaction(text)
-    return _safe_dataset_text(text, WRITER_METADATA_STRING_CHARS)
-
-
-def _safe_dataset_redaction(value: str) -> str:
-    digest = hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()[:12]
-    return f"redacted_{digest}"
-
-
-def _unsafe_dataset_text(value: str) -> bool:
-    text = str(value or "")
-    lower = text.casefold()
-    if WRITER_DATASET_SECRET_PREFIX_RE.search(text):
-        return True
-    return any(marker in lower for marker in WRITER_DATASET_FORBIDDEN_MARKERS)
-
-
-def _selection_candidate_ids_by_tier(selection: SelectionResult | None) -> dict[str, list[str]]:
-    if selection is None:
-        return {}
-    grouped: dict[str, list[str]] = {}
-    for candidate in selection.candidates:
-        tier = candidate.tier.value
-        grouped.setdefault(tier, []).append(candidate.id)
-    return grouped
-
-
-def _selection_selected_ids_by_tier(selection: SelectionResult | None) -> dict[str, list[str]]:
-    if selection is None:
-        return {}
-    grouped: dict[str, list[str]] = {}
-    for item in selection.selected:
-        tier = item.candidate.tier.value
-        grouped.setdefault(tier, []).append(item.candidate.id)
-    return grouped
-
-
-def _rejected_reason_counts(rejected: tuple[dict[str, Any], ...]) -> dict[str, int]:
-    counts: dict[str, int] = {}
-    for item in rejected:
-        reason = str(item.get("reason") or "unknown")
-        counts[reason] = counts.get(reason, 0) + 1
-    return counts
-
-
-def _saved_records(entries: list[ExperienceMemory]) -> list[dict[str, str]]:
-    return [
-        {
-            "id": entry.id,
-            "tier": entry.tier.value,
-            "source_task": entry.source_task,
-        }
-        for entry in entries
-    ]
-
-
-def _saved_tier_counts(entries: list[ExperienceMemory]) -> dict[str, int]:
-    counts: dict[str, int] = {}
-    for entry in entries:
-        tier = entry.tier.value
-        counts[tier] = counts.get(tier, 0) + 1
-    return counts
-
-
 def _new_id(prefix: str) -> str:
     return f"{prefix}_{uuid4().hex[:12]}"
-
-
-def _hit_tier_counts(hits: list[RetrievalHit[ExperienceMemory]]) -> dict[str, int]:
-    counts: dict[str, int] = {}
-    for hit in hits:
-        tier = hit.entry.tier.value
-        counts[tier] = counts.get(tier, 0) + 1
-    return counts
 
 
 def _model_name(llm: AgentLLM | None, config: AgentConfig) -> str:
@@ -1333,14 +642,6 @@ def _model_name(llm: AgentLLM | None, config: AgentConfig) -> str:
     if isinstance(value, str) and value.strip():
         return value
     return config.model
-
-
-def _normalize_project_key(repo_path: Path) -> str:
-    try:
-        resolved = Path(repo_path).expanduser().resolve()
-    except (OSError, RuntimeError):
-        resolved = Path(repo_path).expanduser().absolute()
-    return str(resolved)
 
 
 def _truncate_tool_result(content: str, limit: int) -> str:

@@ -15,7 +15,7 @@ from my_agent.cancellation import CancellationToken
 from my_agent.events import BufferedEventSink
 from my_agent.hitl.handler import HitlHandler
 from my_agent.llm import AgentLLM
-from my_agent.memory import MemoryManager
+from my_agent.memory import MemoryService
 from my_agent.plan import PlanValidationError, TaskResult
 from my_agent.agent_base import AgentBase
 from my_agent.schema import AgentState
@@ -65,7 +65,7 @@ class TeamAgent(AgentBase):
         state_store: TeamStore | None = None,
         worker_factory: Callable[[int], Any] | None = None,
         reviewer_factory: Callable[[str], Any] | None = None,
-        memory_manager: MemoryManager | None = None,
+        memory_manager: MemoryService | None = None,
         hitl_handler: HitlHandler | None = None,
     ) -> None:
         super().__init__(
@@ -83,7 +83,7 @@ class TeamAgent(AgentBase):
         self.reviewer_factory = reviewer_factory
         self._repo_path = Path(".").resolve()
         self._test_command: str | None = None
-        self._memory: MemoryManager | None = None
+        self._memory: MemoryService | None = None
         self._step_max_steps = config.team_step_max_steps
         self._state_lock = threading.RLock()
         self._event_local = threading.local()
@@ -776,7 +776,7 @@ class TeamAgent(AgentBase):
             test_command=self._test_command,
         )
 
-    def _record_team_step_summaries(self, memory: MemoryManager, team: TeamState, *, run_id: str) -> None:
+    def _record_team_step_summaries(self, memory: MemoryService, team: TeamState, *, run_id: str) -> None:
         for step in team.steps:
             if step.status not in {StepStatus.COMPLETED, StepStatus.FAILED, StepStatus.SKIPPED, StepStatus.CANCELLED}:
                 continue

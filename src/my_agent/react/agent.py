@@ -12,7 +12,7 @@ from my_agent.hitl.handler import HitlHandler
 from my_agent.hitl.types import ApprovalEvent
 from my_agent.llm import AgentLLM
 from my_agent.llm.types import ChatResponse, LLMToolCall, Message, MessageLike, messages_to_openai
-from my_agent.memory import MemoryManager
+from my_agent.memory import MemoryService
 from my_agent.memory.evolver import build_write_steps_from_tool_history, runtime_outcome_from_tool_records
 from my_agent.memory.evolver.task_session import AgentEpisodeArtifact
 from my_agent.memory.token import estimate_tokens
@@ -41,7 +41,7 @@ class ReActAgent(AgentBase):
         trace_dir: str | Path,
         command_timeout: int,
         event_sink: EventSink | None = None,
-        memory_manager: MemoryManager | None = None,
+        memory_manager: MemoryService | None = None,
         hitl_handler: HitlHandler | None = None,
         role_prompt: str | None = None,
         run_label: str = "native_tool_calls",
@@ -130,7 +130,8 @@ class ReActAgent(AgentBase):
             base_messages = self._initial_messages(state)
             formal_session = None
             decision_recorder = None
-            if self.config.memory_evolver_mode == "formal":
+            formal_coordinator = memory.evolver_coordinator
+            if formal_coordinator is not None:
                 metadata = dict(getattr(state, "metadata", {}) or {})
                 task_id = str(metadata.get("task_id") or metadata.get("source_task") or "").strip()
                 task_group = str(metadata.get("task_group") or "").strip()
@@ -143,9 +144,8 @@ class ReActAgent(AgentBase):
                         trajectory_id=state.run_id,
                         stream_id=stream_id,
                     )
-                    coordinator = memory.evolver_coordinator
                     decision_recorder = (
-                        coordinator.decision_recorder if coordinator is not None else None
+                        formal_coordinator.decision_recorder
                     )
                 else:
                     self._emit(
@@ -261,8 +261,8 @@ class ReActAgent(AgentBase):
                     tool_history=build_write_steps_from_tool_history(tool_history),
                     task=state.task,
                 )
-                state.evolver_coordinator = memory.evolver_coordinator
-            elif self.config.memory_evolver_mode != "formal":
+                state.evolver_coordinator = formal_coordinator
+            elif formal_coordinator is None:
                 memory.write_experiences_from_run(
                     task=state.task,
                     run_id=state.run_id,
@@ -303,7 +303,7 @@ class ReActAgent(AgentBase):
         writer: TraceWriter,
         state: AgentState,
         *,
-        memory: MemoryManager,
+        memory: MemoryService,
         context_manager: AgentContextManager,
         base_messages: list[MessageLike],
         tool_budget: ToolSchemaBudget,
@@ -366,7 +366,7 @@ class ReActAgent(AgentBase):
         writer: TraceWriter,
         state: AgentState,
         *,
-        memory: MemoryManager,
+        memory: MemoryService,
         context_manager: AgentContextManager,
         base_messages: list[MessageLike],
         tool_budget: ToolSchemaBudget,

@@ -8,6 +8,7 @@ from my_agent.context.profile import ContextProfile, long_term_budget_tokens
 from my_agent.context.tokens import estimate_tokens
 from my_agent.context.tool_budget import ToolSchemaBudget, tool_name
 from my_agent.llm.types import Message, MessageLike, messages_to_openai
+from my_agent.memory.api import MemoryService
 
 
 @dataclass(frozen=True)
@@ -62,7 +63,7 @@ class AgentContextManager:
     def raise_if_over_budget(
         self,
         *,
-        memory: Any,
+        memory: MemoryService,
         estimated_prompt_tokens: int,
         payload: dict[str, Any],
     ) -> None:
@@ -73,7 +74,12 @@ class AgentContextManager:
         enriched = self.trace_over_budget(memory=memory, payload=over_budget_payload)
         raise ContextOverBudgetError(enriched)
 
-    def trace_over_budget(self, *, memory: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    def trace_over_budget(
+        self,
+        *,
+        memory: MemoryService,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
         enriched = self._trace_payload(payload)
         memory.trace_context_event("context.over_budget", enriched)
         return enriched
@@ -84,7 +90,7 @@ class AgentContextManager:
         base_messages: list[MessageLike],
         query: str,
         tools: list[dict[str, Any]],
-        memory: Any,
+        memory: MemoryService,
         force_compact: bool = False,
         focus: str = "",
         tool_budget: ToolSchemaBudget | None = None,

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from my_agent.memory.api import MemoryService
 from my_agent.memory.short_term import MemoryCompressor
 from my_agent.memory.experience.repository import (
     EXPERIENCE_LOCK_FILE,
@@ -52,6 +53,7 @@ from my_agent.memory.types import (
 )
 
 if TYPE_CHECKING:
+    from my_agent.memory.disabled import DisabledMemoryManager
     from my_agent.memory.manager import MemoryManager
     from my_agent.memory.noop import NoopMemoryManager
 
@@ -63,10 +65,15 @@ def __getattr__(name: str) -> Any:
         globals()[name] = MemoryManager
         return MemoryManager
     if name == "NoopMemoryManager":
-        from my_agent.memory.noop import NoopMemoryManager
+        from my_agent.memory.disabled import NoopMemoryManager
 
         globals()[name] = NoopMemoryManager
         return NoopMemoryManager
+    if name == "DisabledMemoryManager":
+        from my_agent.memory.disabled import DisabledMemoryManager
+
+        globals()[name] = DisabledMemoryManager
+        return DisabledMemoryManager
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
@@ -91,6 +98,8 @@ __all__ = [
     "MemoryContext",
     "MemoryEntry",
     "MemoryManager",
+    "MemoryService",
+    "DisabledMemoryManager",
     "NoopMemoryManager",
     "MemoryScope",
     "MemoryStatus",

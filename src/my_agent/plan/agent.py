@@ -10,7 +10,7 @@ from my_agent.config import AgentConfig
 from my_agent.context import AgentContextManager, ContextOverBudgetError
 from my_agent.hitl.handler import HitlHandler
 from my_agent.llm import AgentLLM
-from my_agent.memory import MemoryManager
+from my_agent.memory import MemoryService
 from my_agent.plan.executor import PlanEvent, PlanExecutor, ReActTaskRunner
 from my_agent.plan.graph import PlanValidationError
 from my_agent.plan.planner import Planner
@@ -51,7 +51,7 @@ class PlanExecuteAgent(AgentBase):
         review_handler: PlanReviewHandler | None = None,
         state_store: PlanStore | None = None,
         require_approval: bool = False,
-        memory_manager: MemoryManager | None = None,
+        memory_manager: MemoryService | None = None,
         hitl_handler: HitlHandler | None = None,
     ) -> None:
         super().__init__(
@@ -119,7 +119,12 @@ class PlanExecuteAgent(AgentBase):
                     estimated_prompt_tokens=fixed_with_memory_tokens,
                     payload=planner_memory_payload,
                 )
-                trace_sink = lambda event, payload: self._emit_trace(writer, state, event, payload)
+                trace_sink = lambda event, payload: self._emit_trace(  # noqa: E731
+                    writer,
+                    state,
+                    event,
+                    payload,
+                )
                 planner.trace_sink = trace_sink
                 plan = planner.create_plan(
                     goal,
@@ -220,7 +225,7 @@ class PlanExecuteAgent(AgentBase):
                 self._emit_plan_event("plan.failed", plan)
                 return self._final_state(state, plan, writer, stop_reason="plan_failed")
 
-    def _record_plan_task_summaries(self, memory: MemoryManager, plan: PlanState, *, run_id: str) -> None:
+    def _record_plan_task_summaries(self, memory: MemoryService, plan: PlanState, *, run_id: str) -> None:
         for task in plan.tasks:
             if task.status not in {TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.SKIPPED, TaskStatus.CANCELLED}:
                 continue

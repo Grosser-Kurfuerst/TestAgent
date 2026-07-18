@@ -9,7 +9,7 @@ from my_agent.config import AgentConfig
 from my_agent.hitl.handler import HitlHandler
 from my_agent.llm import AgentLLM
 from my_agent.llm.types import Message, MessageLike
-from my_agent.memory import MemoryManager
+from my_agent.memory import MemoryService
 from my_agent.plan import TaskResult
 from my_agent.team.prompts import (
     TEAM_REVIEWER_SYSTEM_PROMPT,
@@ -36,7 +36,7 @@ class SubAgent:
         repo_path: str | Path,
         trace_dir: str | Path,
         command_timeout: int,
-        memory_manager: MemoryManager | None = None,
+        memory_manager: MemoryService | None = None,
         event_sink: EventSink | None = None,
         hitl_handler: HitlHandler | None = None,
         test_command: str | None = None,

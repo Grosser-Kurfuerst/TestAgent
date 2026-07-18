@@ -11,6 +11,7 @@ from my_agent.config import AgentConfig
 from my_agent.llm import FakeLLM
 from my_agent.memory import ExperienceStore, MemoryManager
 from my_agent.memory.evolver.coordinator import EvolverCoordinator
+from my_agent.memory.evolver.runtime.formal import FormalEvolverRuntime
 from my_agent.policy.identity import PolicyIdentity, policy_identity_manifest_payload
 from my_agent.policy.identity import canonical_sha256
 from my_agent.runtime import CodingAgentRuntime
@@ -173,16 +174,20 @@ class FormalRuntimeValidationTests(unittest.TestCase):
             manager.llm = policy
             manager.experience_store = store
             manager.project_key = str(repo.resolve())
-            manager.embedding_retriever = object()
-            manager.evolver_coordinator = EvolverCoordinator(
+            retriever = object()
+            coordinator = EvolverCoordinator(
                 store=store,
                 project_key=manager.project_key,
                 policy_identity=identity,
-                retriever=manager.embedding_retriever,
+                retriever=retriever,
                 policy=policy,
                 top_k_per_tier=config.memory_evolver_candidate_top_k_per_tier,
                 selected_max_items=config.memory_evolver_selected_max_items,
                 selection_token_budget=config.memory_evolver_selection_prompt_tokens,
+            )
+            manager._evolver_runtime = FormalEvolverRuntime(
+                coordinator=coordinator,
+                candidate_retriever=retriever,
             )
 
             manager.require_formal_runtime_binding(
@@ -217,16 +222,20 @@ class FormalRuntimeValidationTests(unittest.TestCase):
             manager.llm = policy
             manager.experience_store = store
             manager.project_key = str(repo.resolve())
-            manager.embedding_retriever = object()
-            manager.evolver_coordinator = EvolverCoordinator(
+            retriever = object()
+            coordinator = EvolverCoordinator(
                 store=store,
                 project_key=manager.project_key,
                 policy_identity=identity,
-                retriever=manager.embedding_retriever,
+                retriever=retriever,
                 policy=policy,
                 top_k_per_tier=config.memory_evolver_candidate_top_k_per_tier,
                 selected_max_items=config.memory_evolver_selected_max_items,
                 selection_token_budget=config.memory_evolver_selection_prompt_tokens,
+            )
+            manager._evolver_runtime = FormalEvolverRuntime(
+                coordinator=coordinator,
+                candidate_retriever=retriever,
             )
             manager.evolver_coordinator.selector = SimpleNamespace(select=lambda **kwargs: ())
 

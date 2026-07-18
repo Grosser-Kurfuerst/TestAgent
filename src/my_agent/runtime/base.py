@@ -10,7 +10,7 @@ from my_agent.config import AgentConfig
 from my_agent.context import ContextProfile
 from my_agent.hitl.handler import HitlHandler
 from my_agent.llm import AgentLLM
-from my_agent.memory import MemoryManager, NoopMemoryManager
+from my_agent.memory import DisabledMemoryManager, MemoryManager, MemoryService
 from my_agent.observability.tracing import TraceWriter
 from my_agent.policy.runtime_validation import require_formal_policy
 from my_agent.repo import RepoContextRender, RepoIndexer
@@ -26,7 +26,7 @@ MemoryTraceSnapshot = tuple[Any | None, Any | None]
 class RunContext:
     state: AgentState
     writer: TraceWriter
-    memory: MemoryManager
+    memory: MemoryService
     repo_snapshot: Any | None = None
     repo_context: str = ""
     repo_context_render: RepoContextRender | None = None
@@ -43,7 +43,7 @@ class AgentBase(ABC):
         trace_dir: str | Path,
         command_timeout: int,
         event_sink: EventSink | None = None,
-        memory_manager: MemoryManager | None = None,
+        memory_manager: MemoryService | None = None,
         hitl_handler: HitlHandler | None = None,
     ) -> None:
         self.config = config
@@ -118,14 +118,14 @@ class AgentBase(ABC):
         state: AgentState,
         writer: TraceWriter,
         *,
-        memory_manager: MemoryManager | None = None,
-    ) -> tuple[MemoryManager, MemoryTraceSnapshot | None]:
+        memory_manager: MemoryService | None = None,
+    ) -> tuple[MemoryService, MemoryTraceSnapshot | None]:
         def trace_sink(event: str, payload: dict[str, object]) -> None:
             self._emit_trace(writer, state, event, payload)
 
         if not self.config.memory_enabled:
             return (
-                NoopMemoryManager(
+                DisabledMemoryManager(
                     config=self.config,
                     repo_path=Path(repo).resolve(),
                     session_id=state.run_id,
@@ -135,10 +135,8 @@ class AgentBase(ABC):
             )
         active_memory = memory_manager if memory_manager is not None else self.memory_manager
         if active_memory is not None:
-            if self.config.memory_evolver_mode == "formal":
-                policy_identity = require_formal_policy(self.config, self.llm)
-                if policy_identity is None:
-                    raise ValueError("formal OPD runtime requires a validated policy identity")
+            policy_identity = require_formal_policy(self.config, self.llm)
+            if policy_identity is not None:
                 active_memory.require_formal_runtime_binding(
                     config=self.config,
                     policy_identity=policy_identity,
@@ -157,11 +155,11 @@ class AgentBase(ABC):
             None,
         )
 
-    def _restore_memory(self, memory: MemoryManager, snapshot: MemoryTraceSnapshot | None) -> None:
+    def _restore_memory(self, memory: MemoryService, snapshot: MemoryTraceSnapshot | None) -> None:
         if snapshot is not None:
             memory.restore_trace_sink(snapshot)
 
-    def _emit_memory_loaded(self, writer: TraceWriter, state: AgentState, memory: MemoryManager) -> None:
+    def _emit_memory_loaded(self, writer: TraceWriter, state: AgentState, memory: MemoryService) -> None:
         status = memory.status(include_entries=False)
         self._emit_trace(
             writer,

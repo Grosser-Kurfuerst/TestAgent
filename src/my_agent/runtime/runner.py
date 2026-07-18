@@ -7,7 +7,7 @@ from typing import Any, Callable
 from my_agent.config import AgentConfig
 from my_agent.hitl.handler import HitlHandler, NonInteractiveHitlHandler, TerminalHitlHandler
 from my_agent.llm import AgentLLM, build_llm
-from my_agent.memory import MemoryManager
+from my_agent.memory import MemoryService
 from my_agent.observability.tracing import TraceWriter, append_agent_completed
 from my_agent.plan import AgentMode, resolve_mode
 from my_agent.policy.runtime_validation import require_formal_policy
@@ -26,7 +26,7 @@ class CodingAgentRuntime:
         trace_dir: str | Path | None = None,
         command_timeout: int | None = None,
         event_sink: Callable[[Any], None] | None = None,
-        memory_manager: MemoryManager | None = None,
+        memory_manager: MemoryService | None = None,
         hitl_handler: HitlHandler | None = None,
     ):
         self.config = config or AgentConfig.from_env()
@@ -76,7 +76,7 @@ def run_agent(
     trace_dir: str | Path | None = None,
     event_sink: Callable[[Any], None] | None = None,
     mode: AgentMode | str | None = None,
-    memory_manager: MemoryManager | None = None,
+    memory_manager: MemoryService | None = None,
     hitl_handler: HitlHandler | None = None,
     cancellation_token: CancellationToken | None = None,
     metadata: dict[str, Any] | None = None,

@@ -117,6 +117,13 @@ class ShortTermMemory:
     def token_count(self) -> int:
         return self._tokens
 
+    def fork(self) -> "ShortTermMemory":
+        """Create an empty task-local store with the same hard limits."""
+        return ShortTermMemory(
+            max_tokens=self._max_tokens,
+            max_entries=self._max_entries,
+        )
+
     def __len__(self) -> int:
         return len(self._entries)
 

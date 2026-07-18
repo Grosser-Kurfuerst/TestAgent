@@ -7,7 +7,7 @@ from typing import Any, Callable
 from my_agent.config import AgentConfig
 from my_agent.cancellation import CancellationToken
 from my_agent.hitl.handler import HitlHandler
-from my_agent.memory import MemoryManager
+from my_agent.memory import MemoryService
 from my_agent.plan.types import TaskResult
 from my_agent.react.agent import ReActAgent
 from my_agent.schema import AgentState
@@ -37,7 +37,7 @@ class ChildReActRunner:
         llm: Any,
         command_timeout: int,
         event_sink: Callable[[object], None] | None = None,
-        memory_manager: MemoryManager | None = None,
+        memory_manager: MemoryService | None = None,
         hitl_handler: HitlHandler | None = None,
     ) -> None:
         self.config = config
