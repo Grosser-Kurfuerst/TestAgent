@@ -25,6 +25,7 @@ from my_agent.training.role_views import (
 
 
 OPD_EVIDENCE_SCHEMA_VERSION = "opd-round-evidence-v1"
+ACTION_EXECUTION_SCHEMA_VERSION = "opd-action-execution-v1"
 OPD_MAINTENANCE_ATTEMPT_SCHEMA_VERSION = "opd-maintenance-attempt-v1"
 OPD_LEARNER_SCHEMA_VERSION = "opd-learner-sample-v1"
 OPD_EXPORT_MANIFEST_SCHEMA_VERSION = "opd-export-manifest-v2"
@@ -86,6 +87,139 @@ class ActionDecisionEvidence:
                 data["observation_messages"], CanonicalMessage.from_dict, "observation_messages"
             ),
         )
+
+
+@dataclass(frozen=True)
+class ActionExecutionEvidence:
+    collection_round: int
+    task_ordinal: int
+    split: str
+    task_id: str
+    task_group: str
+    decision_id: str
+    trajectory_id: str
+    stream_id: str
+    memory_project_key: str
+    run_id: str
+    policy_identity: PolicyIdentity
+    turn_index: int
+    step_index: int
+    call_index: int
+    call_id: str
+    tool_name: str
+    arguments_hash: str
+    ok: bool
+    blocked: bool
+    error_code: str
+    output_hash: str
+    schema_version: str = ACTION_EXECUTION_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if self.schema_version != ACTION_EXECUTION_SCHEMA_VERSION:
+            raise ValueError("unsupported action execution evidence schema")
+        _require_round(self.collection_round, self.task_ordinal)
+        _require_split(self.split)
+        for field_name in (
+            "task_id", "task_group", "decision_id", "trajectory_id", "stream_id",
+            "memory_project_key", "run_id", "call_id", "tool_name",
+        ):
+            _require_nonblank(getattr(self, field_name), field_name)
+        for field_name in ("turn_index", "step_index", "call_index"):
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"action execution {field_name} must be non-negative")
+        if not isinstance(self.policy_identity, PolicyIdentity):
+            raise ValueError("action execution evidence requires PolicyIdentity")
+        for field_name in ("arguments_hash", "output_hash"):
+            require_sha256(getattr(self, field_name), field_name=field_name)
+        if not isinstance(self.ok, bool) or not isinstance(self.blocked, bool):
+            raise ValueError("action execution ok/blocked must be boolean")
+        if self.ok and self.blocked:
+            raise ValueError("successful action execution cannot be blocked")
+        if not isinstance(self.error_code, str):
+            raise ValueError("action execution error_code must be a string")
+
+    @property
+    def execution_evidence_id(self) -> str:
+        return canonical_sha256(self._payload())
+
+    @property
+    def idempotency_key(self) -> tuple[str, str, str, str, str]:
+        return (
+            self.stream_id,
+            self.memory_project_key,
+            self.task_id,
+            self.decision_id,
+            self.call_id,
+        )
+
+    def _payload(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "collection_round": self.collection_round,
+            "task_ordinal": self.task_ordinal,
+            "split": self.split,
+            "task_id": self.task_id,
+            "task_group": self.task_group,
+            "decision_id": self.decision_id,
+            "trajectory_id": self.trajectory_id,
+            "stream_id": self.stream_id,
+            "memory_project_key": self.memory_project_key,
+            "run_id": self.run_id,
+            "policy_identity": self.policy_identity.to_dict(),
+            "policy_identity_hash": self.policy_identity.identity_hash,
+            "turn_index": self.turn_index,
+            "step_index": self.step_index,
+            "call_index": self.call_index,
+            "call_id": self.call_id,
+            "tool_name": self.tool_name,
+            "arguments_hash": self.arguments_hash,
+            "ok": self.ok,
+            "blocked": self.blocked,
+            "error_code": self.error_code,
+            "output_hash": self.output_hash,
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"execution_evidence_id": self.execution_evidence_id, **self._payload()}
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "ActionExecutionEvidence":
+        expected = {
+            "execution_evidence_id", "schema_version", "collection_round", "task_ordinal",
+            "split", "task_id", "task_group", "decision_id", "trajectory_id",
+            "stream_id", "memory_project_key", "run_id", "policy_identity",
+            "policy_identity_hash", "turn_index", "step_index", "call_index", "call_id",
+            "tool_name", "arguments_hash", "ok", "blocked", "error_code", "output_hash",
+        }
+        _require_exact(data, expected, "action execution evidence")
+        record = cls(
+            schema_version=_string(data["schema_version"], "schema_version"),
+            collection_round=_int(data["collection_round"], "collection_round"),
+            task_ordinal=_int(data["task_ordinal"], "task_ordinal"),
+            split=_string(data["split"], "split"),
+            task_id=_string(data["task_id"], "task_id"),
+            task_group=_string(data["task_group"], "task_group"),
+            decision_id=_string(data["decision_id"], "decision_id"),
+            trajectory_id=_string(data["trajectory_id"], "trajectory_id"),
+            stream_id=_string(data["stream_id"], "stream_id"),
+            memory_project_key=_string(data["memory_project_key"], "memory_project_key"),
+            run_id=_string(data["run_id"], "run_id"),
+            policy_identity=_identity(data),
+            turn_index=_int(data["turn_index"], "turn_index"),
+            step_index=_int(data["step_index"], "step_index"),
+            call_index=_int(data["call_index"], "call_index"),
+            call_id=_string(data["call_id"], "call_id"),
+            tool_name=_string(data["tool_name"], "tool_name"),
+            arguments_hash=_string(data["arguments_hash"], "arguments_hash"),
+            ok=_bool(data["ok"], "ok"),
+            blocked=_bool(data["blocked"], "blocked"),
+            error_code=_string(data["error_code"], "error_code"),
+            output_hash=_string(data["output_hash"], "output_hash"),
+        )
+        if data["execution_evidence_id"] != record.execution_evidence_id:
+            raise ValueError("action execution evidence ID mismatch")
+        return record
 
 
 @dataclass(frozen=True)
@@ -1150,6 +1284,8 @@ def _bool(value: Any, field_name: str) -> bool:
 
 
 __all__ = [
+    "ACTION_EXECUTION_SCHEMA_VERSION",
+    "ActionExecutionEvidence",
     "DATASET_SPLITS",
     "OPD_EVIDENCE_SCHEMA_VERSION",
     "OPD_EXPORT_MANIFEST_SCHEMA_VERSION",

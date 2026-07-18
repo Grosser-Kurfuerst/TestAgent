@@ -16,6 +16,7 @@ from my_agent.memory.evolver.task_session import AgentEpisodeArtifact, TaskEvolv
 from my_agent.memory.experience.repository import ExperienceStore
 from my_agent.opd_data.schema import (
     ActionDecisionEvidence,
+    ActionExecutionEvidence,
     MaintenanceAttemptEvidence,
     MaintenanceEvidence,
     RepositoryEvidence,
@@ -24,7 +25,11 @@ from my_agent.opd_data.schema import (
     TaskEvidence,
     TaskOutcomeEvidence,
 )
-from my_agent.policy.identity import canonical_json_bytes
+from my_agent.policy.identity import (
+    canonical_json_bytes,
+    canonical_sha256,
+    require_matching_policy_identity,
+)
 from my_agent.training.contracts import AuthoritativeTaskOutcome, DecisionEvent
 from my_agent.training.decision_log import DecisionEventRecorder
 from my_agent.training.role_views import (
@@ -57,6 +62,33 @@ class _PendingMaintenance:
     as_of_task_ordinal: int
     outcome_ids: tuple[str, ...]
     redundancy_diagnostics: tuple[RedundancyDiagnostic, ...]
+
+
+@dataclass(frozen=True)
+class _PendingActionExecution:
+    session: TaskEvolverSession
+    decision_id: str
+    turn_index: int
+    step_index: int
+    call_index: int
+    call_id: str
+    tool_name: str
+    run_id: str
+    arguments_hash: str
+    ok: bool
+    blocked: bool
+    error_code: str
+    output_hash: str
+
+    @property
+    def idempotency_key(self) -> tuple[str, str, str, str, str]:
+        return (
+            self.session.stream_id,
+            self.session.memory_project_key,
+            self.session.task_id,
+            self.decision_id,
+            self.call_id,
+        )
 
 
 class _EvidenceStream:
@@ -129,6 +161,11 @@ class RuntimeEvidenceRecorder:
                 item.stream_id, item.memory_project_key, item.outcome.task_id
             ),
         )
+        self.executions = _EvidenceStream(
+            root / "tool_execution_evidence.jsonl",
+            loader=lambda path: _load_records(path, ActionExecutionEvidence.from_dict),
+            key=lambda item: item.idempotency_key,
+        )
         self.repositories = _EvidenceStream(
             root / "repository_events.jsonl",
             loader=lambda path: _load_records(path, RepositoryEvidence.from_dict),
@@ -150,6 +187,9 @@ class RuntimeEvidenceRecorder:
             key=lambda item: item.exclusion_id,
         )
         self._pending_tasks: dict[str, _PendingTask] = {}
+        self._pending_action_executions: dict[
+            tuple[str, str, str, str, str], _PendingActionExecution
+        ] = {}
         self._pending_maintenance: dict[str, _PendingMaintenance] = {}
         self._outcome_by_task = {
             _task_key(item.stream_id, item.memory_project_key, item.outcome.task_id): item
@@ -159,6 +199,7 @@ class RuntimeEvidenceRecorder:
         for record in (
             *self.tasks.records,
             *self.outcomes.records,
+            *self.executions.records,
             *self.repositories.records,
             *self.maintenance.records,
             *self.maintenance_attempts.records,
@@ -168,12 +209,17 @@ class RuntimeEvidenceRecorder:
                 raise ValueError("runtime evidence directory crosses collection rounds")
         for record in (
             *self.tasks.records,
+            *self.executions.records,
             *self.maintenance.records,
             *self.maintenance_attempts.records,
             *self.exclusions.records,
         ):
             if record.split != split:
                 raise ValueError("runtime evidence directory crosses dataset splits")
+        recorder_identity = self.decision_recorder.policy.identity()
+        for record in self.executions.records:
+            require_matching_policy_identity(recorder_identity, record.policy_identity)
+            self._validate_execution_join(record)
         for record in sorted(
             self.repositories.records,
             key=lambda item: (item.stream_id, item.snapshot.memory_project_key, item.event_ordinal),
@@ -214,6 +260,10 @@ class RuntimeEvidenceRecorder:
         pending = self._pending_tasks.get(episode.session.trajectory_id)
         if pending is None or pending.session != episode.session:
             raise ValueError("missing frozen task evidence for finalized trajectory")
+        self._materialize_action_executions(
+            session=episode.session,
+            task_ordinal=task_ordinal,
+        )
         all_events = self._events(episode.session.trajectory_id)
         successful = tuple(event for event in all_events if event.status == "success")
         selections = _role_events(successful, "selection")
@@ -316,6 +366,141 @@ class RuntimeEvidenceRecorder:
         self.tasks.append(task_record)
         self._finish_task_streams(episode=episode, outcome_record=outcome_record)
         del self._pending_tasks[episode.session.trajectory_id]
+
+    def record_action_execution(
+        self,
+        *,
+        session: TaskEvolverSession,
+        decision_id: str,
+        turn_index: int,
+        step_index: int,
+        call_index: int,
+        call_id: str,
+        tool_name: str,
+        arguments: Mapping[str, Any],
+        ok: bool,
+        blocked: bool,
+        error_code: str,
+        output: str,
+    ) -> None:
+        pending_task = self._pending_tasks.get(session.trajectory_id)
+        if pending_task is None or pending_task.session != session:
+            raise ValueError("action execution requires a pending formal task session")
+        if not isinstance(arguments, Mapping):
+            raise ValueError("action execution arguments must be an object")
+        if not isinstance(output, str):
+            raise ValueError("action execution output must be a string")
+        event = self._decision_event(session.trajectory_id, decision_id)
+        if event.role != "action" or event.status != "success":
+            raise ValueError("action execution requires a successful action decision")
+        if event.turn_index != turn_index or event.step_index != step_index:
+            raise ValueError("action execution indexes do not match the decision event")
+        require_matching_policy_identity(session.policy_identity, event.policy_identity)
+        expected_calls = _event_tool_calls(event)
+        if call_index < 0 or call_index >= len(expected_calls):
+            raise ValueError("action execution call_index is absent from the decision")
+        expected_call = expected_calls[call_index]
+        arguments_hash = canonical_sha256(dict(arguments))
+        if (
+            expected_call.call_id != call_id
+            or expected_call.name != tool_name
+            or canonical_sha256(json.loads(expected_call.arguments_json)) != arguments_hash
+        ):
+            raise ValueError("action execution call does not match the decision event")
+        pending = _PendingActionExecution(
+            session=session,
+            decision_id=decision_id,
+            turn_index=turn_index,
+            step_index=step_index,
+            call_index=call_index,
+            call_id=call_id,
+            tool_name=tool_name,
+            run_id=event.run_id,
+            arguments_hash=arguments_hash,
+            ok=ok,
+            blocked=blocked,
+            error_code=error_code,
+            output_hash=canonical_sha256(output),
+        )
+        existing = self._pending_action_executions.get(pending.idempotency_key)
+        if existing is not None and existing != pending:
+            raise ValueError("pending action execution idempotency key conflicts")
+        self._pending_action_executions[pending.idempotency_key] = pending
+
+    def _materialize_action_executions(
+        self,
+        *,
+        session: TaskEvolverSession,
+        task_ordinal: int,
+    ) -> None:
+        pending = sorted(
+            (
+                item
+                for item in self._pending_action_executions.values()
+                if item.session.trajectory_id == session.trajectory_id
+            ),
+            key=lambda item: (item.turn_index, item.step_index, item.call_index),
+        )
+        for item in pending:
+            record = ActionExecutionEvidence(
+                collection_round=self.collection_round,
+                task_ordinal=task_ordinal,
+                split=self.split,
+                task_id=session.task_id,
+                task_group=session.task_group,
+                decision_id=item.decision_id,
+                trajectory_id=session.trajectory_id,
+                stream_id=session.stream_id,
+                memory_project_key=session.memory_project_key,
+                run_id=item.run_id,
+                policy_identity=session.policy_identity,
+                turn_index=item.turn_index,
+                step_index=item.step_index,
+                call_index=item.call_index,
+                call_id=item.call_id,
+                tool_name=item.tool_name,
+                arguments_hash=item.arguments_hash,
+                ok=item.ok,
+                blocked=item.blocked,
+                error_code=item.error_code,
+                output_hash=item.output_hash,
+            )
+            self.executions.append(record)
+            del self._pending_action_executions[item.idempotency_key]
+
+    def _decision_event(self, trajectory_id: str, decision_id: str) -> DecisionEvent:
+        matches = tuple(
+            event
+            for event in self._events(trajectory_id)
+            if event.decision_id == decision_id
+        )
+        if len(matches) != 1:
+            raise ValueError("action execution decision_id is absent or ambiguous")
+        return matches[0]
+
+    def _validate_execution_join(self, record: ActionExecutionEvidence) -> None:
+        event = self._decision_event(record.trajectory_id, record.decision_id)
+        if (
+            event.task_id != record.task_id
+            or event.task_group != record.task_group
+            or event.stream_id != record.stream_id
+            or event.memory_project_key != record.memory_project_key
+            or event.run_id != record.run_id
+            or event.turn_index != record.turn_index
+            or event.step_index != record.step_index
+        ):
+            raise ValueError("persisted action execution does not join its decision event")
+        require_matching_policy_identity(event.policy_identity, record.policy_identity)
+        calls = _event_tool_calls(event)
+        if record.call_index >= len(calls):
+            raise ValueError("persisted action execution call_index is absent")
+        call = calls[record.call_index]
+        if (
+            call.call_id != record.call_id
+            or call.name != record.tool_name
+            or canonical_sha256(json.loads(call.arguments_json)) != record.arguments_hash
+        ):
+            raise ValueError("persisted action execution call does not match its decision")
 
     def begin_maintenance(
         self,

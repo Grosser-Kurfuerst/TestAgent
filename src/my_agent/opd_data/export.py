@@ -10,6 +10,7 @@ from typing import Any, Callable, TypeVar
 import json
 
 from my_agent.opd_data.schema import (
+    ActionExecutionEvidence,
     LearnerSample,
     MaintenanceAttemptEvidence,
     MaintenanceEvidence,
@@ -387,6 +388,12 @@ def load_task_evidence(path: str | Path) -> tuple[TaskEvidence, ...]:
 
 def load_task_outcomes(path: str | Path) -> tuple[TaskOutcomeEvidence, ...]:
     return _load_jsonl(path, TaskOutcomeEvidence.from_dict)
+
+
+def load_action_execution_evidence(
+    path: str | Path,
+) -> tuple[ActionExecutionEvidence, ...]:
+    return _load_jsonl(path, ActionExecutionEvidence.from_dict)
 
 
 def load_repository_evidence(path: str | Path) -> tuple[RepositoryEvidence, ...]:

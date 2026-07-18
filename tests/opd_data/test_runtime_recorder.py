@@ -14,6 +14,7 @@ from my_agent.memory.evolver.writing.contracts import ExperienceWriteStep
 from my_agent.memory.experience.models import ExperienceTier
 from my_agent.memory.experience_store import ExperienceStore
 from my_agent.opd_data.export import (
+    load_action_execution_evidence,
     load_maintenance_evidence,
     load_maintenance_attempts,
     load_repository_evidence,
@@ -108,6 +109,23 @@ class _RolePolicy:
         raise AssertionError("not used")
 
 
+class _ActionToolPolicy(_RolePolicy):
+    def generate_decision(self, request):
+        response = super().generate_decision(request)
+        if request.role != "action":
+            return response
+        call = CanonicalToolCall(
+            "call-action-finish",
+            "finish",
+            canonical_json_bytes({}).decode("utf-8"),
+        )
+        return replace(
+            response,
+            raw_completion="finish",
+            parsed_tool_calls=(call,),
+        )
+
+
 def _action_tool() -> CanonicalTool:
     parameters = {"type": "object", "properties": {}}
     return CanonicalTool(
@@ -123,7 +141,7 @@ def _record_action(
     session,
     *,
     messages: tuple[CanonicalMessage, ...] | None = None,
-) -> None:
+) -> object:
     action_request = DecisionRequest(
         role="action",
         purpose="fast_loop_evidence",
@@ -134,7 +152,7 @@ def _record_action(
         top_p=0.95,
     )
     assert coordinator.decision_recorder is not None
-    coordinator.decision_recorder.generate(
+    return coordinator.decision_recorder.generate(
         action_request,
         context=DecisionEventContext(
             trajectory_id=session.trajectory_id,
@@ -178,6 +196,94 @@ def _outcome(task_id: str = "task-1") -> AuthoritativeTaskOutcome:
 
 
 class OpdRuntimeRecorderTests(unittest.TestCase):
+    def test_action_execution_is_joined_to_decision_and_materialized_on_finish(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dataset = root / "dataset"
+            store = ExperienceStore.from_dir(root / "memory")
+            coordinator = EvolverCoordinator(
+                store=store,
+                project_key="project-a",
+                policy_identity=_identity(),
+                policy=_ActionToolPolicy(),
+                retriever=EmbeddingRetriever(_Encoder()),
+                dataset_dir=dataset,
+                maintenance_interval_tasks=30,
+            )
+            session = coordinator.begin_task(
+                task="Fix the public task",
+                task_id="task-1",
+                task_group="group-a",
+                trajectory_id="traj-1",
+                stream_id="stream-a",
+            )
+            logged = _record_action(coordinator, session)
+            assert coordinator.runtime_evidence_recorder is not None
+            coordinator.runtime_evidence_recorder.record_action_execution(
+                session=session,
+                decision_id=logged.decision_id,
+                turn_index=0,
+                step_index=0,
+                call_index=0,
+                call_id="call-action-finish",
+                tool_name="finish",
+                arguments={},
+                ok=True,
+                blocked=False,
+                error_code="",
+                output="done",
+            )
+            coordinator.finalize_task(_episode(session, store), _outcome())
+            records = load_action_execution_evidence(
+                dataset / "tool_execution_evidence.jsonl"
+            )
+
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertEqual(record.decision_id, logged.decision_id)
+        self.assertEqual(record.task_ordinal, 1)
+        self.assertTrue(record.ok)
+        self.assertEqual(record.execution_evidence_id, canonical_sha256(record._payload()))
+
+    def test_action_execution_conflicting_idempotency_payload_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            coordinator = EvolverCoordinator(
+                store=ExperienceStore.from_dir(root / "memory"),
+                project_key="project-a",
+                policy_identity=_identity(),
+                policy=_ActionToolPolicy(),
+                retriever=EmbeddingRetriever(_Encoder()),
+                dataset_dir=root / "dataset",
+                maintenance_interval_tasks=30,
+            )
+            session = coordinator.begin_task(
+                task="Fix the public task",
+                task_id="task-1",
+                task_group="group-a",
+                trajectory_id="traj-1",
+                stream_id="stream-a",
+            )
+            logged = _record_action(coordinator, session)
+            recorder = coordinator.runtime_evidence_recorder
+            assert recorder is not None
+            common = {
+                "session": session,
+                "decision_id": logged.decision_id,
+                "turn_index": 0,
+                "step_index": 0,
+                "call_index": 0,
+                "call_id": "call-action-finish",
+                "tool_name": "finish",
+                "arguments": {},
+                "blocked": False,
+                "error_code": "",
+                "output": "done",
+            }
+            recorder.record_action_execution(ok=True, **common)
+            with self.assertRaisesRegex(ValueError, "idempotency key conflicts"):
+                recorder.record_action_execution(ok=False, **common)
+
     def test_interrupted_partial_maintenance_attempt_is_excluded_before_retry(self) -> None:
         class CrashAfterLookupPolicy(_RolePolicy):
             def __init__(self) -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import date
 from pathlib import Path
 import threading
@@ -243,7 +244,36 @@ class ReActAgent(AgentBase):
                     break
 
                 budget.record_tool_calls(response.tool_calls)
-                results = self._execute_tool_calls(state, writer, tools, response.tool_calls, budget, tool_budget)
+                execution_recorder = (
+                    formal_coordinator.runtime_evidence_recorder
+                    if formal_session is not None and formal_coordinator is not None
+                    else None
+                )
+                results = self._execute_tool_calls(
+                    state,
+                    writer,
+                    tools,
+                    response.tool_calls,
+                    budget,
+                    tool_budget,
+                    formal_session=formal_session,
+                    execution_recorder=execution_recorder,
+                    decision_id=(
+                        str(response.raw.get("decision_id") or "")
+                        if formal_session is not None
+                        else ""
+                    ),
+                    decision_turn_index=(
+                        int(response.raw.get("decision_turn_index", -1))
+                        if formal_session is not None
+                        else -1
+                    ),
+                    decision_step_index=(
+                        int(response.raw.get("decision_step_index", -1))
+                        if formal_session is not None
+                        else -1
+                    ),
+                )
                 budget.record_tool_results(results, response.tool_calls)
                 for result in results:
                     memory.append_tool_result(result, run_id=state.run_id)
@@ -408,7 +438,13 @@ class ReActAgent(AgentBase):
                     raise RuntimeError(
                         "formal policy must convert its exact DecisionResponse to ChatResponse"
                     )
-                return converter(logged.response)
+                response = converter(logged.response)
+                return replace(response, raw={
+                    **response.raw,
+                    "decision_id": logged.decision_id,
+                    "decision_turn_index": context.turn_index,
+                    "decision_step_index": context.step_index,
+                })
             except DecisionAttemptError as exc:
                 if attempt == 0 and _looks_like_context_error(str(exc)):
                     retry_of = exc.decision_id
@@ -445,7 +481,20 @@ class ReActAgent(AgentBase):
         tool_calls: list[LLMToolCall],
         budget: AgentBudget,
         tool_budget: ToolSchemaBudget,
+        *,
+        formal_session: Any | None = None,
+        execution_recorder: Any | None = None,
+        decision_id: str = "",
+        decision_turn_index: int = -1,
+        decision_step_index: int = -1,
     ) -> list[ToolExecutionResult]:
+        if formal_session is not None and (
+            execution_recorder is None
+            or not decision_id
+            or decision_turn_index < 0
+            or decision_step_index < 0
+        ):
+            raise RuntimeError("formal tool execution requires decision-linked evidence context")
         self._emit_event(ApprovalEvent(event="render.flush_requested", payload={"reason": "before_tool_calls"}))
         prepared: list[tuple[LLMToolCall, ToolInvocation | ToolExecutionResult, bool]] = []
         invocations: list[ToolInvocation] = []
@@ -560,10 +609,25 @@ class ReActAgent(AgentBase):
             )
 
         results: list[ToolExecutionResult] = []
-        for call, item, count_step in prepared:
+        for call_index, (call, item, count_step) in enumerate(prepared):
             result = executed[item.id] if isinstance(item, ToolInvocation) else item
             results.append(result)
             self._record_tool_result(state, writer, call, result, count_step=count_step)
+            if execution_recorder is not None:
+                execution_recorder.record_action_execution(
+                    session=formal_session,
+                    decision_id=decision_id,
+                    turn_index=decision_turn_index,
+                    step_index=decision_step_index,
+                    call_index=call_index,
+                    call_id=call.id,
+                    tool_name=call.name,
+                    arguments=call.arguments,
+                    ok=result.ok,
+                    blocked=result.blocked,
+                    error_code=result.error_code,
+                    output=result.content,
+                )
             self._emit(writer, state.trace_event("tool.completed", result.to_dict()))
         return results
 
