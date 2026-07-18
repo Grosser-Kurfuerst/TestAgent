@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
-from my_agent.memory.evolver.types import (
+from my_agent.memory.experience.models import (
     ExperienceMemory,
     ExperienceTier,
     SkillPayload,
@@ -18,7 +18,7 @@ from my_agent.memory.types import normalize_content
 from my_agent.memory.types import RetrievalHit
 
 if TYPE_CHECKING:
-    from my_agent.memory.experience_store import ExperienceStore, ExperienceStoreIndexSnapshot
+    from my_agent.memory.experience.repository import ExperienceStore, ExperienceStoreIndexSnapshot
 
 
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_./:-]+|[一-鿿]+")

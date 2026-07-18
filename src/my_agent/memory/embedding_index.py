@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Mapping
 
-from my_agent.memory.evolver.types import ExperienceMemory, ExperienceTier
+from my_agent.memory.experience.models import ExperienceMemory, ExperienceTier
 
 
 @dataclass(frozen=True)

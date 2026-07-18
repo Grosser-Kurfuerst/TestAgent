@@ -17,19 +17,21 @@ from my_agent.memory.embedding_retrieval import (
     EmbeddingRetriever,
     TransformersEmbeddingEncoder,
 )
-from my_agent.memory.evolver import (
+from my_agent.memory.experience.models import (
     ExperienceCreatedBy,
     ExperienceMemory,
     ExperiencePayload,
+    ExperienceTier,
+)
+from my_agent.memory.experience.serialization import experience_payload_to_dict
+from my_agent.memory.evolver import (
     ExperienceWriteRequest,
     ExperienceWriteResult,
     ExperienceWriter,
     MemoryWriterDatasetLogger,
     ExperienceSelector,
-    ExperienceTier,
     SelectionResult,
     build_write_steps_from_tool_history,
-    experience_payload_to_dict,
     proposal_tier_counts,
     selection_candidate_summary,
     selection_tier_counts,
@@ -45,7 +47,7 @@ from my_agent.memory.experience_retrieval import (
     ExperienceRetrievalMetrics,
     ExperienceRetriever,
 )
-from my_agent.memory.experience_store import ExperienceStore
+from my_agent.memory.experience.repository import ExperienceStore
 from my_agent.memory.short_term import ShortTermMemory
 from my_agent.memory.token import estimate_tokens
 from my_agent.memory.types import (

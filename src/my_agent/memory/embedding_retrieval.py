@@ -10,9 +10,9 @@ from typing import Any, Protocol, Sequence
 from my_agent.config import AgentConfig
 from my_agent.memory.embedding_cache import EmbeddingCache, EmbeddingCacheKey
 from my_agent.memory.embedding_index import EmbeddingIndexEntry, EmbeddingIndexSnapshot
-from my_agent.memory.evolver.types import ExperienceMemory, ExperienceTier
+from my_agent.memory.experience.models import ExperienceMemory, ExperienceTier
 from my_agent.memory.experience_retrieval import experience_searchable_text
-from my_agent.memory.experience_store import ExperienceStore, ExperienceStoreIndexSnapshot
+from my_agent.memory.experience.repository import ExperienceStore, ExperienceStoreIndexSnapshot
 from my_agent.memory.types import RetrievalHit
 from my_agent.policy.identity import canonical_sha256
 

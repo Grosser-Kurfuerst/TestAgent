@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import ast
 import importlib
+import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -14,8 +17,18 @@ from tests._path import add_src_to_path
 add_src_to_path()
 
 import my_agent.memory as memory_api
+import my_agent.memory.experience as experience_api
+import my_agent.memory.experience_attribution as legacy_attribution_api
+import my_agent.memory.experience_store as legacy_repository_api
 import my_agent.memory.evolver as evolver_api
+import my_agent.memory.evolver.repository_rules as legacy_repository_rules_api
+import my_agent.memory.evolver.serialization as legacy_serialization_api
+import my_agent.memory.evolver.types as legacy_models_api
 from my_agent.config import SUPPORTED_MEMORY_EVOLVER_MODES
+from my_agent.memory.experience import attribution as experience_attribution_api
+from my_agent.memory.experience import repository as experience_repository_api
+from my_agent.memory.experience import repository_rules as experience_repository_rules_api
+from my_agent.memory.experience import serialization as experience_serialization_api
 from my_agent.memory.evolver import maintenance as maintenance_api
 from my_agent.memory.evolver import ExperienceWriteResult
 from my_agent.memory.evolver.attribution_schema import PAPER_ATTRIBUTION_SCHEMA_VERSION
@@ -136,11 +149,29 @@ class _OrderSelector:
 
 class MemoryPublicContractTests(unittest.TestCase):
     def test_memory_and_evolver_barrels_preserve_type_identity(self) -> None:
+        self.assertIs(experience_api.ExperienceMemory, ExperienceMemory)
+        self.assertIs(experience_api.ExperienceTier, ExperienceTier)
         self.assertIs(memory_api.ExperienceMemory, ExperienceMemory)
         self.assertIs(memory_api.ExperienceTier, ExperienceTier)
         self.assertIs(evolver_api.ExperienceMemory, ExperienceMemory)
         self.assertIs(evolver_api.ExperienceTier, ExperienceTier)
         self.assertIs(evolver_api.TipPayload, TipPayload)
+
+    def test_legacy_experience_modules_are_thin_identity_preserving_facades(self) -> None:
+        self.assertIs(legacy_models_api.ExperienceMemory, experience_api.ExperienceMemory)
+        self.assertIs(
+            legacy_serialization_api.experience_to_dict,
+            experience_serialization_api.experience_to_dict,
+        )
+        self.assertIs(
+            legacy_repository_rules_api.experience_memories_revision,
+            experience_repository_rules_api.experience_memories_revision,
+        )
+        self.assertIs(
+            legacy_attribution_api.replace_experience_attribution,
+            experience_attribution_api.replace_experience_attribution,
+        )
+        self.assertIs(legacy_repository_api, experience_repository_api)
 
     def test_maintenance_facade_preserves_contract_identity(self) -> None:
         self.assertIs(maintenance_api.MaintenanceOperation, MaintenanceOperation)
@@ -251,6 +282,33 @@ class MemoryPublicContractTests(unittest.TestCase):
 
 
 class PlannedMemoryArchitectureTests(unittest.TestCase):
+    def test_experience_import_does_not_initialize_higher_level_packages(self) -> None:
+        script = (
+            "import json, sys; "
+            f"sys.path.insert(0, {str(SRC_ROOT.parent)!r}); "
+            "import my_agent.memory.experience.models; "
+            "loaded=tuple(sys.modules); "
+            "print(json.dumps({"
+            "'evolver': any(name == 'my_agent.memory.evolver' or "
+            "name.startswith('my_agent.memory.evolver.') for name in loaded),"
+            "'training': any(name == 'my_agent.training' or "
+            "name.startswith('my_agent.training.') for name in loaded),"
+            "'opd_data': any(name == 'my_agent.opd_data' or "
+            "name.startswith('my_agent.opd_data.') for name in loaded)"
+            "}, sort_keys=True))"
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(
+            json.loads(completed.stdout),
+            {"evolver": False, "opd_data": False, "training": False},
+        )
+
     def test_import_parser_resolves_relative_and_alias_imports(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             source_root = Path(tmp) / "my_agent"

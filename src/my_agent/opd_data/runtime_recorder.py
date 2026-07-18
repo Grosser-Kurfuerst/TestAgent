@@ -13,7 +13,7 @@ import json
 from my_agent.memory.evolver.maintenance_prompt import repository_snapshot_ref
 from my_agent.memory.evolver.planner import redundancy_score
 from my_agent.memory.evolver.task_session import AgentEpisodeArtifact, TaskEvolverSession
-from my_agent.memory.experience_store import ExperienceStore
+from my_agent.memory.experience.repository import ExperienceStore
 from my_agent.opd_data.schema import (
     ActionDecisionEvidence,
     MaintenanceAttemptEvidence,

@@ -24,7 +24,7 @@ from my_agent.context import (
 from my_agent.evaluation.agent_benchmark import record_benchmark_result
 from my_agent.memory.evolver.coordinator import EvolverCoordinator
 from my_agent.memory.evolver.task_session import AgentEpisodeArtifact
-from my_agent.memory.experience_store import ExperienceStore
+from my_agent.memory.experience.repository import ExperienceStore
 from my_agent.observability.trace_metrics import collect_trace_metrics
 from my_agent.observability.tracing import TraceWriter
 from my_agent.policy.identity import canonical_sha256

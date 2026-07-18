@@ -8,12 +8,12 @@ from uuid import uuid4
 from my_agent.config import AgentConfig
 from my_agent.context import ContextProfile
 from my_agent.llm.types import ChatResponse, MessageLike
-from my_agent.memory.evolver import (
+from my_agent.memory.evolver import ExperienceWriteResult
+from my_agent.memory.experience.models import (
     ExperienceCreatedBy,
     ExperienceMemory,
     ExperiencePayload,
     ExperienceTier,
-    ExperienceWriteResult,
 )
 from my_agent.memory.token import estimate_tokens
 from my_agent.memory.types import (

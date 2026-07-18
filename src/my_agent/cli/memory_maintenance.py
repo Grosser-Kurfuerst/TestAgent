@@ -26,7 +26,7 @@ from my_agent.memory.evolver.transaction import (
     _apply_maintenance_plan as apply_maintenance_plan,
 )
 from my_agent.memory.evolver.validation import validate_plan_semantics
-from my_agent.memory.experience_store import (
+from my_agent.memory.experience.repository import (
     EXPERIENCE_LOCK_FILE,
     EXPERIENCE_STORAGE_FILE,
     ExperienceStore,

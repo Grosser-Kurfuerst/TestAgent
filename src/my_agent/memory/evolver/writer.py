@@ -8,11 +8,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from my_agent.memory.evolver.serialization import (
+from my_agent.memory.experience.serialization import (
     experience_payload_from_dict,
     experience_payload_to_dict,
 )
-from my_agent.memory.evolver.types import (
+from my_agent.memory.experience.models import (
     ExperienceMemory,
     ExperiencePayload,
     ExperienceTier,

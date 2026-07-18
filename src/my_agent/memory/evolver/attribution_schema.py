@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from math import isclose, isfinite, sqrt
 from typing import Any, Mapping
 
-from my_agent.memory.evolver.types import ExperienceTier
+from my_agent.memory.experience.models import ExperienceTier
 from my_agent.policy.identity import PolicyIdentity, canonical_sha256, require_sha256
 
 

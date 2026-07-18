@@ -9,16 +9,16 @@ from typing import Any
 from uuid import uuid4
 import json
 
-from my_agent.memory.evolver.serialization import experience_payload_to_dict
-from my_agent.memory.evolver.repository_rules import experience_dedup_key
+from my_agent.memory.experience.serialization import experience_payload_to_dict
+from my_agent.memory.experience.repository_rules import experience_dedup_key
 from my_agent.memory.evolver.task_session import AgentEpisodeArtifact
-from my_agent.memory.evolver.types import ExperienceCreatedBy, ExperienceMemory
+from my_agent.memory.experience.models import ExperienceCreatedBy, ExperienceMemory
 from my_agent.memory.evolver.writer import (
     ExperienceWriteProposal,
     ExperienceWriteResult,
     ExperienceWriter,
 )
-from my_agent.memory.experience_store import ExperienceStore
+from my_agent.memory.experience.repository import ExperienceStore
 from my_agent.memory.store_errors import MemoryStorePostCommitError, MemoryStoreRevisionConflict
 from my_agent.memory.token import estimate_tokens
 from my_agent.memory.types import MemoryScope, content_fingerprint

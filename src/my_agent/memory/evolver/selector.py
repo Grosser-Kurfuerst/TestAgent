@@ -7,7 +7,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from my_agent.memory.evolver.types import ExperienceMemory, ExperienceTier
+from my_agent.memory.experience.models import ExperienceMemory, ExperienceTier
 from my_agent.memory.token import estimate_tokens
 from my_agent.memory.types import MemoryContext, RetrievalHit
 

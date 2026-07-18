@@ -10,7 +10,7 @@ from pathlib import Path
 
 from filelock import FileLock, Timeout as FileLockTimeout
 
-from my_agent.memory.experience_store import (
+from my_agent.memory.experience.repository import (
     EXPERIENCE_LOCK_FILE,
     EXPERIENCE_STORAGE_FILE,
     LEGACY_LONG_TERM_STORAGE_FILE,

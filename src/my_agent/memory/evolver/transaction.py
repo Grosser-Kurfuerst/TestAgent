@@ -46,12 +46,12 @@ from my_agent.memory.evolver.contracts import (
     maintenance_plan_json,
 )
 from my_agent.memory.evolver.repository_reducer import reduce_repository, validate_formal_operations
-from my_agent.memory.evolver.repository_rules import experience_memories_revision
+from my_agent.memory.experience.repository_rules import experience_memories_revision
 from my_agent.memory.evolver.validation import (
     parse_maintenance_plan,
     validate_plan_semantics,
 )
-from my_agent.memory.evolver.types import ExperienceMemory
+from my_agent.memory.experience.models import ExperienceMemory
 from my_agent.memory.store_errors import (
     MemoryStoreLockTimeout,
     MemoryStorePostCommitError,
@@ -61,7 +61,7 @@ from my_agent.memory.types import MemoryScope
 from my_agent.text_safety import sanitize_json_value
 
 if TYPE_CHECKING:
-    from my_agent.memory.experience_store import ExperienceStore
+    from my_agent.memory.experience.repository import ExperienceStore
 
 
 _HISTORY_LOCK_TIMEOUT_SECONDS = 30.0

@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any, Generic, TypeVar
 from my_agent.text_safety import sanitize_json_value
 
 if TYPE_CHECKING:
-    from my_agent.memory.evolver.types import ExperienceMemory
+    from my_agent.memory.experience.models import ExperienceMemory
 
 
 MemoryItemT = TypeVar("MemoryItemT")

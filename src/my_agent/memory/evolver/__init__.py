@@ -11,7 +11,7 @@ from my_agent.memory.evolver.selector import (
     selection_tier_counts,
 )
 from my_agent.memory.evolver.selector_prompt import LLMTaskSelectionPolicy
-from my_agent.memory.evolver.serialization import (
+from my_agent.memory.experience.serialization import (
     EXPERIENCE_SCHEMA_VERSION,
     experience_canonical_json,
     experience_from_dict,
@@ -81,7 +81,7 @@ from my_agent.memory.evolver.trace_join import (
     usage_entry_from_result_row,
     usage_entry_from_trace,
 )
-from my_agent.memory.evolver.types import (
+from my_agent.memory.experience.models import (
     ExperienceCreatedBy,
     ExperienceMemory,
     ExperiencePayload,

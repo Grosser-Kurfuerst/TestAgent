@@ -10,8 +10,8 @@ from my_agent.memory.evolver.contracts import (
     MaintenancePlanError,
     _source_precondition,
 )
-from my_agent.memory.evolver.repository_rules import experience_dedup_key
-from my_agent.memory.evolver.types import ExperienceCreatedBy, ExperienceMemory, ExperienceTier
+from my_agent.memory.experience.repository_rules import experience_dedup_key
+from my_agent.memory.experience.models import ExperienceCreatedBy, ExperienceMemory, ExperienceTier
 from my_agent.memory.types import MemoryScope, content_fingerprint
 
 

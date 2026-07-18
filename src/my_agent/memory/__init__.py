@@ -11,8 +11,10 @@ retrieval, map-reduce compression, and the
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, Any
+
 from my_agent.memory.compression import MemoryCompressor
-from my_agent.memory.experience_store import (
+from my_agent.memory.experience.repository import (
     EXPERIENCE_LOCK_FILE,
     EXPERIENCE_STORAGE_FILE,
     ExperienceStore,
@@ -24,7 +26,7 @@ from my_agent.memory.experience_retrieval import (
     ExperienceRetriever,
     experience_searchable_text,
 )
-from my_agent.memory.evolver import (
+from my_agent.memory.experience.models import (
     ExperienceCreatedBy,
     ExperienceMemory,
     ExperiencePayload,
@@ -35,8 +37,6 @@ from my_agent.memory.evolver import (
     ToolPayload,
     TrajectoryPayload,
 )
-from my_agent.memory.manager import MemoryManager
-from my_agent.memory.noop import NoopMemoryManager
 from my_agent.memory.types import (
     CompressionResult,
     MemoryContext,
@@ -48,6 +48,24 @@ from my_agent.memory.types import (
     content_fingerprint,
     normalize_content,
 )
+
+if TYPE_CHECKING:
+    from my_agent.memory.manager import MemoryManager
+    from my_agent.memory.noop import NoopMemoryManager
+
+
+def __getattr__(name: str) -> Any:
+    if name == "MemoryManager":
+        from my_agent.memory.manager import MemoryManager
+
+        globals()[name] = MemoryManager
+        return MemoryManager
+    if name == "NoopMemoryManager":
+        from my_agent.memory.noop import NoopMemoryManager
+
+        globals()[name] = NoopMemoryManager
+        return NoopMemoryManager
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
     "CompressionResult",

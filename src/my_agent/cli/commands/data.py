@@ -32,7 +32,7 @@ from my_agent.memory.evolver import (
     write_attribution_jsonl,
     write_dataset_summary_json,
 )
-from my_agent.memory.experience_store import ExperienceStore
+from my_agent.memory.experience.repository import ExperienceStore
 from my_agent.opd_data.attribution import build_round_attribution
 from my_agent.opd_data.export import (
     load_repository_evidence,

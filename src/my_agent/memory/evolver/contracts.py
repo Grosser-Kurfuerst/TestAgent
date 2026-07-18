@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
 from enum import Enum
 from hashlib import sha256
@@ -12,8 +12,8 @@ import json
 import math
 import re
 
-from my_agent.memory.evolver.serialization import experience_from_dict, experience_to_dict
-from my_agent.memory.evolver.types import ExperienceMemory, ExperienceTier
+from my_agent.memory.experience.serialization import experience_from_dict, experience_to_dict
+from my_agent.memory.experience.models import ExperienceMemory, ExperienceTier
 from my_agent.memory.types import (
     MemoryScope,
 )

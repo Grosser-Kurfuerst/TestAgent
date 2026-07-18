@@ -38,7 +38,7 @@ from my_agent.memory.evolver.contracts import (
     _valid_tier,
     _validate_evidence_values,
 )
-from my_agent.memory.evolver.types import (
+from my_agent.memory.experience.models import (
     ExperienceCreatedBy,
     ExperienceMemory,
     ExperienceTrajectoryStep,
@@ -48,7 +48,7 @@ from my_agent.memory.evolver.types import (
     ToolPayload,
     TrajectoryPayload,
 )
-from my_agent.memory.evolver.repository_rules import experience_dedup_key
+from my_agent.memory.experience.repository_rules import experience_dedup_key
 from my_agent.memory.experience_retrieval import tokenize_experience_text
 from my_agent.memory.types import (
     MemoryScope,

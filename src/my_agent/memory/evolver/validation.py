@@ -31,7 +31,7 @@ from my_agent.memory.evolver.planner import (
     _promotion_eligible,
     _validate_operation_conflicts,
 )
-from my_agent.memory.evolver.types import (
+from my_agent.memory.experience.models import (
     ExperienceCreatedBy,
     ExperienceMemory,
     ExperienceTier,

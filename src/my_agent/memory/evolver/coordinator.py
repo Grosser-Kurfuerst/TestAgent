@@ -22,10 +22,10 @@ from my_agent.memory.evolver.contracts import MaintenanceOperation
 from my_agent.memory.evolver.formal_writer import FormalExperienceWriter
 from my_agent.memory.evolver.maintenance_agent import FormalMaintenanceAgent, FormalMaintenanceResult
 from my_agent.memory.evolver.selector_prompt import LLMTaskSelectionPolicy
-from my_agent.memory.evolver.types import ExperienceMemory, ExperienceTier
+from my_agent.memory.experience.models import ExperienceMemory, ExperienceTier
 from my_agent.memory.evolver.writer import ExperienceWriteResult
 from my_agent.memory.evolver.transaction import apply_formal_maintenance_operations
-from my_agent.memory.experience_store import ExperienceStore
+from my_agent.memory.experience.repository import ExperienceStore
 from my_agent.memory.store_errors import MemoryStorePostCommitError
 from my_agent.memory.token import estimate_tokens
 from my_agent.memory.types import MemoryContext, RetrievalHit

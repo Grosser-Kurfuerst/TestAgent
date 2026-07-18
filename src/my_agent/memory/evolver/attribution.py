@@ -21,18 +21,18 @@ from pathlib import Path
 from statistics import mean
 from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
-from my_agent.memory.experience_attribution import (
+from my_agent.memory.experience.attribution import (
     canonical_attribution_float,
     canonical_optional_attribution_float,
     replace_experience_attribution,
 )
-from my_agent.memory.evolver.types import ExperienceMemory, ExperienceTier
+from my_agent.memory.experience.models import ExperienceMemory, ExperienceTier
 from my_agent.memory.evolver.usage_log import UsageLogEntry
 from my_agent.memory.types import MemoryScope
 from my_agent.text_safety import sanitize_json_value
 
 if TYPE_CHECKING:
-    from my_agent.memory.experience_store import ExperienceStore
+    from my_agent.memory.experience.repository import ExperienceStore
 
 
 DEFAULT_TIER_WEIGHTS: dict[str, float] = {

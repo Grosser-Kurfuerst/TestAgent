@@ -12,7 +12,7 @@ from my_agent.memory.evolver.contracts import (
     MaintenancePlan,
 )
 from my_agent.memory.evolver.planner import _build_maintenance_plan
-from my_agent.memory.evolver.types import ExperienceMemory
+from my_agent.memory.experience.models import ExperienceMemory
 from my_agent.memory.evolver.validation import validate_legacy_plan_semantics
 
 

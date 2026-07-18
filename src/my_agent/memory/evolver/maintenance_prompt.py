@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from my_agent.memory.evolver.serialization import experience_to_dict
-from my_agent.memory.evolver.types import ExperienceMemory
+from my_agent.memory.experience.serialization import experience_to_dict
+from my_agent.memory.experience.models import ExperienceMemory
 from my_agent.policy.contracts import DecisionRequest
 from my_agent.policy.identity import canonical_json_bytes, canonical_sha256
 from my_agent.training.role_views import (

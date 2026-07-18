@@ -24,7 +24,7 @@ from my_agent.memory.evolver.planner import lookup_experiences
 from my_agent.memory.evolver.repository_reducer import validate_formal_operations
 from my_agent.memory.evolver.transaction import apply_formal_maintenance_operations
 from my_agent.memory.evolver.contracts import MaintenanceOperation, MaintenancePlanError
-from my_agent.memory.experience_store import ExperienceStore
+from my_agent.memory.experience.repository import ExperienceStore
 from my_agent.policy.contracts import DecisionResponse, GenerationPolicy
 from my_agent.policy.identity import canonical_json_bytes
 from my_agent.training.decision_log import (

@@ -14,8 +14,8 @@ from my_agent.memory.evolver.contracts import (
     _operation_id,
     _source_precondition,
 )
-from my_agent.memory.evolver.serialization import experience_payload_from_dict
-from my_agent.memory.evolver.types import ExperienceCreatedBy, ExperienceMemory
+from my_agent.memory.experience.serialization import experience_payload_from_dict
+from my_agent.memory.experience.models import ExperienceCreatedBy, ExperienceMemory
 from my_agent.memory.token import estimate_tokens
 from my_agent.memory.types import content_fingerprint
 from my_agent.policy.identity import canonical_json_bytes, canonical_sha256
