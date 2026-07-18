@@ -10,8 +10,8 @@ from threading import Lock
 from typing import Any
 import json
 
-from my_agent.memory.evolver.maintenance_prompt import repository_snapshot_ref
-from my_agent.memory.evolver.planner import redundancy_score
+from my_agent.memory.evolver.maintenance.formal.prompt import repository_snapshot_ref
+from my_agent.memory.evolver.maintenance.lookup import redundancy_score
 from my_agent.memory.evolver.task_session import AgentEpisodeArtifact, TaskEvolverSession
 from my_agent.memory.experience.repository import ExperienceStore
 from my_agent.opd_data.schema import (

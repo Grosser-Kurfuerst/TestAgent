@@ -46,7 +46,8 @@ from my_agent.memory.evolver.dataset_scoring import (
     annotate_writer_dataset_scores,
     write_dataset_summary_json,
 )
-from my_agent.memory.evolver.maintenance import (
+from my_agent.memory.evolver import maintenance as _maintenance_api
+from my_agent.memory.evolver.maintenance.contracts import (
     AttributionKey,
     MAINTENANCE_POLICY,
     MAINTENANCE_SCHEMA_VERSION,
@@ -58,20 +59,11 @@ from my_agent.memory.evolver.maintenance import (
     MaintenanceConfig,
     MaintenanceError,
     MaintenanceEvidence,
-    MaintenanceHistoryLockTimeout,
     MaintenanceLookupHit,
     MaintenanceOperation,
     MaintenancePlan,
     MaintenancePlanError,
-    apply_maintenance_plan,
-    load_maintenance_plan,
-    load_project_attribution,
-    lookup_experiences,
-    build_maintenance_plan,
-    maintenance_evidence_for_entry,
     maintenance_plan_json,
-    record_post_commit_audit_error,
-    redundancy_score,
     write_maintenance_plan,
 )
 from my_agent.memory.evolver.trace_join import (
@@ -117,6 +109,26 @@ from my_agent.memory.evolver.writing.legacy import (
     runtime_outcome_from_tool_records,
     writer_policy_for_result,
 )
+
+_LAZY_MAINTENANCE_EXPORTS = frozenset({
+    "MaintenanceHistoryLockTimeout",
+    "apply_maintenance_plan",
+    "build_maintenance_plan",
+    "load_maintenance_plan",
+    "load_project_attribution",
+    "lookup_experiences",
+    "maintenance_evidence_for_entry",
+    "record_post_commit_audit_error",
+    "redundancy_score",
+})
+
+
+def __getattr__(name: str):
+    if name not in _LAZY_MAINTENANCE_EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(_maintenance_api, name)
+    globals()[name] = value
+    return value
 
 __all__ = [
     "AttributionKey",

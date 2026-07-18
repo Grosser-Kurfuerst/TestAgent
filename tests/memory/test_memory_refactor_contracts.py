@@ -11,6 +11,8 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 from tests._path import add_src_to_path
 
@@ -29,12 +31,24 @@ import my_agent.memory.experience_store as legacy_repository_api
 import my_agent.memory.noop as legacy_noop_api
 import my_agent.memory.short_term as short_term_api
 import my_agent.memory.evolver as evolver_api
+import my_agent.memory.evolver.artifacts as legacy_maintenance_artifacts_api
+import my_agent.memory.evolver.cadence_ledger as legacy_cadence_ledger_api
+import my_agent.memory.evolver.cadence_schema as legacy_cadence_schema_api
+import my_agent.memory.evolver.contracts as legacy_maintenance_contracts_api
+import my_agent.memory.evolver.maintenance_agent as legacy_maintenance_agent_api
+import my_agent.memory.evolver.maintenance_prompt as legacy_maintenance_prompt_api
+import my_agent.memory.evolver.maintenance_tools as legacy_maintenance_tools_api
+import my_agent.memory.evolver.planner as legacy_maintenance_planner_api
 import my_agent.memory.evolver.repository_rules as legacy_repository_rules_api
+import my_agent.memory.evolver.repository_reducer as legacy_repository_reducer_api
 import my_agent.memory.evolver.serialization as legacy_serialization_api
+import my_agent.memory.evolver.service as legacy_maintenance_service_api
 import my_agent.memory.evolver.formal_writer as legacy_formal_writer_api
 import my_agent.memory.evolver.selector as legacy_selector_api
 import my_agent.memory.evolver.selector_prompt as legacy_selector_prompt_api
+import my_agent.memory.evolver.transaction as legacy_maintenance_transaction_api
 import my_agent.memory.evolver.types as legacy_models_api
+import my_agent.memory.evolver.validation as legacy_maintenance_validation_api
 import my_agent.memory.evolver.writer as legacy_writer_api
 from my_agent.config import SUPPORTED_MEMORY_EVOLVER_MODES
 from my_agent.memory.experience import attribution as experience_attribution_api
@@ -47,6 +61,21 @@ from my_agent.memory.experience.retrieval import embedding_index as embedding_in
 from my_agent.memory.experience.retrieval import lexical as lexical_api
 from my_agent.memory.short_term import compression as short_term_compression_api
 from my_agent.memory.evolver import maintenance as maintenance_api
+from my_agent.memory.evolver.maintenance import contracts as maintenance_contracts_api
+from my_agent.memory.evolver.maintenance import repository_reducer as maintenance_reducer_api
+from my_agent.memory.evolver.maintenance.cadence import ledger as cadence_ledger_api
+from my_agent.memory.evolver.maintenance.cadence import schema as cadence_schema_api
+from my_agent.memory.evolver.maintenance.formal import agent as maintenance_agent_api
+from my_agent.memory.evolver.maintenance.formal import history as formal_history_api
+from my_agent.memory.evolver.maintenance.formal import prompt as maintenance_prompt_api
+from my_agent.memory.evolver.maintenance.formal import tools as maintenance_tools_api
+from my_agent.memory.evolver.maintenance.legacy import artifacts as maintenance_artifacts_api
+from my_agent.memory.evolver.maintenance.legacy import history_io as legacy_history_api
+from my_agent.memory.evolver.maintenance.legacy import history_state as legacy_history_state_api
+from my_agent.memory.evolver.maintenance.legacy import planner as maintenance_planner_api
+from my_agent.memory.evolver.maintenance.legacy import service as maintenance_service_api
+from my_agent.memory.evolver.maintenance.legacy import transaction as maintenance_transaction_api
+from my_agent.memory.evolver.maintenance.legacy import validation as maintenance_validation_api
 from my_agent.memory.evolver.selection import formal as formal_selection_api
 from my_agent.memory.evolver.selection import legacy as weighted_selection_api
 from my_agent.memory.evolver.selection import contracts as selection_contracts_api
@@ -281,6 +310,159 @@ class MemoryPublicContractTests(unittest.TestCase):
         self.assertIs(evolver_api.MaintenanceOperation, MaintenanceOperation)
         self.assertIs(evolver_api.build_maintenance_plan, maintenance_api.build_maintenance_plan)
         self.assertIs(evolver_api.apply_maintenance_plan, maintenance_api.apply_maintenance_plan)
+
+    def test_maintenance_compatibility_modules_preserve_module_identity(self) -> None:
+        aliases = (
+            (legacy_maintenance_artifacts_api, maintenance_artifacts_api),
+            (legacy_cadence_ledger_api, cadence_ledger_api),
+            (legacy_cadence_schema_api, cadence_schema_api),
+            (legacy_maintenance_contracts_api, maintenance_contracts_api),
+            (legacy_maintenance_agent_api, maintenance_agent_api),
+            (legacy_maintenance_prompt_api, maintenance_prompt_api),
+            (legacy_maintenance_tools_api, maintenance_tools_api),
+            (legacy_maintenance_planner_api, maintenance_planner_api),
+            (legacy_repository_reducer_api, maintenance_reducer_api),
+            (legacy_maintenance_service_api, maintenance_service_api),
+            (legacy_maintenance_transaction_api, maintenance_transaction_api),
+            (legacy_maintenance_validation_api, maintenance_validation_api),
+        )
+        for legacy_module, new_module in aliases:
+            with self.subTest(legacy=legacy_module.__name__, new=new_module.__name__):
+                self.assertIs(legacy_module, new_module)
+
+    def test_formal_maintenance_package_does_not_import_legacy_policy(self) -> None:
+        formal_root = SRC_ROOT / "memory" / "evolver" / "maintenance" / "formal"
+        forbidden_prefixes = (
+            "my_agent.memory.evolver.maintenance.legacy",
+            "my_agent.memory.evolver.planner",
+            "my_agent.memory.evolver.service",
+        )
+        violations: list[str] = []
+        for path in formal_root.rglob("*.py"):
+            for imported in _imported_modules(path):
+                if any(
+                    imported == prefix or imported.startswith(prefix + ".")
+                    for prefix in forbidden_prefixes
+                ):
+                    violations.append(f"{path.relative_to(SRC_ROOT)} -> {imported}")
+        self.assertEqual(violations, [])
+
+    def test_importing_formal_maintenance_does_not_load_legacy_modules(self) -> None:
+        script = (
+            "import json, sys; "
+            f"sys.path.insert(0, {str(SRC_ROOT.parent)!r}); "
+            "import my_agent.memory.evolver.maintenance.formal.agent; "
+            "legacy=[name for name in sys.modules if "
+            "name.startswith('my_agent.memory.evolver.maintenance.legacy') or "
+            "name in {'my_agent.memory.evolver.planner', "
+            "'my_agent.memory.evolver.service', "
+            "'my_agent.memory.evolver.transaction', "
+            "'my_agent.memory.evolver.validation'}]; "
+            "print(json.dumps(sorted(legacy)))"
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(json.loads(completed.stdout), [])
+
+    def test_formal_and_legacy_history_schemas_are_isolated(self) -> None:
+        repository_revision = experience_memories_revision(())
+        legacy_plan = maintenance_api.build_maintenance_plan(
+            entries=(),
+            attribution={},
+            repository_revision=repository_revision,
+            project_key="repo:contract",
+            as_of=datetime(2026, 7, 18, 9, 30, tzinfo=timezone.utc),
+        )
+        legacy_record = legacy_history_state_api._pre_commit_history_record(
+            legacy_plan,
+            before_revision=repository_revision,
+            backup_path="",
+            stage="validation",
+            error="contract test",
+            should_retry=False,
+        )
+        cadence_id = canonical_sha256({"cadence": "contract"})
+        plan_id = formal_history_api.formal_maintenance_plan_id(
+            cadence_id=cadence_id,
+            before_revision=repository_revision,
+            expected_after_revision=repository_revision,
+            operations=(),
+        )
+        formal_record = formal_history_api.formal_intent_record(
+            cadence_id=cadence_id,
+            plan_id=plan_id,
+            transaction_id=formal_history_api.formal_maintenance_transaction_id(
+                cadence_id=cadence_id,
+                plan_id=plan_id,
+            ),
+            stream_id="stream-contract",
+            memory_project_key="repo:contract",
+            before_revision=repository_revision,
+            expected_after_revision=repository_revision,
+            operations=(),
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            history_path = Path(tmp) / "maintenance_history.jsonl"
+            history_path.write_text(
+                "\n".join((json.dumps(legacy_record), json.dumps(formal_record))) + "\n",
+                encoding="utf-8",
+            )
+            formal_state = formal_history_api.load_formal_maintenance_history(
+                history_path,
+                cadence_id=cadence_id,
+            )
+            legacy_state = legacy_history_api._load_maintenance_history_state(
+                history_path,
+                legacy_plan,
+            )
+
+        self.assertEqual(formal_state.intent, formal_record)
+        self.assertIsNone(formal_state.completion)
+        self.assertIsNone(legacy_state.intent)
+        self.assertEqual(legacy_state.completion, legacy_record)
+
+    def test_coordinator_cadence_helpers_only_delegate_to_scheduler(self) -> None:
+        coordinator = object.__new__(EvolverCoordinator)
+        coordinator.maintainer = None
+        coordinator.cadence_scheduler = SimpleNamespace(
+            run_maintenance=object(),
+            advance=Mock(return_value=("cadence-id", "committed")),
+            run_or_reconcile=Mock(return_value="noop"),
+            reconcile_persisted=Mock(),
+        )
+        episode = object()
+        outcome = object()
+        cadence = object()
+
+        self.assertEqual(
+            coordinator._advance_cadence(
+                episode=episode,
+                outcome=outcome,
+                writer_status="committed",
+                repository_revision_after="revision",
+                written_memory_ids=("memory-id",),
+            ),
+            ("cadence-id", "committed"),
+        )
+        self.assertEqual(coordinator._run_or_reconcile_cadence(cadence), "noop")
+        coordinator._reconcile_persisted_cadences()
+
+        self.assertIsNone(coordinator.cadence_scheduler.run_maintenance)
+        coordinator.cadence_scheduler.advance.assert_called_once_with(
+            episode=episode,
+            outcome=outcome,
+            writer_status="committed",
+            repository_revision_after="revision",
+            written_memory_ids=("memory-id",),
+        )
+        coordinator.cadence_scheduler.run_or_reconcile.assert_called_once_with(cadence)
+        coordinator.cadence_scheduler.reconcile_persisted.assert_called_once_with()
 
     def test_current_cli_data_training_and_evaluation_consumers_import(self) -> None:
         modules = (

@@ -1,40 +1,9 @@
-"""Orchestration boundary for validated maintenance planning."""
+"""Compatibility module alias for legacy maintenance service."""
 
 from __future__ import annotations
 
-from datetime import datetime
-from typing import Mapping, Sequence
+import sys
 
-from my_agent.memory.evolver.attribution import MemoryAttributionRecord
-from my_agent.memory.evolver.contracts import (
-    AttributionKey,
-    MaintenanceConfig,
-    MaintenancePlan,
-)
-from my_agent.memory.evolver.planner import _build_maintenance_plan
-from my_agent.memory.experience.models import ExperienceMemory
-from my_agent.memory.evolver.validation import validate_legacy_plan_semantics
+from my_agent.memory.evolver.maintenance.legacy import service as _service
 
-
-def build_maintenance_plan(
-    *,
-    entries: Sequence[ExperienceMemory],
-    attribution: Mapping[AttributionKey, MemoryAttributionRecord],
-    repository_revision: str,
-    project_key: str,
-    as_of: datetime,
-    config: MaintenanceConfig | None = None,
-) -> MaintenancePlan:
-    plan = _build_maintenance_plan(
-        entries=entries,
-        attribution=attribution,
-        repository_revision=repository_revision,
-        project_key=project_key,
-        as_of=as_of,
-        config=config,
-    )
-    validate_legacy_plan_semantics(plan, repository_entries=entries)
-    return plan
-
-
-__all__ = ["build_maintenance_plan"]
+sys.modules[__name__] = _service
