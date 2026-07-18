@@ -143,6 +143,11 @@ class LLMTaskSelectionPolicyTests(unittest.TestCase):
         self.assertEqual(policy.calls, 1)
         self.assertEqual(events[0][1]["role"], "selection")
         self.assertEqual(events[0][1]["status"], "success")
+        normalized = {**events[0][1], "decision_id": "<decision-id>"}
+        self.assertEqual(
+            canonical_sha256(normalized),
+            "sha256:908aa7b427643ee68a0d431c34a1700933e91e4006d99fabb7ce8e025aeaf66d",
+        )
 
     def test_invalid_reference_fails_closed_to_empty_selection(self) -> None:
         output = json.dumps({

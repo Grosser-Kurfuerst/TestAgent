@@ -130,6 +130,11 @@ class FormalLLMWriterTests(unittest.TestCase):
         decision = next(payload for event, payload in events if event == "opd.decision")
         self.assertEqual(decision["role"], "writing")
         self.assertFalse(decision["parsed_output"]["fallback_used"])
+        normalized = {**decision, "decision_id": "<decision-id>"}
+        self.assertEqual(
+            canonical_sha256(normalized),
+            "sha256:a120610f499be63e0fb4b212366157fcacdea75dc63c98a0d47ee294f21f4e6c",
+        )
 
     def test_invalid_writer_output_is_audited_no_write(self) -> None:
         events = []

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from datetime import datetime, timezone
 
 from my_agent.llm.types import ChatResponse
 from my_agent.memory.evolver.cadence_ledger import stable_cadence_id
@@ -95,13 +96,16 @@ class FormalMaintenanceAgentTests(unittest.TestCase):
         events = []
         with tempfile.TemporaryDirectory() as tmp:
             store = ExperienceStore.from_dir(tmp)
+            created_at = datetime(2026, 7, 18, 9, 30, tzinfo=timezone.utc)
             store.add(typed_experience(
                 "tip-a", "Run focused tests first.", ExperienceTier.TIP,
                 project_key="project-a", created_by=ExperienceCreatedBy.WRITER,
+                created_at=created_at,
             ))
             store.add(typed_experience(
                 "tip-b", "Run the focused test.", ExperienceTier.TIP,
                 project_key="project-a", created_by=ExperienceCreatedBy.WRITER,
+                created_at=created_at,
             ))
             policy = _Policy(calls)
             agent = FormalMaintenanceAgent(
@@ -130,6 +134,14 @@ class FormalMaintenanceAgentTests(unittest.TestCase):
         decisions = [payload for event, payload in events if event == "opd.decision"]
         self.assertEqual([item["turn_index"] for item in decisions], [0, 1, 2])
         self.assertTrue(all(item["role"] == "maintenance" for item in decisions))
+        normalized = [
+            {**item, "decision_id": f"<decision-{index}>"}
+            for index, item in enumerate(decisions)
+        ]
+        self.assertEqual(
+            canonical_sha256(normalized),
+            "sha256:d07bf42d2049ea3b448eb9e8ecf589bdd8889763805038c3b7be722b7eea7fc0",
+        )
 
     def test_protected_delete_aborts_without_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
