@@ -12,6 +12,8 @@ from my_agent.sft.contracts import (
     deterministic_tool_call_id,
     validate_expected_output_contract,
 )
+from my_agent.sft.rendered import RenderedSFTSample
+from my_agent.sft.semantic import SemanticSFTSample
 from my_agent.training.role_views import CanonicalMessage, CanonicalTool
 
 
@@ -21,6 +23,7 @@ ROOT = Path(__file__).resolve().parents[2]
 class SFTContractTests(unittest.TestCase):
     def test_semantic_and_rendered_fixtures_round_trip_and_hash(self) -> None:
         semantic = _load_json(ROOT / "tests/fixtures/sft/canonical_tool_call.json")
+        semantic_sample = SemanticSFTSample.from_dict(semantic)
         self.assertEqual(semantic["schema_version"], CANONICAL_SFT_SCHEMA_VERSION)
         messages = tuple(CanonicalMessage.from_dict(item) for item in semantic["messages"])
         tools = tuple(CanonicalTool.from_dict(item) for item in semantic["tools"])
@@ -34,8 +37,10 @@ class SFTContractTests(unittest.TestCase):
         )
         semantic_payload = {key: value for key, value in semantic.items() if key != "sample_id"}
         self.assertEqual(semantic["sample_id"], canonical_sha256(semantic_payload))
+        self.assertEqual(semantic_sample.to_dict(), semantic)
 
         rendered = _load_json(ROOT / "tests/fixtures/sft/rendered_tool_call.json")
+        rendered_sample = RenderedSFTSample.from_dict(rendered)
         self.assertEqual(rendered["schema_version"], RENDERED_SFT_SCHEMA_VERSION)
         self.assertEqual(rendered["sample_id"], semantic["sample_id"])
         self.assertEqual(rendered["semantic_sample_hash"], semantic["sample_id"])
@@ -52,6 +57,7 @@ class SFTContractTests(unittest.TestCase):
             key: value for key, value in rendered.items() if key != "rendered_sample_hash"
         }
         self.assertEqual(rendered["rendered_sample_hash"], canonical_sha256(rendered_payload))
+        self.assertEqual(rendered_sample.to_dict(), rendered)
 
     def test_deterministic_call_ids_and_output_contract(self) -> None:
         call_id = deterministic_tool_call_id(

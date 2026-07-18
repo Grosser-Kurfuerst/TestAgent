@@ -21,6 +21,16 @@ class RenderedChat:
     prompt_hash: str
 
 
+@dataclass(frozen=True)
+class RenderedTrainingTurn:
+    raw_completion: str
+    prompt_token_ids: tuple[int, ...]
+    completion_token_ids: tuple[int, ...]
+    input_ids: tuple[int, ...]
+    assistant_loss_mask: tuple[int, ...]
+    normalized_template_input_hash: str
+
+
 class CanonicalChatTemplate:
     def __init__(self, tokenizer: Any, *, configured_template: str = "model_default") -> None:
         self.tokenizer = tokenizer
@@ -52,6 +62,54 @@ class CanonicalChatTemplate:
     ) -> Any:
         return self._apply(messages, tools, tokenize=True, return_tensors=return_tensors)
 
+    def render_training_turn(
+        self,
+        messages: tuple[CanonicalMessage, ...],
+        tools: tuple[CanonicalTool, ...],
+        target: CanonicalMessage,
+    ) -> RenderedTrainingTurn:
+        if target.role != "assistant":
+            raise ValueError("SFT target must be an assistant message")
+        prompt_token_ids = _token_id_tuple(self._apply(
+            messages,
+            tools,
+            tokenize=True,
+            return_tensors=None,
+            add_generation_prompt=True,
+        ))
+        full_messages = (*messages, target)
+        input_ids = _token_id_tuple(self._apply(
+            full_messages,
+            tools,
+            tokenize=True,
+            return_tensors=None,
+            add_generation_prompt=False,
+        ))
+        if input_ids[: len(prompt_token_ids)] != prompt_token_ids:
+            raise ValueError("SFT prompt tokens must be a prefix of the full sequence")
+        if len(input_ids) == len(prompt_token_ids):
+            raise ValueError("SFT target must contribute at least one completion token")
+        completion_token_ids = input_ids[len(prompt_token_ids):]
+        raw_completion = self.tokenizer.decode(
+            list(completion_token_ids),
+            skip_special_tokens=False,
+        )
+        if not isinstance(raw_completion, str):
+            raise TypeError("tokenizer.decode must return SFT completion text")
+        normalized_input = {
+            "messages": canonical_messages_to_hf(messages),
+            "target": canonical_messages_to_hf((target,))[0],
+            "tools": canonical_tools_to_hf(tools),
+        }
+        return RenderedTrainingTurn(
+            raw_completion=raw_completion,
+            prompt_token_ids=prompt_token_ids,
+            completion_token_ids=completion_token_ids,
+            input_ids=input_ids,
+            assistant_loss_mask=(1,) * len(completion_token_ids),
+            normalized_template_input_hash=canonical_sha256(normalized_input),
+        )
+
     def _apply(
         self,
         messages: tuple[CanonicalMessage, ...],
@@ -59,10 +117,11 @@ class CanonicalChatTemplate:
         *,
         tokenize: bool,
         return_tensors: str | None,
+        add_generation_prompt: bool = True,
     ) -> Any:
         kwargs: dict[str, Any] = {
             "tokenize": tokenize,
-            "add_generation_prompt": True,
+            "add_generation_prompt": add_generation_prompt,
             "chat_template": self.template_text,
         }
         if tools:
@@ -88,7 +147,7 @@ def canonicalize_messages(messages: Sequence[MessageLike]) -> tuple[CanonicalMes
         raw_tool_calls = payload.get("tool_calls") or []
         if not isinstance(raw_tool_calls, list):
             raise ValueError("message tool_calls must be an array")
-        for raw_call in raw_tool_calls:
+        for call_index, raw_call in enumerate(raw_tool_calls):
             if not isinstance(raw_call, Mapping):
                 raise ValueError("message tool_calls entries must be objects")
             function = raw_call.get("function")
@@ -99,7 +158,11 @@ def canonicalize_messages(messages: Sequence[MessageLike]) -> tuple[CanonicalMes
             arguments_json = _canonical_arguments(arguments)
             call_id = raw_call.get("id")
             if not isinstance(call_id, str) or not call_id.strip():
-                call_id = f"call_{canonical_sha256({'name': name, 'arguments': json.loads(arguments_json)})[7:19]}"
+                call_id = "call_" + canonical_sha256({
+                    "index": call_index,
+                    "name": name,
+                    "arguments": json.loads(arguments_json),
+                })[7:19]
             tool_calls.append(CanonicalToolCall(call_id, name, arguments_json))
         name_value = payload.get("name")
         tool_call_id_value = payload.get("tool_call_id")
@@ -195,9 +258,18 @@ def _required_string(value: Any, field_name: str) -> str:
     return value
 
 
+def _token_id_tuple(value: Any) -> tuple[int, ...]:
+    if not isinstance(value, (list, tuple)) or any(
+        isinstance(item, bool) or not isinstance(item, int) for item in value
+    ):
+        raise TypeError("tokenizer.apply_chat_template must return one token ID sequence")
+    return tuple(value)
+
+
 __all__ = [
     "CanonicalChatTemplate",
     "RenderedChat",
+    "RenderedTrainingTurn",
     "canonical_messages_to_hf",
     "canonical_tools_to_hf",
     "canonicalize_messages",

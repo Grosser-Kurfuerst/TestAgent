@@ -11,6 +11,8 @@ from my_agent.sft.contracts import (
     deterministic_tool_call_id,
     validate_expected_output_contract,
 )
+from my_agent.sft.rendered import RenderedSFTManifest, RenderedSFTSample
+from my_agent.sft.semantic import SemanticSFTSample
 
 
 __all__ = [
@@ -21,6 +23,9 @@ __all__ = [
     "RENDERED_MANIFEST_SCHEMA_VERSION",
     "RENDERED_SFT_SCHEMA_VERSION",
     "SFT_RUN_MANIFEST_SCHEMA_VERSION",
+    "RenderedSFTManifest",
+    "RenderedSFTSample",
+    "SemanticSFTSample",
     "deterministic_tool_call_id",
     "validate_expected_output_contract",
 ]

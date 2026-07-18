@@ -70,6 +70,26 @@ class ChatTemplateTests(unittest.TestCase):
         ])
         self.assertEqual(messages[0].tool_calls[0].arguments_json, '{"a":1,"b":2}')
 
+    def test_missing_call_ids_use_the_shared_index_aware_rule(self) -> None:
+        messages = canonicalize_messages([{
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"type": "function", "function": {"name": "read_file", "arguments": {"path": "a"}}},
+                {"type": "function", "function": {"name": "read_file", "arguments": {"path": "a"}}},
+            ],
+        }])
+
+        self.assertNotEqual(messages[0].tool_calls[0].call_id, messages[0].tool_calls[1].call_id)
+        self.assertEqual(
+            messages[0].tool_calls[0].call_id,
+            "call_" + canonical_sha256({
+                "index": 0,
+                "name": "read_file",
+                "arguments": {"path": "a"},
+            })[7:19],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
