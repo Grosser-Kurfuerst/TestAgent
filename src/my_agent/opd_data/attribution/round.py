@@ -6,15 +6,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Hashable, Sequence, TypeVar
 
-from my_agent.memory.evolver.attribution_export import (
+from my_agent.opd_data.attribution.io import (
     write_attribution_events,
     write_candidate_exposures,
 )
-from my_agent.memory.evolver.attribution_schema import (
+from my_agent.opd_data.attribution.schema import (
     CandidateExposure,
     PaperAttributionRecord,
 )
-from my_agent.memory.evolver.paper_attribution import compute_round_attribution
+from my_agent.opd_data.attribution.equations import compute_round_attribution
 from my_agent.opd_data.schema import RepositoryEvidence, TaskEvidence, TaskOutcomeEvidence
 
 

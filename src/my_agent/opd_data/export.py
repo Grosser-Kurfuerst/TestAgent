@@ -18,11 +18,14 @@ from my_agent.opd_data.schema import (
     TaskEvidence,
     TaskOutcomeEvidence,
 )
-from my_agent.memory.evolver.attribution_schema import PaperAttributionRecord, WritingScoreDecision
-from my_agent.memory.evolver.paper_attribution import (
+from my_agent.opd_data.attribution.equations import (
     positive_selected_memory_ids,
     teacher_memory_records,
     writing_top_fraction,
+)
+from my_agent.opd_data.attribution.schema import (
+    PaperAttributionRecord,
+    WritingScoreDecision,
 )
 from my_agent.policy.identity import PolicyIdentity, canonical_json_bytes, canonical_sha256
 from my_agent.training.contracts import DecisionEvent

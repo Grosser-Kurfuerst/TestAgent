@@ -20,7 +20,7 @@ from my_agent.opd_data.export import (
     sample_statistics,
 )
 from my_agent.opd_data.schema import ExportManifest
-from my_agent.memory.evolver.attribution_export import load_attribution_events
+from my_agent.opd_data.attribution.io import load_attribution_events
 from my_agent.policy.contracts import TrainablePolicy
 from my_agent.policy.identity import (
     canonical_sha256,

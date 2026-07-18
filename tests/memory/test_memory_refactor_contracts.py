@@ -32,13 +32,18 @@ import my_agent.memory.noop as legacy_noop_api
 import my_agent.memory.short_term as short_term_api
 import my_agent.memory.evolver as evolver_api
 import my_agent.memory.evolver.artifacts as legacy_maintenance_artifacts_api
+import my_agent.memory.evolver.attribution as legacy_offline_attribution_api
+import my_agent.memory.evolver.attribution_export as legacy_attribution_io_api
+import my_agent.memory.evolver.attribution_schema as legacy_attribution_schema_api
 import my_agent.memory.evolver.cadence_ledger as legacy_cadence_ledger_api
 import my_agent.memory.evolver.cadence_schema as legacy_cadence_schema_api
 import my_agent.memory.evolver.contracts as legacy_maintenance_contracts_api
+import my_agent.memory.evolver.dataset_scoring as legacy_dataset_scoring_api
 import my_agent.memory.evolver.maintenance_agent as legacy_maintenance_agent_api
 import my_agent.memory.evolver.maintenance_prompt as legacy_maintenance_prompt_api
 import my_agent.memory.evolver.maintenance_tools as legacy_maintenance_tools_api
 import my_agent.memory.evolver.planner as legacy_maintenance_planner_api
+import my_agent.memory.evolver.paper_attribution as legacy_attribution_equations_api
 import my_agent.memory.evolver.repository_rules as legacy_repository_rules_api
 import my_agent.memory.evolver.repository_reducer as legacy_repository_reducer_api
 import my_agent.memory.evolver.serialization as legacy_serialization_api
@@ -47,7 +52,9 @@ import my_agent.memory.evolver.formal_writer as legacy_formal_writer_api
 import my_agent.memory.evolver.selector as legacy_selector_api
 import my_agent.memory.evolver.selector_prompt as legacy_selector_prompt_api
 import my_agent.memory.evolver.transaction as legacy_maintenance_transaction_api
+import my_agent.memory.evolver.trace_join as legacy_trace_join_api
 import my_agent.memory.evolver.types as legacy_models_api
+import my_agent.memory.evolver.usage_log as legacy_usage_log_api
 import my_agent.memory.evolver.validation as legacy_maintenance_validation_api
 import my_agent.memory.evolver.writer as legacy_writer_api
 from my_agent.config import SUPPORTED_MEMORY_EVOLVER_MODES
@@ -99,6 +106,15 @@ from my_agent.memory.evolver.types import (
 from my_agent.memory.types import MemoryScope, content_fingerprint
 from my_agent.memory.experience_retrieval import ExperienceRetrievalMetrics
 from my_agent.memory.experience_store import ExperienceStore
+import my_agent.opd_data.attribution as attribution_api
+from my_agent.opd_data.attribution import equations as attribution_equations_api
+from my_agent.opd_data.attribution import io as attribution_io_api
+from my_agent.opd_data.attribution import round as attribution_round_api
+from my_agent.opd_data.attribution import schema as attribution_schema_api
+from my_agent.opd_data.legacy import attribution as offline_attribution_api
+from my_agent.opd_data.legacy import dataset_scoring as dataset_scoring_api
+from my_agent.opd_data.legacy import trace_join as trace_join_api
+from my_agent.opd_data.legacy import usage_log as usage_log_api
 from my_agent.policy.identity import PolicyIdentity, canonical_sha256
 from my_agent.training.contracts import (
     DECISION_EVENT_SCHEMA_VERSION,
@@ -329,6 +345,38 @@ class MemoryPublicContractTests(unittest.TestCase):
         for legacy_module, new_module in aliases:
             with self.subTest(legacy=legacy_module.__name__, new=new_module.__name__):
                 self.assertIs(legacy_module, new_module)
+
+    def test_attribution_compatibility_modules_preserve_module_identity(self) -> None:
+        aliases = (
+            (legacy_attribution_schema_api, attribution_schema_api),
+            (legacy_attribution_equations_api, attribution_equations_api),
+            (legacy_attribution_io_api, attribution_io_api),
+            (legacy_offline_attribution_api, offline_attribution_api),
+            (legacy_usage_log_api, usage_log_api),
+            (legacy_trace_join_api, trace_join_api),
+            (legacy_dataset_scoring_api, dataset_scoring_api),
+        )
+        for legacy_module, new_module in aliases:
+            with self.subTest(legacy=legacy_module.__name__, new=new_module.__name__):
+                self.assertIs(legacy_module, new_module)
+
+        self.assertIs(attribution_api.CandidateExposure, attribution_schema_api.CandidateExposure)
+        self.assertIs(
+            attribution_api.PaperAttributionRecord,
+            attribution_schema_api.PaperAttributionRecord,
+        )
+        self.assertIs(
+            attribution_api.compute_round_attribution,
+            attribution_equations_api.compute_round_attribution,
+        )
+        self.assertIs(
+            attribution_api.build_round_attribution,
+            attribution_round_api.build_round_attribution,
+        )
+        self.assertIs(
+            evolver_api.MemoryAttributionRecord,
+            offline_attribution_api.MemoryAttributionRecord,
+        )
 
     def test_formal_maintenance_package_does_not_import_legacy_policy(self) -> None:
         formal_root = SRC_ROOT / "memory" / "evolver" / "maintenance" / "formal"
@@ -642,6 +690,27 @@ class PlannedMemoryArchitectureTests(unittest.TestCase):
                         for prefix in forbidden_prefixes
                     ):
                         violations.append(f"{path.relative_to(SRC_ROOT)} -> {imported}")
+        self.assertEqual(violations, [])
+
+    def test_memory_only_uses_collection_attribution_through_compatibility_facades(
+        self,
+    ) -> None:
+        allowed_facades = {
+            Path("memory/evolver/attribution_export.py"),
+            Path("memory/evolver/attribution_schema.py"),
+            Path("memory/evolver/paper_attribution.py"),
+        }
+        violations: list[str] = []
+        memory_root = SRC_ROOT / "memory"
+        for path in memory_root.rglob("*.py"):
+            relative = path.relative_to(SRC_ROOT)
+            if relative in allowed_facades:
+                continue
+            for imported in _imported_modules(path):
+                if imported == "my_agent.opd_data.attribution" or imported.startswith(
+                    "my_agent.opd_data.attribution."
+                ):
+                    violations.append(f"{relative} -> {imported}")
         self.assertEqual(violations, [])
 
 

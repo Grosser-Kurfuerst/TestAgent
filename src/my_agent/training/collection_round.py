@@ -27,7 +27,7 @@ from my_agent.opd_data.schema import (
     TaskEvidence,
     TaskOutcomeEvidence,
 )
-from my_agent.memory.evolver.attribution_schema import PaperAttributionRecord
+from my_agent.opd_data.attribution.schema import PaperAttributionRecord
 from my_agent.policy.contracts import TrainablePolicy
 from my_agent.policy.identity import canonical_json_bytes, canonical_sha256
 from my_agent.training.contracts import DecisionEvent

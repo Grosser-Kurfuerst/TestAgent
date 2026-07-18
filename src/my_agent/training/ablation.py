@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Sequence
 
-from my_agent.memory.evolver.attribution_schema import (
+from my_agent.opd_data.attribution.schema import (
     AttributionEvidenceRef,
     PaperAttributionRecord,
 )

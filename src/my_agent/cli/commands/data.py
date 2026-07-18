@@ -16,22 +16,26 @@ from my_agent.data import (
     swebench_to_sft,
     traces_to_sft,
 )
-from my_agent.memory.evolver import (
+from my_agent.opd_data.legacy.attribution import (
     AttributionConfig,
-    UsageLogger,
-    annotate_selector_dataset_scores,
-    annotate_writer_dataset_scores,
     apply_attribution_write_back,
     attribution_summary,
     load_attribution_jsonl,
     prepare_attribution_write_back,
     render_attribution_summary,
     score_all_memories,
-    selection_from_trace,
-    usage_entry_from_result_row,
     write_attribution_jsonl,
+)
+from my_agent.opd_data.legacy.dataset_scoring import (
+    annotate_selector_dataset_scores,
+    annotate_writer_dataset_scores,
     write_dataset_summary_json,
 )
+from my_agent.opd_data.legacy.trace_join import (
+    selection_from_trace,
+    usage_entry_from_result_row,
+)
+from my_agent.opd_data.legacy.usage_log import UsageLogger
 from my_agent.memory.experience.repository import ExperienceStore
 from my_agent.opd_data.attribution import build_round_attribution
 from my_agent.opd_data.export import (

@@ -7,7 +7,7 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from hashlib import sha256
 
-from my_agent.memory.evolver.attribution import MemoryAttributionRecord
+from my_agent.opd_data.legacy.attribution import MemoryAttributionRecord
 from my_agent.memory.evolver.maintenance.contracts import (
     AttributionKey,
     MAINTENANCE_POLICY,

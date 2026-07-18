@@ -23,7 +23,7 @@ from my_agent.memory.experience.serialization import (
     experience_payload_to_dict,
     experience_to_dict,
 )
-from my_agent.memory.evolver.attribution import (
+from my_agent.opd_data.legacy.attribution import (
     AttributionConfig,
     AttributionWriteBackPlan,
     AttributionWriteBackSummary,
@@ -39,7 +39,7 @@ from my_agent.memory.evolver.attribution import (
     write_back_attribution,
     write_attribution_jsonl,
 )
-from my_agent.memory.evolver.dataset_scoring import (
+from my_agent.opd_data.legacy.dataset_scoring import (
     DatasetScoringSummary,
     SCORING_SOURCE,
     annotate_selector_dataset_scores,
@@ -66,7 +66,7 @@ from my_agent.memory.evolver.maintenance.contracts import (
     maintenance_plan_json,
     write_maintenance_plan,
 )
-from my_agent.memory.evolver.trace_join import (
+from my_agent.opd_data.legacy.trace_join import (
     BenchmarkOutcome,
     SelectionSnapshot,
     benchmark_outcome_from_trace,
@@ -89,7 +89,7 @@ from my_agent.memory.experience.models import (
     TrajectoryPayload,
     normalize_experience_tier,
 )
-from my_agent.memory.evolver.usage_log import (
+from my_agent.opd_data.legacy.usage_log import (
     UsageLogEntry,
     UsageLogger,
     flatten_tier_ids,

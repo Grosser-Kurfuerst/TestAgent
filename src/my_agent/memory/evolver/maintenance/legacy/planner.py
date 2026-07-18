@@ -8,7 +8,7 @@ import json
 import math
 
 from my_agent.json_safety import loads_json_strict
-from my_agent.memory.evolver.attribution import MemoryAttributionRecord
+from my_agent.opd_data.legacy.attribution import MemoryAttributionRecord
 from my_agent.memory.evolver.maintenance.contracts import (
     AttributionKey,
     MaintenanceAttributionError,

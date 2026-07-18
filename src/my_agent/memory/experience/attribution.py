@@ -15,6 +15,8 @@ ATTRIBUTION_DECIMAL_PLACES = 6
 
 
 class AttributionRecordLike(Protocol):
+    memory_id: str
+    tier: str
     value: float
     confidence: float
     candidate_count: int

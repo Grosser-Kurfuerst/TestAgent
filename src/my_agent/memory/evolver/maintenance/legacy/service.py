@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Mapping, Sequence
 
-from my_agent.memory.evolver.attribution import MemoryAttributionRecord
+from my_agent.opd_data.legacy.attribution import MemoryAttributionRecord
 from my_agent.memory.evolver.maintenance.contracts import (
     AttributionKey,
     MaintenanceConfig,

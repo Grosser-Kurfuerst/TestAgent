@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Mapping
 import json
 
-from my_agent.memory.evolver.attribution_schema import PAPER_ATTRIBUTION_SCHEMA_VERSION
+from my_agent.opd_data.attribution.schema import PAPER_ATTRIBUTION_SCHEMA_VERSION
 from my_agent.opd_ablation import MAIN_ABLATION_RECIPE_HASH, ablation_recipe_hash
 from my_agent.opd_data.schema import OPD_LEARNER_SCHEMA_VERSION
 from my_agent.policy.identity import (

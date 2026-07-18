@@ -24,7 +24,7 @@ from my_agent.memory.evolver.task_session import (
     EvolverFinalizeResult,
     TaskEvolverSession,
 )
-from my_agent.memory.evolver.attribution import MemoryAttributionRecord
+from my_agent.memory.experience.attribution import AttributionRecordLike
 from my_agent.memory.experience.repository import ExperienceStore
 from my_agent.memory.short_term import (
     MemoryCompressor,
@@ -324,7 +324,7 @@ class MemoryManager:
         )
         return stored, created
 
-    def update_experience_attribution(self, record: MemoryAttributionRecord) -> bool:
+    def update_experience_attribution(self, record: AttributionRecordLike) -> bool:
         """Write one attribution record onto a visible experience memory."""
         try:
             expected_tier = ExperienceTier(record.tier)
