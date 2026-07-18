@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from my_agent.memory.compression import MemoryCompressor
+from my_agent.memory.short_term import MemoryCompressor
 from my_agent.memory.experience.repository import (
     EXPERIENCE_LOCK_FILE,
     EXPERIENCE_STORAGE_FILE,
@@ -21,9 +21,11 @@ from my_agent.memory.experience.repository import (
     ExperienceStoreIndexSnapshot,
     ExperienceStoreSnapshot,
 )
-from my_agent.memory.experience_retrieval import (
+from my_agent.memory.experience.retrieval.lexical import (
     ExperienceRetrievalMetrics,
-    ExperienceRetriever,
+    LexicalExperienceRetriever as ExperienceRetriever,
+)
+from my_agent.memory.experience.retrieval.text import (
     experience_searchable_text,
 )
 from my_agent.memory.experience.models import (

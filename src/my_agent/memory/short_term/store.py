@@ -1,3 +1,5 @@
+"""Ordered in-session memory storage."""
+
 from __future__ import annotations
 
 from collections import deque
@@ -7,13 +9,7 @@ from my_agent.memory.types import MemoryEntry, MemoryType
 
 
 class ShortTermMemory:
-    """Ordered short-term conversation memory with FIFO eviction.
-
-    The deque preserves conversation order. When an append pushes the store
-    past ``max_entries`` or ``max_tokens`` the oldest entries are dropped
-    (FIFO). Compression (phase 3.3) normally triggers before this hard cap,
-    so FIFO is the backstop that prevents unbounded growth.
-    """
+    """Ordered short-term conversation memory with FIFO eviction."""
 
     def __init__(self, *, max_tokens: int, max_entries: int = 500) -> None:
         if max_tokens < 1:
@@ -34,14 +30,10 @@ class ShortTermMemory:
         return self._max_entries
 
     def append(self, entry: MemoryEntry) -> list[MemoryEntry]:
-        """Append an entry and evict oldest entries until within limits.
-
-        Returns the evicted entries (oldest first) so callers can trace them.
-        """
+        """Append an entry and return FIFO evictions, oldest first."""
         self._entries.append(entry)
         self._tokens += max(0, entry.token_count)
-        evicted = self._evict()
-        return evicted
+        return self._evict()
 
     def extend(self, entries: Iterable[MemoryEntry]) -> list[MemoryEntry]:
         evicted: list[MemoryEntry] = []
@@ -53,19 +45,12 @@ class ShortTermMemory:
         return list(self._entries)
 
     def recent_turns(self, retain_user_turns: int) -> list[MemoryEntry]:
-        """Entries belonging to the most recent ``retain_user_turns`` user turns.
-
-        A "turn" starts at a user message and includes the assistant/tool
-        entries that follow it, up to the next user message. The returned slice
-        is never compressed.
-        """
+        """Return entries belonging to the most recent user turns."""
         if retain_user_turns < 1:
             return []
         entries = list(self._entries)
         user_indices = [idx for idx, entry in enumerate(entries) if _is_user_boundary(entry)]
         if not user_indices:
-            # No user boundary yet: keep everything so we never drop the only
-            # context we have.
             return entries
         if len(user_indices) <= retain_user_turns:
             start = user_indices[0]
@@ -74,11 +59,7 @@ class ShortTermMemory:
         return entries[start:]
 
     def old_entries_for_compression(self, retain_user_turns: int) -> list[MemoryEntry]:
-        """Entries that may be compressed: everything before the retained turns.
-
-        The split point always falls on a user-message boundary so OpenAI
-        ``tool_calls``/``tool`` result pairs are never severed.
-        """
+        """Return the prefix that may be compressed without splitting a turn."""
         if retain_user_turns < 1:
             return list(self._entries)
         entries = list(self._entries)
@@ -99,13 +80,12 @@ class ShortTermMemory:
         start = user_indices[-retain_user_turns]
         return entries[:start]
 
-    def replace_old_entries_with_summary(self, old_ids: set[str], summary: MemoryEntry) -> None:
-        """Drop compressed entries and insert a summary at their first position.
-
-        For normal multi-turn compression the first removed entry is the head,
-        so this behaves like prepending. For a single task-goal session, the
-        goal is retained and the summary lands after it.
-        """
+    def replace_old_entries_with_summary(
+        self,
+        old_ids: set[str],
+        summary: MemoryEntry,
+    ) -> None:
+        """Replace compressed entries with a summary at their first position."""
         if summary.type != MemoryType.SUMMARY:
             raise ValueError("summary entry must have MemoryType.SUMMARY.")
         old_id_set = set(old_ids)
@@ -146,8 +126,6 @@ class ShortTermMemory:
             len(self._entries) > self._max_entries or self._tokens > self._max_tokens
         ):
             if len(self._entries) == 1:
-                # Never evict the only entry; a single oversized entry is
-                # handled by compression, not by emptying the store.
                 break
             oldest = self._entries.popleft()
             self._tokens = max(0, self._tokens - max(0, oldest.token_count))

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# ruff: noqa: E402 - tests add the src layout before importing project modules
+
 import json
 import tempfile
 import unittest
@@ -21,6 +23,7 @@ from my_agent.memory.evolver.types import (
     TipPayload,
 )
 from my_agent.memory.experience_retrieval import ExperienceRetriever, experience_index_terms
+from my_agent.memory.experience.retrieval.lexical import build_lexical_index
 from my_agent.memory.experience_store import (
     EXPERIENCE_LOCK_FILE,
     EXPERIENCE_STORAGE_FILE,
@@ -174,9 +177,8 @@ class ExperienceStoreTests(unittest.TestCase):
             self.assertEqual(index.dedup_ids[next(iter(index.dedup_ids))], "tip")
             with self.assertRaises(TypeError):
                 index.by_id["new"] = memory  # type: ignore[index]
-            postings = index.lexical_postings_by_tier[ExperienceTier.TIP]
             with self.assertRaises(TypeError):
-                postings["new"] = frozenset({"tip"})  # type: ignore[index]
+                index.global_ids_by_tier[ExperienceTier.TIP] = ("new",)  # type: ignore[index]
 
     def test_invalidated_memory_remains_by_id_but_leaves_lexical_postings(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -186,14 +188,15 @@ class ExperienceStoreTests(unittest.TestCase):
             store.add(active)
             store.add(invalidated)
             index = store.index_snapshot()
+            lexical = build_lexical_index(index)
 
             self.assertIn("invalid", index.by_id)
-            self.assertIn("invalid", index.searchable_text_by_id)
+            self.assertIn("invalid", lexical.searchable_text_by_id)
             for term in experience_index_terms(invalidated):
-                self.assertNotIn("invalid", index.lexical_postings_by_tier[ExperienceTier.TIP].get(term, ()))
+                self.assertNotIn("invalid", lexical.postings_by_tier[ExperienceTier.TIP].get(term, ()))
             self.assertTrue(any(
                 "active" in ids
-                for ids in index.lexical_postings_by_tier[ExperienceTier.TIP].values()
+                for ids in lexical.postings_by_tier[ExperienceTier.TIP].values()
             ))
 
     def test_add_replace_and_cross_process_style_refresh_publish_new_index(self) -> None:
@@ -213,10 +216,11 @@ class ExperienceStoreTests(unittest.TestCase):
                 expected_revision=snapshot.revision,
             )
             refreshed = reader.index_snapshot()
+            lexical = build_lexical_index(refreshed)
             self.assertEqual(refreshed.revision, writer.revision())
             self.assertFalse(any(
                 "second" in ids
-                for ids in refreshed.lexical_postings_by_tier[ExperienceTier.TIP].values()
+                for ids in lexical.postings_by_tier[ExperienceTier.TIP].values()
             ))
 
     def test_attribution_update_preserves_non_attribution_fields_and_guards_scope_tier(self) -> None:

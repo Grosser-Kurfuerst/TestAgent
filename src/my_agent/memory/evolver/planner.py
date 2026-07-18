@@ -49,7 +49,7 @@ from my_agent.memory.experience.models import (
     TrajectoryPayload,
 )
 from my_agent.memory.experience.repository_rules import experience_dedup_key
-from my_agent.memory.experience_retrieval import tokenize_experience_text
+from my_agent.memory.experience.retrieval.text import tokenize_experience_text
 from my_agent.memory.types import (
     MemoryScope,
     content_fingerprint,

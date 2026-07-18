@@ -11,9 +11,9 @@ from uuid import uuid4
 from my_agent.config import AgentConfig
 from my_agent.context import ContextProfile
 from my_agent.llm import AgentLLM
-from my_agent.llm.types import ChatResponse, LLMToolCall, Message, MessageLike, messages_to_openai
-from my_agent.memory.compression import MemoryCompressor
-from my_agent.memory.embedding_retrieval import (
+from my_agent.llm.types import ChatResponse, MessageLike
+from my_agent.memory.experience.retrieval.contracts import ExperienceRetriever
+from my_agent.memory.experience.retrieval.embedding import (
     EmbeddingRetriever,
     TransformersEmbeddingEncoder,
 )
@@ -43,12 +43,16 @@ from my_agent.memory.evolver.coordinator import (
 )
 from my_agent.memory.evolver.task_session import TaskEvolverSession
 from my_agent.memory.evolver.attribution import MemoryAttributionRecord
-from my_agent.memory.experience_retrieval import (
+from my_agent.memory.experience.retrieval.lexical import (
     ExperienceRetrievalMetrics,
-    ExperienceRetriever,
+    LexicalExperienceRetriever,
 )
 from my_agent.memory.experience.repository import ExperienceStore
-from my_agent.memory.short_term import ShortTermMemory
+from my_agent.memory.short_term import (
+    MemoryCompressor,
+    ShortTermMemory,
+    render_short_term_messages,
+)
 from my_agent.memory.token import estimate_tokens
 from my_agent.memory.types import (
     CompressionResult,
@@ -195,7 +199,7 @@ class MemoryManager:
             max_tokens=context_profile.short_term_storage_token_limit,
             max_entries=config.memory_short_term_entries,
         )
-        experience_retriever = ExperienceRetriever()
+        experience_retriever = LexicalExperienceRetriever()
         compressor = MemoryCompressor(
             llm=llm,
             chunk_size=config.memory_map_chunk_size,
@@ -212,7 +216,7 @@ class MemoryManager:
             if policy_identity is None:
                 raise ValueError("formal memory evolver requires a validated policy identity")
             embedding_retriever = (
-                ExperienceRetriever()
+                LexicalExperienceRetriever()
                 if config.memory_evolver_retrieval_backend == "lexical_ablation"
                 else EmbeddingRetriever(TransformersEmbeddingEncoder.from_config(config))
             )
@@ -980,10 +984,10 @@ class MemoryManager:
         return len(removed), []
 
     def render_short_term_messages(self, *, max_tokens: int | None = None) -> list[MessageLike]:
-        entries = self.short_term.all()
-        if max_tokens is not None:
-            entries = _entries_within_token_budget(entries, max_tokens)
-        return _render_short_term_entries(entries)
+        return render_short_term_messages(
+            self.short_term.all(),
+            max_tokens=max_tokens,
+        )
 
     def trace_context_event(self, event: str, payload: dict[str, Any]) -> None:
         self._trace(event, payload)
@@ -1329,144 +1333,6 @@ def _model_name(llm: AgentLLM | None, config: AgentConfig) -> str:
     if isinstance(value, str) and value.strip():
         return value
     return config.model
-
-
-def _render_short_term_entries(entries: list[MemoryEntry]) -> list[MessageLike]:
-    rendered: list[MessageLike] = []
-    idx = 0
-    while idx < len(entries):
-        entry = entries[idx]
-        if entry.type == MemoryType.SUMMARY:
-            rendered.append(Message(role="user", content=entry.content))
-            idx += 1
-        elif entry.source == "task_goal":
-            rendered.append(Message(role="user", content=f"[Task goal]\n{entry.content}"))
-            idx += 1
-        elif entry.source == "user":
-            rendered.append(Message(role="user", content=entry.content))
-            idx += 1
-        elif entry.source == "assistant":
-            tool_calls = _tool_calls_from_metadata(entry.metadata)
-            if not tool_calls:
-                rendered.append(Message(role="assistant", content=entry.content or ""))
-                idx += 1
-                continue
-
-            tool_entries, next_idx = _contiguous_tool_entries(entries, idx + 1)
-            if _tool_entries_match_calls(tool_entries, tool_calls):
-                rendered.append(
-                    Message(
-                        role="assistant",
-                        content=entry.content or "",
-                        tool_calls=tool_calls,
-                    )
-                )
-                rendered.extend(_tool_message_from_entry(tool_entry) for tool_entry in tool_entries)
-            else:
-                rendered.append(Message(role="user", content=_incomplete_tool_call_memory(entry, tool_entries)))
-            idx = next_idx
-        elif entry.source.startswith("tool:"):
-            rendered.append(Message(role="user", content=f"[Tool result memory]\n{entry.content}"))
-            idx += 1
-        else:
-            rendered.append(Message(role="user", content=entry.content))
-            idx += 1
-    return rendered
-
-
-def _entries_within_token_budget(entries: list[MemoryEntry], max_tokens: int) -> list[MemoryEntry]:
-    if max_tokens <= 0 or not entries:
-        return []
-    groups = _entry_groups(entries)
-    selected: list[list[MemoryEntry]] = []
-    start_idx = 0
-    if groups and groups[0] and groups[0][0].source == "task_goal":
-        if _rendered_groups_tokens([groups[0]]) <= max_tokens:
-            selected.append(groups[0])
-        start_idx = 1
-    tail: list[list[MemoryEntry]] = []
-    for group in reversed(groups[start_idx:]):
-        candidate_tail = [group, *tail]
-        if _rendered_groups_tokens([*selected, *candidate_tail]) > max_tokens:
-            continue
-        tail = candidate_tail
-    selected.extend(tail)
-    return [entry for group in selected for entry in group]
-
-
-def _entry_groups(entries: list[MemoryEntry]) -> list[list[MemoryEntry]]:
-    groups: list[list[MemoryEntry]] = []
-    idx = 0
-    while idx < len(entries):
-        entry = entries[idx]
-        if entry.source == "assistant":
-            tool_entries, next_idx = _contiguous_tool_entries(entries, idx + 1)
-            groups.append([entry, *tool_entries])
-            idx = next_idx
-            continue
-        groups.append([entry])
-        idx += 1
-    return groups
-
-
-def _rendered_groups_tokens(groups: list[list[MemoryEntry]]) -> int:
-    entries = [entry for group in groups for entry in group]
-    if not entries:
-        return 0
-    return estimate_tokens(messages_to_openai(_render_short_term_entries(entries)))
-
-
-def _contiguous_tool_entries(entries: list[MemoryEntry], start: int) -> tuple[list[MemoryEntry], int]:
-    tool_entries: list[MemoryEntry] = []
-    idx = start
-    while idx < len(entries) and entries[idx].source.startswith("tool:"):
-        tool_entries.append(entries[idx])
-        idx += 1
-    return tool_entries, idx
-
-
-def _tool_entries_match_calls(tool_entries: list[MemoryEntry], tool_calls: list[LLMToolCall]) -> bool:
-    if len(tool_entries) != len(tool_calls):
-        return False
-    entry_ids = [str(entry.metadata.get("tool_call_id") or entry.id) for entry in tool_entries]
-    call_ids = [call.id for call in tool_calls]
-    return entry_ids == call_ids
-
-
-def _tool_message_from_entry(entry: MemoryEntry) -> Message:
-    return Message(
-        role="tool",
-        content=entry.content,
-        tool_call_id=str(entry.metadata.get("tool_call_id") or entry.id),
-        name=str(entry.metadata.get("tool_name") or entry.source.removeprefix("tool:")),
-    )
-
-
-def _incomplete_tool_call_memory(assistant: MemoryEntry, tool_entries: list[MemoryEntry]) -> str:
-    parts = ["[Incomplete tool-call memory]"]
-    if assistant.content:
-        parts.append(f"assistant: {assistant.content}")
-    tool_names = assistant.metadata.get("tool_calls")
-    if tool_names:
-        parts.append(f"tool_calls: {tool_names}")
-    for tool_entry in tool_entries:
-        parts.append(f"{tool_entry.source}: {tool_entry.content}")
-    return "\n".join(parts)
-
-
-def _tool_calls_from_metadata(metadata: dict[str, Any]) -> list[LLMToolCall]:
-    raw_calls = metadata.get("tool_calls_payload")
-    if not isinstance(raw_calls, list):
-        return []
-    calls: list[LLMToolCall] = []
-    for raw in raw_calls:
-        if not isinstance(raw, dict):
-            continue
-        try:
-            calls.append(LLMToolCall.from_openai(raw))
-        except ValueError:
-            continue
-    return calls
 
 
 def _normalize_project_key(repo_path: Path) -> str:

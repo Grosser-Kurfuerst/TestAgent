@@ -2,8 +2,13 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from unittest.mock import patch
 
-from my_agent.memory.embedding_retrieval import EmbeddingRetriever, cosine_similarity
+from my_agent.memory.embedding_retrieval import (
+    EmbeddingRetrievalError,
+    EmbeddingRetriever,
+    cosine_similarity,
+)
 from my_agent.memory.evolver import ExperienceTier
 from my_agent.memory.experience_store import ExperienceStore
 from tests.memory.experience_fixtures import typed_experience
@@ -72,6 +77,24 @@ class EmbeddingRetrievalTests(unittest.TestCase):
 
     def test_cosine_matches_reference(self) -> None:
         self.assertAlmostEqual(cosine_similarity((3.0, 4.0), (4.0, 3.0)), 24.0 / 25.0)
+
+    def test_repository_failure_does_not_fall_back_to_lexical_retrieval(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ExperienceStore.from_dir(tmp)
+            retriever = EmbeddingRetriever(_FakeEncoder())
+
+            with (
+                patch.object(store, "index_snapshot", side_effect=RuntimeError("unavailable")),
+                patch.object(store, "all") as lexical_fallback,
+                self.assertRaisesRegex(EmbeddingRetrievalError, "formal embedding retrieval failed"),
+            ):
+                retriever.retrieve_candidates(
+                    "alpha",
+                    store=store,
+                    project_key="/repo",
+                )
+
+            lexical_fallback.assert_not_called()
 
 
 if __name__ == "__main__":

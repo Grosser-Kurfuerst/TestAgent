@@ -1,30 +1,9 @@
-"""Immutable embedding index records coupled to one repository revision."""
+"""Compatibility module alias for the Experience embedding index."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Mapping
+import sys
 
-from my_agent.memory.experience.models import ExperienceMemory, ExperienceTier
+from my_agent.memory.experience.retrieval import embedding_index as _embedding_index
 
-
-@dataclass(frozen=True)
-class EmbeddingIndexEntry:
-    memory: ExperienceMemory
-    vector: tuple[float, ...]
-    content_hash: str
-
-
-@dataclass(frozen=True)
-class EmbeddingIndexSnapshot:
-    repository_revision: str
-    entries_by_tier: Mapping[ExperienceTier, tuple[EmbeddingIndexEntry, ...]]
-
-    def __post_init__(self) -> None:
-        if not self.repository_revision:
-            raise ValueError("embedding index requires repository_revision")
-        if set(self.entries_by_tier) != set(ExperienceTier):
-            raise ValueError("embedding index must include every experience tier")
-
-
-__all__ = ["EmbeddingIndexEntry", "EmbeddingIndexSnapshot"]
+sys.modules[__name__] = _embedding_index

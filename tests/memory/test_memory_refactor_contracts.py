@@ -17,9 +17,15 @@ from tests._path import add_src_to_path
 add_src_to_path()
 
 import my_agent.memory as memory_api
+import my_agent.memory.compression as legacy_compression_api
+import my_agent.memory.embedding_cache as legacy_embedding_cache_api
+import my_agent.memory.embedding_index as legacy_embedding_index_api
+import my_agent.memory.embedding_retrieval as legacy_embedding_retrieval_api
 import my_agent.memory.experience as experience_api
 import my_agent.memory.experience_attribution as legacy_attribution_api
+import my_agent.memory.experience_retrieval as legacy_retrieval_api
 import my_agent.memory.experience_store as legacy_repository_api
+import my_agent.memory.short_term as short_term_api
 import my_agent.memory.evolver as evolver_api
 import my_agent.memory.evolver.repository_rules as legacy_repository_rules_api
 import my_agent.memory.evolver.serialization as legacy_serialization_api
@@ -29,6 +35,11 @@ from my_agent.memory.experience import attribution as experience_attribution_api
 from my_agent.memory.experience import repository as experience_repository_api
 from my_agent.memory.experience import repository_rules as experience_repository_rules_api
 from my_agent.memory.experience import serialization as experience_serialization_api
+from my_agent.memory.experience.retrieval import embedding as embedding_api
+from my_agent.memory.experience.retrieval import embedding_cache as embedding_cache_api
+from my_agent.memory.experience.retrieval import embedding_index as embedding_index_api
+from my_agent.memory.experience.retrieval import lexical as lexical_api
+from my_agent.memory.short_term import compression as short_term_compression_api
 from my_agent.memory.evolver import maintenance as maintenance_api
 from my_agent.memory.evolver import ExperienceWriteResult
 from my_agent.memory.evolver.attribution_schema import PAPER_ATTRIBUTION_SCHEMA_VERSION
@@ -172,6 +183,18 @@ class MemoryPublicContractTests(unittest.TestCase):
             experience_attribution_api.replace_experience_attribution,
         )
         self.assertIs(legacy_repository_api, experience_repository_api)
+
+    def test_retrieval_and_short_term_facades_preserve_identity(self) -> None:
+        self.assertIs(legacy_retrieval_api, lexical_api)
+        self.assertIs(legacy_embedding_retrieval_api, embedding_api)
+        self.assertIs(legacy_embedding_cache_api, embedding_cache_api)
+        self.assertIs(legacy_embedding_index_api, embedding_index_api)
+        self.assertIs(legacy_compression_api, short_term_compression_api)
+        self.assertIs(memory_api.ExperienceRetriever, lexical_api.LexicalExperienceRetriever)
+        self.assertIs(
+            short_term_api.MemoryCompressor,
+            short_term_compression_api.MemoryCompressor,
+        )
 
     def test_maintenance_facade_preserves_contract_identity(self) -> None:
         self.assertIs(maintenance_api.MaintenanceOperation, MaintenanceOperation)

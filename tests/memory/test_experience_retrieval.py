@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# ruff: noqa: E402 - tests add the src layout before importing project modules
+
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -313,6 +315,41 @@ class ExperienceRetrievalTests(unittest.TestCase):
             )
 
             self.assertEqual([hit.entry.id for hit in hits], ["active"])
+
+    def test_lexical_index_is_reused_until_repository_revision_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ExperienceStore.from_dir(tmp)
+            store.add(typed_experience("first", "pytest first", created_at=NOW))
+            retriever = ExperienceRetriever(now=NOW)
+
+            retriever.retrieve_candidates(
+                "pytest",
+                store=store,
+                project_key="/repo",
+                top_k_per_tier=5,
+            )
+            first_index = retriever.last_index
+            retriever.retrieve_candidates(
+                "pytest",
+                store=store,
+                project_key="/repo",
+                top_k_per_tier=5,
+            )
+            self.assertIs(retriever.last_index, first_index)
+
+            store.add(typed_experience("second", "pytest second", created_at=NOW))
+            retriever.retrieve_candidates(
+                "pytest",
+                store=store,
+                project_key="/repo",
+                top_k_per_tier=5,
+            )
+
+            self.assertIsNot(retriever.last_index, first_index)
+            self.assertEqual(
+                retriever.last_index.repository_revision,
+                store.index_snapshot().revision,
+            )
 
 
 if __name__ == "__main__":

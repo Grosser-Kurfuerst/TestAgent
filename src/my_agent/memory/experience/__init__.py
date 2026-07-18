@@ -27,6 +27,7 @@ from my_agent.memory.experience.repository import (
     ExperienceStoreIndexSnapshot,
     ExperienceStoreSnapshot,
 )
+from my_agent.memory.experience.repository_index import ExperienceRepositoryIndexSnapshot
 from my_agent.memory.experience.repository_rules import (
     ExperienceDedupKey,
     experience_dedup_key,
@@ -52,6 +53,7 @@ __all__ = [
     "ExperienceDedupKey",
     "ExperienceMemory",
     "ExperiencePayload",
+    "ExperienceRepositoryIndexSnapshot",
     "ExperienceStore",
     "ExperienceStoreIndexSnapshot",
     "ExperienceStoreSnapshot",

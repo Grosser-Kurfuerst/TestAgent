@@ -6,13 +6,11 @@ import json
 import math
 import os
 import threading
-from collections import defaultdict
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from types import MappingProxyType
 from typing import Any, Callable
 
 from filelock import FileLock, Timeout as FileLockTimeout
@@ -23,6 +21,12 @@ from my_agent.memory.experience.attribution import (
     replace_experience_attribution,
 )
 from my_agent.memory.experience.models import ExperienceMemory, ExperienceTier
+from my_agent.memory.experience.repository_index import (
+    ExperienceRepositoryIndexSnapshot,
+    ExperienceStoreIndexSnapshot,
+    build_repository_index_snapshot,
+    visible_ids_for_tier,
+)
 from my_agent.memory.experience.repository_rules import (
     ExperienceDedupKey,
     experience_dedup_key,
@@ -34,7 +38,6 @@ from my_agent.memory.experience.serialization import (
     experience_from_dict,
     experience_to_dict,
 )
-from my_agent.memory.experience_retrieval import experience_index_terms, experience_searchable_text
 from my_agent.memory.store_errors import (
     MemoryStoreLoadError,
     MemoryStoreLockTimeout,
@@ -61,20 +64,6 @@ class ExperienceStoreSnapshot:
     memories: tuple[ExperienceMemory, ...]
     raw_bytes: bytes
     revision: str
-
-
-@dataclass(frozen=True)
-class ExperienceStoreIndexSnapshot:
-    revision: str
-    by_id: Mapping[str, ExperienceMemory]
-    dedup_ids: Mapping[DedupKey, str]
-    global_ids_by_tier: Mapping[ExperienceTier, tuple[str, ...]]
-    project_ids_by_tier: Mapping[tuple[str, ExperienceTier], tuple[str, ...]]
-    lexical_postings_by_tier: Mapping[
-        ExperienceTier,
-        Mapping[str, frozenset[str]],
-    ]
-    searchable_text_by_id: Mapping[str, str]
 
 
 class ExperienceStore:
@@ -205,10 +194,11 @@ class ExperienceStore:
             raise ValueError("tier must be an ExperienceTier")
         self._refresh_for_read()
         with self._lock:
-            visible = set(self._index.global_ids_by_tier.get(tier, ()))
-            if project_key:
-                visible.update(self._index.project_ids_by_tier.get((project_key, tier), ()))
-            return tuple(sorted(visible))
+            return visible_ids_for_tier(
+                self._index,
+                project_key=project_key,
+                tier=tier,
+            )
 
     def index_snapshot(self) -> ExperienceStoreIndexSnapshot:
         self._refresh_for_read()
@@ -510,52 +500,7 @@ def _build_index_snapshot(
     *,
     revision: str,
 ) -> ExperienceStoreIndexSnapshot:
-    by_id: dict[str, ExperienceMemory] = {}
-    dedup_ids: dict[DedupKey, str] = {}
-    global_ids: dict[ExperienceTier, list[str]] = {tier: [] for tier in ExperienceTier}
-    project_ids: dict[tuple[str, ExperienceTier], list[str]] = defaultdict(list)
-    postings: dict[ExperienceTier, dict[str, set[str]]] = {
-        tier: defaultdict(set) for tier in ExperienceTier
-    }
-    searchable_text: dict[str, str] = {}
-
-    for memory in sorted(memories, key=lambda item: item.id):
-        by_id[memory.id] = memory
-        dedup_ids[experience_dedup_key(memory)] = memory.id
-        if memory.scope == MemoryScope.GLOBAL:
-            global_ids[memory.tier].append(memory.id)
-        else:
-            project_ids[(memory.project_key, memory.tier)].append(memory.id)
-        text = experience_searchable_text(memory)
-        searchable_text[memory.id] = text
-        if memory.invalidated:
-            continue
-        for term in experience_index_terms(memory):
-            postings[memory.tier][term].add(memory.id)
-
-    frozen_postings: dict[ExperienceTier, Mapping[str, frozenset[str]]] = {}
-    for tier in ExperienceTier:
-        frozen_postings[tier] = MappingProxyType({
-            term: frozenset(ids)
-            for term, ids in sorted(postings[tier].items())
-        })
-
-    return ExperienceStoreIndexSnapshot(
-        revision=revision,
-        by_id=MappingProxyType(dict(by_id)),
-        dedup_ids=MappingProxyType(dict(dedup_ids)),
-        global_ids_by_tier=MappingProxyType({
-            tier: tuple(sorted(global_ids[tier])) for tier in ExperienceTier
-        }),
-        project_ids_by_tier=MappingProxyType({
-            key: tuple(sorted(ids)) for key, ids in sorted(
-                project_ids.items(),
-                key=lambda item: (item[0][0], item[0][1].value),
-            )
-        }),
-        lexical_postings_by_tier=MappingProxyType(frozen_postings),
-        searchable_text_by_id=MappingProxyType(dict(searchable_text)),
-    )
+    return build_repository_index_snapshot(memories, revision=revision)
 
 
 def _dedupe_permissive(
@@ -601,6 +546,7 @@ __all__ = [
     "EXPERIENCE_STORAGE_FILE",
     "LEGACY_LONG_TERM_STORAGE_FILE",
     "ExperienceStore",
+    "ExperienceRepositoryIndexSnapshot",
     "ExperienceStoreIndexSnapshot",
     "ExperienceStoreSnapshot",
     "MemoryStoreLoadError",
