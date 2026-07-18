@@ -10,8 +10,8 @@ from my_agent.opd_data.schema import (
     TaskEvidence,
     TaskOutcomeEvidence,
 )
-from my_agent.memory.evolver.attribution_schema import CandidateExposure, PaperAttributionRecord
-from my_agent.memory.evolver.paper_attribution import compute_round_attribution
+from my_agent.opd_data.attribution.equations import compute_round_attribution
+from my_agent.opd_data.attribution.schema import CandidateExposure, PaperAttributionRecord
 from my_agent.policy.contracts import DecisionRequest, DecisionResponse, TokenBatch
 from my_agent.policy.identity import PolicyIdentity, canonical_json_bytes, canonical_sha256
 from my_agent.training.contracts import DecisionEvent

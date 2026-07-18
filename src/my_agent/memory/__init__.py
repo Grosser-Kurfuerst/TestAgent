@@ -14,21 +14,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from my_agent.memory.api import MemoryService
-from my_agent.memory.short_term import MemoryCompressor
-from my_agent.memory.experience.repository import (
-    EXPERIENCE_LOCK_FILE,
-    EXPERIENCE_STORAGE_FILE,
-    ExperienceStore,
-    ExperienceStoreIndexSnapshot,
-    ExperienceStoreSnapshot,
-)
-from my_agent.memory.experience.retrieval.lexical import (
-    ExperienceRetrievalMetrics,
-    LexicalExperienceRetriever as ExperienceRetriever,
-)
-from my_agent.memory.experience.retrieval.text import (
-    experience_searchable_text,
-)
 from my_agent.memory.experience.models import (
     ExperienceCreatedBy,
     ExperienceMemory,
@@ -48,8 +33,6 @@ from my_agent.memory.types import (
     MemoryStatus,
     MemoryType,
     RetrievalHit,
-    content_fingerprint,
-    normalize_content,
 )
 
 if TYPE_CHECKING:
@@ -79,22 +62,14 @@ def __getattr__(name: str) -> Any:
 __all__ = [
     "CompressionResult",
     "ExperienceCreatedBy",
-    "ExperienceRetrievalMetrics",
-    "ExperienceRetriever",
-    "ExperienceStore",
-    "ExperienceStoreIndexSnapshot",
-    "ExperienceStoreSnapshot",
     "ExperienceMemory",
     "ExperiencePayload",
     "ExperienceTier",
     "ExperienceTrajectoryStep",
-    "EXPERIENCE_LOCK_FILE",
-    "EXPERIENCE_STORAGE_FILE",
     "SkillPayload",
     "TipPayload",
     "ToolPayload",
     "TrajectoryPayload",
-    "MemoryCompressor",
     "MemoryContext",
     "MemoryEntry",
     "MemoryManager",
@@ -105,7 +80,4 @@ __all__ = [
     "MemoryStatus",
     "MemoryType",
     "RetrievalHit",
-    "content_fingerprint",
-    "experience_searchable_text",
-    "normalize_content",
 ]

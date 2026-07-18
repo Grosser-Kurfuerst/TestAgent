@@ -22,9 +22,9 @@ from my_agent.evaluation.manifest_benchmark import (
     run_manifest_benchmark,
     summarize_manifest_results,
 )
-from my_agent.memory import MemoryManager
+from my_agent.memory.manager import MemoryManager
 from my_agent.tools import RepoTools
-from tests.memory.experience_fixtures import save_typed_experience
+from tests.memory.experience.fixtures import save_typed_experience
 
 
 def fake_config(trace_dir: Path | None = None, **overrides: object) -> AgentConfig:

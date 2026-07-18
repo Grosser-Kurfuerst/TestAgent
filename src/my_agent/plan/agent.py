@@ -10,7 +10,7 @@ from my_agent.config import AgentConfig
 from my_agent.context import AgentContextManager, ContextOverBudgetError
 from my_agent.hitl.handler import HitlHandler
 from my_agent.llm import AgentLLM
-from my_agent.memory import MemoryService
+from my_agent.memory.api import MemoryService
 from my_agent.plan.executor import PlanEvent, PlanExecutor, ReActTaskRunner
 from my_agent.plan.graph import PlanValidationError
 from my_agent.plan.planner import Planner

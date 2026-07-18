@@ -10,22 +10,26 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
-from my_agent.memory.evolver import (
+from my_agent.memory.evolver.maintenance.contracts import (
     MaintenanceApplyResult,
     MaintenanceApplyStatus,
     MaintenanceConfig,
     MaintenancePlan,
-    build_maintenance_plan,
-    load_maintenance_plan,
-    load_project_attribution,
-    record_post_commit_audit_error,
     write_maintenance_plan,
 )
-from my_agent.memory.evolver.artifacts import _resolve_maintenance_artifact_graph
-from my_agent.memory.evolver.transaction import (
-    _apply_maintenance_plan as apply_maintenance_plan,
+from my_agent.memory.evolver.maintenance.legacy.artifacts import (
+    _resolve_maintenance_artifact_graph,
 )
-from my_agent.memory.evolver.validation import validate_plan_semantics
+from my_agent.memory.evolver.maintenance.legacy.planner import load_project_attribution
+from my_agent.memory.evolver.maintenance.legacy.service import build_maintenance_plan
+from my_agent.memory.evolver.maintenance.legacy.transaction import (
+    _apply_maintenance_plan as apply_maintenance_plan,
+    record_post_commit_audit_error,
+)
+from my_agent.memory.evolver.maintenance.legacy.validation import (
+    load_maintenance_plan,
+    validate_plan_semantics,
+)
 from my_agent.memory.experience.repository import (
     EXPERIENCE_LOCK_FILE,
     EXPERIENCE_STORAGE_FILE,

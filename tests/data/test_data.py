@@ -10,7 +10,6 @@ from tests._path import add_src_to_path
 add_src_to_path()
 
 from my_agent.data import (
-    AlpacaOutput,
     BuildReport,
     build_humaneval,
     build_mbpp,

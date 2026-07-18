@@ -10,7 +10,8 @@ from my_agent.context import AgentContextManager, ContextProfile
 from my_agent.cancellation import CancellationToken
 from my_agent.hitl import SwitchableHitlHandler, TerminalHitlHandler
 from my_agent.llm import build_llm
-from my_agent.memory import DisabledMemoryManager, MemoryManager
+from my_agent.memory.disabled import DisabledMemoryManager
+from my_agent.memory.manager import MemoryManager
 from my_agent.mcp.manager import McpServerManager, McpServerManagerPool
 from my_agent.mcp.observability import format_mcp_summary
 from my_agent.plan import AgentMode, normalize_mode

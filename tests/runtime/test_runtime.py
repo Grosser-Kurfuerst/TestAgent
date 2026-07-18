@@ -17,13 +17,13 @@ from my_agent.cancellation import CancellationToken
 from my_agent.hitl import ApprovalDecision, ApprovalEvent, ApprovalRequest, ApprovalResult, ApprovalScope
 from my_agent.llm import FakeLLM
 from my_agent.llm.types import ChatResponse, LLMToolCall, MessageLike, messages_to_openai
-from my_agent.memory import MemoryManager
+from my_agent.memory.manager import MemoryManager
 from my_agent.plan import AgentMode
-from my_agent.runtime import CodingAgentRuntime, run_agent
+from my_agent.runtime import run_agent
 from my_agent.schema import AgentState, TraceEvent
 from my_agent.react import ReActAgent
 from my_agent.tracing import TraceWriter
-from tests.memory.experience_fixtures import save_typed_experience
+from tests.memory.experience.fixtures import save_typed_experience
 
 
 def write_runtime_repo(repo: Path) -> None:

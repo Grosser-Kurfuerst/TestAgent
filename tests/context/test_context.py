@@ -19,9 +19,9 @@ from my_agent.context import (
 )
 from my_agent.llm import FakeLLM
 from my_agent.llm.types import ChatResponse, LLMToolCall, Message, messages_to_openai
-from my_agent.memory import MemoryManager
+from my_agent.memory.manager import MemoryManager
 from my_agent.tools import ToolExecutionResult
-from tests.memory.experience_fixtures import save_typed_experience
+from tests.memory.experience.fixtures import save_typed_experience
 
 
 def _config(memory_dir: Path, **overrides: object) -> AgentConfig:

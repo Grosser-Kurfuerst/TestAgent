@@ -7,7 +7,7 @@ from typing import Any, Callable
 from my_agent.config import AgentConfig
 from my_agent.hitl.handler import HitlHandler, NonInteractiveHitlHandler, TerminalHitlHandler
 from my_agent.llm import AgentLLM, build_llm
-from my_agent.memory import MemoryService
+from my_agent.memory.api import MemoryService
 from my_agent.observability.tracing import TraceWriter, append_agent_completed
 from my_agent.plan import AgentMode, resolve_mode
 from my_agent.policy.runtime_validation import require_formal_policy

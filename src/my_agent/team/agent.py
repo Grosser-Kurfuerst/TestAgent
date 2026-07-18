@@ -15,7 +15,7 @@ from my_agent.cancellation import CancellationToken
 from my_agent.events import BufferedEventSink
 from my_agent.hitl.handler import HitlHandler
 from my_agent.llm import AgentLLM
-from my_agent.memory import MemoryService
+from my_agent.memory.api import MemoryService
 from my_agent.plan import PlanValidationError, TaskResult
 from my_agent.agent_base import AgentBase
 from my_agent.schema import AgentState

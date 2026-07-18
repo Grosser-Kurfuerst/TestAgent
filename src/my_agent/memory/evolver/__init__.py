@@ -1,81 +1,21 @@
-from __future__ import annotations
+"""Stable runtime and domain contracts for memory evolution."""
 
+from my_agent.memory.evolver.runtime.contracts import EvolverRuntime
 from my_agent.memory.evolver.selection.contracts import (
     ExperienceCandidate,
     SelectedExperience,
     SelectionResult,
 )
-from my_agent.memory.evolver.selection.formal import LLMTaskSelectionPolicy
-from my_agent.memory.evolver.selection.legacy import (
-    ExperienceSelector,
-    selection_candidate_summary,
-    selection_score,
-    selection_tier_counts,
+from my_agent.memory.evolver.task_session import (
+    AgentEpisodeArtifact,
+    EvolverFinalizeResult,
+    TaskEvolverSession,
 )
-from my_agent.memory.evolver.selection.rendering import (
-    render_selected_experiences,
-)
-from my_agent.memory.experience.serialization import (
-    EXPERIENCE_SCHEMA_VERSION,
-    experience_canonical_json,
-    experience_from_dict,
-    experience_payload_from_dict,
-    experience_payload_to_dict,
-    experience_to_dict,
-)
-from my_agent.opd_data.legacy.attribution import (
-    AttributionConfig,
-    AttributionWriteBackPlan,
-    AttributionWriteBackSummary,
-    DEFAULT_TIER_WEIGHTS,
-    MemoryAttributionRecord,
-    apply_attribution_write_back,
-    attribution_summary,
-    load_attribution_jsonl,
-    prepare_attribution_write_back,
-    render_attribution_summary,
-    score_all_memories,
-    score_memory,
-    write_back_attribution,
-    write_attribution_jsonl,
-)
-from my_agent.opd_data.legacy.dataset_scoring import (
-    DatasetScoringSummary,
-    SCORING_SOURCE,
-    annotate_selector_dataset_scores,
-    annotate_writer_dataset_scores,
-    write_dataset_summary_json,
-)
-from my_agent.memory.evolver import maintenance as _maintenance_api
-from my_agent.memory.evolver.maintenance.contracts import (
-    AttributionKey,
-    MAINTENANCE_POLICY,
-    MAINTENANCE_SCHEMA_VERSION,
-    MAINTENANCE_SCOPE_MODE,
-    MaintenanceAction,
-    MaintenanceApplyResult,
-    MaintenanceApplyStatus,
-    MaintenanceAttributionError,
-    MaintenanceConfig,
-    MaintenanceError,
-    MaintenanceEvidence,
-    MaintenanceLookupHit,
-    MaintenanceOperation,
-    MaintenancePlan,
-    MaintenancePlanError,
-    maintenance_plan_json,
-    write_maintenance_plan,
-)
-from my_agent.opd_data.legacy.trace_join import (
-    BenchmarkOutcome,
-    SelectionSnapshot,
-    benchmark_outcome_from_trace,
-    collect_usage_from_manifest_results,
-    read_trace_events,
-    selection_from_trace,
-    usage_entry_from_manifest_result,
-    usage_entry_from_result_row,
-    usage_entry_from_trace,
+from my_agent.memory.evolver.writing.contracts import (
+    ExperienceWriteProposal,
+    ExperienceWriteRequest,
+    ExperienceWriteResult,
+    ExperienceWriteStep,
 )
 from my_agent.memory.experience.models import (
     ExperienceCreatedBy,
@@ -89,139 +29,41 @@ from my_agent.memory.experience.models import (
     TrajectoryPayload,
     normalize_experience_tier,
 )
-from my_agent.opd_data.legacy.usage_log import (
-    UsageLogEntry,
-    UsageLogger,
-    flatten_tier_ids,
-    group_ids_by_tier,
+from my_agent.memory.experience.serialization import (
+    EXPERIENCE_SCHEMA_VERSION,
+    experience_canonical_json,
+    experience_from_dict,
+    experience_payload_from_dict,
+    experience_payload_to_dict,
+    experience_to_dict,
 )
-from my_agent.memory.evolver.writing.contracts import (
-    ExperienceWriteProposal,
-    ExperienceWriteRequest,
-    ExperienceWriteResult,
-    ExperienceWriteStep,
-)
-from my_agent.memory.evolver.writing.dataset import MemoryWriterDatasetLogger
-from my_agent.memory.evolver.writing.legacy import (
-    ExperienceWriter,
-    build_write_steps_from_tool_history,
-    proposal_tier_counts,
-    runtime_outcome_from_tool_records,
-    writer_policy_for_result,
-)
-
-_LAZY_MAINTENANCE_EXPORTS = frozenset({
-    "MaintenanceHistoryLockTimeout",
-    "apply_maintenance_plan",
-    "build_maintenance_plan",
-    "load_maintenance_plan",
-    "load_project_attribution",
-    "lookup_experiences",
-    "maintenance_evidence_for_entry",
-    "record_post_commit_audit_error",
-    "redundancy_score",
-})
-
-
-def __getattr__(name: str):
-    if name not in _LAZY_MAINTENANCE_EXPORTS:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    value = getattr(_maintenance_api, name)
-    globals()[name] = value
-    return value
 
 __all__ = [
-    "AttributionKey",
-    "AttributionConfig",
-    "AttributionWriteBackPlan",
-    "AttributionWriteBackSummary",
     "EXPERIENCE_SCHEMA_VERSION",
-    "BenchmarkOutcome",
-    "DEFAULT_TIER_WEIGHTS",
-    "DatasetScoringSummary",
+    "AgentEpisodeArtifact",
+    "EvolverFinalizeResult",
+    "EvolverRuntime",
     "ExperienceCandidate",
     "ExperienceCreatedBy",
     "ExperienceMemory",
     "ExperiencePayload",
-    "ExperienceSelector",
     "ExperienceTier",
     "ExperienceTrajectoryStep",
-    "SkillPayload",
-    "TipPayload",
-    "ToolPayload",
-    "TrajectoryPayload",
     "ExperienceWriteProposal",
     "ExperienceWriteRequest",
     "ExperienceWriteResult",
     "ExperienceWriteStep",
-    "ExperienceWriter",
-    "MemoryAttributionRecord",
-    "MemoryWriterDatasetLogger",
-    "MAINTENANCE_POLICY",
-    "MAINTENANCE_SCHEMA_VERSION",
-    "MAINTENANCE_SCOPE_MODE",
-    "MaintenanceAction",
-    "MaintenanceApplyResult",
-    "MaintenanceApplyStatus",
-    "MaintenanceAttributionError",
-    "MaintenanceConfig",
-    "MaintenanceError",
-    "MaintenanceEvidence",
-    "MaintenanceHistoryLockTimeout",
-    "MaintenanceLookupHit",
-    "MaintenanceOperation",
-    "MaintenancePlan",
-    "MaintenancePlanError",
-    "SelectionSnapshot",
     "SelectedExperience",
     "SelectionResult",
-    "LLMTaskSelectionPolicy",
-    "SCORING_SOURCE",
-    "UsageLogEntry",
-    "UsageLogger",
-    "apply_maintenance_plan",
-    "annotate_selector_dataset_scores",
-    "annotate_writer_dataset_scores",
-    "apply_attribution_write_back",
-    "attribution_summary",
-    "build_maintenance_plan",
-    "build_write_steps_from_tool_history",
-    "benchmark_outcome_from_trace",
-    "collect_usage_from_manifest_results",
+    "SkillPayload",
+    "TaskEvolverSession",
+    "TipPayload",
+    "ToolPayload",
+    "TrajectoryPayload",
     "experience_canonical_json",
     "experience_from_dict",
     "experience_payload_from_dict",
     "experience_payload_to_dict",
     "experience_to_dict",
-    "flatten_tier_ids",
-    "group_ids_by_tier",
-    "load_attribution_jsonl",
-    "load_maintenance_plan",
-    "load_project_attribution",
-    "lookup_experiences",
-    "maintenance_evidence_for_entry",
-    "maintenance_plan_json",
-    "record_post_commit_audit_error",
     "normalize_experience_tier",
-    "proposal_tier_counts",
-    "prepare_attribution_write_back",
-    "read_trace_events",
-    "render_selected_experiences",
-    "render_attribution_summary",
-    "redundancy_score",
-    "runtime_outcome_from_tool_records",
-    "score_all_memories",
-    "score_memory",
-    "selection_candidate_summary",
-    "selection_from_trace",
-    "selection_score",
-    "selection_tier_counts",
-    "usage_entry_from_manifest_result",
-    "usage_entry_from_result_row",
-    "usage_entry_from_trace",
-    "write_back_attribution",
-    "write_attribution_jsonl",
-    "write_dataset_summary_json",
-    "write_maintenance_plan",
-    "writer_policy_for_result",
 ]

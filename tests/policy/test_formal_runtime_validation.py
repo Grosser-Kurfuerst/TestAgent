@@ -9,7 +9,8 @@ from types import SimpleNamespace
 
 from my_agent.config import AgentConfig
 from my_agent.llm import FakeLLM
-from my_agent.memory import ExperienceStore, MemoryManager
+from my_agent.memory.experience.repository import ExperienceStore
+from my_agent.memory.manager import MemoryManager
 from my_agent.memory.evolver.coordinator import EvolverCoordinator
 from my_agent.memory.evolver.runtime.formal import FormalEvolverRuntime
 from my_agent.policy.identity import PolicyIdentity, policy_identity_manifest_payload

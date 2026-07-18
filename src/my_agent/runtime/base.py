@@ -10,7 +10,9 @@ from my_agent.config import AgentConfig
 from my_agent.context import ContextProfile
 from my_agent.hitl.handler import HitlHandler
 from my_agent.llm import AgentLLM
-from my_agent.memory import DisabledMemoryManager, MemoryManager, MemoryService
+from my_agent.memory.api import MemoryService
+from my_agent.memory.disabled import DisabledMemoryManager
+from my_agent.memory.manager import MemoryManager
 from my_agent.observability.tracing import TraceWriter
 from my_agent.policy.runtime_validation import require_formal_policy
 from my_agent.repo import RepoContextRender, RepoIndexer

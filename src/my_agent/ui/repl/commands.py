@@ -8,7 +8,8 @@ from typing import TYPE_CHECKING
 from my_agent.context import budget_tool_definitions
 from my_agent.llm.types import Message
 from my_agent.mcp.observability import format_mcp_disabled, format_mcp_logs, format_mcp_status
-from my_agent.memory import ExperienceTier, MemoryScope, SkillPayload, TipPayload
+from my_agent.memory.experience.models import ExperienceTier, SkillPayload, TipPayload
+from my_agent.memory.types import MemoryScope
 from my_agent.plan import AgentMode, normalize_mode
 from my_agent.ui.repl.status import format_context_text, format_memory_text, format_tools_text
 

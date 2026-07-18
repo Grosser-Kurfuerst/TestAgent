@@ -9,7 +9,7 @@ from my_agent.config import AgentConfig
 from my_agent.hitl.handler import HitlHandler
 from my_agent.llm import AgentLLM
 from my_agent.llm.types import Message, MessageLike
-from my_agent.memory import MemoryService
+from my_agent.memory.api import MemoryService
 from my_agent.plan import TaskResult
 from my_agent.team.prompts import (
     TEAM_REVIEWER_SYSTEM_PROMPT,

@@ -12,9 +12,12 @@ from my_agent.hitl.handler import HitlHandler
 from my_agent.hitl.types import ApprovalEvent
 from my_agent.llm import AgentLLM
 from my_agent.llm.types import ChatResponse, LLMToolCall, Message, MessageLike, messages_to_openai
-from my_agent.memory import MemoryService
-from my_agent.memory.evolver import build_write_steps_from_tool_history, runtime_outcome_from_tool_records
+from my_agent.memory.api import MemoryService
 from my_agent.memory.evolver.task_session import AgentEpisodeArtifact
+from my_agent.memory.evolver.writing.legacy import (
+    build_write_steps_from_tool_history,
+    runtime_outcome_from_tool_records,
+)
 from my_agent.memory.token import estimate_tokens
 from my_agent.agent_base import AgentBase
 from my_agent.policy.chat_template import canonicalize_messages, canonicalize_tools

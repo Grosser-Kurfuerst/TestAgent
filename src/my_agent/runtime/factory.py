@@ -6,7 +6,7 @@ from typing import Any, Callable
 from my_agent.config import AgentConfig
 from my_agent.hitl.handler import HitlHandler
 from my_agent.llm import AgentLLM
-from my_agent.memory import MemoryService
+from my_agent.memory.api import MemoryService
 from my_agent.plan import AgentMode, PlanExecuteAgent
 from my_agent.react import ReActAgent
 from my_agent.runtime.base import AgentBase

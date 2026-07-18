@@ -16,7 +16,7 @@ from my_agent.llm.types import ChatResponse, MessageLike, messages_to_openai
 from my_agent.config import AgentConfig
 from my_agent.cancellation import CancellationToken
 from my_agent.plan import AgentMode, PlanValidationError, TaskResult, TaskType, normalize_mode, resolve_mode
-from my_agent.memory import MemoryManager
+from my_agent.memory.manager import MemoryManager
 from my_agent.schema import AgentState
 from my_agent.team import (
     ExecutionStep,
@@ -34,7 +34,7 @@ from my_agent.team import (
     validate_team_graph,
 )
 from my_agent.team.types import AgentRole, TeamStatus
-from tests.memory.experience_fixtures import save_typed_experience
+from tests.memory.experience.fixtures import save_typed_experience
 
 
 def step(
