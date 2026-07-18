@@ -27,6 +27,7 @@ from my_agent.training.recollection import (
 )
 from my_agent.training.collection_round import build_replay_ablation_dataset
 from my_agent.training.opd_dataset import OPDLearnerDataset
+from my_agent.training.opd_trainer import SharedAdapterConfig
 from my_agent.training.role_views import CanonicalMessage
 from my_agent.cli.main import build_parser
 from tests.training.opd_round_fixtures import identity
@@ -70,6 +71,7 @@ class _FakeBackend:
             f"round-{collection_round}".encode()
         )
         output_identity = output_identity_for_adapter(checkpoint.identity, checkpoint_dir)
+        adapter = SharedAdapterConfig()
         manifest = CheckpointManifest(
             collection_round=collection_round,
             initialization_identity=checkpoint.identity,
@@ -95,6 +97,8 @@ class _FakeBackend:
                 role: 1.0 for role in dataset.manifest.role_counts
             },
             shared_adapter_name="shared",
+            shared_adapter_config=adapter.canonical_payload,
+            adapter_config_hash=adapter.adapter_config_hash,
             reload_identity_verified=True,
         )
         write_checkpoint_manifests(checkpoint_dir, manifest)

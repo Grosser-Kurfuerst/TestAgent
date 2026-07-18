@@ -1,0 +1,20 @@
+{
+  "schema_version": "agentcli-rendered-sft-v1",
+  "sample_id": "sha256:8a82569daba1e411a9089a0b10c5192fe3c662056c42e224788958e2c633bb77",
+  "semantic_sample_hash": "sha256:8a82569daba1e411a9089a0b10c5192fe3c662056c42e224788958e2c633bb77",
+  "rendered_sample_hash": "sha256:ccf614d0d1c1e6e059169b7b5f9806256578b3fb52cea95c524f4ec0841b9d5d",
+  "expected_output_kind": "tool_call",
+  "expected_tool_call_count": 1,
+  "tokenizer_revision": "cdbee75f17c01a7cc42f958dc650907174af0554",
+  "tokenizer_hash": "sha256:ddf682a20b894a10040162d7cff6f3bfa0bea031b3b68728d26f5a9ec35f0189",
+  "chat_template_hash": "sha256:479f8bb750d2d029044e0c8c9f77ea254d81b748a667841a445c9aa91b32a675",
+  "raw_completion": "<tool_call>{\"name\":\"read_file\",\"arguments\":{\"path\":\"src/foo.py\"}}</tool_call>",
+  "prompt_token_ids": [1, 2],
+  "completion_token_ids": [3, 4],
+  "assistant_loss_mask": [1, 1],
+  "input_ids": [1, 2, 3, 4],
+  "full_sequence_loss_mask": [0, 0, 1, 1],
+  "labels": [-100, -100, 3, 4],
+  "cutoff_len": 8192,
+  "truncated": false
+}

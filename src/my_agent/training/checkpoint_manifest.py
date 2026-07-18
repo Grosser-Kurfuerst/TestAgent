@@ -13,6 +13,7 @@ from my_agent.opd_data.schema import OPD_LEARNER_SCHEMA_VERSION
 from my_agent.policy.identity import (
     PolicyIdentity,
     canonical_json_bytes,
+    canonical_sha256,
     policy_identity_manifest_payload,
     require_sha256,
 )
@@ -20,7 +21,7 @@ from my_agent.policy.transformers_policy import hash_adapter_artifacts
 from my_agent.training.role_views import ROLE_VIEW_SCHEMA_VERSION
 
 
-OPD_CHECKPOINT_MANIFEST_SCHEMA_VERSION = "opd-checkpoint-manifest-v2"
+OPD_CHECKPOINT_MANIFEST_SCHEMA_VERSION = "opd-checkpoint-manifest-v3"
 OPD_PROMPT_VERSION = "opd-role-prompts-v1"
 CHECKPOINT_MANIFEST_FILENAME = "opd_checkpoint_manifest.json"
 POLICY_IDENTITY_MANIFEST_FILENAME = "policy_identity_manifest.json"
@@ -48,6 +49,8 @@ class CheckpointManifest:
     gradient_norm: Mapping[str, float]
     mixed_step_gradient_norm_by_role: Mapping[str, float]
     shared_adapter_name: str
+    shared_adapter_config: Mapping[str, Any]
+    adapter_config_hash: str
     reload_identity_verified: bool
     ablation: str = ""
     ablation_recipe_hash: str = MAIN_ABLATION_RECIPE_HASH
@@ -67,6 +70,24 @@ class CheckpointManifest:
             require_sha256(getattr(self, field_name), field_name=field_name)
         if not self.shared_adapter_name.strip():
             raise ValueError("checkpoint requires one shared adapter name")
+        expected_adapter_fields = {
+            "rank", "alpha", "dropout", "target_modules", "task_type", "bias", "modules_to_save"
+        }
+        adapter_payload = dict(self.shared_adapter_config)
+        if set(adapter_payload) != expected_adapter_fields:
+            raise ValueError("checkpoint shared adapter config fields are invalid")
+        targets = adapter_payload["target_modules"]
+        if (
+            not isinstance(targets, list)
+            or targets != sorted(set(targets))
+            or adapter_payload["task_type"] != "CAUSAL_LM"
+            or adapter_payload["bias"] != "none"
+            or adapter_payload["modules_to_save"] != []
+        ):
+            raise ValueError("checkpoint shared adapter config is not canonical")
+        require_sha256(self.adapter_config_hash, field_name="adapter_config_hash")
+        if self.adapter_config_hash != canonical_sha256(adapter_payload):
+            raise ValueError("checkpoint adapter config hash mismatch")
         if self.output_identity.adapter_hash is None:
             raise ValueError("OPD checkpoint output identity requires a shared adapter hash")
         if self.ablation.strip().lower() != self.ablation:
@@ -117,6 +138,8 @@ class CheckpointManifest:
                 self.mixed_step_gradient_norm_by_role.items()
             )),
             "shared_adapter_name": self.shared_adapter_name,
+            "shared_adapter_config": dict(self.shared_adapter_config),
+            "adapter_config_hash": self.adapter_config_hash,
             "reload_identity_verified": self.reload_identity_verified,
             "ablation": self.ablation,
             "ablation_recipe_hash": self.ablation_recipe_hash,
@@ -177,6 +200,10 @@ class CheckpointManifest:
                 "mixed_step_gradient_norm_by_role",
             ),
             shared_adapter_name=str(data.get("shared_adapter_name", "")),
+            shared_adapter_config=dict(_mapping(
+                data.get("shared_adapter_config"), "shared_adapter_config"
+            )),
+            adapter_config_hash=str(data.get("adapter_config_hash", "")),
             reload_identity_verified=bool(data.get("reload_identity_verified", False)),
             ablation=str(data.get("ablation", "")),
             ablation_recipe_hash=str(data.get("ablation_recipe_hash", "")),

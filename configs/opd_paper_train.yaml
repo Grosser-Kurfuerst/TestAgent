@@ -33,3 +33,7 @@ trainer:
     alpha: 32
     dropout: 0.0
     target_modules: [q_proj, k_proj, v_proj, o_proj]
+    task_type: CAUSAL_LM
+    bias: none
+    modules_to_save: []
+    adapter_config_hash: sha256:fc2d911dc40bbf3965a70afab1547eea4102a2c1c54bd0a44cbf5b40cbc5f91c

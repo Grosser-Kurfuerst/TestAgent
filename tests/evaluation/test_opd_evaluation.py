@@ -21,6 +21,7 @@ from my_agent.training.decision_log import DecisionEventContext
 from my_agent.training.role_views import CandidateSnapshotEntry
 from my_agent.training.recollection import CheckpointArtifact
 from my_agent.training.checkpoint_manifest import CheckpointManifest
+from my_agent.training.opd_trainer import SharedAdapterConfig
 from tests.training.opd_round_fixtures import identity
 
 
@@ -322,6 +323,7 @@ def _checkpoint_manifest(
         "selection", "action", "writing", "maintenance",
     } - set(ablation_excluded_roles(ablation))
     counts = {role: 1 for role in sorted(roles)}
+    adapter = SharedAdapterConfig()
     return CheckpointManifest(
         collection_round=1,
         initialization_identity=identity(),
@@ -343,6 +345,8 @@ def _checkpoint_manifest(
         gradient_norm={"mean": 1.0, "max": 1.0},
         mixed_step_gradient_norm_by_role={role: 1.0 for role in sorted(roles)},
         shared_adapter_name="shared",
+        shared_adapter_config=adapter.canonical_payload,
+        adapter_config_hash=adapter.adapter_config_hash,
         reload_identity_verified=True,
         ablation=ablation,
         ablation_recipe_hash=ablation_recipe_hash(ablation),

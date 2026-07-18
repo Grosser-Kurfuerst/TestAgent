@@ -1,0 +1,86 @@
+diff --git a/src/llamafactory/data/converter.py b/src/llamafactory/data/converter.py
+index 7ec6f12b..bcb29cbb 100644
+--- a/src/llamafactory/data/converter.py
++++ b/src/llamafactory/data/converter.py
+@@ -369,0 +370,23 @@ class OpenAIDatasetConverter(DatasetConverter):
++@dataclass
++class AgentCliOpenAIToolsDatasetConverter(OpenAIDatasetConverter):
++    def __call__(self, example: dict[str, Any]) -> dict[str, Any]:
++        output = super().__call__(example)
++        messages = example[self.dataset_attr.messages]
++        tools = example[self.dataset_attr.tools]
++        if not isinstance(messages, list) or not isinstance(tools, list):
++            raise ValueError("AgentCli messages and tools must be JSON arrays.")
++
++        for message in messages:
++            if not isinstance(message, dict):
++                raise ValueError("AgentCli messages must be JSON objects.")
++            for tool_call in message.get("tool_calls", []):
++                function = tool_call.get("function") if isinstance(tool_call, dict) else None
++                arguments = function.get("arguments") if isinstance(function, dict) else None
++                if not isinstance(arguments, dict):
++                    raise ValueError("AgentCli function.arguments must be a JSON object.")
++
++        output["_agentcli_messages"] = messages
++        output["_agentcli_tools"] = tools
++        return output
++
++
+@@ -373,0 +397 @@ DATASET_CONVERTERS = {
++    "agentcli_openai_tools": AgentCliOpenAIToolsDatasetConverter,
+diff --git a/src/llamafactory/data/parser.py b/src/llamafactory/data/parser.py
+index 5209da64..e3c8c942 100644
+--- a/src/llamafactory/data/parser.py
++++ b/src/llamafactory/data/parser.py
+@@ -33 +33 @@ class DatasetAttr:
+-    formatting: Literal["alpaca", "sharegpt", "openai"] = "alpaca"
++    formatting: Literal["alpaca", "sharegpt", "openai", "agentcli_openai_tools"] = "alpaca"
+diff --git a/src/llamafactory/data/processor/supervised.py b/src/llamafactory/data/processor/supervised.py
+index b5aba11b..35adbbe0 100644
+--- a/src/llamafactory/data/processor/supervised.py
++++ b/src/llamafactory/data/processor/supervised.py
+@@ -32,0 +33,30 @@ class SupervisedDatasetProcessor(DatasetProcessor):
++    def _encode_agentcli_example(
++        self,
++        messages: list[dict[str, Any]],
++        tools: list[dict[str, Any]],
++    ) -> tuple[list[int], list[int]]:
++        if self.data_args.train_on_prompt or not self.data_args.mask_history:
++            raise ValueError("AgentCli SFT requires train_on_prompt=false and mask_history=true.")
++        if not messages or messages[-1].get("role") != "assistant":
++            raise ValueError("AgentCli SFT target must be the final assistant message.")
++
++        prompt_ids = self.tokenizer.apply_chat_template(
++            messages[:-1],
++            tools=tools,
++            add_generation_prompt=True,
++            tokenize=True,
++        )
++        input_ids = self.tokenizer.apply_chat_template(
++            messages,
++            tools=tools,
++            add_generation_prompt=False,
++            tokenize=True,
++        )
++        if input_ids[: len(prompt_ids)] != prompt_ids or len(input_ids) == len(prompt_ids):
++            raise ValueError("AgentCli prompt tokens must be a strict prefix of the full sequence.")
++        if len(input_ids) > self.data_args.cutoff_len:
++            raise ValueError("AgentCli SFT samples must not be truncated.")
++
++        labels = [IGNORE_INDEX] * len(prompt_ids) + input_ids[len(prompt_ids) :]
++        return input_ids, labels
++
+@@ -92,0 +123,13 @@ class SupervisedDatasetProcessor(DatasetProcessor):
++            if "_agentcli_messages" in examples:
++                input_ids, labels = self._encode_agentcli_example(
++                    examples["_agentcli_messages"][i],
++                    examples["_agentcli_tools"][i],
++                )
++                model_inputs["input_ids"].append(input_ids)
++                model_inputs["attention_mask"].append([1] * len(input_ids))
++                model_inputs["labels"].append(labels)
++                model_inputs["images"].append(None)
++                model_inputs["videos"].append(None)
++                model_inputs["audios"].append(None)
++                continue
++

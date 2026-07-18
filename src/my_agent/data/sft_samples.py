@@ -1,9 +1,12 @@
-from __future__ import annotations
-
 """Typed SFT sample schema and sample factories."""
+
+from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Iterable, TypedDict
+
+
+LEGACY_SFT_SCHEMA_VERSION = "agentcli-legacy-alpaca-sft-v1"
 
 
 class ToolCallOutput(TypedDict):
@@ -134,6 +137,7 @@ def validate_sft_sample(record: dict[str, Any], *, path: Path, line_num: int) ->
 
 
 __all__ = [
+    "LEGACY_SFT_SCHEMA_VERSION",
     "SftSample",
     "ToolCallOutput",
     "make_repair_plan_sample",

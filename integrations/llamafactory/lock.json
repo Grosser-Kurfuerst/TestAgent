@@ -1,0 +1,14 @@
+{
+  "schema_version": "agentcli-llamafactory-lock-v1",
+  "repository": "hiyouga/LLaMA-Factory",
+  "revision": "95ac3f2373b82662c1bd855c284d3379e6a763d3",
+  "version": "0.9.4",
+  "dataset_format": "agentcli_openai_tools",
+  "template_mode": "pinned_patch",
+  "template_name": "qwen3",
+  "patch_path": "integrations/llamafactory/patches/agentcli_qwen3.patch",
+  "patch_apply_args": ["--unidiff-zero"],
+  "template_artifact_hash": "sha256:07312b50dbb514945c88d014bba08c871715dd62b203d11ad985eb8046f56df6",
+  "tool_fixture_manifest_hash": "sha256:f2d4910a8afc046aee986617dcde47c9217a6750311bdf9ea6d47f5731f4ea6b",
+  "dataset_info_fixture_hash": "sha256:8ca1656917585face4bc9d68399124bec594652993e5083ed7f25af2faade24f"
+}

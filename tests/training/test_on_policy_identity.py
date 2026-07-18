@@ -12,6 +12,7 @@ from my_agent.training.opd_dataset import OPDLearnerDataset
 from my_agent.training.opd_trainer import (
     OPDTrainer,
     OPDTrainerConfig,
+    SharedAdapterConfig,
     _merge_distributed_metrics,
 )
 from my_agent.training.checkpoint_manifest import output_identity_for_adapter
@@ -28,7 +29,16 @@ class _TinyAdapterModel:
                 self.adapter = torch.nn.Linear(12, 12, bias=False)
                 self.embedding.weight.requires_grad_(False)
                 self.output.weight.requires_grad_(False)
-                self.peft_config = {"shared": object()}
+                adapter = SharedAdapterConfig()
+                self.peft_config = {"shared": SimpleNamespace(
+                    r=adapter.rank,
+                    lora_alpha=adapter.alpha,
+                    lora_dropout=adapter.dropout,
+                    target_modules=set(adapter.target_modules),
+                    task_type=adapter.task_type,
+                    bias=adapter.bias,
+                    modules_to_save=None,
+                )}
                 self.forward_grad_enabled: list[bool] = []
 
             def hidden_states(self, *, input_ids, attention_mask):

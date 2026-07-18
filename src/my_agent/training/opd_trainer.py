@@ -5,12 +5,17 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from math import ceil
+from math import ceil, isfinite
 from pathlib import Path
 from typing import Any
 
 from my_agent.policy.contracts import ChunkedKLPolicy, EVOLVER_ROLES, TokenBatch, TrainablePolicy
-from my_agent.policy.identity import PolicyIdentity, hash_artifact_path, require_matching_policy_identity
+from my_agent.policy.identity import (
+    PolicyIdentity,
+    canonical_sha256,
+    hash_artifact_path,
+    require_matching_policy_identity,
+)
 from my_agent.training.checkpoint_manifest import (
     CheckpointManifest,
     load_checkpoint_manifest,
@@ -33,14 +38,43 @@ class SharedAdapterConfig:
     alpha: int = 32
     dropout: float = 0.0
     target_modules: tuple[str, ...] = ("q_proj", "k_proj", "v_proj", "o_proj")
+    task_type: str = "CAUSAL_LM"
+    bias: str = "none"
+    modules_to_save: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        if not self.name.strip() or self.rank < 1 or self.alpha < 1:
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise ValueError("shared adapter name must not be blank")
+        if (
+            isinstance(self.rank, bool)
+            or not isinstance(self.rank, int)
+            or self.rank < 1
+            or isinstance(self.alpha, bool)
+            or not isinstance(self.alpha, int)
+            or self.alpha < 1
+        ):
             raise ValueError("shared adapter name/rank/alpha are invalid")
-        if not 0.0 <= self.dropout < 1.0:
+        if (
+            isinstance(self.dropout, bool)
+            or not isinstance(self.dropout, (int, float))
+            or not isfinite(float(self.dropout))
+            or not 0.0 <= float(self.dropout) < 1.0
+        ):
             raise ValueError("shared adapter dropout must be in [0, 1)")
-        if not self.target_modules:
-            raise ValueError("shared adapter target_modules must not be empty")
+        payload = canonical_adapter_payload(self)
+        object.__setattr__(self, "name", self.name.strip())
+        object.__setattr__(self, "target_modules", tuple(payload["target_modules"]))
+        object.__setattr__(self, "task_type", str(payload["task_type"]))
+        object.__setattr__(self, "bias", str(payload["bias"]))
+        object.__setattr__(self, "modules_to_save", tuple(payload["modules_to_save"]))
+
+    @property
+    def canonical_payload(self) -> dict[str, Any]:
+        return canonical_adapter_payload(self)
+
+    @property
+    def adapter_config_hash(self) -> str:
+        return canonical_sha256(self.canonical_payload)
 
 
 @dataclass(frozen=True)
@@ -91,6 +125,30 @@ class OPDTrainerConfig:
         if not isinstance(role_weights, Mapping):
             raise ValueError("role_sampling_weights must be an object")
         samples_per_epoch = data.get("samples_per_epoch")
+        shared_adapter = SharedAdapterConfig(
+            name=str(adapter_data.get("name", "shared")),
+            rank=int(adapter_data.get("rank", 16)),
+            alpha=int(adapter_data.get("alpha", 32)),
+            dropout=float(adapter_data.get("dropout", 0.0)),
+            target_modules=_optional_string_tuple(
+                adapter_data.get(
+                    "target_modules", ("q_proj", "k_proj", "v_proj", "o_proj")
+                ),
+                field_name="shared_adapter.target_modules",
+            ),
+            task_type=str(adapter_data.get("task_type", "CAUSAL_LM")),
+            bias=str(adapter_data.get("bias", "none")),
+            modules_to_save=_optional_string_tuple(
+                adapter_data.get("modules_to_save"),
+                field_name="shared_adapter.modules_to_save",
+            ),
+        )
+        configured_adapter_hash = adapter_data.get("adapter_config_hash")
+        if (
+            configured_adapter_hash is not None
+            and configured_adapter_hash != shared_adapter.adapter_config_hash
+        ):
+            raise ValueError("shared_adapter adapter_config_hash does not match its config")
         return cls(
             schema_version=str(data.get("schema_version", OPD_TRAIN_CONFIG_SCHEMA_VERSION)),
             epochs=int(data.get("epochs", 1)),
@@ -105,15 +163,7 @@ class OPDTrainerConfig:
             seed=int(data.get("seed", 0)),
             samples_per_epoch=(None if samples_per_epoch is None else int(samples_per_epoch)),
             role_sampling_weights={str(key): float(value) for key, value in role_weights.items()},
-            shared_adapter=SharedAdapterConfig(
-                name=str(adapter_data.get("name", "shared")),
-                rank=int(adapter_data.get("rank", 16)),
-                alpha=int(adapter_data.get("alpha", 32)),
-                dropout=float(adapter_data.get("dropout", 0.0)),
-                target_modules=tuple(str(item) for item in adapter_data.get(
-                    "target_modules", ("q_proj", "k_proj", "v_proj", "o_proj")
-                )),
-            ),
+            shared_adapter=shared_adapter,
         )
 
 
@@ -172,7 +222,10 @@ class OPDTrainer:
         policy_model = getattr(self.policy, "model", None)
         if policy_model is None:
             raise ValueError("OPD trainer requires a policy exposing its shared model")
-        adapter_name = require_one_shared_adapter(policy_model)
+        adapter_name = validate_shared_adapter_config(
+            policy_model,
+            self.config.shared_adapter,
+        )
         model = _hidden_state_training_model(self.policy, policy_model, self.torch)
         trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
         if not trainable_parameters:
@@ -394,6 +447,8 @@ class OPDTrainer:
                     for role, values in sorted(role_gradient_norms.items())
                 },
                 shared_adapter_name=adapter_name,
+                shared_adapter_config=self.config.shared_adapter.canonical_payload,
+                adapter_config_hash=self.config.shared_adapter.adapter_config_hash,
                 reload_identity_verified=False,
                 ablation=self.dataset.ablation,
                 ablation_recipe_hash=self.dataset.ablation_recipe_hash,
@@ -502,7 +557,7 @@ def attach_or_validate_shared_adapter(
 ) -> Any:
     peft_config = getattr(model, "peft_config", None)
     if peft_config:
-        require_one_shared_adapter(model)
+        validate_shared_adapter_config(model, config)
         return model
     try:
         from peft import LoraConfig, get_peft_model
@@ -513,9 +568,64 @@ def attach_or_validate_shared_adapter(
         lora_alpha=config.alpha,
         lora_dropout=config.dropout,
         target_modules=list(config.target_modules),
-        task_type="CAUSAL_LM",
+        task_type=config.task_type,
+        bias=config.bias,
+        modules_to_save=None,
     )
-    return get_peft_model(model, adapter, adapter_name=config.name)
+    model = get_peft_model(model, adapter, adapter_name=config.name)
+    validate_shared_adapter_config(model, config)
+    return model
+
+
+def canonical_adapter_payload(config: Any) -> dict[str, Any]:
+    rank = _adapter_value(config, "rank", "r")
+    alpha = _adapter_value(config, "alpha", "lora_alpha")
+    dropout = _adapter_value(config, "dropout", "lora_dropout")
+    target_modules = _adapter_value(config, "target_modules")
+    task_type = _adapter_value(config, "task_type")
+    bias = _adapter_value(config, "bias")
+    modules_to_save = _adapter_value(config, "modules_to_save", default=None)
+    if isinstance(rank, bool) or not isinstance(rank, int) or rank < 1:
+        raise ValueError("adapter rank must be a positive integer")
+    if isinstance(alpha, bool) or not isinstance(alpha, int) or alpha < 1:
+        raise ValueError("adapter alpha must be a positive integer")
+    if isinstance(dropout, bool):
+        raise ValueError("adapter dropout must be a finite float")
+    dropout_value = float(dropout)
+    if not isfinite(dropout_value) or not 0.0 <= dropout_value < 1.0:
+        raise ValueError("adapter dropout must be in [0, 1)")
+    normalized_targets = _normalize_target_modules(target_modules)
+    normalized_task_type = _normalize_task_type(task_type)
+    normalized_bias = str(bias).strip().lower()
+    if normalized_task_type != "CAUSAL_LM":
+        raise ValueError("formal shared adapter task_type must be CAUSAL_LM")
+    if normalized_bias != "none":
+        raise ValueError("formal shared adapter bias must be none")
+    normalized_modules_to_save = _normalize_modules_to_save(modules_to_save)
+    if normalized_modules_to_save:
+        raise ValueError("formal shared adapter modules_to_save must be empty")
+    return {
+        "rank": rank,
+        "alpha": alpha,
+        "dropout": dropout_value,
+        "target_modules": list(normalized_targets),
+        "task_type": normalized_task_type,
+        "bias": normalized_bias,
+        "modules_to_save": list(normalized_modules_to_save),
+    }
+
+
+def validate_shared_adapter_config(model: Any, expected: SharedAdapterConfig) -> str:
+    adapter_name = require_one_shared_adapter(model)
+    actual = model.peft_config[adapter_name]
+    actual_payload = canonical_adapter_payload(actual)
+    expected_payload = expected.canonical_payload
+    if actual_payload != expected_payload:
+        raise ValueError(
+            "shared adapter config mismatch: "
+            f"expected={expected_payload}, actual={actual_payload}"
+        )
+    return adapter_name
 
 
 def require_one_shared_adapter(model: Any) -> str:
@@ -523,6 +633,52 @@ def require_one_shared_adapter(model: Any) -> str:
     if not isinstance(configurations, Mapping) or len(configurations) != 1:
         raise ValueError("formal OPD training requires exactly one shared adapter")
     return str(next(iter(configurations)))
+
+
+def _adapter_value(config: Any, *names: str, default: Any = ...) -> Any:
+    for name in names:
+        if isinstance(config, Mapping) and name in config:
+            return config[name]
+        if hasattr(config, name):
+            return getattr(config, name)
+    if default is not ...:
+        return default
+    raise ValueError(f"adapter config is missing {names[0]}")
+
+
+def _normalize_target_modules(value: Any) -> tuple[str, ...]:
+    if isinstance(value, str) or not isinstance(value, (list, tuple, set, frozenset)):
+        raise ValueError("formal adapter target_modules must be an explicit collection")
+    normalized = tuple(sorted({str(item).strip() for item in value}))
+    if not normalized or any(not item for item in normalized):
+        raise ValueError("shared adapter target_modules must not be empty")
+    if any(item.lower() == "all" or any(char in item for char in "*?[]") for item in normalized):
+        raise ValueError("formal adapter target_modules cannot use all, regex, or wildcards")
+    return normalized
+
+
+def _normalize_task_type(value: Any) -> str:
+    enum_value = getattr(value, "value", value)
+    normalized = str(enum_value).strip().upper()
+    if normalized.startswith("TASKTYPE."):
+        normalized = normalized.split(".", 1)[1]
+    return normalized
+
+
+def _normalize_modules_to_save(value: Any) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str) or not isinstance(value, (list, tuple, set, frozenset)):
+        raise ValueError("modules_to_save must be an explicit collection or null")
+    return tuple(sorted({str(item).strip() for item in value if str(item).strip()}))
+
+
+def _optional_string_tuple(value: Any, *, field_name: str) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str) or not isinstance(value, (list, tuple, set, frozenset)):
+        raise ValueError(f"{field_name} must be an array or null")
+    return tuple(str(item) for item in value)
 
 
 def _hidden_state_training_model(
@@ -710,6 +866,8 @@ __all__ = [
     "OPDTrainerConfig",
     "SharedAdapterConfig",
     "attach_or_validate_shared_adapter",
+    "canonical_adapter_payload",
     "build_training_accelerator",
     "require_one_shared_adapter",
+    "validate_shared_adapter_config",
 ]

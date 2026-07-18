@@ -33,3 +33,6 @@ trainer:
     alpha: 16
     dropout: 0.0
     target_modules: [c_attn, c_proj]
+    task_type: CAUSAL_LM
+    bias: none
+    modules_to_save: []
