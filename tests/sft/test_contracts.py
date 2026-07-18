@@ -87,6 +87,14 @@ class SFTContractTests(unittest.TestCase):
             lock["template_artifact_hash"],
             hash_artifact_path(ROOT / lock["patch_path"]),
         )
+        self.assertEqual(
+            set(lock["patched_file_hashes"]),
+            {
+                "src/llamafactory/data/converter.py",
+                "src/llamafactory/data/parser.py",
+                "src/llamafactory/data/processor/supervised.py",
+            },
+        )
         fixture_manifest = _load_json(integration / "fixtures/manifest.json")
         self.assertEqual(lock["tool_fixture_manifest_hash"], canonical_sha256(fixture_manifest))
         dataset_info = _load_json(integration / "fixtures/dataset_info.json")
