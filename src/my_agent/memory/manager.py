@@ -16,7 +16,8 @@ from my_agent.memory.experience.models import (
     ExperiencePayload,
     ExperienceTier,
 )
-from my_agent.memory.evolver import ExperienceWriteResult, SelectionResult
+from my_agent.memory.evolver.selection.contracts import SelectionResult
+from my_agent.memory.evolver.writing.contracts import ExperienceWriteResult
 from my_agent.memory.evolver.runtime.contracts import EvolverRuntime
 from my_agent.memory.evolver.task_session import (
     AgentEpisodeArtifact,
@@ -465,7 +466,6 @@ class MemoryManager:
         memory_mode: str = "",
     ) -> ExperienceWriteResult:
         return self._evolver_runtime.write_legacy_run(
-            save_experience=self.save_experience,
             task=task,
             run_id=run_id,
             trace_path=trace_path,

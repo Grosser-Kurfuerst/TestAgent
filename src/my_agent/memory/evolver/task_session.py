@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from my_agent.memory.evolver.writer import ExperienceWriteStep
+from my_agent.memory.evolver.writing.contracts import ExperienceWriteStep
 from my_agent.policy.identity import PolicyIdentity, require_sha256
 from my_agent.training.role_views import CandidateSnapshotEntry
 

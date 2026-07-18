@@ -179,6 +179,37 @@ class LLMTaskSelectionPolicyTests(unittest.TestCase):
         self.assertEqual(events[0][1]["status"], "invalid_output")
         self.assertEqual(events[0][1]["completion_token_ids"], [3, 4])
 
+    def test_formal_selection_is_clipped_by_shared_item_and_token_limits(self) -> None:
+        output = json.dumps({
+            "selected_skills": [
+                "RETRIEVED_SKILL_01",
+                "RETRIEVED_SKILL_02",
+            ],
+            "selected_tips": [],
+            "selected_tools": [],
+            "selected_trajectories": [],
+            "reasoning": "both are useful",
+        })
+        policy = _Policy(output)
+        candidates = (
+            _candidate("RETRIEVED_SKILL_01", "mem-1", "skill"),
+            _candidate("RETRIEVED_SKILL_02", "mem-2", "skill"),
+        )
+        selector = LLMTaskSelectionPolicy(
+            policy=policy,
+            recorder=DecisionEventRecorder(policy=policy),
+        )
+
+        selected = selector.select(
+            task="task",
+            candidates=candidates,
+            token_budget=8,
+            max_items=1,
+            context=_context(),
+        )
+
+        self.assertEqual(selected, ("mem-1",))
+
 
 if __name__ == "__main__":
     unittest.main()

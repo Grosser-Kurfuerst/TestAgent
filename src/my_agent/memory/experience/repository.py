@@ -66,6 +66,13 @@ class ExperienceStoreSnapshot:
     revision: str
 
 
+@dataclass(frozen=True)
+class ExperienceAppendResult:
+    appended: tuple[ExperienceMemory, ...]
+    duplicate_ids: tuple[str, ...]
+    revision: str
+
+
 class ExperienceStore:
     """Typed four-tier JSONL repository with revision-coupled indexes."""
 
@@ -150,15 +157,69 @@ class ExperienceStore:
     def add(self, memory: ExperienceMemory) -> tuple[ExperienceMemory, bool]:
         if not isinstance(memory, ExperienceMemory):
             raise TypeError("experience store only accepts ExperienceMemory")
-        _validate_strict_memories((memory,))
+        result = self.append_all_atomically((memory,))
+        if result.appended:
+            return result.appended[0], True
+        duplicate_id = result.duplicate_ids[0]
+        duplicate = self.get(duplicate_id)
+        if duplicate is None:  # pragma: no cover - committed snapshot invariant
+            raise MemoryStoreLoadError(
+                f"duplicate experience disappeared after append: {duplicate_id}"
+            )
+        return duplicate, False
+
+    def append_all_atomically(
+        self,
+        memories: Sequence[ExperienceMemory],
+        *,
+        expected_revision: str | None = None,
+    ) -> ExperienceAppendResult:
+        additions = tuple(memories)
+        _validate_strict_memories(additions)
         with self.exclusive_process_lock():
             with self._lock:
-                self._load_strict_snapshot_locked()
-                duplicate_id = self._index.dedup_ids.get(experience_dedup_key(memory))
-                if duplicate_id is not None:
-                    return self._index.by_id[duplicate_id], False
-                self._commit_memories_locked((*self._memories, memory))
-                return self._index.by_id[memory.id], True
+                current = self._load_strict_snapshot_locked()
+                if (
+                    expected_revision is not None
+                    and current.revision != expected_revision
+                ):
+                    raise MemoryStoreRevisionConflict(
+                        "experience revision changed: "
+                        f"expected {expected_revision}, got {current.revision}"
+                    )
+                if not additions:
+                    return ExperienceAppendResult((), (), current.revision)
+
+                by_id = dict(self._index.by_id)
+                dedup_ids = dict(self._index.dedup_ids)
+                appended: list[ExperienceMemory] = []
+                duplicate_ids: list[str] = []
+                for memory in additions:
+                    duplicate_id = dedup_ids.get(experience_dedup_key(memory))
+                    if duplicate_id is not None:
+                        duplicate_ids.append(duplicate_id)
+                        continue
+                    if memory.id in by_id:
+                        raise MemoryStoreLoadError(
+                            f"duplicate experience id: {memory.id}"
+                        )
+                    by_id[memory.id] = memory
+                    dedup_ids[experience_dedup_key(memory)] = memory.id
+                    appended.append(memory)
+                if not appended:
+                    return ExperienceAppendResult(
+                        (),
+                        tuple(duplicate_ids),
+                        current.revision,
+                    )
+                written = self._commit_memories_locked(
+                    (*current.memories, *appended)
+                )
+                return ExperienceAppendResult(
+                    tuple(appended),
+                    tuple(duplicate_ids),
+                    written.revision,
+                )
 
     def get(self, memory_id: str) -> ExperienceMemory | None:
         self._refresh_for_read()
@@ -546,6 +607,7 @@ __all__ = [
     "EXPERIENCE_STORAGE_FILE",
     "LEGACY_LONG_TERM_STORAGE_FILE",
     "ExperienceStore",
+    "ExperienceAppendResult",
     "ExperienceRepositoryIndexSnapshot",
     "ExperienceStoreIndexSnapshot",
     "ExperienceStoreSnapshot",

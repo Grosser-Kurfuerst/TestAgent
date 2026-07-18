@@ -31,7 +31,11 @@ import my_agent.memory.short_term as short_term_api
 import my_agent.memory.evolver as evolver_api
 import my_agent.memory.evolver.repository_rules as legacy_repository_rules_api
 import my_agent.memory.evolver.serialization as legacy_serialization_api
+import my_agent.memory.evolver.formal_writer as legacy_formal_writer_api
+import my_agent.memory.evolver.selector as legacy_selector_api
+import my_agent.memory.evolver.selector_prompt as legacy_selector_prompt_api
 import my_agent.memory.evolver.types as legacy_models_api
+import my_agent.memory.evolver.writer as legacy_writer_api
 from my_agent.config import SUPPORTED_MEMORY_EVOLVER_MODES
 from my_agent.memory.experience import attribution as experience_attribution_api
 from my_agent.memory.experience import repository as experience_repository_api
@@ -43,6 +47,12 @@ from my_agent.memory.experience.retrieval import embedding_index as embedding_in
 from my_agent.memory.experience.retrieval import lexical as lexical_api
 from my_agent.memory.short_term import compression as short_term_compression_api
 from my_agent.memory.evolver import maintenance as maintenance_api
+from my_agent.memory.evolver.selection import formal as formal_selection_api
+from my_agent.memory.evolver.selection import legacy as weighted_selection_api
+from my_agent.memory.evolver.selection import contracts as selection_contracts_api
+from my_agent.memory.evolver.writing import contracts as writing_contracts_api
+from my_agent.memory.evolver.writing import formal as formal_writing_api
+from my_agent.memory.evolver.writing import legacy as legacy_writing_api
 from my_agent.memory.evolver import ExperienceWriteResult
 from my_agent.memory.evolver.attribution_schema import PAPER_ATTRIBUTION_SCHEMA_VERSION
 from my_agent.memory.evolver.cadence_ledger import CADENCE_SCHEMA_VERSION
@@ -201,6 +211,69 @@ class MemoryPublicContractTests(unittest.TestCase):
         self.assertIs(
             legacy_noop_api.NoopMemoryManager,
             disabled_memory_api.DisabledMemoryManager,
+        )
+
+    def test_selection_and_writing_facades_preserve_identity(self) -> None:
+        self.assertIs(
+            legacy_selector_api.ExperienceSelector,
+            weighted_selection_api.ExperienceSelector,
+        )
+        self.assertIs(
+            legacy_selector_api.SelectionResult,
+            selection_contracts_api.SelectionResult,
+        )
+        self.assertIs(
+            legacy_selector_prompt_api.LLMTaskSelectionPolicy,
+            formal_selection_api.LLMTaskSelectionPolicy,
+        )
+        self.assertIs(
+            legacy_writer_api.ExperienceWriter,
+            legacy_writing_api.ExperienceWriter,
+        )
+        self.assertIs(
+            legacy_writer_api.ExperienceWriteResult,
+            writing_contracts_api.ExperienceWriteResult,
+        )
+        self.assertIs(
+            legacy_formal_writer_api.FormalExperienceWriter,
+            formal_writing_api.FormalExperienceWriter,
+        )
+
+    def test_formal_selection_and_writing_do_not_import_legacy_policies(self) -> None:
+        formal_selection_imports = _imported_modules(
+            SRC_ROOT / "memory" / "evolver" / "selection" / "formal.py"
+        )
+        formal_writing_imports = _imported_modules(
+            SRC_ROOT / "memory" / "evolver" / "writing" / "formal.py"
+        )
+
+        self.assertNotIn(
+            "my_agent.memory.evolver.selection.legacy",
+            formal_selection_imports,
+        )
+        self.assertNotIn(
+            "my_agent.memory.evolver.writing.legacy",
+            formal_writing_imports,
+        )
+        self.assertIn(
+            "my_agent.memory.evolver.writing.persistence.ExperienceRepositoryWriter",
+            formal_writing_imports,
+        )
+
+    def test_all_selection_strategies_share_the_policy_protocol(self) -> None:
+        policy = selection_contracts_api.TaskSelectionPolicy
+
+        self.assertTrue(
+            issubclass(weighted_selection_api.LegacyWeightedSelectionPolicy, policy)
+        )
+        self.assertTrue(
+            issubclass(formal_selection_api.LLMTaskSelectionPolicy, policy)
+        )
+        self.assertTrue(
+            issubclass(formal_selection_api.SimilarityTaskSelectionPolicy, policy)
+        )
+        self.assertTrue(
+            issubclass(formal_selection_api.EmptyTaskSelectionPolicy, policy)
         )
 
     def test_maintenance_facade_preserves_contract_identity(self) -> None:

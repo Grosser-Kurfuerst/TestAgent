@@ -6,13 +6,13 @@ from pathlib import Path
 from typing import Any
 
 from my_agent.config import AgentConfig
-from my_agent.memory.evolver import ExperienceWriteResult
 from my_agent.memory.evolver.coordinator import EvolverCoordinator
 from my_agent.memory.evolver.task_session import (
     AgentEpisodeArtifact,
     EvolverFinalizeResult,
     TaskEvolverSession,
 )
+from my_agent.memory.evolver.writing.contracts import ExperienceWriteResult
 from my_agent.memory.experience.models import ExperienceMemory
 from my_agent.memory.types import MemoryContext, RetrievalHit
 from my_agent.policy.identity import PolicyIdentity, require_matching_policy_identity
@@ -146,8 +146,8 @@ class FormalEvolverRuntime:
     ) -> EvolverFinalizeResult:
         return self._coordinator.finalize_task(episode, outcome)
 
-    def write_legacy_run(self, *, save_experience: Any, **kwargs: Any) -> ExperienceWriteResult:
-        del save_experience, kwargs
+    def write_legacy_run(self, **kwargs: Any) -> ExperienceWriteResult:
+        del kwargs
         return ExperienceWriteResult()
 
     def require_formal_binding(

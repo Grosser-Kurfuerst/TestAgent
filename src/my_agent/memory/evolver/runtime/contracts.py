@@ -19,7 +19,6 @@ if TYPE_CHECKING:
     from my_agent.training.contracts import AuthoritativeTaskOutcome
 
 TraceSink = Callable[[str, dict[str, Any]], None]
-SaveExperience = Callable[..., tuple[ExperienceMemory, bool]]
 
 
 class EvolverRuntime(Protocol):
@@ -87,8 +86,6 @@ class EvolverRuntime(Protocol):
 
     def write_legacy_run(
         self,
-        *,
-        save_experience: SaveExperience,
         **kwargs: Any,
     ) -> Any: ...
 
@@ -106,4 +103,4 @@ class EvolverRuntime(Protocol):
     def fork(self) -> "EvolverRuntime": ...
 
 
-__all__ = ["EvolverRuntime", "SaveExperience", "TraceSink"]
+__all__ = ["EvolverRuntime", "TraceSink"]

@@ -7,15 +7,14 @@ from typing import Any
 from my_agent.config import AgentConfig
 from my_agent.context import ContextProfile
 from my_agent.llm import AgentLLM
-from my_agent.memory.evolver import ExperienceSelector, ExperienceWriter
-from my_agent.memory.evolver.coordinator import (
-    EvolverCoordinator,
-    SimilarityTaskSelectionPolicy,
-)
+from my_agent.memory.evolver.coordinator import EvolverCoordinator
 from my_agent.memory.evolver.runtime.contracts import EvolverRuntime
 from my_agent.memory.evolver.runtime.disabled import DisabledEvolverRuntime
 from my_agent.memory.evolver.runtime.formal import FormalEvolverRuntime
 from my_agent.memory.evolver.runtime.legacy import LegacyEvolverRuntime
+from my_agent.memory.evolver.selection.formal import SimilarityTaskSelectionPolicy
+from my_agent.memory.evolver.selection.legacy import ExperienceSelector
+from my_agent.memory.evolver.writing.legacy import ExperienceWriter
 from my_agent.memory.experience.repository import ExperienceStore
 from my_agent.memory.experience.retrieval.embedding import (
     EmbeddingRetriever,

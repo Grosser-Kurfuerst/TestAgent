@@ -223,6 +223,42 @@ class ExperienceStoreTests(unittest.TestCase):
                 for ids in lexical.postings_by_tier[ExperienceTier.TIP].values()
             ))
 
+    def test_bulk_append_is_atomic_and_reports_existing_duplicates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ExperienceStore.from_dir(tmp)
+            first = _memory("first", "first pytest memory")
+            duplicate = _memory("duplicate", first.content)
+            second = _memory("second", "second pytest memory")
+            store.add(first)
+            revision = store.revision()
+
+            result = store.append_all_atomically(
+                (duplicate, second),
+                expected_revision=revision,
+            )
+
+            self.assertEqual(result.appended, (second,))
+            self.assertEqual(result.duplicate_ids, (first.id,))
+            self.assertEqual(result.revision, store.revision())
+            self.assertEqual(
+                [memory.id for memory in store.all(project_key="/repo")],
+                ["first", "second"],
+            )
+
+    def test_bulk_append_rejects_stale_revision_without_writing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ExperienceStore.from_dir(tmp)
+            store.add(_memory("first", "first pytest memory"))
+            before = store.path.read_bytes()
+
+            with self.assertRaises(MemoryStoreRevisionConflict):
+                store.append_all_atomically(
+                    (_memory("second", "second pytest memory"),),
+                    expected_revision="sha256:stale",
+                )
+
+            self.assertEqual(store.path.read_bytes(), before)
+
     def test_attribution_update_preserves_non_attribution_fields_and_guards_scope_tier(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = ExperienceStore.from_dir(tmp)

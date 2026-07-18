@@ -1,16 +1,20 @@
 from __future__ import annotations
 
-from my_agent.memory.evolver.selector import (
+from my_agent.memory.evolver.selection.contracts import (
     ExperienceCandidate,
-    ExperienceSelector,
     SelectedExperience,
     SelectionResult,
-    render_selected_experiences,
+)
+from my_agent.memory.evolver.selection.formal import LLMTaskSelectionPolicy
+from my_agent.memory.evolver.selection.legacy import (
+    ExperienceSelector,
     selection_candidate_summary,
     selection_score,
     selection_tier_counts,
 )
-from my_agent.memory.evolver.selector_prompt import LLMTaskSelectionPolicy
+from my_agent.memory.evolver.selection.rendering import (
+    render_selected_experiences,
+)
 from my_agent.memory.experience.serialization import (
     EXPERIENCE_SCHEMA_VERSION,
     experience_canonical_json,
@@ -99,13 +103,15 @@ from my_agent.memory.evolver.usage_log import (
     flatten_tier_ids,
     group_ids_by_tier,
 )
-from my_agent.memory.evolver.writer import (
+from my_agent.memory.evolver.writing.contracts import (
     ExperienceWriteProposal,
     ExperienceWriteRequest,
     ExperienceWriteResult,
     ExperienceWriteStep,
+)
+from my_agent.memory.evolver.writing.dataset import MemoryWriterDatasetLogger
+from my_agent.memory.evolver.writing.legacy import (
     ExperienceWriter,
-    MemoryWriterDatasetLogger,
     build_write_steps_from_tool_history,
     proposal_tier_counts,
     runtime_outcome_from_tool_records,

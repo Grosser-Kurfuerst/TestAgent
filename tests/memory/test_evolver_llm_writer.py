@@ -9,6 +9,7 @@ from unittest.mock import patch
 from my_agent.llm.types import ChatResponse
 from my_agent.memory.evolver.coordinator import EvolverCoordinator
 from my_agent.memory.evolver.task_session import AgentEpisodeArtifact, TaskEvolverSession
+from my_agent.memory.evolver.writing.validation import ExperienceProposalValidator
 from my_agent.memory.experience_store import ExperienceStore
 from my_agent.memory.store_errors import MemoryStorePostCommitError
 from my_agent.policy.contracts import DecisionResponse
@@ -136,6 +137,19 @@ class FormalLLMWriterTests(unittest.TestCase):
             "sha256:a120610f499be63e0fb4b212366157fcacdea75dc63c98a0d47ee294f21f4e6c",
         )
 
+    def test_formal_writer_uses_shared_validator_without_legacy_writer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ExperienceStore.from_dir(tmp)
+            coordinator = EvolverCoordinator(
+                store=store,
+                project_key="project-a",
+                policy_identity=_identity(),
+                policy=_Policy(self._two_record_output()),
+            )
+
+        self.assertIs(type(coordinator.writer.validator), ExperienceProposalValidator)
+        self.assertFalse(hasattr(coordinator.writer.validator, "llm"))
+
     def test_invalid_writer_output_is_audited_no_write(self) -> None:
         events = []
         with tempfile.TemporaryDirectory() as tmp:
@@ -224,15 +238,15 @@ class FormalLLMWriterTests(unittest.TestCase):
 
             with patch.object(
                 store,
-                "replace_all_atomically",
+                "append_all_atomically",
                 side_effect=RuntimeError("injected atomic failure"),
-            ) as replace_all:
+            ) as append_all:
                 result = coordinator.finalize_task(_episode(store), _outcome())
             memories = store.all(project_key="project-a")
 
         self.assertEqual(result.writer_status, "failed_no_write")
         self.assertEqual(memories, [])
-        replace_all.assert_called_once()
+        append_all.assert_called_once()
 
     def test_post_commit_verification_failure_recovers_committed_writer_ids(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -243,19 +257,19 @@ class FormalLLMWriterTests(unittest.TestCase):
                 policy_identity=_identity(),
                 policy=_Policy(self._two_record_output()),
             )
-            original_replace = store.replace_all_atomically
+            original_append = store.append_all_atomically
 
             def commit_then_fail(memories, *, expected_revision):
-                written_revision = original_replace(
+                written = original_append(
                     memories,
                     expected_revision=expected_revision,
                 )
                 raise MemoryStorePostCommitError(
                     "injected post-commit verification failure",
-                    expected_revision=written_revision,
+                    expected_revision=written.revision,
                 )
 
-            with patch.object(store, "replace_all_atomically", side_effect=commit_then_fail):
+            with patch.object(store, "append_all_atomically", side_effect=commit_then_fail):
                 result = coordinator.finalize_task(_episode(store), _outcome())
             memories = store.all(project_key="project-a")
 

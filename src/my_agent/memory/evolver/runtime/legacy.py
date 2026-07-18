@@ -3,65 +3,46 @@
 from __future__ import annotations
 
 import hashlib
-import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 from my_agent.config import AgentConfig
 from my_agent.context import ContextProfile
-from my_agent.memory.evolver import (
+from my_agent.memory.evolver.selection.contracts import SelectionResult
+from my_agent.memory.evolver.selection.legacy import (
     ExperienceSelector,
-    ExperienceWriteRequest,
-    ExperienceWriteResult,
-    ExperienceWriter,
-    MemoryWriterDatasetLogger,
-    SelectionResult,
-    build_write_steps_from_tool_history,
-    proposal_tier_counts,
     selection_candidate_summary,
     selection_tier_counts,
+)
+from my_agent.memory.evolver.writing.contracts import (
+    ExperienceWriteRequest,
+    ExperienceWriteResult,
+)
+from my_agent.memory.evolver.writing.dataset import (
+    MemoryWriterDatasetLogger,
+    safe_dataset_join_text,
+    safe_error_text,
+    saved_records,
+    writer_dataset_context_payload,
+    writer_dataset_record,
+)
+from my_agent.memory.evolver.writing.legacy import (
+    ExperienceWriter,
+    build_write_steps_from_tool_history,
+    proposal_tier_counts,
     writer_policy_for_result,
 )
+from my_agent.memory.evolver.writing.persistence import ExperienceRepositoryWriter
 from my_agent.memory.experience.models import (
-    ExperienceCreatedBy,
     ExperienceMemory,
     ExperienceTier,
 )
 from my_agent.memory.experience.retrieval.contracts import ExperienceRetriever
 from my_agent.memory.experience.retrieval.lexical import ExperienceRetrievalMetrics
 from my_agent.memory.experience.repository import ExperienceStore
-from my_agent.memory.experience.serialization import experience_payload_to_dict
 from my_agent.memory.types import MemoryContext, RetrievalHit
 from my_agent.policy.identity import PolicyIdentity
-
-WRITER_METADATA_STRING_CHARS = 1_000
-WRITER_DATASET_TASK_CHARS = 2_000
-WRITER_DATASET_CONTENT_CHARS = 1_200
-WRITER_DATASET_OUTPUT_CHARS = 1_000
-WRITER_DATASET_FORBIDDEN_MARKERS = (
-    "hidden_test_output",
-    "hidden_ok",
-    "official_solution",
-    "ground_truth",
-    "expected_patch",
-    "private_key",
-    "api_key",
-    "apikey",
-    "access_key",
-    "bearer",
-    "cookie",
-    "credential",
-    "github_pat_",
-    "ghp_",
-    "glpat-",
-    "password",
-    "secret",
-    "token",
-)
-WRITER_DATASET_SECRET_PREFIX_RE = re.compile(
-    r"(?i)(?:github_pat_|ghp_|glpat-|sk-[A-Za-z0-9_-]{16,}|xox[baprs]-|AKIA|ASIA|AIza|ya29\.|eyJ[A-Za-z0-9_-]{8,})"
-)
 
 
 class LegacyEvolverRuntime:
@@ -89,6 +70,10 @@ class LegacyEvolverRuntime:
         self.retriever = retriever
         self.selector = selector
         self.writer = writer
+        self.repository_writer = ExperienceRepositoryWriter(
+            store=store,
+            project_key=project_key,
+        )
         self._selector_factory = selector_factory
         self._writer_factory = writer_factory
         self.write_enabled = write_enabled
@@ -321,7 +306,6 @@ class LegacyEvolverRuntime:
     def write_legacy_run(
         self,
         *,
-        save_experience: Any,
         task: str,
         run_id: str,
         trace_path: str | Path | None = None,
@@ -365,7 +349,7 @@ class LegacyEvolverRuntime:
             project_key=self.project_key,
             memory_mode=str(memory_mode or ""),
         )
-        context_payload = _writer_dataset_context_payload(request)
+        context_payload = writer_dataset_context_payload(request)
         try:
             self._trace("memory.evolver_writer_started", {
                 **context_payload,
@@ -399,44 +383,42 @@ class LegacyEvolverRuntime:
                 self._append_writer_dataset(request, proposed)
                 return proposed
 
-            saved: list[ExperienceMemory] = []
-            duplicate_ids: list[str] = []
-            safe_source_task = _safe_dataset_join_text(request.source_task)
+            safe_source_task = safe_dataset_join_text(request.source_task)
             writer_policy = writer_policy_for_result(
                 llm_used=proposed.llm_used,
                 fallback_used=proposed.fallback_used,
             )
-            for proposal in proposed.proposals:
-                entry, created = save_experience(
-                    tier=proposal.tier,
-                    content=proposal.content,
-                    payload=proposal.payload,
-                    source_task=safe_source_task,
-                    created_by=ExperienceCreatedBy.WRITER,
-                    run_id=request.run_id,
-                    stream_id=request.stream_id,
-                    writer_confidence=proposal.confidence,
-                )
-                if created:
-                    saved.append(entry)
-                else:
-                    duplicate_ids.append(entry.id)
-
+            persisted = self.repository_writer.write(
+                proposed.proposals,
+                source_task=safe_source_task,
+                run_id=request.run_id,
+                stream_id=request.stream_id,
+            )
+            if persisted.error:
+                self._trace("memory.evolver_writer_failed", {
+                    **context_payload,
+                    "error": safe_error_text(persisted.error),
+                    "phase": "unknown",
+                    "fallback_attempted": True,
+                })
+                return ExperienceWriteResult(error=persisted.error)
             result = ExperienceWriteResult(
                 proposals=proposed.proposals,
-                saved=tuple(saved),
-                duplicate_ids=tuple(duplicate_ids),
-                rejected=proposed.rejected,
+                saved=persisted.saved,
+                duplicate_ids=persisted.duplicate_ids,
+                rejected=(*proposed.rejected, *persisted.rejected),
                 llm_used=proposed.llm_used,
                 fallback_used=proposed.fallback_used,
+                error=persisted.error,
             )
+            self._trace_persisted_entries(result)
             self._trace("memory.evolver_writer_saved", {
                 **context_payload,
-                "saved_count": len(saved),
-                "duplicate_count": len(duplicate_ids),
-                "saved_ids": [entry.id for entry in saved],
-                "saved_records": _saved_records(saved),
-                "tiers": _saved_tier_counts(saved),
+                "saved_count": len(result.saved),
+                "duplicate_count": len(result.duplicate_ids),
+                "saved_ids": [entry.id for entry in result.saved],
+                "saved_records": saved_records(result.saved),
+                "tiers": _saved_tier_counts(list(result.saved)),
                 "writer_policy": writer_policy,
             })
             self._append_writer_dataset(request, result)
@@ -445,7 +427,7 @@ class LegacyEvolverRuntime:
             error = f"{type(exc).__name__}: {exc}"
             self._trace("memory.evolver_writer_failed", {
                 **context_payload,
-                "error": _safe_error_text(error),
+                "error": safe_error_text(error),
                 "phase": "unknown",
                 "fallback_attempted": True,
             })
@@ -564,7 +546,7 @@ class LegacyEvolverRuntime:
             return
         try:
             MemoryWriterDatasetLogger(dataset_path).append(
-                _writer_dataset_record(
+                writer_dataset_record(
                     request=request,
                     result=result,
                     selection=self.last_selection,
@@ -572,11 +554,35 @@ class LegacyEvolverRuntime:
             )
         except Exception as exc:  # noqa: BLE001 - logging must not affect writes
             self._trace("memory.evolver_writer_failed", {
-                **_writer_dataset_context_payload(request),
-                "error": _safe_error_text(f"{type(exc).__name__}: {exc}"),
+                **writer_dataset_context_payload(request),
+                "error": safe_error_text(f"{type(exc).__name__}: {exc}"),
                 "phase": "dataset",
                 "fallback_attempted": result.fallback_used,
             })
+
+    def _trace_persisted_entries(self, result: ExperienceWriteResult) -> None:
+        for entry in result.saved:
+            self._trace_experience_saved(entry, created=True)
+        for duplicate_id in result.duplicate_ids:
+            duplicate = self.store.get(duplicate_id)
+            if duplicate is not None:
+                self._trace_experience_saved(duplicate, created=False)
+
+    def _trace_experience_saved(
+        self,
+        entry: ExperienceMemory,
+        *,
+        created: bool,
+    ) -> None:
+        self._trace("memory.evolver_saved", {
+            "id": entry.id,
+            "created": created,
+            "tier": entry.tier.value,
+            "scope": entry.scope.value,
+            "tokens": entry.token_count,
+            "source_task": entry.source_task,
+            "created_by": entry.created_by.value,
+        })
 
     def _trace(self, event: str, payload: dict[str, Any]) -> None:
         if self._trace_sink is None:
@@ -603,196 +609,12 @@ def _selection_selected_ids(selection: SelectionResult | None) -> tuple[str, ...
     return tuple(item.candidate.id for item in selection.selected)
 
 
-def _writer_dataset_context_payload(request: ExperienceWriteRequest) -> dict[str, Any]:
-    return {
-        "source_task": _safe_dataset_join_text(request.source_task),
-        "stream_id": _safe_dataset_join_text(request.stream_id),
-        "task_type": _safe_dataset_join_text(request.task_type),
-        "memory_project_key": _safe_dataset_join_text(request.project_key),
-        "memory_mode": _safe_dataset_join_text(request.memory_mode),
-    }
-
-
-def _writer_dataset_record(
-    *,
-    request: ExperienceWriteRequest,
-    result: ExperienceWriteResult,
-    selection: SelectionResult | None,
-) -> dict[str, Any]:
-    record: dict[str, Any] = {
-        "schema_version": 1,
-        "task": _safe_dataset_text(request.task, WRITER_DATASET_TASK_CHARS),
-        "run_id": request.run_id,
-        "trace_path": _safe_dataset_join_text(str(request.trace_path or "")),
-        "source_task": _safe_dataset_join_text(request.source_task),
-        "task_id": _safe_dataset_join_text(request.source_task),
-        "task_type": _safe_dataset_join_text(request.task_type),
-        "stream_id": _safe_dataset_join_text(request.stream_id),
-        "memory_project_key": _safe_dataset_join_text(request.project_key),
-        "memory_mode": _safe_dataset_join_text(request.memory_mode),
-        "outcome": request.outcome,
-        "outcome_source": request.outcome_source,
-        "stop_reason": request.stop_reason,
-        "selected_memory_ids": list(request.selected_memory_ids),
-        "candidate_memory_ids": list(request.candidate_memory_ids),
-        "selected_memory_ids_by_tier": _selection_selected_ids_by_tier(selection),
-        "candidate_memory_ids_by_tier": _selection_candidate_ids_by_tier(selection),
-        "steps": [_writer_dataset_step(step) for step in request.steps],
-        "proposals": [
-            _writer_dataset_proposal(proposal) for proposal in result.proposals
-        ],
-        "saved_ids": [entry.id for entry in result.saved],
-        "saved_records": _saved_records(list(result.saved)),
-        "duplicate_ids": list(result.duplicate_ids),
-        "rejected": [_safe_dataset_value(dict(item)) for item in result.rejected],
-        "llm_used": result.llm_used,
-        "fallback_used": result.fallback_used,
-    }
-    if result.error:
-        record["error"] = _safe_error_text(result.error)
-    return record
-
-
-def _writer_dataset_step(step: Any) -> dict[str, Any]:
-    output = str(getattr(step, "output", "") or "")
-    redacted = _unsafe_dataset_text(output)
-    return {
-        "step_num": int(getattr(step, "step_num", 0) or 0),
-        "tool": str(getattr(step, "tool", "") or ""),
-        "arguments": _safe_dataset_value(dict(getattr(step, "arguments", {}) or {})),
-        "ok": bool(getattr(step, "ok", False)),
-        "output": ""
-        if redacted
-        else _safe_dataset_text(output, WRITER_DATASET_OUTPUT_CHARS),
-        "output_redacted": redacted,
-        "blocked": bool(getattr(step, "blocked", False)),
-        "error_code": str(getattr(step, "error_code", "") or ""),
-    }
-
-
-def _writer_dataset_proposal(proposal: Any) -> dict[str, Any]:
-    tier = getattr(proposal, "tier", "")
-    payload = getattr(proposal, "payload", None)
-    try:
-        serialized_payload = experience_payload_to_dict(payload)
-    except (TypeError, ValueError):
-        serialized_payload = {}
-    return {
-        "tier": tier.value if isinstance(tier, ExperienceTier) else str(tier),
-        "content": _safe_dataset_text(
-            str(getattr(proposal, "content", "") or ""),
-            WRITER_DATASET_CONTENT_CHARS,
-        ),
-        "payload": _safe_dataset_value(serialized_payload),
-        "confidence": float(getattr(proposal, "confidence", 0.0) or 0.0),
-        "reason": _safe_dataset_text(
-            str(getattr(proposal, "reason", "") or ""),
-            WRITER_METADATA_STRING_CHARS,
-        ),
-    }
-
-
-def _safe_dataset_value(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        safe_items: dict[str, Any] = {}
-        for key, item in value.items():
-            raw_key = str(key)
-            if _unsafe_dataset_text(raw_key):
-                safe_items[_safe_dataset_redaction(raw_key)] = ""
-                continue
-            safe_items[_safe_dataset_text(
-                raw_key,
-                WRITER_METADATA_STRING_CHARS,
-            )] = _safe_dataset_value(item)
-        return safe_items
-    if isinstance(value, list):
-        return [_safe_dataset_value(item) for item in value]
-    if isinstance(value, tuple):
-        return [_safe_dataset_value(item) for item in value]
-    if isinstance(value, str):
-        return _safe_dataset_text(value, WRITER_METADATA_STRING_CHARS)
-    return value
-
-
-def _safe_dataset_text(value: str, max_chars: int) -> str:
-    text = str(value or "")
-    if _unsafe_dataset_text(text):
-        return ""
-    if len(text) <= max_chars:
-        return text
-    if max_chars <= 3:
-        return "." * max_chars
-    return text[: max_chars - 3].rstrip() + "..."
-
-
-def _safe_dataset_join_text(value: str) -> str:
-    text = str(value or "")
-    if _unsafe_dataset_text(text):
-        return _safe_dataset_redaction(text)
-    return _safe_dataset_text(text, WRITER_METADATA_STRING_CHARS)
-
-
-def _safe_error_text(value: str) -> str:
-    text = str(value or "")
-    if _unsafe_dataset_text(text):
-        return _safe_dataset_redaction(text)
-    return _safe_dataset_text(text, WRITER_METADATA_STRING_CHARS)
-
-
-def _safe_dataset_redaction(value: str) -> str:
-    digest = hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()[:12]
-    return f"redacted_{digest}"
-
-
-def _unsafe_dataset_text(value: str) -> bool:
-    text = str(value or "")
-    lower = text.casefold()
-    if WRITER_DATASET_SECRET_PREFIX_RE.search(text):
-        return True
-    return any(marker in lower for marker in WRITER_DATASET_FORBIDDEN_MARKERS)
-
-
-def _selection_candidate_ids_by_tier(
-    selection: SelectionResult | None,
-) -> dict[str, list[str]]:
-    if selection is None:
-        return {}
-    grouped: dict[str, list[str]] = {}
-    for candidate in selection.candidates:
-        tier = candidate.tier.value
-        grouped.setdefault(tier, []).append(candidate.id)
-    return grouped
-
-
-def _selection_selected_ids_by_tier(
-    selection: SelectionResult | None,
-) -> dict[str, list[str]]:
-    if selection is None:
-        return {}
-    grouped: dict[str, list[str]] = {}
-    for item in selection.selected:
-        tier = item.candidate.tier.value
-        grouped.setdefault(tier, []).append(item.candidate.id)
-    return grouped
-
-
 def _rejected_reason_counts(rejected: tuple[dict[str, Any], ...]) -> dict[str, int]:
     counts: dict[str, int] = {}
     for item in rejected:
         reason = str(item.get("reason") or "unknown")
         counts[reason] = counts.get(reason, 0) + 1
     return counts
-
-
-def _saved_records(entries: list[ExperienceMemory]) -> list[dict[str, str]]:
-    return [
-        {
-            "id": entry.id,
-            "tier": entry.tier.value,
-            "source_task": entry.source_task,
-        }
-        for entry in entries
-    ]
 
 
 def _saved_tier_counts(entries: list[ExperienceMemory]) -> dict[str, int]:

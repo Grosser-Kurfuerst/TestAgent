@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
 from my_agent.memory.evolver.task_session import (
     AgentEpisodeArtifact,
@@ -19,80 +19,37 @@ from my_agent.memory.evolver.cadence_ledger import (
 )
 from my_agent.memory.evolver.cadence_schema import EVOLVER_STATE_FILENAME
 from my_agent.memory.evolver.contracts import MaintenanceOperation
-from my_agent.memory.evolver.formal_writer import FormalExperienceWriter
+from my_agent.memory.evolver.selection.contracts import TaskSelectionPolicy
+from my_agent.memory.evolver.selection.formal import (
+    EmptyTaskSelectionPolicy,
+    LLMTaskSelectionPolicy,
+    SimilarityTaskSelectionPolicy,
+)
+from my_agent.memory.evolver.selection.rendering import render_formal_selected_context
+from my_agent.memory.evolver.selection.service import (
+    SelectionService,
+    candidate_snapshot,
+    limit_selected_ids,
+)
 from my_agent.memory.evolver.maintenance_agent import FormalMaintenanceAgent, FormalMaintenanceResult
-from my_agent.memory.evolver.selector_prompt import LLMTaskSelectionPolicy
-from my_agent.memory.experience.models import ExperienceMemory, ExperienceTier
-from my_agent.memory.evolver.writer import ExperienceWriteResult
+from my_agent.memory.evolver.writing.contracts import ExperienceWriteResult
+from my_agent.memory.evolver.writing.formal import FormalExperienceWriter
+from my_agent.memory.experience.models import ExperienceMemory
 from my_agent.memory.evolver.transaction import apply_formal_maintenance_operations
 from my_agent.memory.experience.repository import ExperienceStore
 from my_agent.memory.store_errors import MemoryStorePostCommitError
 from my_agent.memory.token import estimate_tokens
-from my_agent.memory.types import MemoryContext, RetrievalHit
+from my_agent.memory.types import MemoryContext
 from my_agent.opd_data.runtime_recorder import RuntimeEvidenceRecorder
 from my_agent.policy.identity import PolicyIdentity, canonical_sha256, require_matching_policy_identity
 from my_agent.policy.contracts import GenerationPolicy
 from my_agent.training.contracts import AuthoritativeTaskOutcome
 from my_agent.training.decision_log import DecisionEventContext, DecisionEventRecorder
-from my_agent.training.role_views import CandidateSnapshotEntry, SELECTED_MEMORY_CONTEXT_HEADER
 from my_agent.training.role_views import TaskOutcomeRef
 
 
 TraceSink = Callable[[str, dict[str, Any]], None]
 WriterCallback = Callable[[AgentEpisodeArtifact, AuthoritativeTaskOutcome], ExperienceWriteResult]
-
-
-class TaskSelectionPolicy(Protocol):
-    def select(
-        self,
-        *,
-        task: str,
-        candidates: tuple[CandidateSnapshotEntry, ...],
-        token_budget: int,
-        max_items: int,
-        context: DecisionEventContext,
-    ) -> tuple[str, ...]: ...
-
-
-class EmptyTaskSelectionPolicy:
-    """Iteration-2 fail-closed selector; replaced by the LLM selector in 3B."""
-
-    def select(
-        self,
-        *,
-        task: str,
-        candidates: tuple[CandidateSnapshotEntry, ...],
-        token_budget: int,
-        max_items: int,
-        context: DecisionEventContext,
-    ) -> tuple[str, ...]:
-        del task, candidates, token_budget, max_items, context
-        return ()
-
-
-class SimilarityTaskSelectionPolicy:
-    """Paper-ablation selector that keeps highest retrieval scores without an LLM."""
-
-    def select(
-        self,
-        *,
-        task: str,
-        candidates: tuple[CandidateSnapshotEntry, ...],
-        token_budget: int,
-        max_items: int,
-        context: DecisionEventContext,
-    ) -> tuple[str, ...]:
-        del task, context
-        ordered = sorted(candidates, key=lambda item: (-item.retrieval_score, item.memory_id))
-        selected: list[str] = []
-        used_tokens = 0
-        for candidate in ordered:
-            candidate_tokens = candidate.token_count
-            if len(selected) >= max_items or used_tokens + candidate_tokens > token_budget:
-                continue
-            selected.append(candidate.memory_id)
-            used_tokens += candidate_tokens
-        return tuple(selected)
 
 
 class EvolverCoordinator:
@@ -168,6 +125,7 @@ class EvolverCoordinator:
             self.selector = LLMTaskSelectionPolicy(policy=policy, recorder=self.decision_recorder)
         else:
             self.selector = EmptyTaskSelectionPolicy()
+        self.selection_service = SelectionService(self.selector)
         if writer is not None:
             self.writer = writer
         elif policy is not None and self.decision_recorder is not None:
@@ -282,7 +240,7 @@ class EvolverCoordinator:
             top_k_per_tier=self.top_k_per_tier,
         )
         repository_revision = self.retriever.last_metrics.repository_revision
-        candidates = _candidate_snapshot(hits)
+        candidates = candidate_snapshot(hits)
         candidate_snapshot_hash = canonical_sha256([item.to_dict() for item in candidates])
         decision_context = DecisionEventContext(
             trajectory_id=trajectory_id,
@@ -296,20 +254,20 @@ class EvolverCoordinator:
             repository_revision=repository_revision,
             candidate_snapshot_hash=candidate_snapshot_hash,
         )
-        selected_ids = self.selector.select(
+        selected_ids = self.selection_service.select(
             task=task,
             candidates=candidates,
             token_budget=self.selection_token_budget,
             max_items=self.selected_max_items,
             context=decision_context,
         )
-        selected_ids = _validate_and_clip_selection(
+        selected_ids = limit_selected_ids(
             selected_ids,
             candidates=candidates,
             token_budget=self.selection_token_budget,
             max_items=self.selected_max_items,
         )
-        context = _render_selected_context(selected_ids, hits)
+        context = render_formal_selected_context(selected_ids, hits)
         session = TaskEvolverSession(
             task_id=task_id,
             task_group=task_group,
@@ -628,68 +586,6 @@ class EvolverCoordinator:
     def _trace(self, event: str, payload: dict[str, Any]) -> None:
         if self.trace_sink is not None:
             self.trace_sink(event, payload)
-
-
-def _candidate_snapshot(
-    hits: tuple[RetrievalHit[ExperienceMemory], ...],
-) -> tuple[CandidateSnapshotEntry, ...]:
-    ranks = {tier: 0 for tier in ExperienceTier}
-    candidates: list[CandidateSnapshotEntry] = []
-    for hit in hits:
-        tier = hit.entry.tier
-        ranks[tier] += 1
-        candidates.append(CandidateSnapshotEntry(
-            label=f"RETRIEVED_{tier.value.upper()}_{ranks[tier]:02d}",
-            memory_id=hit.entry.id,
-            tier=tier.value,
-            content=hit.entry.content,
-            retrieval_score=float(hit.score),
-            rank=ranks[tier],
-            token_count=hit.entry.token_count,
-        ))
-    return tuple(candidates)
-
-
-def _validate_and_clip_selection(
-    selected_ids: tuple[str, ...],
-    *,
-    candidates: tuple[CandidateSnapshotEntry, ...],
-    token_budget: int,
-    max_items: int,
-) -> tuple[str, ...]:
-    if not isinstance(selected_ids, tuple) or any(not isinstance(item, str) for item in selected_ids):
-        raise ValueError("selector must return a tuple of memory IDs")
-    if len(set(selected_ids)) != len(selected_ids):
-        raise ValueError("selector returned duplicate memory IDs")
-    by_id = {item.memory_id: item for item in candidates}
-    if any(memory_id not in by_id for memory_id in selected_ids):
-        raise ValueError("selector referenced memory outside the frozen candidate snapshot")
-    kept: list[str] = []
-    used_tokens = 0
-    for memory_id in selected_ids:
-        if len(kept) >= max_items:
-            break
-        candidate = by_id[memory_id]
-        if used_tokens + candidate.token_count > token_budget:
-            break
-        kept.append(memory_id)
-        used_tokens += candidate.token_count
-    return tuple(kept)
-
-
-def _render_selected_context(
-    selected_ids: tuple[str, ...],
-    hits: tuple[RetrievalHit[ExperienceMemory], ...],
-) -> MemoryContext[ExperienceMemory]:
-    by_id = {hit.entry.id: hit for hit in hits}
-    selected_hits = [by_id[memory_id] for memory_id in selected_ids]
-    if not selected_hits:
-        return MemoryContext(injected_text="", hits=[], estimated_tokens=0)
-    blocks = [SELECTED_MEMORY_CONTEXT_HEADER]
-    for hit in selected_hits:
-        blocks.append(f"[{hit.entry.id} | {hit.entry.tier.value}]\n{hit.entry.content}")
-    rendered = "\n\n".join(blocks)
-    return MemoryContext(rendered, selected_hits, estimate_tokens(rendered))
 
 
 __all__ = [
