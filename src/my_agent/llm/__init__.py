@@ -119,6 +119,7 @@ class OpenAICompatibleLLM:
         self.base_url = (config.base_url or "https://api.openai.com/v1").rstrip("/")
         self.model = config.model
         self.temperature = config.temperature
+        self.reasoning_effort = config.reasoning_effort
         self.timeout = timeout
         self.max_retries = max(0, max_retries)
 
@@ -128,6 +129,8 @@ class OpenAICompatibleLLM:
             "messages": messages_to_openai(messages),
             "temperature": self.temperature,
         }
+        if self.reasoning_effort is not None:
+            payload["reasoning_effort"] = self.reasoning_effort
         if tools is not None:
             payload["tools"] = tools
         body = self._post_chat_completion(payload)
@@ -150,6 +153,7 @@ class OpenAICompatibleLLM:
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
+                "User-Agent": "AgentCli/1.0",
             },
             method="POST",
         )

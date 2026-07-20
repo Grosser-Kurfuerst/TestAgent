@@ -108,6 +108,7 @@ def tool_environment_overrides(env: Mapping[str, str]) -> dict[str, str]:
         "OPENAI_BASE_URL",
         "MY_AGENT_MODEL",
         "MY_AGENT_TEMPERATURE",
+        "MY_AGENT_REASONING_EFFORT",
         "MY_AGENT_MAX_STEPS",
         "MY_AGENT_COMMAND_TIMEOUT",
         "MY_AGENT_TRACE_DIR",

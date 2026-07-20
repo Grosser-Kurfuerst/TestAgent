@@ -120,6 +120,7 @@ class LLMTests(unittest.TestCase):
                         "MY_AGENT_BASE_URL=https://example.test/v1",
                         "MY_AGENT_MODEL=test-model",
                         "MY_AGENT_TEMPERATURE=0.2",
+                        "MY_AGENT_REASONING_EFFORT=high",
                     ]
                 ),
                 encoding="utf-8",
@@ -139,6 +140,7 @@ class LLMTests(unittest.TestCase):
         payload = json.loads(request.data.decode("utf-8"))
         self.assertEqual(payload["model"], "test-model")
         self.assertEqual(payload["temperature"], 0.2)
+        self.assertEqual(payload["reasoning_effort"], "high")
         self.assertEqual(payload["messages"], [{"role": "user", "content": "plan"}])
         self.assertEqual(urlopen.call_args.kwargs["timeout"], 3)
 
@@ -204,6 +206,7 @@ class LLMTests(unittest.TestCase):
         request = urlopen.call_args.args[0]
         payload = json.loads(request.data.decode("utf-8"))
         self.assertEqual(payload["tools"], tools)
+        self.assertNotIn("reasoning_effort", payload)
 
     def test_openai_chat_retries_retryable_http_errors(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

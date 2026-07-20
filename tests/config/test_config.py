@@ -33,6 +33,7 @@ class AgentConfigTests(unittest.TestCase):
         self.assertIsNone(config.base_url)
         self.assertEqual(config.model, "gpt-4o-mini")
         self.assertEqual(config.temperature, 0.1)
+        self.assertIsNone(config.reasoning_effort)
         self.assertEqual(config.max_steps, 8)
         self.assertEqual(config.command_timeout, 60)
         self.assertEqual(str(config.trace_dir), "traces")
@@ -86,6 +87,7 @@ class AgentConfigTests(unittest.TestCase):
                         'MY_AGENT_BASE_URL="https://example.test/v1"',
                         "MY_AGENT_MODEL=test-model",
                         "MY_AGENT_TEMPERATURE=0.2",
+                        "MY_AGENT_REASONING_EFFORT=high",
                         "MY_AGENT_MAX_STEPS=5",
                         "MY_AGENT_COMMAND_TIMEOUT=12",
                         "MY_AGENT_TRACE_DIR=tmp-traces",
@@ -106,6 +108,7 @@ class AgentConfigTests(unittest.TestCase):
         self.assertEqual(config.base_url, "https://example.test/v1")
         self.assertEqual(config.model, "test-model")
         self.assertEqual(config.temperature, 0.2)
+        self.assertEqual(config.reasoning_effort, "high")
         self.assertEqual(config.max_steps, 5)
         self.assertEqual(config.command_timeout, 12)
         self.assertEqual(str(config.trace_dir), "tmp-traces")

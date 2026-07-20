@@ -31,6 +31,7 @@ def _config_payload(config: object) -> dict[str, object]:
         "base_url": config.base_url,
         "model": config.model,
         "temperature": config.temperature,
+        "reasoning_effort": config.reasoning_effort,
         "max_steps": config.max_steps,
         "command_timeout": config.command_timeout,
         "trace_dir": str(config.trace_dir),

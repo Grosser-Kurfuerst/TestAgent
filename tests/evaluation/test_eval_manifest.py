@@ -162,6 +162,13 @@ class ManifestBenchmarkTests(unittest.TestCase):
 
         self.assertEqual(values["AGENTCLI_MEMORY_PROJECT_KEY"], "stream:alpha")
 
+    def test_config_env_values_preserves_reasoning_effort(self) -> None:
+        config = fake_config(reasoning_effort="high")
+
+        values = _config_env_values(config)
+
+        self.assertEqual(values["MY_AGENT_REASONING_EFFORT"], "high")
+
     def test_config_env_values_preserves_evolver_config(self) -> None:
         config = fake_config(
             memory_evolver_mode="retrieve_select",

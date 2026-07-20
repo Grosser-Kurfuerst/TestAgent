@@ -1271,6 +1271,8 @@ def _config_env_values(config: AgentConfig) -> dict[str, str]:
     }
     if config.base_url:
         values["MY_AGENT_BASE_URL"] = config.base_url
+    if config.reasoning_effort:
+        values["MY_AGENT_REASONING_EFFORT"] = config.reasoning_effort
     if config.memory_evolver_mode == "formal":
         values.update({
             "AGENTCLI_MEMORY_EVOLVER_CANDIDATE_TOP_K_PER_TIER": str(

@@ -29,6 +29,7 @@ class AgentConfig:
     command_timeout: int
     trace_dir: Path
     use_fake_llm: bool
+    reasoning_effort: str | None = None
     tool_env_overrides: dict[str, str] = field(default_factory=dict)
 
     # Dynamic tool loading is opt-in for project-controlled sources.
@@ -197,6 +198,9 @@ class AgentConfig:
             base_url=values.get("MY_AGENT_BASE_URL") or values.get("OPENAI_BASE_URL") or None,
             model=values.get("MY_AGENT_MODEL", "gpt-4o-mini"),
             temperature=float(values.get("MY_AGENT_TEMPERATURE", "0.1")),
+            reasoning_effort=(
+                values.get("MY_AGENT_REASONING_EFFORT", "").strip() or None
+            ),
             max_steps=int(values.get("MY_AGENT_MAX_STEPS", "8")),
             command_timeout=int(values.get("MY_AGENT_COMMAND_TIMEOUT", "60")),
             trace_dir=Path(values.get("MY_AGENT_TRACE_DIR", "traces")),
