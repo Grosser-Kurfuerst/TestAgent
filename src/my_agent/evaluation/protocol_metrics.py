@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """Pure protocol metrics for base-vs-SFT evaluation.
 
 This module intentionally has no model-loading or filesystem side effects, so
@@ -7,16 +5,21 @@ later end-to-end evaluation can reuse these metrics without importing heavy
 training dependencies.
 """
 
+from __future__ import annotations
+
 import json
 import re
 from collections import Counter
 from typing import Any
+
+from my_agent.policy.transformers_policy import parse_tool_calls
 
 
 METRIC_KEYS = (
     "json_valid_rate",
     "field_hit_rate",
     "tool_accuracy",
+    "runtime_tool_call_parse_rate",
     "file_mention_rate",
     "rouge_l",
 )
@@ -132,12 +135,16 @@ def score_response(response: str, sample: dict[str, Any]) -> dict[str, Any]:
     prediction = parse_json_object(response)
     reference = parse_json_object(reference_text)
     tool_accuracy = compute_tool_accuracy(prediction, reference) if task_type == "tool_call" else None
+    runtime_tool_call_parse = (
+        _runtime_tool_call_parse(response) if task_type == "tool_call" else None
+    )
     file_mention_rate = compute_file_mention_rate(response, sample, reference)
     return {
         "task_type": task_type,
         "json_valid": is_valid_json(response),
         "field_hit_rate": compute_field_hit_rate(prediction, task_type),
         "tool_accuracy": tool_accuracy,
+        "runtime_tool_call_parse": runtime_tool_call_parse,
         "file_mention_rate": file_mention_rate,
         "rouge_l": rouge_l_f1(response, reference_text),
     }
@@ -150,6 +157,7 @@ def evaluate_responses(responses: list[str], samples: list[dict[str, Any]]) -> d
     json_valid: list[float] = []
     field_hits: list[float] = []
     tool_accs: list[float] = []
+    runtime_tool_call_parses: list[float] = []
     file_mentions: list[float] = []
     rouge_scores: list[float] = []
     task_counts: Counter[str] = Counter()
@@ -163,6 +171,8 @@ def evaluate_responses(responses: list[str], samples: list[dict[str, Any]]) -> d
         rouge_scores.append(float(score["rouge_l"]))
         if score["tool_accuracy"] is not None:
             tool_accs.append(float(score["tool_accuracy"]))
+        if score["runtime_tool_call_parse"] is not None:
+            runtime_tool_call_parses.append(float(score["runtime_tool_call_parse"]))
         if score["file_mention_rate"] is not None:
             file_mentions.append(float(score["file_mention_rate"]))
 
@@ -172,9 +182,11 @@ def evaluate_responses(responses: list[str], samples: list[dict[str, Any]]) -> d
         "json_valid_rate": _mean(json_valid),
         "field_hit_rate": _mean(field_hits),
         "tool_accuracy": _mean(tool_accs),
+        "runtime_tool_call_parse_rate": _mean(runtime_tool_call_parses),
         "file_mention_rate": _mean(file_mentions),
         "rouge_l": _mean(rouge_scores),
         "_n_tool_accuracy": len(tool_accs),
+        "_n_runtime_tool_call_parse": len(runtime_tool_call_parses),
         "_n_file_mention": len(file_mentions),
     }
 
@@ -219,6 +231,14 @@ def _collect_reference_files(sample: dict[str, Any], reference: dict[str, Any] |
     _collect_files_from_value(sample.get("input"), files)
     _collect_files_from_value(reference, files)
     return files
+
+
+def _runtime_tool_call_parse(response: str) -> float:
+    try:
+        calls = parse_tool_calls(response)
+    except ValueError:
+        return 0.0
+    return 1.0 if calls else 0.0
 
 
 def _collect_files_from_value(value: Any, files: set[str]) -> None:

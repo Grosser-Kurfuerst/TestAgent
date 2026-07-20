@@ -132,6 +132,11 @@ def add_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) 
         action="store_true",
         help="Skip malformed SFT records and include them in dataset_stats.json.",
     )
+    alpaca_parser.add_argument(
+        "--tool-calls-only",
+        action="store_true",
+        help="Export only legacy SFT rows with output.tool and object output.arguments.",
+    )
     alpaca_parser.set_defaults(_handler=handle)
 
     _add_memory_attribution_parsers(subparsers)
@@ -235,6 +240,7 @@ def handle(args: argparse.Namespace, ctx: CliContext) -> int:
                 "train_ratio": args.train_ratio,
                 "seed": args.seed,
                 "strict": not args.non_strict,
+                "tool_calls_only": args.tool_calls_only,
             }
             if args.system_prompt:
                 kwargs["system_prompt"] = args.system_prompt

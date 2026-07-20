@@ -1,9 +1,0 @@
-{
-  "schema_version": "agentcli-lf-tool-fixture-manifest-v1",
-  "fixtures": {
-    "openai_tool_multi.json": "sha256:d5e37ffdc890d36e0630fefb299c61dd2ee494f9ebc0d5e38b2cebdb17a84604",
-    "openai_tool_observation.json": "sha256:948eddff9b63c86057783203ac124d7d4fb5773ac7e11af92a7b5f6104b8034b",
-    "openai_tool_single.json": "sha256:2b8c053dbec1a363ae2fd7cd0fba60311643957335f4948f21cffef4ac40f723"
-  },
-  "dataset_info_fixture_hash": "sha256:8ca1656917585face4bc9d68399124bec594652993e5083ed7f25af2faade24f"
-}

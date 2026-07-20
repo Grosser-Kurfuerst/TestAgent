@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from pathlib import Path
+import json
 import tempfile
 import unittest
 
@@ -154,6 +155,32 @@ class TransformersPolicyTests(unittest.TestCase):
         calls = parse_tool_calls(RAW_TOOL_CALL)
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0].arguments_json, '{"path":"src/a.py"}')
+
+    def test_tool_parser_accepts_legacy_sft_tool_json(self) -> None:
+        calls = parse_tool_calls(json.dumps({
+            "tool": "read_file",
+            "arguments": {"path": "src/a.py"},
+            "reason": "inspect",
+        }))
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].name, "read_file")
+        self.assertEqual(calls[0].arguments_json, '{"path":"src/a.py"}')
+
+    def test_tool_parser_rejects_conflicting_native_and_legacy_names(self) -> None:
+        with self.assertRaisesRegex(ValueError, "conflicts"):
+            parse_tool_calls(json.dumps({
+                "name": "read_file",
+                "tool": "run_tests",
+                "arguments": {},
+            }))
+
+    def test_tool_parser_rejects_legacy_non_object_arguments(self) -> None:
+        with self.assertRaisesRegex(ValueError, "must be an object"):
+            parse_tool_calls(json.dumps({
+                "tool": "read_file",
+                "arguments": ["src/a.py"],
+            }))
 
     def test_invalid_tool_output_retains_exact_generated_token_span(self) -> None:
         tokenizer = _MalformedTokenizer()

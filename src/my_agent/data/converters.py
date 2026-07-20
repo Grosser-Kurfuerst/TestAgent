@@ -1,10 +1,10 @@
-from __future__ import annotations
-
 """LLaMA-Factory / Alpaca format conversion for SFT samples.
 
 Takes JSONL SFT records (instruction/input/output/metadata) and produces
 the alpaca-format JSON arrays expected by LLaMA-Factory, plus dataset metadata.
 """
+
+from __future__ import annotations
 
 import json
 import random
@@ -34,6 +34,7 @@ class AlpacaOutput:
     train: int = 0
     val: int = 0
     skipped: int = 0
+    filtered: int = 0
     errors: tuple[str, ...] = ()
     source_counts: dict[str, int] = field(default_factory=dict)
 
@@ -43,6 +44,7 @@ class AlpacaOutput:
             f"Train: {self.train}",
             f"Val:   {self.val}",
             f"Skipped: {self.skipped}",
+            f"Filtered: {self.filtered}",
             "",
             "Source counts:",
         ]
@@ -79,6 +81,7 @@ def export_alpaca(
     train_name: str = "coding_agent_train",
     val_name: str = "coding_agent_val",
     strict: bool = True,
+    tool_calls_only: bool = False,
 ) -> AlpacaOutput:
     """Read one or more SFT JSONL files and produce LLaMA-Factory alpaca splits.
 
@@ -106,6 +109,7 @@ def export_alpaca(
     rows: list[dict[str, str]] = []
     source_counts: dict[str, int] = {}
     skipped = 0
+    filtered = 0
     errors: list[str] = []
     for input_file in input_files:
         path = Path(input_file)
@@ -127,6 +131,9 @@ def export_alpaca(
                     raise
                 errors.append(str(exc))
                 skipped += 1
+                continue
+            if tool_calls_only and not _is_tool_call_record(record):
+                filtered += 1
                 continue
             source = _resolve_source(record, path.name)
             rows.append(_to_alpaca(record, source, system_prompt))
@@ -177,6 +184,8 @@ def export_alpaca(
         "train": len(train_rows),
         "val": len(val_rows),
         "skipped": skipped,
+        "filtered": filtered,
+        "tool_calls_only": tool_calls_only,
         "source_counts": source_counts,
         "errors": errors,
     }
@@ -192,6 +201,7 @@ def export_alpaca(
         train=len(train_rows),
         val=len(val_rows),
         skipped=skipped,
+        filtered=filtered,
         errors=tuple(errors),
         source_counts=source_counts,
     )
@@ -208,6 +218,16 @@ def _to_alpaca(record: dict[str, Any], source_name: str, system_prompt: str) -> 
         "input": json.dumps(user_input, ensure_ascii=False, indent=2),
         "output": json.dumps(output, ensure_ascii=False, indent=2),
     }
+
+
+def _is_tool_call_record(record: dict[str, Any]) -> bool:
+    output = record.get("output")
+    return (
+        isinstance(output, dict)
+        and isinstance(output.get("tool"), str)
+        and bool(output["tool"].strip())
+        and isinstance(output.get("arguments"), dict)
+    )
 
 
 def _validate_train_ratio(train_ratio: float) -> None:

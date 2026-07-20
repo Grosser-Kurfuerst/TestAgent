@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -69,6 +71,7 @@ class SftProtocolMetricTests(unittest.TestCase):
         self.assertTrue(score["json_valid"])
         self.assertEqual(score["field_hit_rate"], 1.0)
         self.assertEqual(score["tool_accuracy"], 1.0)
+        self.assertEqual(score["runtime_tool_call_parse"], 1.0)
         self.assertEqual(score["file_mention_rate"], 1.0)
         self.assertGreater(score["rouge_l"], 0.5)
 
@@ -84,6 +87,7 @@ class SftProtocolMetricTests(unittest.TestCase):
         self.assertFalse(score["json_valid"])
         self.assertEqual(score["field_hit_rate"], 0.0)
         self.assertEqual(score["tool_accuracy"], 0.0)
+        self.assertEqual(score["runtime_tool_call_parse"], 0.0)
         self.assertEqual(score["file_mention_rate"], 1.0)
 
     def test_evaluate_responses_aggregates_required_metrics(self) -> None:
@@ -110,6 +114,7 @@ class SftProtocolMetricTests(unittest.TestCase):
         self.assertEqual(metrics["json_valid_rate"], 1.0)
         self.assertEqual(metrics["field_hit_rate"], 1.0)
         self.assertEqual(metrics["tool_accuracy"], 1.0)
+        self.assertEqual(metrics["runtime_tool_call_parse_rate"], 1.0)
         self.assertAlmostEqual(metrics["file_mention_rate"], 0.75)
         self.assertIn("repair_plan", metrics["task_counts"])
 
@@ -171,6 +176,7 @@ class SftProtocolOutputTests(unittest.TestCase):
             self.assertIn("base", summary)
             self.assertIn("sft", summary)
             self.assertIn("delta", summary)
+            self.assertEqual(summary["sft"]["runtime_tool_call_parse_rate"], 1.0)
             self.assertNotIn("passed", summary)
             details = json.loads((output_dir / "detailed_results.json").read_text(encoding="utf-8"))
             self.assertEqual(details[0]["task_type"], "tool_call")
@@ -225,6 +231,68 @@ class SftProtocolOutputTests(unittest.TestCase):
         self.assertIn("NUM_TRAIN_EPOCHS", text)
         self.assertIn("CUTOFF_LEN", text)
         self.assertIn("llamafactory-cli", text)
+
+    def test_training_script_uses_opd_warm_start_contract(self) -> None:
+        script = Path(__file__).resolve().parents[2] / "scripts" / "train_llamafactory_lora.sh"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dataset = root / "dataset"
+            dataset.mkdir()
+            (dataset / "dataset_info.json").write_text("{}", encoding="utf-8")
+            sample = [{"instruction": "tool", "input": "{}", "output": "{}"}]
+            (dataset / "train_alpaca.json").write_text(json.dumps(sample), encoding="utf-8")
+            (dataset / "val_alpaca.json").write_text(json.dumps(sample), encoding="utf-8")
+            capture = root / "args.json"
+            fake_cli = root / "llamafactory-cli"
+            fake_cli.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, sys\n"
+                "if sys.argv[1:] == ['version']:\n"
+                "    print('LLaMA-Factory 0.9.4')\n"
+                "else:\n"
+                "    open(os.environ['CAPTURE_FILE'], 'w', encoding='utf-8').write(json.dumps(sys.argv[1:]))\n",
+                encoding="utf-8",
+            )
+            fake_cli.chmod(0o755)
+            environment = dict(os.environ)
+            environment.update({
+                "DATASET_DIR": str(dataset),
+                "OUTPUT_DIR": str(root / "output"),
+                "LLAMAFACTORY_CMD": str(fake_cli),
+                "CAPTURE_FILE": str(capture),
+            })
+
+            subprocess.run(["bash", str(script)], check=True, env=environment)
+
+            arguments = json.loads(capture.read_text(encoding="utf-8"))
+            pairs = dict(zip(arguments[1::2], arguments[2::2]))
+            self.assertEqual(arguments[0], "train")
+            self.assertEqual(pairs["--model_name_or_path"], "Qwen/Qwen3-4B-Instruct-2507")
+            self.assertEqual(pairs["--model_revision"], "cdbee75f17c01a7cc42f958dc650907174af0554")
+            self.assertEqual(pairs["--template"], "qwen3_nothink")
+            self.assertEqual(pairs["--lora_rank"], "16")
+            self.assertEqual(pairs["--lora_alpha"], "32")
+            self.assertEqual(pairs["--lora_dropout"], "0.0")
+            self.assertEqual(pairs["--lora_target"], "q_proj,k_proj,v_proj,o_proj")
+            self.assertEqual(pairs["--train_on_prompt"], "false")
+            self.assertEqual(pairs["--mask_history"], "true")
+            self.assertEqual(pairs["--cutoff_len"], "8192")
+            manifest = json.loads(
+                (root / "output" / "sft_training_manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                manifest["schema_version"], "agentcli-legacy-sft-training-v1"
+            )
+            self.assertEqual(manifest["template"], "qwen3_nothink")
+            self.assertEqual(
+                manifest["base_model"], "Qwen/Qwen3-4B-Instruct-2507"
+            )
+            self.assertEqual(
+                manifest["adapter_config_hash"],
+                "sha256:fc2d911dc40bbf3965a70afab1547eea4102a2c1c54bd0a44cbf5b40cbc5f91c",
+            )
 
 
 if __name__ == "__main__":

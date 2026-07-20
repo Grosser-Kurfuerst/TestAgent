@@ -1,6 +1,6 @@
-from __future__ import annotations
-
 """Protocol evaluation orchestration and artifact writing."""
+
+from __future__ import annotations
 
 import json
 import math
@@ -159,6 +159,7 @@ def render_report(summary: dict[str, Any], details: list[dict[str, Any]]) -> str
             "",
             "- Higher JSON validity and field hit rate indicate better adherence to the agent output protocol.",
             "- Tool accuracy is meaningful only for tool-call samples with reference tool names.",
+            "- Runtime tool-call parse rate verifies that the current AgentCli parser can execute the response.",
             "- File mention rate checks whether referenced implementation or test files appear in the prediction.",
             "- ROUGE-L is a weak similarity signal and should be inspected with detailed results.",
             "- End-to-end repair quality still requires separate agent runs, diffs, and tests.",

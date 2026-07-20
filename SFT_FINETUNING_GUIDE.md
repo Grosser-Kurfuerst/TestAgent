@@ -1,140 +1,79 @@
-# SFT Fine-Tuning Guide
+# SFT Warm-Start and OPD Integration Guide
 
-本文档说明如何在 `my-Agent` 中准备 SFT 数据、使用 LLaMA-Factory 进行 LoRA SFT 微调，以及如何使用微调后的模型进行测试。
+本文档说明如何复用 AgentCli 原有的 legacy Alpaca SFT 流程，训练 Qwen3-4B LoRA，并将训练结果注册为 OPD 的初始检查点 M0。
 
-所有命令默认在仓库根目录执行：
-
-```bash
-cd /home/kurfuerst/Coding/work/Coding-Agent/SFT/my-Agent
-```
-
-## 1. 总体流程
-
-完整链路是：
+## 1. 数据流
 
 ```text
-原始任务 / Agent trace
-  -> SFT JSONL
-  -> LLaMA-Factory Alpaca 数据
-  -> LoRA SFT 训练
-  -> protocol 评估
-  -> 可选：MBPP 端到端评估
+task manifest / passed Agent traces
+  -> legacy SFT JSONL
+  -> export-alpaca --tool-calls-only
+  -> data/llamafactory
+  -> train_llamafactory_lora.sh
+  -> trainer-output
+  -> register_sft_checkpoint.py
+  -> outputs/opd/M0
 ```
 
-其中：
+原始 SFT schema 保持不变：
 
-- SFT JSONL 是本项目内部的统一监督数据格式。
-- Alpaca 数据是 LLaMA-Factory 训练需要的格式。
-- LoRA 训练产物是 adapter checkpoint，不是完整模型。
-- `eval_sft_protocol.py` 测的是模型输出协议质量。
-- `eval_mbpp.py` 测的是完整 coding agent 在 MBPP repo 上修代码并跑测试的端到端效果。
+```json
+{
+  "instruction": "根据用户任务、计划和已有工具轨迹，选择下一步工具调用。",
+  "input": {
+    "task": "修复测试失败",
+    "plan": "",
+    "history": []
+  },
+  "output": {
+    "tool": "read_file",
+    "arguments": {"path": "src/example.py"},
+    "reason": "inspect"
+  }
+}
+```
 
-## 2. 准备依赖
+当前 runtime 会把顶层 `tool` 当作 `name` 的 legacy 别名，因此这个输出能够转换为真实 `CanonicalToolCall` 并执行。
 
-安装项目数据和开发依赖：
+## 2. 构建原有 SFT 数据
+
+从可运行任务生成 strategy 样本：
 
 ```bash
-uv sync --extra data --extra dev
+UV_CACHE_DIR=/tmp/agentcli-uv-cache uv run my-agent tasks-to-sft \
+  --input data/sft_raw/tasks/tasks.jsonl \
+  --output data/sft_raw/sft/task_strategy_sft.jsonl
 ```
 
-真实 LoRA 训练还需要安装 LLaMA-Factory，并确保命令可用：
+从已经通过 benchmark 的 trace 生成 next-tool-call 样本：
 
 ```bash
-# 新建一个虚拟环境，安装 LLaMA-Factory
-uv venv venv_train --python 3.12
-source venv_train/bin/activate
-
-git clone --depth 1 https://github.com/hiyouga/LLaMA-Factory.git
-cd LLaMA-Factory
-pip install -e ".[torch,metrics]"
-```
-
-```bash
-llamafactory-cli version
-```
-
-如果你的命令不是 `llamafactory-cli`，训练时可以用 `LLAMAFACTORY_CMD` 指定。
-
-真实模型推理评估还需要 `torch`、`transformers` 和 `peft`。这些依赖不在当前 `pyproject.toml` 的基础依赖中，需要在你的训练/推理环境中单独安装。
-
-## 3. 构建 SFT JSONL 数据
-
-### 3.1 从 MBPP 构建
-
-```bash
-uv run python run_agent.py build-mbpp \
-  --limit 500 \
-  --output-dir data/sft_raw
-```
-
-输出包括：
-
-```text
-data/sft_raw/
-  repos/mbpp/
-  tasks/mbpp_tasks.jsonl
-  sft/mbpp_sft.jsonl
-```
-
-`mbpp_sft.jsonl` 主要是 `write_file` 风格样本，用于让模型学习根据任务和测试生成 `solution.py`。
-
-### 3.2 从 HumanEval 构建
-
-```bash
-uv run python run_agent.py build-humaneval \
-  --limit 100 \
-  --output-dir data/sft_raw
-```
-
-输出包括：
-
-```text
-data/sft_raw/
-  repos/humaneval/
-  tasks/humaneval_tasks.jsonl
-  sft/humaneval_sft.jsonl
-```
-
-### 3.3 从任务 manifest 构建 strategy SFT
-
-如果已经有任务 manifest，例如 `mbpp_tasks.jsonl`，可以转成 strategy 样本：
-
-```bash
-uv run python run_agent.py tasks-to-sft \
-  --input data/sft_raw/tasks/mbpp_tasks.jsonl \
-  --output data/sft_raw/sft/mbpp_strategy_sft.jsonl
-```
-
-这类样本用于让模型学习如何选择下一步策略，而不是直接生成完整代码。
-
-### 3.4 从 Agent trace 构建 SFT
-
-把已有 agent 运行 trace 转成 SFT 样本：
-
-```bash
-uv run python run_agent.py traces-to-sft \
+UV_CACHE_DIR=/tmp/agentcli-uv-cache uv run my-agent traces-to-sft \
   --input traces \
   --output data/sft_raw/sft/agent_traces_sft.jsonl
 ```
 
-trace 转换会保留成功的非 `finish` 工具调用，用于让模型学习真实 agent 轨迹中的工具调用格式和上下文。
+`traces-to-sft` 只转换包含 `benchmark_result.status=passed` 的 trace，并保留成功的非 `finish` 工具调用。
 
-## 4. 导出 LLaMA-Factory Alpaca 数据
+也可以继续使用 `build-mbpp`、`build-humaneval` 和 `swebench-to-sft` 生成原有 schema 的数据。
 
-把一个或多个 SFT JSONL 文件导出为 LLaMA-Factory 可训练格式：
+## 3. 导出 LLaMA-Factory Alpaca 数据
+
+OPD warm-start 只需要工具调用样本，因此使用 `--tool-calls-only` 排除 strategy 和 repair-plan 输出：
 
 ```bash
-uv run python run_agent.py export-alpaca \
+UV_CACHE_DIR=/tmp/agentcli-uv-cache uv run my-agent export-alpaca \
   --inputs \
     data/sft_raw/sft/mbpp_sft.jsonl \
     data/sft_raw/sft/humaneval_sft.jsonl \
-    data/sft_raw/sft/mbpp_strategy_sft.jsonl \
     data/sft_raw/sft/agent_traces_sft.jsonl \
   --output-dir data/llamafactory \
-  --train-ratio 0.95
+  --train-ratio 0.95 \
+  --seed 42 \
+  --tool-calls-only
 ```
 
-导出后目录应包含：
+输出：
 
 ```text
 data/llamafactory/
@@ -144,356 +83,154 @@ data/llamafactory/
   dataset_stats.json
 ```
 
-训练前建议检查 `dataset_stats.json`：
+训练前检查：
 
 ```bash
-cat data/llamafactory/dataset_stats.json
+jq '{total, train, val, skipped, filtered, tool_calls_only, source_counts}' \
+  data/llamafactory/dataset_stats.json
 ```
 
-重点看：
+`train` 和 `val` 都必须大于零。默认不传 `--tool-calls-only` 时，`export-alpaca` 仍保持原有行为。
 
-- `total`：总样本数。
-- `train` / `val`：训练集和验证集数量。
-- `skipped`：被跳过的坏样本数量。
-- `source_counts`：各数据来源的样本数量。
+## 4. 安装 LLaMA-Factory
 
-## 5. 启动 LoRA SFT 训练
-
-使用默认配置训练：
+使用独立 Python 3.11 环境安装 LLaMA-Factory 0.9.4，避免覆盖 AgentCli 的依赖：
 
 ```bash
-DATASET_DIR=data/llamafactory \
-OUTPUT_DIR=outputs/coding_agent_lora \
-BASE_MODEL=Qwen/Qwen3.5-9B \
-CUDA_VISIBLE_DEVICES=0 \
-BATCH_SIZE=1 \
-GRADIENT_ACCUMULATION_STEPS=16 \
-LEARNING_RATE=1e-4 \
-NUM_TRAIN_EPOCHS=1 \
-CUTOFF_LEN=4096 \
-bash scripts/train_llamafactory_lora.sh
+git clone --depth 1 --branch v0.9.4 \
+  https://github.com/hiyouga/LLaMA-Factory.git \
+  ../LLaMA-Factory-v0.9.4
+
+cd ../LLaMA-Factory-v0.9.4
+uv venv --python 3.11 .venv
+uv pip install --python .venv/bin/python -e .
+source .venv/bin/activate
+llamafactory-cli version
 ```
 
-这里的 `BASE_MODEL=Qwen/Qwen3.5-9B` 指向 Hugging Face 上的原始 HuggingFace/Transformers 权重。也可以使用等价的本地 `safetensors` 模型目录。
+版本输出必须包含 `0.9.4`。该 legacy Alpaca 流程不需要 AgentCli 自定义 ingestion patch。
 
-如果 base model 已经下载到本地：
+## 5. 训练 Qwen3-4B LoRA
+
+回到 AgentCli 仓库根目录后执行：
 
 ```bash
 DATASET_DIR=data/llamafactory \
 OUTPUT_DIR=outputs/coding_agent_lora \
-LOCAL_MODEL_DIR=/root/autodl-tmp/CodeAgent-SFT/models/Qwen3.5-9B \
 CUDA_VISIBLE_DEVICES=0 \
-BATCH_SIZE=1 \
-GRADIENT_ACCUMULATION_STEPS=16 \
-LEARNING_RATE=1e-4 \
-NUM_TRAIN_EPOCHS=1 \
-CUTOFF_LEN=4096 \
 bash scripts/train_llamafactory_lora.sh
 ```
 
-常用可调参数：
-
-```bash
-LORA_RANK=8
-LORA_ALPHA=32
-LORA_TARGET=all
-BATCH_SIZE=1
-GRADIENT_ACCUMULATION_STEPS=16
-LEARNING_RATE=1e-4
-NUM_TRAIN_EPOCHS=1
-CUTOFF_LEN=4096
-SAVE_STEPS=50
-EVAL_STEPS=50
-BF16=true
-FP16=false
-```
-
-训练脚本实际调用的是：
+默认训练合同：
 
 ```text
-llamafactory-cli train
+base model: Qwen/Qwen3-4B-Instruct-2507
+revision: cdbee75f17c01a7cc42f958dc650907174af0554
+template: qwen3_nothink
+LoRA: rank=16, alpha=32, dropout=0
+targets: q_proj,k_proj,v_proj,o_proj
+learning rate: 2e-5
+cutoff length: 8192
+batch size: 1
+gradient accumulation: 16
+BF16: true
 ```
 
-并使用：
+脚本会拒绝与 OPD shared adapter 不一致的 LoRA 参数，也会拒绝空的 train/validation 数据或错误的 LLaMA-Factory 版本。
+
+为保证 M0 身份可以追溯，训练脚本不允许使用 `LOCAL_MODEL_DIR` 或其他本地模型覆盖。训练完成后会额外写入：
 
 ```text
---stage sft
---finetuning_type lora
---template qwen
---dataset coding_agent_train
---eval_dataset coding_agent_val
+outputs/coding_agent_lora/sft_training_manifest.json
 ```
 
-训练完成后，LoRA adapter 会在：
+其中固定记录实际训练使用的 base model、immutable revision、tokenizer revision、`qwen3_nothink` 模板、LLaMA-Factory 版本以及 canonical adapter config/hash。
 
-```text
-outputs/coding_agent_lora/
-```
-
-常见结构：
+训练完成后，最终 adapter 必须直接位于：
 
 ```text
 outputs/coding_agent_lora/
   adapter_config.json
   adapter_model.safetensors
-  checkpoint-50/
-  checkpoint-100/
-  trainer_state.json
+  sft_training_manifest.json
 ```
 
-如果存在多个 `checkpoint-*`，当前评估代码会自动选择编号最大的 checkpoint。
+中间 `checkpoint-*` 可以保留用于训练审计，但注册脚本不会自动选择它们。
 
-## 6. 使用微调模型做 protocol 评估
-
-这个评估比较 base model 和 LoRA adapter 在验证集上的输出协议质量。
+## 6. Protocol 评估
 
 ```bash
-uv run python scripts/eval_sft_protocol.py \
+UV_CACHE_DIR=/tmp/agentcli-uv-cache uv run --extra opd-train python \
+  scripts/eval_sft_protocol.py \
   --val-data data/llamafactory/val_alpaca.json \
-  --base-model Qwen/Qwen3.5-9B \
+  --base-model Qwen/Qwen3-4B-Instruct-2507 \
   --adapter-dir outputs/coding_agent_lora \
-  --output-dir outputs/sft_protocol_eval \
-  --limit 100 \
-  --max-new-tokens 512 \
-  --device auto \
-  --dtype bfloat16
+  --output-dir outputs/sft_protocol_eval
 ```
 
-如果 base model 在本地：
-
-```bash
-uv run python scripts/eval_sft_protocol.py \
-  --val-data data/llamafactory/val_alpaca.json \
-  --base-model /path/to/Qwen3.5-9B \
-  --adapter-dir outputs/coding_agent_lora \
-  --output-dir outputs/sft_protocol_eval \
-  --limit 100 \
-  --max-new-tokens 512
-```
-
-输出目录：
+除原有 JSON、字段和工具准确率外，报告还包含：
 
 ```text
-outputs/sft_protocol_eval/
-  base_responses.json
-  sft_responses.json
-  metrics_summary.json
-  detailed_results.json
-  experiment_report.md
+runtime_tool_call_parse_rate
 ```
 
-核心指标：
+该指标表示生成结果能否被当前 AgentCli runtime 解析为至少一个真实工具调用。
 
-- `json_valid_rate`：输出是否是严格 JSON object。
-- `field_hit_rate`：必填字段是否完整。
-- `tool_accuracy`：工具调用样本中工具名是否正确。
-- `file_mention_rate`：输出是否提到关键文件路径。
-- `rouge_l`：与参考输出的弱文本相似度。
-
-这个评估只说明模型是否更会遵守 agent 输出协议，不直接证明模型具备复杂真实代码修复能力。
-
-## 7. 使用响应文件做指标回放
-
-如果已经有 `base_responses.json` 和 `sft_responses.json`，可以只跑指标计算，不加载模型：
+## 7. 注册为 M0
 
 ```bash
-uv run python scripts/eval_sft_protocol.py \
-  --val-data data/llamafactory/val_alpaca.json \
-  --base-responses outputs/sft_protocol_eval/base_responses.json \
-  --sft-responses outputs/sft_protocol_eval/sft_responses.json \
-  --output-dir outputs/sft_protocol_eval_replay
+UV_CACHE_DIR=/tmp/agentcli-uv-cache uv run --extra opd-train python \
+  scripts/register_sft_checkpoint.py \
+  --trainer-output outputs/coding_agent_lora \
+  --output outputs/opd/M0 \
+  --base-model Qwen/Qwen3-4B-Instruct-2507 \
+  --base-revision cdbee75f17c01a7cc42f958dc650907174af0554 \
+  --tokenizer-revision cdbee75f17c01a7cc42f958dc650907174af0554 \
+  --opd-config configs/opd_paper_train.yaml
 ```
 
-这适合：
+注册步骤会：
 
-- 快速验证指标逻辑。
-- 在无 GPU 环境下复算结果。
-- 对同一批响应生成不同报告。
+- 校验 trainer-output 根目录中的最终 adapter；
+- 校验 `sft_training_manifest.json` 与注册参数、PEFT adapter 和 OPD 配置一致；
+- 校验 adapter 与 OPD shared adapter 合同一致；
+- 使用 `TransformersPolicy` 加载 base model 和 adapter；
+- 复制干净的 deployable adapter；
+- 写入 `policy_identity_manifest.json`。
 
-## 8. 使用微调模型跑 MBPP 端到端测试
-
-`eval_sft_protocol.py` 直接加载 base model + LoRA adapter。
-
-但 `scripts/eval_mbpp.py` 走的是 agent runtime，runtime 通过 OpenAI-compatible API 调模型。因此，想用微调模型跑 MBPP，需要先把模型服务成 OpenAI-compatible API。
-
-常见方式：
-
-1. 用 LLaMA-Factory / vLLM / 其他推理服务加载 base model + LoRA adapter。
-2. 或先把 LoRA adapter merge 到 base model，再服务 merged model。
-
-服务启动后，配置 `.env`：
-
-```bash
-MY_AGENT_LLM_PROVIDER=openai
-MY_AGENT_API_KEY=dummy
-MY_AGENT_BASE_URL=http://127.0.0.1:8000/v1
-MY_AGENT_MODEL=your-sft-served-model-name
-MY_AGENT_TEMPERATURE=0.1
-MY_AGENT_MAX_STEPS=10
-MY_AGENT_COMMAND_TIMEOUT=60
-MY_AGENT_TRACE_DIR=traces
-```
-
-检查配置：
-
-```bash
-uv run python run_agent.py config --check-api-key
-```
-
-跑少量 MBPP：
-
-```bash
-uv run python scripts/eval_mbpp.py \
-  --limit 10 \
-  --output-dir evaluationResults/mbpp_sft_eval_run1 \
-  --max-steps 10
-```
-
-跑全量 MBPP：
-
-```bash
-uv run python scripts/eval_mbpp.py \
-  --limit 500 \
-  --output-dir evaluationResults/mbpp_sft_eval_full \
-  --max-steps 10
-```
-
-建议每次评估使用新的 `--output-dir`，避免 `results.jsonl` 追加到旧结果里。
-
-## 9. 使用微调模型跑 HumanEval 端到端对比
-
-如果要直接对比 base model 和 LoRA SFT adapter 的完整 Agent 修题能力，可以使用 `eval_sft_humaneval_api.py`。这个脚本会顺序启动两个 LLaMA-Factory OpenAI-compatible API 服务：先跑 base HumanEval，再关闭服务并启动带 adapter 的 SFT 服务跑同一批 HumanEval。
-
-```bash
-uv run python scripts/eval_sft_humaneval_api.py \
-  --base-model Qwen/Qwen3.5-9B \
-  --adapter-dir outputs/coding_agent_lora \
-  --output-dir evaluationResults/humaneval_base_vs_sft \
-  --limit 10 \
-  --max-steps 10 \
-  --template qwen \
-  --api-port 8000
-```
-
-如果使用 vLLM 后端，可以通过 override 透传 LLaMA-Factory 推理参数：
-
-```bash
-uv run python scripts/eval_sft_humaneval_api.py \
-  --base-model Qwen/Qwen3.5-9B \
-  --adapter-dir outputs/coding_agent_lora \
-  --output-dir evaluationResults/humaneval_base_vs_sft_vllm \
-  --limit 10 \
-  --infer-backend vllm \
-  --serve-override vllm_enforce_eager=true
-```
-
-输出目录：
+输出：
 
 ```text
-evaluationResults/humaneval_base_vs_sft/
-  base/results.jsonl
-  base/summary.json
-  base/server.log
-  sft/results.jsonl
-  sft/summary.json
-  sft/server.log
-  comparison_summary.json
-  experiment_report.md
+outputs/opd/M0/
+  adapter/
+    adapter_config.json
+    adapter_model.safetensors
+  sft_training_manifest.json
+  policy_identity_manifest.json
 ```
 
-这个评估复用 `eval_humaneval.py` 的完整 Agent 流程：构造 HumanEval repo、让 Agent 修改 `solution.py`、运行测试并统计通过率。它和 `eval_sft_protocol.py` 的区别是，前者评估端到端修题效果，后者只评估输出协议质量。
+## 8. 从 M0 进入 OPD
 
-## 10. 推荐实验顺序
+OPD round 0 使用：
 
-第一次跑通建议：
+```text
+checkpoint: outputs/opd/M0/adapter
+identity manifest: outputs/opd/M0/policy_identity_manifest.json
+```
 
-1. `build-mbpp --limit 20` 和 `build-humaneval --limit 20`，先构建小数据。
-2. `export-alpaca`，确认 `dataset_stats.json` 正常。
-3. 用 `NUM_TRAIN_EPOCHS=1` 跑一次小规模 LoRA。
-4. 跑 `eval_sft_protocol.py --limit 50`，检查协议指标。
-5. 如果协议指标有提升，再服务 LoRA 模型。
-6. 跑 `eval_mbpp.py --limit 10`，检查端到端通过率。
-7. 跑 `eval_sft_humaneval_api.py --limit 10`，对比 base/SFT 的 HumanEval 端到端通过率。
-8. 最后再扩大样本数、训练 epoch 和 MBPP/HumanEval 评测规模。
-
-## 11. 常见问题
-
-### `llamafactory-cli` 找不到
-
-确认 LLaMA-Factory 是否安装，并且当前 shell 能找到命令：
+示例：
 
 ```bash
-which llamafactory-cli
-llamafactory-cli version
+UV_CACHE_DIR=/tmp/agentcli-uv-cache uv run --extra opd-train python \
+  scripts/train_opd_evolver.py \
+  --config configs/opd_paper_train.yaml \
+  --checkpoint outputs/opd/M0/adapter \
+  --identity-manifest outputs/opd/M0/policy_identity_manifest.json \
+  --learner-dataset outputs/opd/round-0/learner_dataset.jsonl \
+  --export-manifest outputs/opd/round-0/export_manifest.json \
+  --output-dir outputs/opd/M1
 ```
 
-如果命令路径不同：
+OPD trainer 会继续训练 M0 中唯一的 LoRA adapter，不会创建第二个 adapter。
 
-```bash
-LLAMAFACTORY_CMD=/path/to/llamafactory-cli \
-bash scripts/train_llamafactory_lora.sh
-```
-
-### 缺少 `dataset_info.json`
-
-说明还没有执行 `export-alpaca`，或者 `DATASET_DIR` 指错了。
-
-检查：
-
-```bash
-ls data/llamafactory
-```
-
-重新导出：
-
-```bash
-uv run python run_agent.py export-alpaca \
-  --inputs data/sft_raw/sft/mbpp_sft.jsonl \
-  --output-dir data/llamafactory
-```
-
-### 显存不够
-
-优先降低：
-
-```bash
-BATCH_SIZE=1
-CUTOFF_LEN=2048
-```
-
-也可以增大：
-
-```bash
-GRADIENT_ACCUMULATION_STEPS=32
-```
-
-如果仍然不够，换更小的 base model 或使用量化训练方案。
-
-### Protocol 指标提升但 MBPP 不提升
-
-这通常说明模型更会输出格式，但端到端修题能力仍不足。优先检查：
-
-- `traces/` 中是否还有大量 `invalid_tool_call`。
-- 是否经常没有读取测试文件就编辑。
-- 是否经常使用大段 `write_file` 生成非法 JSON。
-- 是否工具 description 和 actor prompt 足够明确。
-- MBPP 失败是协议问题、语义问题还是 API transient error。
-
-### MBPP 端到端评测调用的不是微调模型
-
-确认 `.env` 中：
-
-```bash
-MY_AGENT_BASE_URL=http://127.0.0.1:8000/v1
-MY_AGENT_MODEL=your-sft-served-model-name
-MY_AGENT_LLM_PROVIDER=openai
-MY_AGENT_USE_FAKE_LLM=false
-```
-
-然后运行：
-
-```bash
-uv run python run_agent.py config --check-api-key
-```
-
-确认输出里 `use_fake_llm` 是 `false`，并且 `model` 是你服务出来的微调模型名。
+`data/` 和 `outputs/` 均为运行产物目录，不应提交到 Git。

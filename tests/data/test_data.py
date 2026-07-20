@@ -401,7 +401,50 @@ class ExportAlpacaTests(unittest.TestCase):
         self.assertEqual(stats["total"], 2)
         self.assertEqual(stats["train"] + stats["val"], 2)
         self.assertEqual(stats["skipped"], 0)
+        self.assertEqual(stats["filtered"], 0)
+        self.assertFalse(stats["tool_calls_only"])
         self.assertIn("source_counts", stats)
+
+    def test_tool_calls_only_filters_non_tool_records(self) -> None:
+        mixed_file = self.tmp / "mixed_tool_records.jsonl"
+        _write_jsonl(
+            mixed_file,
+            [
+                {
+                    "instruction": "根据任务选择工具。",
+                    "input": {"task": "fix bug"},
+                    "output": {
+                        "tool": "read_file",
+                        "arguments": {"path": "x.py"},
+                        "reason": "inspect",
+                    },
+                },
+                {
+                    "instruction": "制定策略。",
+                    "input": {"task": "fix bug"},
+                    "output": {"strategy": [{"tool": "read_file"}]},
+                },
+                {
+                    "instruction": "制定修复计划。",
+                    "input": {"task": "fix bug"},
+                    "output": {"plan": "inspect", "validation": "pytest"},
+                },
+            ],
+        )
+
+        result = export_alpaca(
+            input_files=[mixed_file],
+            output_dir=self.tmp / "alpaca_tool_only",
+            tool_calls_only=True,
+        )
+
+        self.assertEqual(result.total, 1)
+        self.assertEqual(result.filtered, 2)
+        exported = json.loads(result.train_path.read_text(encoding="utf-8"))
+        self.assertEqual(json.loads(exported[0]["output"])["tool"], "read_file")
+        stats = json.loads(result.stats_path.read_text(encoding="utf-8"))
+        self.assertTrue(stats["tool_calls_only"])
+        self.assertEqual(stats["filtered"], 2)
 
     def test_missing_input_files_are_errors(self) -> None:
         with self.assertRaises(FileNotFoundError):

@@ -63,26 +63,26 @@ class SharedAdapterContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "must be empty"):
             SharedAdapterConfig(modules_to_save=("lm_head",))
 
-    def test_sft_and_opd_presets_share_the_same_adapter_hash(self) -> None:
-        sft = yaml.safe_load((ROOT / "configs/sft_warm_start_qwen3_4b.yaml").read_text())
+    def test_legacy_sft_training_script_and_opd_share_adapter_contract(self) -> None:
+        script = (ROOT / "scripts/train_llamafactory_lora.sh").read_text(encoding="utf-8")
         opd = yaml.safe_load((ROOT / "configs/opd_paper_train.yaml").read_text())
-        sft_adapter = dict(sft["adapter"])
-        sft_hash = sft_adapter.pop("adapter_config_hash")
         opd_adapter = dict(opd["trainer"]["shared_adapter"])
         opd_hash = opd_adapter.pop("adapter_config_hash")
-        sft_config = SharedAdapterConfig(**sft_adapter)
         opd_config = OPDTrainerConfig.from_mapping({"shared_adapter": opd_adapter}).shared_adapter
-        self.assertEqual(sft_config.canonical_payload, opd_config.canonical_payload)
-        self.assertEqual(sft_hash, sft_config.adapter_config_hash)
+        self.assertEqual(SharedAdapterConfig().canonical_payload, opd_config.canonical_payload)
         self.assertEqual(opd_hash, opd_config.adapter_config_hash)
-        self.assertEqual(
-            sft["model"]["base_revision"],
-            "cdbee75f17c01a7cc42f958dc650907174af0554",
+        self.assertIn('LORA_RANK="${LORA_RANK:-16}"', script)
+        self.assertIn('LORA_ALPHA="${LORA_ALPHA:-32}"', script)
+        self.assertIn('LORA_DROPOUT="${LORA_DROPOUT:-0.0}"', script)
+        self.assertIn(
+            'LORA_TARGET="${LORA_TARGET:-q_proj,k_proj,v_proj,o_proj}"',
+            script,
         )
-        self.assertEqual(
-            sft["model"]["base_revision"],
-            sft["model"]["tokenizer_revision"],
+        self.assertIn(
+            'MODEL_REVISION="${MODEL_REVISION:-cdbee75f17c01a7cc42f958dc650907174af0554}"',
+            script,
         )
+        self.assertIn('TEMPLATE="${TEMPLATE:-qwen3_nothink}"', script)
 
         opd_adapter["adapter_config_hash"] = "sha256:" + "0" * 64
         with self.assertRaisesRegex(ValueError, "adapter_config_hash"):

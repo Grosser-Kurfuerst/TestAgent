@@ -352,13 +352,24 @@ def parse_tool_calls(raw_completion: str) -> tuple[CanonicalToolCall, ...]:
                 raw_calls = parsed.get("tool_calls")
                 if isinstance(raw_calls, list):
                     payloads.extend(item for item in raw_calls if isinstance(item, Mapping))
-                elif "name" in parsed:
+                elif "name" in parsed or "tool" in parsed:
                     payloads.append(parsed)
 
     calls: list[CanonicalToolCall] = []
     for index, payload in enumerate(payloads):
         function = payload.get("function") if isinstance(payload.get("function"), Mapping) else payload
         name = function.get("name") if isinstance(function, Mapping) else None
+        legacy_name = function.get("tool") if isinstance(function, Mapping) else None
+        if (
+            isinstance(name, str)
+            and name.strip()
+            and isinstance(legacy_name, str)
+            and legacy_name.strip()
+            and name.strip() != legacy_name.strip()
+        ):
+            raise ValueError("generated tool call name conflicts with legacy tool field")
+        if not isinstance(name, str) or not name.strip():
+            name = legacy_name
         if not isinstance(name, str) or not name.strip():
             raise ValueError("generated tool call is missing name")
         arguments = function.get("arguments", {})
@@ -419,7 +430,11 @@ def _is_adapter_artifact(path: Path) -> bool:
 def hash_adapter_artifacts(path: str | Path) -> str:
     """Hash deployable adapter files without including trainer/checkpoint metadata."""
 
-    return hash_artifact_path(path, include=_is_adapter_artifact)
+    adapter_root = _adapter_load_path(Path(path))
+    return hash_artifact_path(
+        adapter_root,
+        include=lambda item: item.parent == adapter_root and _is_adapter_artifact(item),
+    )
 
 
 def _adapter_load_path(path: Path) -> Path:
