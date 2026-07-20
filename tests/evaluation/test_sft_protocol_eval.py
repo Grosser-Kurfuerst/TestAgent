@@ -248,7 +248,7 @@ class SftProtocolOutputTests(unittest.TestCase):
                 "#!/usr/bin/env python3\n"
                 "import json, os, sys\n"
                 "if sys.argv[1:] == ['version']:\n"
-                "    print('LLaMA-Factory 0.9.4')\n"
+                "    print('LLaMA-Factory 0.9.6.dev0')\n"
                 "else:\n"
                 "    open(os.environ['CAPTURE_FILE'], 'w', encoding='utf-8').write(json.dumps(sys.argv[1:]))\n",
                 encoding="utf-8",
@@ -267,9 +267,9 @@ class SftProtocolOutputTests(unittest.TestCase):
             arguments = json.loads(capture.read_text(encoding="utf-8"))
             pairs = dict(zip(arguments[1::2], arguments[2::2]))
             self.assertEqual(arguments[0], "train")
-            self.assertEqual(pairs["--model_name_or_path"], "Qwen/Qwen3-4B-Instruct-2507")
-            self.assertEqual(pairs["--model_revision"], "cdbee75f17c01a7cc42f958dc650907174af0554")
-            self.assertEqual(pairs["--template"], "qwen3_nothink")
+            self.assertEqual(pairs["--model_name_or_path"], "Qwen/Qwen3.5-4B")
+            self.assertEqual(pairs["--model_revision"], "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a")
+            self.assertEqual(pairs["--template"], "qwen3_5_nothink")
             self.assertEqual(pairs["--lora_rank"], "16")
             self.assertEqual(pairs["--lora_alpha"], "32")
             self.assertEqual(pairs["--lora_dropout"], "0.0")
@@ -285,9 +285,9 @@ class SftProtocolOutputTests(unittest.TestCase):
             self.assertEqual(
                 manifest["schema_version"], "agentcli-legacy-sft-training-v1"
             )
-            self.assertEqual(manifest["template"], "qwen3_nothink")
+            self.assertEqual(manifest["template"], "qwen3_5_nothink")
             self.assertEqual(
-                manifest["base_model"], "Qwen/Qwen3-4B-Instruct-2507"
+                manifest["base_model"], "Qwen/Qwen3.5-4B"
             )
             self.assertEqual(
                 manifest["adapter_config_hash"],

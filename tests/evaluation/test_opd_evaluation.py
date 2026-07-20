@@ -213,11 +213,11 @@ class OPDEvaluationTests(unittest.TestCase):
             report = check_numerical_reproduction_readiness(
                 project_root=root,
                 source_revisions={source: "rev" for source in manifests},
-                model_revisions={"qwen3_4b": "rev", "embedding": "rev"},
+                model_revisions={"qwen3_5_4b": "rev", "embedding": "rev"},
                 training_tasks_total=7000,
                 source_manifests=manifests,
                 source_manifest_hashes=hashes,
-                model_artifacts={"qwen3_4b": policy, "embedding": embedding},
+                model_artifacts={"qwen3_5_4b": policy, "embedding": embedding},
             )
 
         self.assertFalse(report.ready)

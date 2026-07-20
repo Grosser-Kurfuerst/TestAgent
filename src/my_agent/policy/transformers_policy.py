@@ -32,6 +32,14 @@ from my_agent.training.role_views import CanonicalToolCall
 
 
 _TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
+_QWEN35_FUNCTION_RE = re.compile(
+    r"^\s*<function=([^>\n]+)>\s*(.*?)\s*</function>\s*$",
+    re.DOTALL,
+)
+_QWEN35_PARAMETER_RE = re.compile(
+    r"<parameter=([^>\n]+)>\s*(.*?)\s*</parameter>",
+    re.DOTALL,
+)
 _MODEL_ARTIFACT_NAMES = frozenset({
     "config.json",
     "generation_config.json",
@@ -112,7 +120,8 @@ class TransformersPolicy:
         }
         if config.policy_device == "auto":
             model_kwargs["device_map"] = "auto"
-        model = transformers.AutoModelForCausalLM.from_pretrained(
+        model = _load_generation_model(
+            transformers,
             base_snapshot,
             **model_kwargs,
         )
@@ -514,11 +523,55 @@ def _seeded_generator(torch: Any | None, seed: int | None, device: Any) -> Any |
 def _tool_call_mapping(text: str) -> Mapping[str, Any]:
     try:
         payload = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise ValueError("generated <tool_call> payload is invalid JSON") from exc
+    except json.JSONDecodeError:
+        return _qwen35_tool_call_mapping(text)
     if not isinstance(payload, Mapping):
         raise ValueError("generated <tool_call> payload must be an object")
     return payload
+
+
+def _qwen35_tool_call_mapping(text: str) -> Mapping[str, Any]:
+    match = _QWEN35_FUNCTION_RE.fullmatch(text)
+    if match is None:
+        raise ValueError("generated <tool_call> payload is neither JSON nor Qwen3.5 XML")
+    name = match.group(1).strip()
+    if not name:
+        raise ValueError("generated Qwen3.5 tool call is missing function name")
+    arguments: dict[str, Any] = {}
+    body = match.group(2)
+    for parameter in _QWEN35_PARAMETER_RE.finditer(body):
+        parameter_name = parameter.group(1).strip()
+        if not parameter_name:
+            raise ValueError("generated Qwen3.5 tool call has an empty parameter name")
+        raw_value = parameter.group(2).strip()
+        try:
+            value = json.loads(raw_value)
+        except json.JSONDecodeError:
+            value = raw_value
+        arguments[parameter_name] = value
+    residual = _QWEN35_PARAMETER_RE.sub("", body).strip()
+    if residual:
+        raise ValueError("generated Qwen3.5 tool call contains malformed parameters")
+    return {"name": name, "arguments": arguments}
+
+
+def _load_generation_model(transformers: Any, model_path: Any, **model_kwargs: Any) -> Any:
+    loaders = [getattr(transformers, "AutoModelForCausalLM", None)]
+    loaders.extend(
+        getattr(transformers, name, None)
+        for name in ("AutoModelForImageTextToText", "AutoModelForVision2Seq")
+    )
+    errors: list[Exception] = []
+    for loader in loaders:
+        if loader is None:
+            continue
+        try:
+            return loader.from_pretrained(model_path, **model_kwargs)
+        except ValueError as exc:
+            errors.append(exc)
+    if errors:
+        raise errors[-1]
+    raise RuntimeError("transformers does not expose a compatible generation model loader")
 
 
 def _to_llm_tool_call(call: CanonicalToolCall) -> LLMToolCall:

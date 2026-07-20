@@ -14,11 +14,11 @@ memory_evolver_teacher_min_score: 0.01
 memory_evolver_writing_top_fraction: 0.30
 
 policy_backend: transformers
-policy_base_model: Qwen/Qwen3-4B-Instruct-2507
-policy_base_revision: REPLACE_WITH_IMMUTABLE_REVISION
+policy_base_model: Qwen/Qwen3.5-4B
+policy_base_revision: 851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a
 policy_adapter_path: null
 policy_identity_manifest: REPLACE_WITH_CHECKPOINT_IDENTITY_MANIFEST
-policy_tokenizer_revision: REPLACE_WITH_IMMUTABLE_REVISION
+policy_tokenizer_revision: 851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a
 policy_chat_template: model_default
 policy_dtype: bfloat16
 policy_device: auto

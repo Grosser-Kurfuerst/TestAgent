@@ -79,10 +79,10 @@ class SharedAdapterContractTests(unittest.TestCase):
             script,
         )
         self.assertIn(
-            'MODEL_REVISION="${MODEL_REVISION:-cdbee75f17c01a7cc42f958dc650907174af0554}"',
+            'MODEL_REVISION="${MODEL_REVISION:-851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a}"',
             script,
         )
-        self.assertIn('TEMPLATE="${TEMPLATE:-qwen3_nothink}"', script)
+        self.assertIn('TEMPLATE="${TEMPLATE:-qwen3_5_nothink}"', script)
 
         opd_adapter["adapter_config_hash"] = "sha256:" + "0" * 64
         with self.assertRaisesRegex(ValueError, "adapter_config_hash"):

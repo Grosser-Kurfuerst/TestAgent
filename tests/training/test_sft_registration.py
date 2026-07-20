@@ -16,7 +16,7 @@ from my_agent.policy.transformers_policy import hash_adapter_artifacts
 from my_agent.training.sft_registration import register_sft_checkpoint
 
 
-BASE_MODEL = "Qwen/Qwen3-4B-Instruct-2507"
+BASE_MODEL = "Qwen/Qwen3.5-4B"
 REVISION = "revision-1"
 
 
@@ -81,8 +81,8 @@ def _trainer_output(path: Path, **config_overrides) -> Path:
         "base_model": BASE_MODEL,
         "model_revision": REVISION,
         "tokenizer_revision": REVISION,
-        "template": "qwen3_nothink",
-        "llamafactory_version": "0.9.4",
+        "template": "qwen3_5_nothink",
+        "llamafactory_version": "0.9.6.dev0",
         "adapter_config": adapter,
         "adapter_config_hash": canonical_sha256(adapter),
     }

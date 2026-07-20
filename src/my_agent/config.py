@@ -111,7 +111,7 @@ class AgentConfig:
     embedding_model: str = "Qwen/Qwen3-Embedding-0.6B"
     embedding_revision: str = ""
     policy_backend: str = "transformers"
-    policy_base_model: str = "Qwen/Qwen3-4B-Instruct-2507"
+    policy_base_model: str = "Qwen/Qwen3.5-4B"
     policy_base_revision: str = ""
     policy_adapter_path: Path | None = None
     policy_identity_manifest: Path | None = None
@@ -444,7 +444,7 @@ class AgentConfig:
             policy_base_model=str(
                 values.get("AGENTCLI_POLICY_BASE_MODEL")
                 or values.get("MY_AGENT_POLICY_BASE_MODEL")
-                or "Qwen/Qwen3-4B-Instruct-2507"
+                or "Qwen/Qwen3.5-4B"
             ).strip(),
             policy_base_revision=str(
                 values.get("AGENTCLI_POLICY_BASE_REVISION")

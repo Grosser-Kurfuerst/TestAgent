@@ -28,8 +28,8 @@ from my_agent.training.opd_trainer import (
 
 SFT_TRAINING_MANIFEST_FILENAME = "sft_training_manifest.json"
 SFT_TRAINING_MANIFEST_SCHEMA_VERSION = "agentcli-legacy-sft-training-v1"
-SFT_TRAINING_TEMPLATE = "qwen3_nothink"
-SFT_LLAMAFACTORY_VERSION = "0.9.4"
+SFT_TRAINING_TEMPLATE = "qwen3_5_nothink"
+SFT_LLAMAFACTORY_VERSION = "0.9.6.dev0"
 _TRAINING_MANIFEST_FIELDS = {
     "schema_version",
     "base_model",
@@ -206,7 +206,7 @@ def _load_training_manifest(
     if manifest["tokenizer_revision"] != tokenizer_revision:
         raise ValueError("SFT training manifest tokenizer revision does not match registration")
     if manifest["template"] != SFT_TRAINING_TEMPLATE:
-        raise ValueError("SFT training manifest must use qwen3_nothink")
+        raise ValueError("SFT training manifest must use qwen3_5_nothink")
     if manifest["llamafactory_version"] != SFT_LLAMAFACTORY_VERSION:
         raise ValueError("SFT training manifest LLaMA-Factory version is unsupported")
     adapter = manifest["adapter_config"]

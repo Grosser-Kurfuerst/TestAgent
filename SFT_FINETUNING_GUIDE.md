@@ -1,6 +1,6 @@
 # SFT Warm-Start and OPD Integration Guide
 
-本文档说明如何复用 AgentCli 原有的 legacy Alpaca SFT 流程，训练 Qwen3-4B LoRA，并将训练结果注册为 OPD 的初始检查点 M0。
+本文档说明如何复用 AgentCli 原有的 legacy Alpaca SFT 流程，训练 Qwen3.5-4B LoRA，并将训练结果注册为 OPD 的初始检查点 M0。
 
 ## 1. 数据流
 
@@ -94,23 +94,23 @@ jq '{total, train, val, skipped, filtered, tool_calls_only, source_counts}' \
 
 ## 4. 安装 LLaMA-Factory
 
-使用独立 Python 3.11 环境安装 LLaMA-Factory 0.9.4，避免覆盖 AgentCli 的依赖：
+Qwen3.5 需要 LLaMA-Factory 主线 `0.9.6.dev0` 的 `qwen3_5_nothink` 模板。使用独立 Python 3.11 环境安装，避免覆盖 AgentCli 的依赖：
 
 ```bash
-git clone --depth 1 --branch v0.9.4 \
+git clone --depth 1 \
   https://github.com/hiyouga/LLaMA-Factory.git \
-  ../LLaMA-Factory-v0.9.4
+  ../LLaMA-Factory-qwen35
 
-cd ../LLaMA-Factory-v0.9.4
+cd ../LLaMA-Factory-qwen35
 uv venv --python 3.11 .venv
 uv pip install --python .venv/bin/python -e .
 source .venv/bin/activate
 llamafactory-cli version
 ```
 
-版本输出必须包含 `0.9.4`。该 legacy Alpaca 流程不需要 AgentCli 自定义 ingestion patch。
+版本输出必须包含 `0.9.6.dev0`。LLaMA-Factory v0.9.4 不包含 Qwen3.5 模板，不能用于该模型。该 legacy Alpaca 流程不需要 AgentCli 自定义 ingestion patch。
 
-## 5. 训练 Qwen3-4B LoRA
+## 5. 训练 Qwen3.5-4B LoRA
 
 回到 AgentCli 仓库根目录后执行：
 
@@ -124,9 +124,9 @@ bash scripts/train_llamafactory_lora.sh
 默认训练合同：
 
 ```text
-base model: Qwen/Qwen3-4B-Instruct-2507
-revision: cdbee75f17c01a7cc42f958dc650907174af0554
-template: qwen3_nothink
+base model: Qwen/Qwen3.5-4B
+revision: 851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a
+template: qwen3_5_nothink
 LoRA: rank=16, alpha=32, dropout=0
 targets: q_proj,k_proj,v_proj,o_proj
 learning rate: 2e-5
@@ -144,7 +144,7 @@ BF16: true
 outputs/coding_agent_lora/sft_training_manifest.json
 ```
 
-其中固定记录实际训练使用的 base model、immutable revision、tokenizer revision、`qwen3_nothink` 模板、LLaMA-Factory 版本以及 canonical adapter config/hash。
+其中固定记录实际训练使用的 base model、immutable revision、tokenizer revision、`qwen3_5_nothink` 模板、LLaMA-Factory 版本以及 canonical adapter config/hash。
 
 训练完成后，最终 adapter 必须直接位于：
 
@@ -163,7 +163,7 @@ outputs/coding_agent_lora/
 UV_CACHE_DIR=/tmp/agentcli-uv-cache uv run --extra opd-train python \
   scripts/eval_sft_protocol.py \
   --val-data data/llamafactory/val_alpaca.json \
-  --base-model Qwen/Qwen3-4B-Instruct-2507 \
+  --base-model Qwen/Qwen3.5-4B \
   --adapter-dir outputs/coding_agent_lora \
   --output-dir outputs/sft_protocol_eval
 ```
@@ -183,9 +183,9 @@ UV_CACHE_DIR=/tmp/agentcli-uv-cache uv run --extra opd-train python \
   scripts/register_sft_checkpoint.py \
   --trainer-output outputs/coding_agent_lora \
   --output outputs/opd/M0 \
-  --base-model Qwen/Qwen3-4B-Instruct-2507 \
-  --base-revision cdbee75f17c01a7cc42f958dc650907174af0554 \
-  --tokenizer-revision cdbee75f17c01a7cc42f958dc650907174af0554 \
+  --base-model Qwen/Qwen3.5-4B \
+  --base-revision 851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a \
+  --tokenizer-revision 851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a \
   --opd-config configs/opd_paper_train.yaml
 ```
 

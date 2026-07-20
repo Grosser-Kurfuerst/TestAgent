@@ -43,12 +43,14 @@ def generate_sft_responses(
 def _load_base_model(base_model: str, *, device: str, dtype: str):
     try:
         import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        import transformers
+        from transformers import AutoTokenizer
     except ImportError as exc:
         raise RuntimeError("Model inference requires torch and transformers. Use response files for metric-only runs.") from exc
 
     tokenizer = AutoTokenizer.from_pretrained(base_model, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
+    model = _load_generation_model(
+        transformers,
         base_model,
         trust_remote_code=True,
         torch_dtype=_torch_dtype(torch, dtype),
@@ -56,6 +58,25 @@ def _load_base_model(base_model: str, *, device: str, dtype: str):
     )
     model.eval()
     return tokenizer, model, torch
+
+
+def _load_generation_model(transformers: Any, model_path: str, **model_kwargs: Any):
+    loaders = [getattr(transformers, "AutoModelForCausalLM", None)]
+    loaders.extend(
+        getattr(transformers, name, None)
+        for name in ("AutoModelForImageTextToText", "AutoModelForVision2Seq")
+    )
+    errors: list[Exception] = []
+    for loader in loaders:
+        if loader is None:
+            continue
+        try:
+            return loader.from_pretrained(model_path, **model_kwargs)
+        except ValueError as exc:
+            errors.append(exc)
+    if errors:
+        raise errors[-1]
+    raise RuntimeError("transformers does not expose a compatible generation model loader")
 
 
 def _load_adapter_model(base_model: str, adapter_dir: str | Path, *, device: str, dtype: str):

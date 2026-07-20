@@ -35,7 +35,7 @@ numerical_reproduction:
     nemotron_terminal_corpus: REPLACE_WITH_IMMUTABLE_REVISION
     envscaler: REPLACE_WITH_IMMUTABLE_REVISION
   model_revisions:
-    qwen3_4b: REPLACE_WITH_IMMUTABLE_REVISION
+    qwen3_5_4b: 851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a
     qwen3_5_9b: REPLACE_WITH_IMMUTABLE_REVISION
     embedding: REPLACE_WITH_IMMUTABLE_REVISION
   source_manifests:
@@ -43,7 +43,7 @@ numerical_reproduction:
     nemotron_terminal_corpus: REPLACE_WITH_NORMALIZED_SOURCE_MANIFEST
     envscaler: REPLACE_WITH_NORMALIZED_SOURCE_MANIFEST
   model_artifacts:
-    qwen3_4b: REPLACE_WITH_LOCAL_POLICY_ARTIFACT
+    qwen3_5_4b: REPLACE_WITH_LOCAL_POLICY_ARTIFACT
     qwen3_5_9b: REPLACE_WITH_LOCAL_POLICY_ARTIFACT
     embedding: REPLACE_WITH_LOCAL_EMBEDDING_ARTIFACT
   source_manifest_hashes:

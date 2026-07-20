@@ -5,12 +5,12 @@ cd "$(dirname "$0")/.."
 
 DATASET_DIR="${DATASET_DIR:-data/llamafactory}"
 OUTPUT_DIR="${OUTPUT_DIR:-outputs/coding_agent_lora}"
-BASE_MODEL="${BASE_MODEL:-Qwen/Qwen3-4B-Instruct-2507}"
-MODEL_REVISION="${MODEL_REVISION:-cdbee75f17c01a7cc42f958dc650907174af0554}"
+BASE_MODEL="${BASE_MODEL:-Qwen/Qwen3.5-4B}"
+MODEL_REVISION="${MODEL_REVISION:-851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a}"
 LOCAL_MODEL_DIR="${LOCAL_MODEL_DIR:-}"
 MODEL_NAME_OR_PATH="${MODEL_NAME_OR_PATH:-${BASE_MODEL}}"
 
-TEMPLATE="${TEMPLATE:-qwen3_nothink}"
+TEMPLATE="${TEMPLATE:-qwen3_5_nothink}"
 FINETUNING_TYPE="${FINETUNING_TYPE:-lora}"
 LORA_RANK="${LORA_RANK:-16}"
 LORA_ALPHA="${LORA_ALPHA:-32}"
@@ -34,7 +34,7 @@ BF16="${BF16:-true}"
 FP16="${FP16:-false}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 LLAMAFACTORY_CMD="${LLAMAFACTORY_CMD:-llamafactory-cli}"
-LLAMAFACTORY_VERSION="${LLAMAFACTORY_VERSION:-0.9.4}"
+LLAMAFACTORY_VERSION="${LLAMAFACTORY_VERSION:-0.9.6.dev0}"
 PYTHON_CMD="${PYTHON_CMD:-python}"
 
 export CUDA_VISIBLE_DEVICES
@@ -60,11 +60,11 @@ if ! command -v "${PYTHON_CMD}" >/dev/null 2>&1; then
   exit 1
 fi
 
-if [[ "${BASE_MODEL}" != "Qwen/Qwen3-4B-Instruct-2507" \
-  || "${MODEL_REVISION}" != "cdbee75f17c01a7cc42f958dc650907174af0554" \
+if [[ "${BASE_MODEL}" != "Qwen/Qwen3.5-4B" \
+  || "${MODEL_REVISION}" != "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a" \
   || "${MODEL_NAME_OR_PATH}" != "${BASE_MODEL}" \
   || -n "${LOCAL_MODEL_DIR}" ]]; then
-  echo "OPD warm-start requires the pinned Qwen3-4B base model and revision; local model overrides are not supported." >&2
+  echo "OPD warm-start requires the pinned Qwen3.5-4B base model and revision; local model overrides are not supported." >&2
   exit 1
 fi
 
@@ -90,7 +90,7 @@ if [[ "${FINETUNING_TYPE}" != "lora" \
   || "${LORA_ALPHA}" != "32" \
   || "${LORA_DROPOUT}" != "0" && "${LORA_DROPOUT}" != "0.0" \
   || "${LORA_TARGET}" != "q_proj,k_proj,v_proj,o_proj" \
-  || "${TEMPLATE}" != "qwen3_nothink" \
+  || "${TEMPLATE}" != "qwen3_5_nothink" \
   || "${TRAIN_ON_PROMPT}" != "false" \
   || "${MASK_HISTORY}" != "true" ]]; then
   echo "SFT LoRA settings must match the OPD shared adapter contract." >&2

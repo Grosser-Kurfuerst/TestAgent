@@ -411,7 +411,7 @@ def check_numerical_reproduction_readiness(
         ):
             missing.append(f"source_schema:{source}")
     artifacts = dict(model_artifacts or {})
-    for model in ("qwen3_4b", "qwen3_5_9b", "embedding"):
+    for model in ("qwen3_5_4b", "qwen3_5_9b", "embedding"):
         revision = str(model_revisions.get(model, "")).strip()
         if not revision or "REPLACE_WITH" in revision:
             missing.append(f"model_revision:{model}")

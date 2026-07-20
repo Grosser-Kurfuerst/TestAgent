@@ -64,6 +64,18 @@ class _TinyModel:
         return SimpleNamespace(logits="tiny-logits")
 
 
+class _RejectingModelLoader:
+    @classmethod
+    def from_pretrained(cls, model_path: object, **kwargs: object) -> object:
+        raise ValueError("unsupported causal LM config")
+
+
+class _ImageTextModelLoader:
+    @classmethod
+    def from_pretrained(cls, model_path: object, **kwargs: object) -> object:
+        return {"model_path": model_path, "kwargs": kwargs}
+
+
 def _identity(tokenizer: _TinyTokenizer) -> PolicyIdentity:
     return PolicyIdentity(
         base_model="tiny-model",
@@ -155,6 +167,35 @@ class TransformersPolicyTests(unittest.TestCase):
         calls = parse_tool_calls(RAW_TOOL_CALL)
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0].arguments_json, '{"path":"src/a.py"}')
+
+    def test_tool_parser_accepts_qwen35_xml_tool_call_block(self) -> None:
+        calls = parse_tool_calls(
+            "<tool_call>\n"
+            "<function=read_file>\n"
+            "<parameter=path>\nsrc/a.py\n</parameter>\n"
+            "<parameter=limit>\n12000\n</parameter>\n"
+            "</function>\n"
+            "</tool_call>"
+        )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].name, "read_file")
+        self.assertEqual(calls[0].arguments_json, '{"limit":12000,"path":"src/a.py"}')
+
+    def test_generation_model_loader_falls_back_for_qwen35(self) -> None:
+        transformers = SimpleNamespace(
+            AutoModelForCausalLM=_RejectingModelLoader,
+            AutoModelForImageTextToText=_ImageTextModelLoader,
+        )
+
+        model = transformers_policy._load_generation_model(
+            transformers,
+            "Qwen/Qwen3.5-4B",
+            local_files_only=True,
+        )
+
+        self.assertEqual(model["model_path"], "Qwen/Qwen3.5-4B")
+        self.assertEqual(model["kwargs"], {"local_files_only": True})
 
     def test_tool_parser_accepts_legacy_sft_tool_json(self) -> None:
         calls = parse_tool_calls(json.dumps({
