@@ -6,7 +6,7 @@ export_manifest: REPLACE_WITH_CURRENT_ROUND_EXPORT_MANIFEST
 output_dir: REPLACE_WITH_NEXT_CHECKPOINT_OUTPUT
 
 policy:
-  chat_template: model_default
+  chat_template: qwen3_5_nothink
   dtype: bfloat16
   device: auto
 

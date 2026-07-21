@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Mapping
 import json
 import re
+import warnings
 
 from my_agent.config import AgentConfig
 from my_agent.llm.types import ChatResponse, ChatUsage, LLMToolCall, MessageLike
@@ -137,11 +138,22 @@ class TransformersPolicy:
                 from peft import PeftModel
             except ImportError as exc:
                 raise RuntimeError("policy adapters require the 'opd-train' extra") from exc
-            model = PeftModel.from_pretrained(
-                model,
-                _adapter_load_path(adapter_path),
-                is_trainable=True,
-            )
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "error",
+                    message=r"Found missing adapter keys while loading the checkpoint.*",
+                    category=UserWarning,
+                )
+                try:
+                    model = PeftModel.from_pretrained(
+                        model,
+                        _adapter_load_path(adapter_path),
+                        is_trainable=True,
+                    )
+                except UserWarning as exc:
+                    raise ValueError(
+                        "policy adapter is incompatible with the loaded base-model architecture"
+                    ) from exc
             adapter_hash = hash_adapter_artifacts(adapter_path)
 
         identity = PolicyIdentity(
@@ -556,11 +568,11 @@ def _qwen35_tool_call_mapping(text: str) -> Mapping[str, Any]:
 
 
 def _load_generation_model(transformers: Any, model_path: Any, **model_kwargs: Any) -> Any:
-    loaders = [getattr(transformers, "AutoModelForCausalLM", None)]
-    loaders.extend(
-        getattr(transformers, name, None)
-        for name in ("AutoModelForImageTextToText", "AutoModelForVision2Seq")
-    )
+    loaders = [
+        getattr(transformers, "AutoModelForImageTextToText", None),
+        getattr(transformers, "AutoModelForVision2Seq", None),
+        getattr(transformers, "AutoModelForCausalLM", None),
+    ]
     errors: list[Exception] = []
     for loader in loaders:
         if loader is None:

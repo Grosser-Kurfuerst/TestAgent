@@ -5,7 +5,10 @@ import os
 import subprocess
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 
 from tests._path import add_src_to_path
 
@@ -17,6 +20,8 @@ from my_agent.evaluation.protocol_metrics import (
     evaluate_responses,
     score_response,
 )
+from my_agent.evaluation import model_inference
+from my_agent.evaluation.model_inference import _print_progress
 from my_agent.evaluation.protocol_runner import load_response_file, run_evaluation
 
 
@@ -120,6 +125,66 @@ class SftProtocolMetricTests(unittest.TestCase):
 
 
 class SftProtocolOutputTests(unittest.TestCase):
+    def test_protocol_prompt_disables_qwen35_thinking(self) -> None:
+        class Tokenizer:
+            def __init__(self) -> None:
+                self.kwargs: dict[str, object] = {}
+
+            def apply_chat_template(self, messages, **kwargs):
+                self.kwargs = dict(kwargs)
+                return "prompt"
+
+        tokenizer = Tokenizer()
+        prompt = model_inference._build_prompt(
+            tokenizer,
+            {"system": "system", "instruction": "instruction", "input": "input"},
+        )
+
+        self.assertEqual(prompt, "prompt")
+        self.assertIs(tokenizer.kwargs["enable_thinking"], False)
+
+    def test_protocol_loader_prefers_conditional_generation_architecture(self) -> None:
+        calls: list[str] = []
+
+        class ImageTextLoader:
+            @classmethod
+            def from_pretrained(cls, model_path: str, **kwargs: object) -> object:
+                calls.append("conditional")
+                return {"model_path": model_path, "kwargs": kwargs}
+
+        class CausalLoader:
+            @classmethod
+            def from_pretrained(cls, model_path: str, **kwargs: object) -> object:
+                calls.append("causal")
+                return {"model_path": model_path, "kwargs": kwargs}
+
+        loaded = model_inference._load_generation_model(
+            SimpleNamespace(
+                AutoModelForImageTextToText=ImageTextLoader,
+                AutoModelForCausalLM=CausalLoader,
+            ),
+            "Qwen/Qwen3.5-4B",
+            local_files_only=True,
+        )
+
+        self.assertEqual(calls, ["conditional"])
+        self.assertEqual(loaded["model_path"], "Qwen/Qwen3.5-4B")
+
+    def test_model_inference_progress_reports_phase_count_and_speed(self) -> None:
+        output = StringIO()
+
+        with redirect_stdout(output):
+            _print_progress(
+                "base",
+                completed=2,
+                total=4,
+                total_tokens=16,
+                total_time=2.0,
+            )
+
+        self.assertIn("[protocol-eval] base: 2/4 ( 50.0%)", output.getvalue())
+        self.assertIn("8.00 tok/s", output.getvalue())
+
     def test_builds_detailed_results_with_required_fields(self) -> None:
         samples = [
             _alpaca_sample(
@@ -227,6 +292,7 @@ class SftProtocolOutputTests(unittest.TestCase):
         self.assertIn("LOCAL_MODEL_DIR", text)
         self.assertIn("OUTPUT_DIR", text)
         self.assertIn("BATCH_SIZE", text)
+        self.assertIn("GRADIENT_CHECKPOINTING", text)
         self.assertIn("LEARNING_RATE", text)
         self.assertIn("NUM_TRAIN_EPOCHS", text)
         self.assertIn("CUTOFF_LEN", text)
@@ -277,6 +343,7 @@ class SftProtocolOutputTests(unittest.TestCase):
             self.assertEqual(pairs["--train_on_prompt"], "false")
             self.assertEqual(pairs["--mask_history"], "true")
             self.assertEqual(pairs["--cutoff_len"], "8192")
+            self.assertEqual(pairs["--gradient_checkpointing"], "true")
             manifest = json.loads(
                 (root / "output" / "sft_training_manifest.json").read_text(
                     encoding="utf-8"

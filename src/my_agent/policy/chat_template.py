@@ -15,6 +15,9 @@ from my_agent.training.role_views import (
 )
 
 
+QWEN35_NOTHINK_TEMPLATE = "qwen3_5_nothink"
+
+
 @dataclass(frozen=True)
 class RenderedChat:
     text: str
@@ -34,14 +37,24 @@ class RenderedTrainingTurn:
 class CanonicalChatTemplate:
     def __init__(self, tokenizer: Any, *, configured_template: str = "model_default") -> None:
         self.tokenizer = tokenizer
-        if configured_template == "model_default":
+        self.enable_thinking: bool | None = None
+        if configured_template in {"model_default", QWEN35_NOTHINK_TEMPLATE}:
             template = getattr(tokenizer, "chat_template", None)
+            if configured_template == QWEN35_NOTHINK_TEMPLATE:
+                self.enable_thinking = False
         else:
             template = configured_template
         if not isinstance(template, str) or not template.strip():
             raise ValueError("formal policy requires a non-empty chat template")
         self.template_text = template
-        self.template_hash = canonical_sha256(template)
+        self.template_hash = canonical_sha256(
+            {
+                "template": template,
+                "enable_thinking": self.enable_thinking,
+            }
+            if self.enable_thinking is not None
+            else template
+        )
 
     def render(
         self,
@@ -126,6 +139,8 @@ class CanonicalChatTemplate:
         }
         if tools:
             kwargs["tools"] = canonical_tools_to_hf(tools)
+        if self.enable_thinking is not None:
+            kwargs["enable_thinking"] = self.enable_thinking
         if return_tensors is not None:
             kwargs["return_tensors"] = return_tensors
         return self.tokenizer.apply_chat_template(
@@ -268,6 +283,7 @@ def _token_id_tuple(value: Any) -> tuple[int, ...]:
 
 __all__ = [
     "CanonicalChatTemplate",
+    "QWEN35_NOTHINK_TEMPLATE",
     "RenderedChat",
     "RenderedTrainingTurn",
     "canonical_messages_to_hf",

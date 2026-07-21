@@ -17,7 +17,7 @@ def main() -> int:
     parser.add_argument("--base-revision", required=True)
     parser.add_argument("--tokenizer-revision", required=True)
     parser.add_argument("--opd-config", required=True)
-    parser.add_argument("--chat-template", default="model_default")
+    parser.add_argument("--chat-template", default="qwen3_5_nothink")
     parser.add_argument("--dtype", default="bfloat16")
     parser.add_argument("--device", default="auto")
     args = parser.parse_args()

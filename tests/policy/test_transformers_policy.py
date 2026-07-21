@@ -182,7 +182,7 @@ class TransformersPolicyTests(unittest.TestCase):
         self.assertEqual(calls[0].name, "read_file")
         self.assertEqual(calls[0].arguments_json, '{"limit":12000,"path":"src/a.py"}')
 
-    def test_generation_model_loader_falls_back_for_qwen35(self) -> None:
+    def test_generation_model_loader_prefers_conditional_qwen35_architecture(self) -> None:
         transformers = SimpleNamespace(
             AutoModelForCausalLM=_RejectingModelLoader,
             AutoModelForImageTextToText=_ImageTextModelLoader,

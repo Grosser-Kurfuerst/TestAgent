@@ -5,6 +5,7 @@ import unittest
 
 from my_agent.policy.chat_template import (
     CanonicalChatTemplate,
+    QWEN35_NOTHINK_TEMPLATE,
     canonicalize_messages,
     canonicalize_tools,
 )
@@ -30,6 +31,25 @@ class _RecordingTokenizer:
 
 
 class ChatTemplateTests(unittest.TestCase):
+    def test_qwen35_nothink_mode_disables_thinking_and_binds_identity(self) -> None:
+        tokenizer = _RecordingTokenizer()
+        template = CanonicalChatTemplate(
+            tokenizer,
+            configured_template=QWEN35_NOTHINK_TEMPLATE,
+        )
+        messages = canonicalize_messages([{"role": "user", "content": "read"}])
+
+        template.render(messages, ())
+
+        self.assertIs(tokenizer.calls[0][1]["enable_thinking"], False)
+        self.assertEqual(
+            template.template_hash,
+            canonical_sha256({
+                "template": tokenizer.chat_template,
+                "enable_thinking": False,
+            }),
+        )
+
     def test_canonical_render_and_tokenize_share_messages_tools_and_template(self) -> None:
         tokenizer = _RecordingTokenizer()
         template = CanonicalChatTemplate(tokenizer)

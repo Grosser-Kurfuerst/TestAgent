@@ -19,6 +19,7 @@ LORA_TARGET="${LORA_TARGET:-q_proj,k_proj,v_proj,o_proj}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-1}"
 GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-16}"
+GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-true}"
 LEARNING_RATE="${LEARNING_RATE:-2e-5}"
 NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-1}"
 CUTOFF_LEN="${CUTOFF_LEN:-8192}"
@@ -117,6 +118,7 @@ fi
   --per_device_train_batch_size "${BATCH_SIZE}" \
   --per_device_eval_batch_size "${EVAL_BATCH_SIZE}" \
   --gradient_accumulation_steps "${GRADIENT_ACCUMULATION_STEPS}" \
+  --gradient_checkpointing "${GRADIENT_CHECKPOINTING}" \
   --learning_rate "${LEARNING_RATE}" \
   --train_on_prompt "${TRAIN_ON_PROMPT}" \
   --mask_history "${MASK_HISTORY}" \

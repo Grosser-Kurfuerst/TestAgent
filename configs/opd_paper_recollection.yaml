@@ -9,6 +9,7 @@ environment:
   AGENTCLI_MEMORY_EVOLVER_MODE: formal
   AGENTCLI_POLICY_DEVICE: auto
   AGENTCLI_POLICY_DTYPE: bfloat16
+  AGENTCLI_POLICY_CHAT_TEMPLATE: qwen3_5_nothink
 
 rounds:
   0:

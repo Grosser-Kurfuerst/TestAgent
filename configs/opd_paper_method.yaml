@@ -19,7 +19,7 @@ policy_base_revision: 851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a
 policy_adapter_path: null
 policy_identity_manifest: REPLACE_WITH_CHECKPOINT_IDENTITY_MANIFEST
 policy_tokenizer_revision: 851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a
-policy_chat_template: model_default
+policy_chat_template: qwen3_5_nothink
 policy_dtype: bfloat16
 policy_device: auto
 

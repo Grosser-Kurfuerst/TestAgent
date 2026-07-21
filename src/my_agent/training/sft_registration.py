@@ -58,7 +58,7 @@ def register_sft_checkpoint(
     base_revision: str,
     tokenizer_revision: str,
     opd_config: str | Path,
-    chat_template: str = "model_default",
+    chat_template: str = "qwen3_5_nothink",
     dtype: str = "bfloat16",
     device: str = "auto",
     policy_loader: Callable[[AgentConfig], Any] = TransformersPolicy.from_config,
