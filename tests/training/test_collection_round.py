@@ -76,9 +76,29 @@ class CollectionRoundTests(unittest.TestCase):
             "0",
         ])
         self.assertEqual(build.opd_command, "build-round")
+        self.assertEqual(build.max_new_tokens, 1_024)
         self.assertEqual(verify.opd_command, "verify-run")
         self.assertEqual(replay.opd_command, "build-replay-ablation")
         self.assertEqual(attribution.data_command, "compute-opd-attribution")
+
+    def test_opd_cli_accepts_explicit_learner_token_limit(self) -> None:
+        parser = build_parser()
+        build = parser.parse_args([
+            "opd",
+            "build-round",
+            "--run-dir",
+            "/tmp/run",
+            "--checkpoint",
+            "/tmp/checkpoint",
+            "--output",
+            "/tmp/output",
+            "--collection-round",
+            "0",
+            "--max-new-tokens",
+            "1024",
+        ])
+
+        self.assertEqual(build.max_new_tokens, 1_024)
 
     def test_empty_completion_is_rejected_from_formal_dataset(self) -> None:
         fixture = round_fixture()

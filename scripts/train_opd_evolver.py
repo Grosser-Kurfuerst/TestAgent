@@ -103,6 +103,13 @@ def main() -> int:
         policy.model,
         trainer_config.shared_adapter,
     )
+    _configure_gradient_checkpointing(
+        policy.model,
+        enabled=_required_bool(
+            policy_data.get("gradient_checkpointing", False),
+            "policy.gradient_checkpointing",
+        ),
+    )
     dataset = OPDLearnerDataset.from_files(
         learner_path,
         export_manifest_path,
@@ -169,6 +176,30 @@ def main() -> int:
         "ablation": result.manifest.ablation,
     }, ensure_ascii=False, sort_keys=True))
     return 0
+
+
+def _required_bool(value: object, field_name: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"{field_name} must be a boolean")
+    return value
+
+
+def _configure_gradient_checkpointing(model: Any, *, enabled: bool) -> None:
+    if not enabled:
+        return
+    base_model = model.get_base_model() if hasattr(model, "get_base_model") else model
+    enable_checkpointing = getattr(base_model, "gradient_checkpointing_enable", None)
+    if not callable(enable_checkpointing):
+        raise ValueError("policy model does not support gradient checkpointing")
+    enable_input_grads = getattr(base_model, "enable_input_require_grads", None)
+    if not callable(enable_input_grads):
+        raise ValueError("policy model does not support input gradient hooks")
+    config = getattr(base_model, "config", None)
+    if config is None:
+        raise ValueError("policy model does not expose a config")
+    enable_checkpointing()
+    enable_input_grads()
+    config.use_cache = False
 
 
 def _resolve_path(base: Path, payload: Mapping[str, Any], key: str) -> Path:

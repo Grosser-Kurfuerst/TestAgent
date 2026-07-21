@@ -51,6 +51,12 @@ def add_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) 
     build.add_argument("--identity-manifest")
     build.add_argument("--output", required=True)
     build.add_argument("--collection-round", type=int, required=True)
+    build.add_argument(
+        "--max-new-tokens",
+        type=_positive_max_new_tokens,
+        default=1_024,
+        help="Maximum learner completion tokens (default: 1024).",
+    )
     build.add_argument("--seed", type=int)
     build.add_argument("--ablation", choices=PAPER_ABLATIONS)
     build.set_defaults(_handler=handle)
@@ -156,6 +162,7 @@ def _build_round(args: argparse.Namespace) -> dict[str, object]:
         ),
         writing_top_fraction=config.memory_evolver_writing_top_fraction,
         teacher_minimum_score=config.memory_evolver_teacher_min_score,
+        max_new_tokens=args.max_new_tokens,
         seed=args.seed,
         ablation=requested_ablation,
     )
@@ -166,6 +173,16 @@ def _build_round(args: argparse.Namespace) -> dict[str, object]:
         "policy_identity_hash": result.manifest.trainer_initialization_identity.identity_hash,
         "ablation": result.manifest.ablation,
     }
+
+
+def _positive_max_new_tokens(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("max-new-tokens must be an integer") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("max-new-tokens must be >= 1")
+    return parsed
 
 
 def _verify_run(run_dir: Path) -> dict[str, object]:

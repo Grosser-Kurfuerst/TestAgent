@@ -1,0 +1,55 @@
+schema_version: opd-recollection-run-v1
+root: ../runs/opd-16gb-recollection
+baseline_commit: db51773876a7a1b6a29ad7011aa7dc548ca73e06
+lockfile: ../uv.lock
+m0_checkpoint: ../outputs/opd/M0/adapter
+m0_identity_manifest: ../outputs/opd/M0/policy_identity_manifest.json
+
+environment:
+  CUDA_VISIBLE_DEVICES: "0"
+  AGENTCLI_MEMORY_EVOLVER_MODE: formal
+  AGENTCLI_POLICY_DEVICE: cuda
+  AGENTCLI_POLICY_DTYPE: bfloat16
+  AGENTCLI_POLICY_CHAT_TEMPLATE: qwen3_5_nothink
+  AGENTCLI_EMBEDDING_MODEL: Qwen/Qwen3-Embedding-0.6B
+  AGENTCLI_EMBEDDING_REVISION: 97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3
+  MY_AGENT_CONTEXT_WINDOW: "4096"
+  MY_AGENT_RESPONSE_RESERVE_TOKENS: "1024"
+  AGENTCLI_MEMORY_EVOLVER_CANDIDATE_TOP_K_PER_TIER: "16"
+  AGENTCLI_MEMORY_EVOLVER_SELECTED_MAX_ITEMS: "8"
+  AGENTCLI_MEMORY_EVOLVER_SELECTION_PROMPT_TOKENS: "512"
+  AGENTCLI_MEMORY_EVOLVER_MAINTENANCE_INTERVAL_TASKS: "8"
+  AGENTCLI_MEMORY_EVOLVER_MAINTENANCE_MAX_TURNS: "2"
+
+rounds:
+  0:
+    environment:
+      AGENTCLI_MEMORY_DIR: "{memory_dir}"
+      AGENTCLI_MEMORY_EVOLVER_DATASET_DIR: "{run_output}/evolver_datasets"
+      AGENTCLI_MEMORY_EVOLVER_COLLECTION_ROUND: "{collection_round}"
+      AGENTCLI_MEMORY_EVOLVER_DATASET_SPLIT: train
+    collection_commands:
+      - [uv, run, --extra, opd-train, my-agent, eval-manifest, --tasks, data/sft_raw/mbpp_train/tasks/opd_round0_tasks.json, --output-dir, "{run_output}", --mode, react, --max-steps, "8", --checkpoint, "{checkpoint}", --identity-manifest, "{identity_manifest}"]
+      - [uv, run, my-agent, data, compute-opd-attribution, --run-dir, "{run_output}", --collection-round, "{collection_round}"]
+      - [uv, run, --extra, opd-train, my-agent, opd, build-round, --run-dir, "{run_output}", --checkpoint, "{checkpoint}", --identity-manifest, "{identity_manifest}", --output, "{dataset_dir}", --collection-round, "{collection_round}", --max-new-tokens, "1024"]
+    training_command: [uv, run, --extra, opd-train, python, scripts/train_opd_evolver.py, --config, configs/opd_16gb_train.yaml, --checkpoint, "{checkpoint}", --identity-manifest, "{identity_manifest}", --learner-dataset, "{learner_dataset}", --export-manifest, "{export_manifest}", --output-dir, "{checkpoint_output}"]
+  1:
+    environment:
+      AGENTCLI_MEMORY_DIR: "{memory_dir}"
+      AGENTCLI_MEMORY_EVOLVER_DATASET_DIR: "{run_output}/evolver_datasets"
+      AGENTCLI_MEMORY_EVOLVER_COLLECTION_ROUND: "{collection_round}"
+      AGENTCLI_MEMORY_EVOLVER_DATASET_SPLIT: train
+    collection_commands:
+      - [uv, run, --extra, opd-train, my-agent, eval-manifest, --tasks, data/sft_raw/mbpp_train/tasks/opd_round1_tasks.json, --output-dir, "{run_output}", --mode, react, --max-steps, "8", --checkpoint, "{checkpoint}", --identity-manifest, "{identity_manifest}"]
+      - [uv, run, my-agent, data, compute-opd-attribution, --run-dir, "{run_output}", --collection-round, "{collection_round}"]
+      - [uv, run, --extra, opd-train, my-agent, opd, build-round, --run-dir, "{run_output}", --checkpoint, "{checkpoint}", --identity-manifest, "{identity_manifest}", --output, "{dataset_dir}", --collection-round, "{collection_round}", --max-new-tokens, "1024"]
+    training_command: [uv, run, --extra, opd-train, python, scripts/train_opd_evolver.py, --config, configs/opd_16gb_train.yaml, --checkpoint, "{checkpoint}", --identity-manifest, "{identity_manifest}", --learner-dataset, "{learner_dataset}", --export-manifest, "{export_manifest}", --output-dir, "{checkpoint_output}"]
+
+numerical_reproduction:
+  enabled: false
+  training_tasks_total: 0
+  source_revisions: {}
+  model_revisions: {}
+  source_manifests: {}
+  model_artifacts: {}
+  source_manifest_hashes: {}

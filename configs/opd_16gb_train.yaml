@@ -1,0 +1,41 @@
+schema_version: opd-train-run-v1
+checkpoint: REPLACE_WITH_CURRENT_CHECKPOINT
+identity_manifest: REPLACE_WITH_CURRENT_IDENTITY_MANIFEST
+learner_dataset: REPLACE_WITH_CURRENT_ROUND_LEARNER_DATASET
+export_manifest: REPLACE_WITH_CURRENT_ROUND_EXPORT_MANIFEST
+output_dir: REPLACE_WITH_NEXT_CHECKPOINT_OUTPUT
+
+policy:
+  chat_template: qwen3_5_nothink
+  dtype: bfloat16
+  device: cuda
+  gradient_checkpointing: true
+
+trainer:
+  schema_version: opd-train-config-v1
+  epochs: 1
+  batch_size: 1
+  gradient_accumulation_steps: 16
+  learning_rate: 0.00002
+  weight_decay: 0.0
+  warmup_steps: 0
+  max_gradient_norm: 1.0
+  vocab_chunk_size: 256
+  mixed_precision: bf16
+  samples_per_epoch: 16
+  seed: 42
+  role_sampling_weights:
+    selection: 1.0
+    action: 1.0
+    writing: 1.0
+    maintenance: 1.0
+  shared_adapter:
+    name: shared
+    rank: 16
+    alpha: 32
+    dropout: 0.0
+    target_modules: [q_proj, k_proj, v_proj, o_proj]
+    task_type: CAUSAL_LM
+    bias: none
+    modules_to_save: []
+    adapter_config_hash: sha256:fc2d911dc40bbf3965a70afab1547eea4102a2c1c54bd0a44cbf5b40cbc5f91c
