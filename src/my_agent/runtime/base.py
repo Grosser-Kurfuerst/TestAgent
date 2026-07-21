@@ -79,15 +79,21 @@ class AgentBase(ABC):
         try:
             if emit_memory_loaded:
                 self._emit_memory_loaded(writer, state, memory)
+            context_profile = getattr(memory, "context_profile", None)
+            if context_profile is None:
+                model_name = getattr(self.llm, "model", "")
+                if not isinstance(model_name, str):
+                    model_name = getattr(self.config, "policy_base_model", "")
+                context_profile = ContextProfile.resolve(self.config, model_name)
             repo_snapshot = self._repo_snapshot(
                 repo_path,
                 query or state.task,
                 writer,
                 state,
-                getattr(memory, "context_profile", ContextProfile.resolve(self.config, getattr(self.llm, "model", ""))),
+                context_profile,
             ) if index_repo else None
             repo_context_render = (
-                repo_snapshot.render_context(max_tokens=memory.context_profile.repo_context_budget_tokens)
+                repo_snapshot.render_context(max_tokens=context_profile.repo_context_budget_tokens)
                 if repo_snapshot is not None
                 else None
             )

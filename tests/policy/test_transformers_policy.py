@@ -37,6 +37,17 @@ class _TinyTokenizer:
         return RAW_TOOL_CALL
 
 
+class _BatchEncodingTokenizer(_TinyTokenizer):
+    def apply_chat_template(self, messages: list[dict[str, object]], **kwargs: object) -> object:
+        self.rendered_calls.append({"messages": messages, **kwargs})
+        if kwargs["tokenize"]:
+            return {
+                "input_ids": [[101, 102]],
+                "attention_mask": [[1, 0]],
+            }
+        return "<user>task</user><assistant>"
+
+
 class _MalformedTokenizer(_TinyTokenizer):
     def decode(self, token_ids: list[int], *, skip_special_tokens: bool) -> str:
         self.last_decode = (token_ids, skip_special_tokens)
@@ -162,6 +173,35 @@ class TransformersPolicyTests(unittest.TestCase):
         self.assertEqual(batch.attention_mask, [[1, 1]])
         self.assertEqual(batch.assistant_loss_mask, [[0, 0]])
         self.assertEqual(self.policy.forward_logits(batch), "tiny-logits")
+
+    def test_batch_encoding_uses_input_ids_and_preserves_attention_mask(self) -> None:
+        tokenizer = _BatchEncodingTokenizer()
+        model = _TinyModel()
+        policy = TransformersPolicy(
+            model=model,
+            tokenizer=tokenizer,
+            identity=_identity(tokenizer),
+            default_max_new_tokens=8,
+        )
+        request = DecisionRequest(
+            role="action",
+            purpose="fast_loop_evidence",
+            messages=(CanonicalMessage("user", "task"),),
+            tools=(),
+            max_new_tokens=8,
+            temperature=0.0,
+            top_p=1.0,
+        )
+
+        response = policy.generate_decision(request)
+        batch = policy.tokenize(request)
+
+        self.assertEqual(response.prompt_token_ids, (101, 102))
+        self.assertEqual(model.generate_kwargs["input_ids"], [[101, 102]])
+        self.assertEqual(model.generate_kwargs["attention_mask"], [[1, 0]])
+        self.assertEqual(batch.input_ids, [[101, 102]])
+        self.assertEqual(batch.attention_mask, [[1, 0]])
+        self.assertEqual(batch.assistant_loss_mask, [[0, 0]])
 
     def test_tool_parser_accepts_qwen_style_tool_call_block(self) -> None:
         calls = parse_tool_calls(RAW_TOOL_CALL)

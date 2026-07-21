@@ -231,6 +231,27 @@ class RuntimeTests(unittest.TestCase):
             self.assertIs(state.cancellation_token, token)
             self.assertEqual(state.stop_reason, "assistant_final")
 
+    def test_run_agent_does_not_treat_transformers_model_object_as_model_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            write_runtime_repo(repo)
+            llm = FakeLLM(
+                chat_responses=[ChatResponse(content="done", finish_reason="stop")]
+            )
+            llm.model = object()
+
+            state = run_agent(
+                repo_path=repo,
+                task="Return final response.",
+                config=fake_config(base / "traces"),
+                llm=llm,
+                trace_dir=base / "traces",
+            )
+
+            self.assertEqual(state.stop_reason, "assistant_final")
+
     def test_agent_state_metadata_is_copied_and_run_agent_preserves_it(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)

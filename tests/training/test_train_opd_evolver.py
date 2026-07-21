@@ -79,6 +79,22 @@ class SingleGpuConfigTests(unittest.TestCase):
             payload["environment"]["AGENTCLI_EMBEDDING_REVISION"],
             "97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3",
         )
+        self.assertEqual(
+            payload["environment"]["AGENTCLI_POLICY_BASE_REVISION"],
+            "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
+        )
+        self.assertEqual(
+            payload["environment"]["AGENTCLI_POLICY_TOKENIZER_REVISION"],
+            "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
+        )
+        self.assertEqual(
+            payload["environment"]["AGENTCLI_POLICY_IDENTITY_MANIFEST"],
+            "outputs/opd/M0/policy_identity_manifest.json",
+        )
+        self.assertEqual(
+            payload["environment"]["AGENTCLI_POLICY_ADAPTER_PATH"],
+            "outputs/opd/M0/adapter",
+        )
         for round_index in (0, 1):
             commands = payload["rounds"][round_index]["collection_commands"]
             task_command = commands[0]

@@ -22,4 +22,5 @@ tests/data/**/__pycache__/
 tests/data/**/*.py[cod]
 models/
 docs/*
+runs/
 AGENTS.md

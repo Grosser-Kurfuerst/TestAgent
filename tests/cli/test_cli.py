@@ -186,6 +186,54 @@ class CliTests(unittest.TestCase):
         self.assertEqual(config.memory_evolver_min_score, 0.4)
         self.assertEqual(config.memory_evolver_min_experience_entries, 2)
 
+    def test_cli_config_from_env_allows_formal_opd_environment_overrides(self) -> None:
+        config = cli_config_from_env(
+            env={
+                "MY_AGENT_LLM_PROVIDER": "fake",
+                "AGENTCLI_MEMORY_EVOLVER_MODE": "formal",
+                "AGENTCLI_MEMORY_EVOLVER_CANDIDATE_TOP_K_PER_TIER": "16",
+                "AGENTCLI_MEMORY_EVOLVER_SELECTION_PROMPT_TOKENS": "512",
+                "AGENTCLI_MEMORY_EVOLVER_MAINTENANCE_INTERVAL_TASKS": "8",
+                "AGENTCLI_MEMORY_EVOLVER_MAINTENANCE_MAX_TURNS": "2",
+                "AGENTCLI_MEMORY_EVOLVER_DATASET_DIR": "/tmp/opd-datasets",
+                "AGENTCLI_MEMORY_EVOLVER_COLLECTION_ROUND": "1",
+                "AGENTCLI_MEMORY_EVOLVER_DATASET_SPLIT": "train",
+                "AGENTCLI_EMBEDDING_MODEL": "embedding-model",
+                "AGENTCLI_EMBEDDING_REVISION": "embedding-revision-1",
+                "AGENTCLI_POLICY_BACKEND": "transformers",
+                "AGENTCLI_POLICY_BASE_MODEL": "base-model",
+                "AGENTCLI_POLICY_BASE_REVISION": "base-revision-1",
+                "AGENTCLI_POLICY_ADAPTER_PATH": "/tmp/m1/adapter",
+                "AGENTCLI_POLICY_IDENTITY_MANIFEST": "/tmp/m1/policy_identity_manifest.json",
+                "AGENTCLI_POLICY_TOKENIZER_REVISION": "tokenizer-revision-1",
+                "AGENTCLI_POLICY_CHAT_TEMPLATE": "qwen3_5_nothink",
+                "AGENTCLI_POLICY_DTYPE": "bfloat16",
+                "AGENTCLI_POLICY_DEVICE": "cuda",
+            },
+            require_env_file=False,
+        )
+
+        self.assertEqual(config.memory_evolver_mode, "formal")
+        self.assertEqual(config.memory_evolver_candidate_top_k_per_tier, 16)
+        self.assertEqual(config.memory_evolver_selection_prompt_tokens, 512)
+        self.assertEqual(config.memory_evolver_maintenance_interval_tasks, 8)
+        self.assertEqual(config.memory_evolver_maintenance_max_turns, 2)
+        self.assertEqual(config.memory_evolver_dataset_dir, Path("/tmp/opd-datasets"))
+        self.assertEqual(config.memory_evolver_collection_round, 1)
+        self.assertEqual(config.embedding_model, "embedding-model")
+        self.assertEqual(config.embedding_revision, "embedding-revision-1")
+        self.assertEqual(config.policy_base_model, "base-model")
+        self.assertEqual(config.policy_base_revision, "base-revision-1")
+        self.assertEqual(config.policy_adapter_path, Path("/tmp/m1/adapter"))
+        self.assertEqual(
+            config.policy_identity_manifest,
+            Path("/tmp/m1/policy_identity_manifest.json"),
+        )
+        self.assertEqual(config.policy_tokenizer_revision, "tokenizer-revision-1")
+        self.assertEqual(config.policy_chat_template, "qwen3_5_nothink")
+        self.assertEqual(config.policy_dtype, "bfloat16")
+        self.assertEqual(config.policy_device, "cuda")
+
     def test_cli_run_executes_fake_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)

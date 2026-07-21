@@ -233,13 +233,13 @@ class TransformersPolicy:
         )
 
     def generate_decision(self, request: DecisionRequest) -> DecisionResponse:
-        input_ids = self.chat_template.tokenize(
+        encoded = self.chat_template.tokenize(
             request.messages,
             request.tools,
             return_tensors="pt",
         )
-        input_ids = _move_to_device(input_ids, _model_device(self.model))
-        attention_mask = _ones_like(input_ids, self._torch)
+        encoded = _move_to_device(encoded, _model_device(self.model))
+        input_ids, attention_mask = _token_inputs(encoded, self._torch)
         generate_kwargs: dict[str, Any] = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
@@ -288,15 +288,16 @@ class TransformersPolicy:
         )
 
     def tokenize(self, request: DecisionRequest) -> TokenBatch:
-        input_ids = self.chat_template.tokenize(
+        encoded = self.chat_template.tokenize(
             request.messages,
             request.tools,
             return_tensors="pt",
         )
-        input_ids = _move_to_device(input_ids, _model_device(self.model))
+        encoded = _move_to_device(encoded, _model_device(self.model))
+        input_ids, attention_mask = _token_inputs(encoded, self._torch)
         return TokenBatch(
             input_ids=input_ids,
-            attention_mask=_ones_like(input_ids, self._torch),
+            attention_mask=attention_mask,
             assistant_loss_mask=_zeros_like(input_ids, self._torch),
         )
 
@@ -493,6 +494,20 @@ def _model_device(model: Any) -> Any:
         return next(model.parameters()).device
     except (AttributeError, StopIteration, TypeError):
         return None
+
+
+def _token_inputs(value: Any, torch: Any | None) -> tuple[Any, Any]:
+    if isinstance(value, Mapping):
+        input_ids = value.get("input_ids")
+        if input_ids is None:
+            raise TypeError("tokenizer batch encoding must contain input_ids")
+        attention_mask = value.get("attention_mask")
+    else:
+        input_ids = value
+        attention_mask = None
+    if attention_mask is None:
+        attention_mask = _ones_like(input_ids, torch)
+    return input_ids, attention_mask
 
 
 def _first_row_ids(value: Any) -> list[int]:
