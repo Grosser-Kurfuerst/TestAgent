@@ -1,6 +1,6 @@
 schema_version: opd-recollection-run-v1
 root: ../runs/opd-16gb-recollection
-baseline_commit: db51773876a7a1b6a29ad7011aa7dc548ca73e06
+baseline_commit: b69fe9556225d6389d775eeccc7642cf4b0373d5
 lockfile: ../uv.lock
 m0_checkpoint: ../outputs/opd/M0/adapter
 m0_identity_manifest: ../outputs/opd/M0/policy_identity_manifest.json
