@@ -9,12 +9,13 @@ import unittest
 from my_agent.policy.contracts import DecisionOutputError, DecisionRequest
 from my_agent.policy.identity import PolicyIdentity, canonical_sha256
 from my_agent.policy import transformers_policy
+from my_agent.policy.chat_template import CanonicalChatTemplate, QWEN35_NOTHINK_TEMPLATE
 from my_agent.policy.transformers_policy import (
     TransformersPolicy,
     hash_adapter_artifacts,
     parse_tool_calls,
 )
-from my_agent.training.role_views import CanonicalMessage
+from my_agent.training.role_views import CanonicalMessage, CanonicalTool
 
 
 RAW_TOOL_CALL = '<tool_call>{"name":"read_file","arguments":{"path":"src/a.py"}}</tool_call>'
@@ -22,6 +23,8 @@ RAW_TOOL_CALL = '<tool_call>{"name":"read_file","arguments":{"path":"src/a.py"}}
 
 class _TinyTokenizer:
     chat_template = "tiny-template-v1"
+    eos_token_id = 248046
+    pad_token_id = 248044
 
     def __init__(self) -> None:
         self.rendered_calls: list[dict[str, object]] = []
@@ -73,6 +76,21 @@ class _TinyModel:
     def __call__(self, **kwargs: object) -> SimpleNamespace:
         self.forward_kwargs = dict(kwargs)
         return SimpleNamespace(logits="tiny-logits")
+
+
+class _ScriptedGenerationModel(_TinyModel):
+    def __init__(self, completion_ids: list[int]) -> None:
+        super().__init__()
+        self.completion_ids = list(completion_ids)
+
+    def generate(self, **kwargs: object) -> list[list[int]]:
+        self.generate_kwargs = dict(kwargs)
+        prompt_ids = kwargs["input_ids"]
+        if hasattr(prompt_ids, "tolist"):
+            prompt_ids = prompt_ids.tolist()
+        if prompt_ids and isinstance(prompt_ids[0], list):
+            prompt_ids = prompt_ids[0]
+        return [list(prompt_ids) + self.completion_ids]
 
 
 class _RejectingModelLoader:
@@ -131,6 +149,8 @@ class TransformersPolicyTests(unittest.TestCase):
         self.assertEqual(response.identity, self.policy.identity())
         self.assertTrue(self.policy.verify_completion_round_trip(response))
         self.assertEqual(response.parsed_tool_calls[0].name, "read_file")
+        self.assertEqual(self.model.generate_kwargs["eos_token_id"], 248046)
+        self.assertEqual(self.model.generate_kwargs["pad_token_id"], 248044)
 
     def test_chat_remains_agent_llm_compatible_and_returns_tool_call(self) -> None:
         response = self.policy.chat(
@@ -156,6 +176,29 @@ class TransformersPolicyTests(unittest.TestCase):
         self.assertEqual(response.raw["raw_completion"], RAW_TOOL_CALL)
         self.assertEqual(response.raw["assistant_loss_mask"], [1, 1])
         self.assertEqual(response.raw["policy_identity_hash"], self.policy.identity().identity_hash)
+
+    def test_generation_stops_at_first_tokenizer_or_model_eos(self) -> None:
+        model = _ScriptedGenerationModel([201, 248044, 202, 248046])
+        model.generation_config = SimpleNamespace(eos_token_id=248044)
+        policy = TransformersPolicy(
+            model=model,
+            tokenizer=self.tokenizer,
+            identity=_identity(self.tokenizer),
+        )
+        request = DecisionRequest(
+            role="action",
+            purpose="fast_loop_evidence",
+            messages=(CanonicalMessage("user", "task"),),
+            tools=(),
+            max_new_tokens=8,
+            temperature=0.0,
+            top_p=1.0,
+        )
+
+        response = policy.generate_decision(request)
+
+        self.assertEqual(model.generate_kwargs["eos_token_id"], [248046, 248044])
+        self.assertEqual(response.completion_token_ids, (201, 248044))
 
     def test_tokenize_and_forward_logits_expose_white_box_interface(self) -> None:
         request = DecisionRequest(
@@ -221,6 +264,129 @@ class TransformersPolicyTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0].name, "read_file")
         self.assertEqual(calls[0].arguments_json, '{"limit":12000,"path":"src/a.py"}')
+
+    def test_tool_parser_ignores_content_after_first_assistant_turn(self) -> None:
+        calls = parse_tool_calls(
+            RAW_TOOL_CALL
+            + "<|im_end|>\n<|im_start|>user\nignored<|im_end|>\n"
+            + '<|im_start|>assistant\n<tool_call>{"name":"run_tests"}</tool_call>'
+        )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].name, "read_file")
+
+    def test_legacy_tool_json_ignores_content_after_first_assistant_turn(self) -> None:
+        calls = parse_tool_calls(
+            json.dumps({
+                "tool": "read_file",
+                "arguments": {"path": "src/a.py"},
+            })
+            + "<|im_end|><|im_start|>assistant\n"
+            + json.dumps({"tool": "run_tests", "arguments": {}})
+        )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].name, "read_file")
+
+    def test_tool_parser_rejects_more_than_four_calls_in_one_decision(self) -> None:
+        completion = "".join(
+            '<tool_call>{"name":"read_file","arguments":{"path":"file-'
+            + str(index)
+            + '.py"}}</tool_call>'
+            for index in range(5)
+        )
+
+        with self.assertRaisesRegex(ValueError, "per-decision tool-call limit"):
+            parse_tool_calls(completion)
+
+    def test_tool_parser_accepts_four_calls_in_one_decision(self) -> None:
+        completion = "".join(
+            '<tool_call>{"name":"read_file","arguments":{"path":"file-'
+            + str(index)
+            + '.py"}}</tool_call>'
+            for index in range(4)
+        )
+
+        self.assertEqual(len(parse_tool_calls(completion)), 4)
+
+    def test_local_qwen35_tokenizer_stops_at_first_im_end(self) -> None:
+        try:
+            import torch
+            from huggingface_hub import snapshot_download
+            from transformers import AutoTokenizer
+        except ImportError as exc:
+            self.skipTest(f"Qwen3.5 tokenizer integration dependencies unavailable: {exc}")
+        try:
+            snapshot = snapshot_download(
+                repo_id="Qwen/Qwen3.5-4B",
+                revision="851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
+                local_files_only=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - local optional integration fixture
+            self.skipTest(f"local Qwen3.5 tokenizer snapshot unavailable: {exc}")
+
+        tokenizer = AutoTokenizer.from_pretrained(snapshot, local_files_only=True)
+        template = CanonicalChatTemplate(
+            tokenizer,
+            configured_template=QWEN35_NOTHINK_TEMPLATE,
+        )
+        tool_call_ids = tokenizer.encode(RAW_TOOL_CALL, add_special_tokens=False)
+        fake_next_turn_ids = tokenizer.encode(
+            "<|im_start|>user\nthis must not be parsed<|im_end|>",
+            add_special_tokens=False,
+        )
+        model = _ScriptedGenerationModel([
+            *tool_call_ids,
+            tokenizer.eos_token_id,
+            *fake_next_turn_ids,
+        ])
+        model.generation_config = SimpleNamespace(eos_token_id=tokenizer.pad_token_id)
+        identity = PolicyIdentity(
+            base_model="Qwen/Qwen3.5-4B",
+            base_revision="851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
+            checkpoint_hash="sha256:" + "1" * 64,
+            adapter_hash=None,
+            tokenizer_revision="851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
+            tokenizer_hash="sha256:" + "2" * 64,
+            chat_template_hash=template.template_hash,
+        )
+        policy = TransformersPolicy(
+            model=model,
+            tokenizer=tokenizer,
+            identity=identity,
+            configured_template=QWEN35_NOTHINK_TEMPLATE,
+            torch_module=torch,
+        )
+        request = DecisionRequest(
+            role="action",
+            purpose="fast_loop_evidence",
+            messages=(CanonicalMessage("user", "read the file"),),
+            tools=(CanonicalTool(
+                name="read_file",
+                description="Read a repository file.",
+                parameters_json='{"properties":{"path":{"type":"string"}},"type":"object"}',
+                schema_hash=canonical_sha256({
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                }),
+            ),),
+            max_new_tokens=1_024,
+            temperature=0.0,
+            top_p=1.0,
+        )
+
+        response = policy.generate_decision(request)
+
+        self.assertEqual(
+            model.generate_kwargs["eos_token_id"],
+            [tokenizer.eos_token_id, tokenizer.pad_token_id],
+        )
+        self.assertEqual(model.generate_kwargs["pad_token_id"], tokenizer.pad_token_id)
+        self.assertEqual(response.completion_token_ids[-1], tokenizer.eos_token_id)
+        self.assertNotIn("<|im_start|>user", response.raw_completion)
+        self.assertTrue(policy.verify_completion_round_trip(response))
+        self.assertEqual(len(response.parsed_tool_calls), 1)
+        self.assertEqual(response.parsed_tool_calls[0].name, "read_file")
 
     def test_generation_model_loader_prefers_conditional_qwen35_architecture(self) -> None:
         transformers = SimpleNamespace(

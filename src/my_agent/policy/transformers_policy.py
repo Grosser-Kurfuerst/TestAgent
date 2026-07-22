@@ -41,6 +41,8 @@ _QWEN35_PARAMETER_RE = re.compile(
     r"<parameter=([^>\n]+)>\s*(.*?)\s*</parameter>",
     re.DOTALL,
 )
+_TERMINAL_COMPLETION_TOKENS = ("<|im_end|>", "<|endoftext|>")
+_MAX_TOOL_CALLS_PER_DECISION = 4
 _MODEL_ARTIFACT_NAMES = frozenset({
     "config.json",
     "generation_config.json",
@@ -247,6 +249,14 @@ class TransformersPolicy:
             "do_sample": request.temperature > 0.0,
             "top_p": request.top_p,
         }
+        eos_token_ids = _generation_eos_token_ids(self.model, self.tokenizer)
+        pad_token_id = getattr(self.tokenizer, "pad_token_id", None)
+        if eos_token_ids:
+            generate_kwargs["eos_token_id"] = (
+                eos_token_ids[0] if len(eos_token_ids) == 1 else list(eos_token_ids)
+            )
+        if pad_token_id is not None:
+            generate_kwargs["pad_token_id"] = pad_token_id
         if request.temperature > 0.0:
             generate_kwargs["temperature"] = request.temperature
         generator = _seeded_generator(self._torch, request.seed, _model_device(self.model))
@@ -260,6 +270,13 @@ class TransformersPolicy:
         if all_ids[: len(prompt_ids)] != prompt_ids:
             raise RuntimeError("generated token sequence does not preserve the prompt prefix")
         completion_ids = all_ids[len(prompt_ids):]
+        terminal_indexes = [
+            completion_ids.index(token_id)
+            for token_id in eos_token_ids
+            if token_id in completion_ids
+        ]
+        if terminal_indexes:
+            completion_ids = completion_ids[: min(terminal_indexes) + 1]
         raw_completion = self.tokenizer.decode(
             list(completion_ids),
             skip_special_tokens=False,
@@ -354,15 +371,16 @@ class TransformersPolicy:
 
 def parse_tool_calls(raw_completion: str) -> tuple[CanonicalToolCall, ...]:
     payloads: list[Mapping[str, Any]] = []
-    matches = _TOOL_CALL_RE.findall(raw_completion)
+    assistant_turn = _first_assistant_turn(raw_completion)
+    matches = _TOOL_CALL_RE.findall(assistant_turn)
     if matches:
         for match in matches:
             payloads.append(_tool_call_mapping(match))
-        residual = _TOOL_CALL_RE.sub("", raw_completion)
+        residual = _TOOL_CALL_RE.sub("", assistant_turn)
         if "<tool_call" in residual or "</tool_call" in residual:
             raise ValueError("generated tool call contains an unmatched marker")
     else:
-        stripped = raw_completion.strip()
+        stripped = assistant_turn.strip()
         if "<tool_call" in stripped or "</tool_call" in stripped:
             raise ValueError("generated tool call contains an unmatched marker")
         if stripped.startswith("{"):
@@ -376,6 +394,12 @@ def parse_tool_calls(raw_completion: str) -> tuple[CanonicalToolCall, ...]:
                     payloads.extend(item for item in raw_calls if isinstance(item, Mapping))
                 elif "name" in parsed or "tool" in parsed:
                     payloads.append(parsed)
+
+    if len(payloads) > _MAX_TOOL_CALLS_PER_DECISION:
+        raise ValueError(
+            "generated response exceeds the per-decision tool-call limit "
+            f"of {_MAX_TOOL_CALLS_PER_DECISION}"
+        )
 
     calls: list[CanonicalToolCall] = []
     for index, payload in enumerate(payloads):
@@ -409,6 +433,17 @@ def parse_tool_calls(raw_completion: str) -> tuple[CanonicalToolCall, ...]:
         )
         calls.append(CanonicalToolCall(call_id, name, arguments_json))
     return tuple(calls)
+
+
+def _first_assistant_turn(raw_completion: str) -> str:
+    terminal_indexes = [
+        index
+        for token in _TERMINAL_COMPLETION_TOKENS
+        if (index := raw_completion.find(token)) >= 0
+    ]
+    if not terminal_indexes:
+        return raw_completion
+    return raw_completion[: min(terminal_indexes)]
 
 
 def _load_transformers_dependencies() -> tuple[Any, Any, Any]:
@@ -494,6 +529,23 @@ def _model_device(model: Any) -> Any:
         return next(model.parameters()).device
     except (AttributeError, StopIteration, TypeError):
         return None
+
+
+def _generation_eos_token_ids(model: Any, tokenizer: Any) -> tuple[int, ...]:
+    model_generation_config = getattr(model, "generation_config", None)
+    candidates = (
+        getattr(tokenizer, "eos_token_id", None),
+        getattr(model_generation_config, "eos_token_id", None),
+    )
+    token_ids: list[int] = []
+    for token_id in candidates:
+        if (
+            isinstance(token_id, int)
+            and not isinstance(token_id, bool)
+            and token_id not in token_ids
+        ):
+            token_ids.append(token_id)
+    return tuple(token_ids)
 
 
 def _token_inputs(value: Any, torch: Any | None) -> tuple[Any, Any]:
