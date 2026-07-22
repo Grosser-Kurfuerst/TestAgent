@@ -28,6 +28,7 @@ class _Policy:
     def __init__(self, output: str, *, on_generate=None) -> None:
         self.output = output
         self.on_generate = on_generate
+        self.requests = []
 
     def identity(self):
         return _identity()
@@ -36,6 +37,7 @@ class _Policy:
         return canonical_sha256([item.to_dict() for item in request.messages])
 
     def generate_decision(self, request):
+        self.requests.append(request)
         if self.on_generate is not None:
             self.on_generate()
         return DecisionResponse(
@@ -78,6 +80,35 @@ def _outcome() -> AuthoritativeTaskOutcome:
 
 
 class FormalLLMWriterTests(unittest.TestCase):
+    def test_writer_prompt_exposes_validator_threshold_and_tier_payloads(self) -> None:
+        policy = _Policy("[]")
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ExperienceStore.from_dir(tmp)
+            coordinator = EvolverCoordinator(
+                store=store,
+                project_key="project-a",
+                policy_identity=_identity(),
+                policy=policy,
+            )
+
+            result = coordinator.finalize_task(_episode(store), _outcome())
+
+        request = policy.requests[0]
+        prompt = json.loads(request.messages[1].content)
+        self.assertEqual(result.writer_status, "no_write")
+        self.assertEqual(prompt["min_confidence"], 0.7)
+        self.assertEqual(
+            set(prompt["tier_payload_schemas"]),
+            {"trajectory", "tip", "skill", "tool"},
+        )
+        self.assertEqual(
+            set(prompt["tier_payload_schemas"]["skill"]),
+            {"category", "technique", "preconditions", "steps"},
+        )
+        self.assertIn("code", prompt["tier_payload_schemas"]["tool"])
+        self.assertIn("command", prompt["tier_payload_schemas"]["tool"])
+        self.assertIn("return []", request.messages[0].content)
+
     @staticmethod
     def _two_record_output() -> str:
         return json.dumps([
@@ -134,7 +165,7 @@ class FormalLLMWriterTests(unittest.TestCase):
         normalized = {**decision, "decision_id": "<decision-id>"}
         self.assertEqual(
             canonical_sha256(normalized),
-            "sha256:a120610f499be63e0fb4b212366157fcacdea75dc63c98a0d47ee294f21f4e6c",
+            "sha256:ecaac17142431218ca7cdf0059484f3dc39c4eee2d2dc6cadb180e13cdecd8a5",
         )
 
     def test_formal_writer_uses_shared_validator_without_legacy_writer(self) -> None:

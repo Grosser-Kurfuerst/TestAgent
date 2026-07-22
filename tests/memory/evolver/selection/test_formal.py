@@ -8,6 +8,7 @@ from my_agent.llm.types import ChatResponse
 from my_agent.memory.embedding_retrieval import EmbeddingRetriever
 from my_agent.memory.evolver.coordinator import EvolverCoordinator
 from my_agent.memory.evolver.selector_prompt import LLMTaskSelectionPolicy
+from my_agent.memory.evolver.selection.prompt import build_selection_request
 from my_agent.memory.experience.models import ExperienceTier
 from my_agent.memory.experience_store import ExperienceStore
 from my_agent.policy.contracts import DecisionResponse
@@ -76,6 +77,23 @@ def _context() -> DecisionEventContext:
 
 
 class LLMTaskSelectionPolicyTests(unittest.TestCase):
+    def test_prompt_lists_only_real_candidate_labels(self) -> None:
+        request = build_selection_request(
+            task="task",
+            candidates=(_candidate("RETRIEVED_TIP_01", "mem-1", "tip"),),
+            token_budget=100,
+            max_items=20,
+            max_new_tokens=128,
+            temperature=0.0,
+            top_p=1.0,
+        )
+        payload = json.loads(request.messages[1].content)
+
+        self.assertEqual(payload["allowed_labels_by_tier"]["tip"], ["RETRIEVED_TIP_01"])
+        self.assertEqual(payload["allowed_labels_by_tier"]["skill"], [])
+        self.assertEqual(payload["output_schema"]["selected_skills"], [])
+        self.assertNotIn("RETRIEVED_SKILL_01", request.messages[1].content)
+
     def test_empty_candidates_skip_llm_generation(self) -> None:
         policy = _Policy("should not be used")
         events = []
@@ -221,7 +239,7 @@ class LLMTaskSelectionPolicyTests(unittest.TestCase):
         normalized = {**events[0][1], "decision_id": "<decision-id>"}
         self.assertEqual(
             canonical_sha256(normalized),
-            "sha256:908aa7b427643ee68a0d431c34a1700933e91e4006d99fabb7ce8e025aeaf66d",
+            "sha256:1387cc9c546033c6b95ab4eb4329c876367e9db9396e122996ed17e03c60bea8",
         )
 
     def test_invalid_reference_fails_closed_to_empty_selection(self) -> None:

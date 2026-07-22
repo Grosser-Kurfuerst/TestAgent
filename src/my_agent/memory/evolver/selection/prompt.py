@@ -26,8 +26,12 @@ def build_selection_request(
         candidates=candidates,
         token_budget=token_budget,
     )
+    allowed_labels = {
+        tier: [candidate.label for candidate in candidates if candidate.tier == tier]
+        for tier in ("skill", "tip", "tool", "trajectory")
+    }
     schema = {
-        "selected_skills": ["RETRIEVED_SKILL_01"],
+        "selected_skills": [],
         "selected_tips": [],
         "selected_tools": [],
         "selected_trajectories": [],
@@ -39,13 +43,18 @@ def build_selection_request(
         messages=(
             CanonicalMessage(
                 "system",
-                "Select only useful candidate labels. Return exactly one JSON object and no prose.",
+                "Select zero or more useful memories from the provided candidate labels. "
+                "Use only labels listed in allowed_labels_by_tier, place each label in its "
+                "matching tier field, and never invent or duplicate labels. Respect max_items "
+                "and token_budget. If no candidate is useful, return empty arrays. Return "
+                "exactly one JSON object matching output_schema and no prose.",
             ),
             CanonicalMessage(
                 "user",
                 canonical_json_bytes({
                     "public_view": public.to_dict(),
                     "max_items": max_items,
+                    "allowed_labels_by_tier": allowed_labels,
                     "output_schema": schema,
                 }).decode("utf-8"),
             ),

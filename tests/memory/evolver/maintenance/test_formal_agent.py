@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -44,6 +45,7 @@ def _cadence_id() -> str:
 class _Policy:
     def __init__(self, calls: list[CanonicalToolCall]) -> None:
         self.calls = list(calls)
+        self.requests = []
 
     def identity(self):
         return _identity()
@@ -52,6 +54,7 @@ class _Policy:
         return canonical_sha256([item.to_dict() for item in request.messages])
 
     def generate_decision(self, request):
+        self.requests.append(request)
         call = self.calls.pop(0)
         return DecisionResponse(
             raw_completion=f"<tool_call>{call.arguments_json}</tool_call>",
@@ -70,6 +73,32 @@ class _Policy:
 
 
 class FormalMaintenanceAgentTests(unittest.TestCase):
+    def test_empty_repository_prompt_requires_finish_without_invented_ids(self) -> None:
+        policy = _Policy([_call("finish", {"summary": "repository is empty"})])
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ExperienceStore.from_dir(tmp)
+            agent = FormalMaintenanceAgent(
+                policy=policy,
+                recorder=DecisionEventRecorder(policy=policy),
+                store=store,
+                project_key="project-a",
+            )
+
+            result = agent.run(
+                maintenance_id=_cadence_id(),
+                attempt_id="attempt-a",
+                stream_id="stream-a",
+                task_group="group-a",
+            )
+
+        request = policy.requests[0]
+        public = json.loads(request.messages[1].content)["public_view"]
+        self.assertEqual(result.status, "noop")
+        self.assertEqual(public["repository_snapshot"]["memory_ids"], [])
+        self.assertIn("repository is empty", request.messages[0].content)
+        self.assertIn("exactly one tool call", request.messages[0].content)
+        self.assertIn("never invent memory IDs", request.messages[0].content)
+
     def test_tools_exclude_promote(self) -> None:
         self.assertEqual(
             [tool.name for tool in formal_maintenance_tools()],
@@ -131,6 +160,11 @@ class FormalMaintenanceAgentTests(unittest.TestCase):
         self.assertEqual(len(memories), 1)
         self.assertEqual(memories[0].id, "tip-a")
         self.assertEqual(memories[0].content, "Run the focused test before the full suite.")
+        lookup_observation = json.loads(policy.requests[1].messages[-1].content)
+        self.assertEqual(
+            set(lookup_observation["hits"][0]["payload"]),
+            {"category", "severity", "trigger"},
+        )
         decisions = [payload for event, payload in events if event == "opd.decision"]
         self.assertEqual([item["turn_index"] for item in decisions], [0, 1, 2])
         self.assertTrue(all(item["role"] == "maintenance" for item in decisions))
@@ -140,8 +174,41 @@ class FormalMaintenanceAgentTests(unittest.TestCase):
         ]
         self.assertEqual(
             canonical_sha256(normalized),
-            "sha256:d07bf42d2049ea3b448eb9e8ecf589bdd8889763805038c3b7be722b7eea7fc0",
+            "sha256:e9d940e8106d33cafe2e142ba0fb95987f06e211b9ec56737ed0b99cedc1f35a",
         )
+
+    def test_lookup_accepts_exact_snapshot_memory_id(self) -> None:
+        calls = [
+            _call("lookup", {"query": "tip-a", "limit": 10}),
+            _call("finish", {"summary": "inspected tip-a"}),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ExperienceStore.from_dir(tmp)
+            store.add(typed_experience(
+                "tip-a",
+                "Run focused tests first.",
+                ExperienceTier.TIP,
+                project_key="project-a",
+                created_by=ExperienceCreatedBy.WRITER,
+            ))
+            policy = _Policy(calls)
+            agent = FormalMaintenanceAgent(
+                policy=policy,
+                recorder=DecisionEventRecorder(policy=policy),
+                store=store,
+                project_key="project-a",
+            )
+
+            result = agent.run(
+                maintenance_id=_cadence_id(),
+                attempt_id="attempt-a",
+                stream_id="stream-a",
+                task_group="group-a",
+            )
+
+        observation = json.loads(policy.requests[1].messages[-1].content)
+        self.assertEqual(result.status, "noop")
+        self.assertEqual(observation["hits"][0]["memory_id"], "tip-a")
 
     def test_protected_delete_aborts_without_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

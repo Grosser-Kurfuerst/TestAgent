@@ -82,6 +82,7 @@ class FormalExperienceWriter:
         request = build_writing_request(
             public,
             max_records=self.validator.max_records,
+            min_confidence=self.validator.min_confidence,
             max_new_tokens=self.max_new_tokens,
             temperature=self.temperature,
             top_p=self.top_p,
@@ -147,6 +148,7 @@ def build_writing_request(
     public: WritingPublic,
     *,
     max_records: int,
+    min_confidence: float,
     max_new_tokens: int,
     temperature: float,
     top_p: float,
@@ -157,20 +159,29 @@ def build_writing_request(
         messages=(
             CanonicalMessage(
                 "system",
-                "Return only a JSON array of reusable memory records. Do not include prose or fallback content.",
+                "Extract only reusable experience supported by the task trajectory and outcome. "
+                "Do not store the task-specific answer, a one-off implementation, secrets, or "
+                "unsupported claims. Use trajectory for a reusable multi-step path, tip for a "
+                "concise warning, skill for a general technique, and tool only for a reusable "
+                "executable helper. Do not create a tool record for a generic command such as "
+                "pytest or git unless the trajectory introduced a reusable wrapper. If there "
+                "is no reusable experience, return []. Return only "
+                "one JSON array matching the record and tier payload schemas, with no prose.",
             ),
             CanonicalMessage(
                 "user",
                 canonical_json_bytes({
                     "public_view": public.to_dict(),
                     "max_records": max_records,
+                    "min_confidence": min_confidence,
                     "record_schema": {
                         "tier": "trajectory|tip|skill|tool",
                         "content": "reusable memory text",
-                        "payload": {},
-                        "confidence": 0.0,
-                        "reason": "brief reason",
+                        "payload": "exactly one matching tier payload below",
+                        "confidence": f"number in [{min_confidence}, 1.0]",
+                        "reason": "brief evidence-based reason",
                     },
+                    "tier_payload_schemas": _writing_payload_schemas(),
                 }).decode("utf-8"),
             ),
         ),
@@ -179,6 +190,47 @@ def build_writing_request(
         temperature=temperature,
         top_p=top_p,
     )
+
+
+def _writing_payload_schemas() -> dict[str, Any]:
+    return {
+        "trajectory": {
+            "task_description": "generalized task description",
+            "steps": [{
+                "step_num": 1,
+                "observation": "relevant observation",
+                "action": "action or tool name",
+                "action_params": {},
+                "result": "result summary",
+                "reward": None,
+            }],
+            "outcome": "success",
+            "total_reward": None,
+            "key_learnings": [],
+            "tags": [],
+        },
+        "tip": {
+            "category": "category",
+            "severity": "warning",
+            "trigger": "when this tip applies",
+        },
+        "skill": {
+            "category": "category",
+            "technique": "general reusable technique",
+            "preconditions": [],
+            "steps": ["ordered reusable step"],
+        },
+        "tool": {
+            "name": "tool name",
+            "language": "language or shell",
+            "code": "reusable code, or empty when command is provided",
+            "input_description": "expected inputs",
+            "output_description": "expected outputs",
+            "command": "reusable command, or empty when code is provided",
+            "args_schema": {},
+            "repo_context": "where the helper applies",
+        },
+    }
 
 
 def parse_writing_response(

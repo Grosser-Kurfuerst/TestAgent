@@ -34,6 +34,7 @@ from my_agent.memory.evolver.maintenance.repository_reducer import (
     validate_formal_operations,
 )
 from my_agent.memory.experience.repository import ExperienceStore
+from my_agent.memory.experience.serialization import experience_payload_to_dict
 from my_agent.policy.contracts import DecisionResponse, GenerationPolicy
 from my_agent.policy.identity import canonical_json_bytes
 from my_agent.training.decision_log import (
@@ -240,6 +241,7 @@ class FormalMaintenanceAgent:
                     "memory_id": hit.memory.id,
                     "tier": hit.tier,
                     "content": hit.memory.content,
+                    "payload": experience_payload_to_dict(hit.memory.payload),
                     "score": hit.score,
                 }
                 for hit in hits

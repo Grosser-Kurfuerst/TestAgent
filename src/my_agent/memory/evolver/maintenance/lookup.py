@@ -46,12 +46,13 @@ def lookup_experiences(
         content_terms = set(tokenize_experience_text(entry.content))
         matched = tuple(sorted(query_terms.intersection(content_terms)))
         coverage = len(matched) / len(query_terms) if query_terms else 0.0
+        exact_id_match = normalized_query == normalize_content(entry.id)
         substring_bonus = (
             0.25
             if normalized_query and normalized_query in normalize_content(entry.content)
             else 0.0
         )
-        score = min(1.0, coverage + substring_bonus)
+        score = 1.0 if exact_id_match else min(1.0, coverage + substring_bonus)
         if score <= 0:
             continue
         hits.append(MaintenanceLookupHit(

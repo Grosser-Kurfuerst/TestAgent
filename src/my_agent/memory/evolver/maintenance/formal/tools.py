@@ -36,7 +36,7 @@ def formal_maintenance_tools() -> tuple[CanonicalTool, ...]:
     return tuple(_tool(name, description, parameters) for name, description, parameters in (
         (
             "lookup",
-            "Inspect matching repository memories without mutating the staged plan.",
+            "Inspect matching repository memories by content query or exact memory ID without mutating the staged plan.",
             {
                 "type": "object",
                 "properties": {
