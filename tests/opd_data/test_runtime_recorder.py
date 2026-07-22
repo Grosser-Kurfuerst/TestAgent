@@ -196,6 +196,52 @@ def _outcome(task_id: str = "task-1") -> AuthoritativeTaskOutcome:
 
 
 class OpdRuntimeRecorderTests(unittest.TestCase):
+    def test_empty_repository_keeps_task_evidence_without_selection_decision(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dataset = root / "dataset"
+            store = ExperienceStore.from_dir(root / "memory")
+            coordinator = EvolverCoordinator(
+                store=store,
+                project_key="project-a",
+                policy_identity=_identity(),
+                policy=_RolePolicy(),
+                retriever=EmbeddingRetriever(_Encoder()),
+                dataset_dir=dataset,
+                maintenance_interval_tasks=30,
+            )
+            session = coordinator.begin_task(
+                task="Fix the public task",
+                task_id="task-1",
+                task_group="group-a",
+                trajectory_id="traj-1",
+                stream_id="stream-a",
+            )
+            action = _record_action(coordinator, session)
+            coordinator.finalize_task(_episode(session, store), _outcome())
+
+            decisions = load_decision_events(dataset / "decision_events.jsonl")
+            tasks = load_task_evidence(dataset / "task_evidence.jsonl")
+            exclusions = load_runtime_exclusions(dataset / "runtime_exclusions.jsonl")
+            prepared = prepare_round_decisions(
+                collection_round=0,
+                trainer_identity=_identity(),
+                tasks=tasks,
+                outcomes=load_task_outcomes(dataset / "task_outcomes.jsonl"),
+                repositories=load_repository_evidence(dataset / "repository_events.jsonl"),
+                maintenance=(),
+                decision_events=decisions,
+                attribution=(),
+            )
+
+        self.assertEqual(session.candidate_snapshot, ())
+        self.assertEqual({event.role for event in decisions}, {"action", "writing"})
+        self.assertEqual(len(tasks), 1)
+        self.assertIsNone(tasks[0].selection_decision_id)
+        self.assertIn(action.decision_id, tasks[0].source_decision_ids)
+        self.assertFalse(any(item.role == "selection" for item in exclusions))
+        self.assertFalse(any(item.role == "selection" for item in prepared.decisions))
+
     def test_action_execution_is_joined_to_decision_and_materialized_on_finish(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -624,6 +670,13 @@ class OpdRuntimeRecorderTests(unittest.TestCase):
                 root = Path(tmp)
                 dataset = root / "dataset"
                 store = ExperienceStore.from_dir(root / "memory")
+                if expected_role == "selection":
+                    store.add(typed_experience(
+                        "tip-a",
+                        "Run focused tests before the full suite.",
+                        ExperienceTier.TIP,
+                        project_key="project-a",
+                    ))
                 policy = _RolePolicy(invalid_roles=invalid_roles)
                 coordinator = EvolverCoordinator(
                     store=store,

@@ -240,7 +240,7 @@ class TaskEvidence:
     selected_memory_ids: tuple[str, ...]
     trajectory: TrajectoryEvidence
     written_memory_ids: tuple[str, ...]
-    selection_decision_id: str
+    selection_decision_id: str | None
     action_decisions: tuple[ActionDecisionEvidence, ...]
     writing_decision_id: str | None
     selection_token_budget: int
@@ -252,9 +252,13 @@ class TaskEvidence:
         _require_split(self.split)
         for field_name in (
             "task", "task_id", "task_group", "trajectory_id", "stream_id",
-            "memory_project_key", "selection_decision_id",
+            "memory_project_key",
         ):
             _require_nonblank(getattr(self, field_name), field_name)
+        if self.selection_decision_id is not None:
+            _require_nonblank(self.selection_decision_id, "selection_decision_id")
+        elif self.candidates:
+            raise ValueError("task evidence with candidates requires selection decision evidence")
         if not isinstance(self.policy_identity, PolicyIdentity):
             raise ValueError("task evidence requires PolicyIdentity")
         require_sha256(self.repository_snapshot_hash, field_name="repository_snapshot_hash")
@@ -295,10 +299,9 @@ class TaskEvidence:
 
     @property
     def source_decision_ids(self) -> tuple[str, ...]:
-        values = (
-            self.selection_decision_id,
-            *(item.decision_id for item in self.action_decisions),
-        )
+        values = tuple(item.decision_id for item in self.action_decisions)
+        if self.selection_decision_id is not None:
+            values = (self.selection_decision_id, *values)
         if self.writing_decision_id is not None:
             values = (*values, self.writing_decision_id)
         return values
@@ -345,6 +348,9 @@ class TaskEvidence:
         }
         _require_exact(data, expected, "task evidence")
         identity = _identity(data)
+        selection_id = data["selection_decision_id"]
+        if selection_id is not None and not isinstance(selection_id, str):
+            raise ValueError("selection_decision_id must be a string or null")
         writing_id = data["writing_decision_id"]
         if writing_id is not None and not isinstance(writing_id, str):
             raise ValueError("writing_decision_id must be a string or null")
@@ -369,9 +375,7 @@ class TaskEvidence:
             selected_memory_ids=_strings(data["selected_memory_ids"], "selected_memory_ids"),
             trajectory=TrajectoryEvidence.from_dict(_mapping(data["trajectory"], "trajectory")),
             written_memory_ids=_strings(data["written_memory_ids"], "written_memory_ids"),
-            selection_decision_id=_string(
-                data["selection_decision_id"], "selection_decision_id"
-            ),
+            selection_decision_id=selection_id,
             action_decisions=_objects(
                 data["action_decisions"], ActionDecisionEvidence.from_dict, "action_decisions"
             ),

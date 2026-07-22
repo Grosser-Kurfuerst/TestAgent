@@ -163,29 +163,38 @@ def prepare_round_decisions(
             exclusions.append(_exclusion(task.evidence_id, "task", "invalid_or_unknown_outcome"))
             continue
 
-        candidate_values = _ready_values(task.candidates, attribution_by_id)
-        if candidate_values is None:
-            exclusions.append(_exclusion(task.evidence_id, "selection", "missing_candidate_attribution"))
-        else:
-            prepared.append(PreparedLearnerDecision(
-                role="selection",
-                collection_round=collection_round,
-                split=task.split,
-                task_group=task.task_group,
-                stream_id=task.stream_id,
-                memory_project_key=task.memory_project_key,
-                source_evidence_ids=(task.evidence_id, outcome.outcome_id),
-                evidence_refs=(
-                    task.selection_decision_id,
-                    *(_attribution_ref(item.memory_id, attribution_by_id) for item in task.candidates),
-                ),
-                public_view=SelectionPublic(
-                    task=task.task,
-                    candidates=task.candidates,
-                    token_budget=task.selection_token_budget,
-                ),
-                hindsight_view=SelectionHindsight(candidate_values),
-            ))
+        if task.candidates:
+            candidate_values = _ready_values(task.candidates, attribution_by_id)
+            if candidate_values is None:
+                exclusions.append(_exclusion(
+                    task.evidence_id,
+                    "selection",
+                    "missing_candidate_attribution",
+                ))
+            else:
+                assert task.selection_decision_id is not None
+                prepared.append(PreparedLearnerDecision(
+                    role="selection",
+                    collection_round=collection_round,
+                    split=task.split,
+                    task_group=task.task_group,
+                    stream_id=task.stream_id,
+                    memory_project_key=task.memory_project_key,
+                    source_evidence_ids=(task.evidence_id, outcome.outcome_id),
+                    evidence_refs=(
+                        task.selection_decision_id,
+                        *(
+                            _attribution_ref(item.memory_id, attribution_by_id)
+                            for item in task.candidates
+                        ),
+                    ),
+                    public_view=SelectionPublic(
+                        task=task.task,
+                        candidates=task.candidates,
+                        token_budget=task.selection_token_budget,
+                    ),
+                    hindsight_view=SelectionHindsight(candidate_values),
+                ))
 
         positive_ids = positive_selected_memory_ids(
             task.selected_memory_ids,
@@ -551,7 +560,9 @@ def _validate_task_join(
         for candidate in task.candidates
     ):
         raise ValueError("task candidate is absent from the joined repository snapshot")
-    expected_roles = {task.selection_decision_id: "selection"}
+    expected_roles: dict[str, str] = {}
+    if task.selection_decision_id is not None:
+        expected_roles[task.selection_decision_id] = "selection"
     if task.writing_decision_id is not None:
         expected_roles[task.writing_decision_id] = "writing"
     for decision_id, role in expected_roles.items():

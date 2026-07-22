@@ -281,7 +281,8 @@ class RuntimeEvidenceRecorder:
             outcome_finalized=outcome.outcome_finalized,
         )
         invalid_roles: list[tuple[str, str]] = []
-        if len(selections) != 1:
+        selection_required = bool(episode.session.candidate_snapshot)
+        if len(selections) > 1 or (selection_required and len(selections) != 1):
             invalid_roles.append(("selection", "missing_successful_selection_decision"))
         if not actions:
             invalid_roles.append(("action", "missing_successful_action_decision"))
@@ -307,8 +308,6 @@ class RuntimeEvidenceRecorder:
             )
             del self._pending_tasks[episode.session.trajectory_id]
             return
-
-        selection = selections[0]
 
         trajectory = TrajectoryEvidence(
             trajectory_id=episode.session.trajectory_id,
@@ -344,7 +343,7 @@ class RuntimeEvidenceRecorder:
             selected_memory_ids=episode.session.selected_memory_ids,
             trajectory=trajectory,
             written_memory_ids=written_memory_ids,
-            selection_decision_id=selection.decision_id,
+            selection_decision_id=selections[0].decision_id if selections else None,
             action_decisions=tuple(
                 ActionDecisionEvidence(
                     decision_id=event.decision_id,

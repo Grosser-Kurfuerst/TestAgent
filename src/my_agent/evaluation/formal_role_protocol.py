@@ -20,16 +20,20 @@ from my_agent.training.decision_log import load_decision_events
 from my_agent.training.role_views import CanonicalToolCall, SelectionPublic
 
 
-FORMAL_ROLE_PROTOCOL_SCHEMA_VERSION = "agentcli-formal-role-protocol-eval-v1"
+FORMAL_ROLE_PROTOCOL_SCHEMA_VERSION = "agentcli-formal-role-protocol-eval-v2"
 FORMAL_ROLES = ("selection", "action", "writing", "maintenance")
+_TERMINAL_SPECIAL_TOKENS = ("<|im_end|>", "<|endoftext|>")
 DEFAULT_THRESHOLDS = {
+    "selection.decision_success_rate": 0.98,
     "selection.schema_valid_rate": 0.98,
     "selection.unknown_label_rate": 0.0,
     "action.decision_success_rate": 0.95,
     "action.runtime_tool_call_parse_rate": 0.95,
     "action.unknown_tool_rate": 0.0,
+    "writing.decision_success_rate": 0.95,
     "writing.json_array_rate": 0.95,
     "writing.validator_accept_rate": 0.90,
+    "maintenance.decision_success_rate": 0.95,
     "maintenance.runtime_tool_call_parse_rate": 0.95,
     "maintenance.unknown_memory_id_rate": 0.0,
 }
@@ -166,10 +170,10 @@ def _score_selection(event: DecisionEvent) -> dict[str, Any]:
     schema_valid = False
     unknown_label = "unknown candidate label" in _event_error(event)
     try:
-        payload = _json_value(event.raw_completion)
+        content = _strip_terminal_special_tokens(event.raw_completion)
         public = SelectionPublic.from_dict(_user_payload(event)["public_view"])
         parse_selection_response(
-            canonical_json_bytes(payload).decode("utf-8"),
+            content,
             candidates=public.candidates,
         )
         schema_valid = True
@@ -201,13 +205,14 @@ def _score_writing(event: DecisionEvent) -> dict[str, Any]:
     validator_accept = False
     proposal_count = 0
     try:
-        payload = _json_value(event.raw_completion)
+        content = _strip_terminal_special_tokens(event.raw_completion)
+        payload = json.loads(content)
         json_array = isinstance(payload, list)
         prompt = _user_payload(event)
         min_confidence = float(prompt.get("min_confidence", 0.70))
         max_records = int(prompt.get("max_records", 6))
         proposals = parse_writing_response(
-            canonical_json_bytes(payload).decode("utf-8"),
+            content,
             validator=ExperienceProposalValidator(
                 min_confidence=min_confidence,
                 max_records=max_records,
@@ -334,13 +339,15 @@ def _maintenance_snapshot_ids(event: DecisionEvent) -> set[str]:
     return {str(item) for item in ids} if isinstance(ids, list) else set()
 
 
-def _json_value(text: str) -> Any:
+def _strip_terminal_special_tokens(text: str) -> str:
     stripped = text.strip()
-    starts = [index for index in (stripped.find("{"), stripped.find("[")) if index >= 0]
-    if not starts:
-        raise ValueError("completion does not contain JSON")
-    value, _end = json.JSONDecoder().raw_decode(stripped[min(starts):])
-    return value
+    while True:
+        for token in _TERMINAL_SPECIAL_TOKENS:
+            if stripped.endswith(token):
+                stripped = stripped[:-len(token)].rstrip()
+                break
+        else:
+            return stripped
 
 
 def _looks_like_tool_call(text: str) -> bool:

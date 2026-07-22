@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 import tempfile
 import unittest
@@ -132,6 +133,167 @@ def _selection_events() -> list[DecisionEvent]:
 
 
 class FormalRoleProtocolTests(unittest.TestCase):
+    def test_selection_accepts_terminal_special_tokens(self) -> None:
+        selection = _selection_events()[0]
+        with_terminal_tokens = replace(
+            selection,
+            raw_completion=selection.raw_completion + "<|im_end|>\n<|endoftext|>",
+        )
+
+        summary, _details = evaluate_formal_role_events([with_terminal_tokens])
+
+        self.assertEqual(summary["roles"]["selection"]["schema_valid_rate"], 1.0)
+
+    def test_writing_accepts_terminal_special_tokens(self) -> None:
+        valid_tip = [{
+            "tier": "tip",
+            "content": "Run focused tests before the full suite.",
+            "payload": {
+                "category": "testing",
+                "severity": "info",
+                "trigger": "after a focused code change",
+            },
+            "confidence": 0.9,
+            "reason": "reusable verification guidance",
+        }]
+        writing = _event(
+            decision_id="writing-terminal-tokens",
+            role="writing",
+            raw_completion=json.dumps(valid_tip) + "<|im_end|><|endoftext|>",
+            parsed_output={"proposals": valid_tip},
+            messages=(CanonicalMessage(
+                "user",
+                json.dumps({"min_confidence": 0.7, "max_records": 6}),
+            ),),
+        )
+
+        summary, _details = evaluate_formal_role_events([writing])
+
+        self.assertEqual(summary["roles"]["writing"]["json_array_rate"], 1.0)
+        self.assertEqual(summary["roles"]["writing"]["validator_accept_rate"], 1.0)
+
+    def test_wrapped_json_is_rejected_like_the_runtime_parser(self) -> None:
+        selection = _selection_events()[0]
+        wrapped_selection = replace(
+            selection,
+            raw_completion=f"prose\n{selection.raw_completion}\ntrailing",
+            parsed_output={"error": "selector output must be valid JSON"},
+            status="invalid_output",
+        )
+        valid_tip = [{
+            "tier": "tip",
+            "content": "Run focused tests before the full suite.",
+            "payload": {
+                "category": "testing",
+                "severity": "info",
+                "trigger": "after a focused code change",
+            },
+            "confidence": 0.9,
+            "reason": "reusable verification guidance",
+        }]
+        wrapped_writing = _event(
+            decision_id="writing-wrapped",
+            role="writing",
+            raw_completion=f"prose\n{json.dumps(valid_tip)}\ntrailing",
+            parsed_output={"error": "writer output must be valid JSON"},
+            status="invalid_output",
+            messages=(CanonicalMessage(
+                "user",
+                json.dumps({"min_confidence": 0.7, "max_records": 6}),
+            ),),
+        )
+
+        summary, _details = evaluate_formal_role_events([
+            wrapped_selection,
+            wrapped_writing,
+        ])
+
+        self.assertEqual(summary["roles"]["selection"]["schema_valid_rate"], 0.0)
+        self.assertEqual(summary["roles"]["writing"]["json_array_rate"], 0.0)
+        self.assertEqual(summary["roles"]["writing"]["validator_accept_rate"], 0.0)
+
+    def test_runtime_rejected_role_outputs_cannot_pass_acceptance(self) -> None:
+        selection = replace(
+            _selection_events()[0],
+            parsed_output={"error": "runtime rejected output"},
+            status="invalid_output",
+        )
+        valid_tip = [{
+            "tier": "tip",
+            "content": "Run focused tests before the full suite.",
+            "payload": {
+                "category": "testing",
+                "severity": "info",
+                "trigger": "after a focused code change",
+            },
+            "confidence": 0.9,
+            "reason": "reusable verification guidance",
+        }]
+        writing = _event(
+            decision_id="writing-runtime-rejected",
+            role="writing",
+            raw_completion=json.dumps(valid_tip),
+            parsed_output={"error": "runtime rejected output"},
+            status="invalid_output",
+            messages=(CanonicalMessage(
+                "user",
+                json.dumps({"min_confidence": 0.7, "max_records": 6}),
+            ),),
+        )
+        read_call = CanonicalToolCall(
+            "call-read",
+            "read_file",
+            canonical_json_bytes({"path": "README.md"}).decode("utf-8"),
+        )
+        action = _event(
+            decision_id="action-valid",
+            role="action",
+            raw_completion=json.dumps({
+                "tool": "read_file",
+                "arguments": {"path": "README.md"},
+            }),
+            parsed_output={"tool_calls": [read_call.to_dict()]},
+            tools=(_read_file_tool(),),
+        )
+        finish_call = CanonicalToolCall(
+            "call-finish",
+            "finish",
+            canonical_json_bytes({"summary": "no changes"}).decode("utf-8"),
+        )
+        maintenance = _event(
+            decision_id="maintenance-valid",
+            role="maintenance",
+            raw_completion="<tool_call>" + json.dumps({
+                "name": "finish",
+                "arguments": {"summary": "no changes"},
+            }) + "</tool_call>",
+            parsed_output={
+                "tool_call": {
+                    "call_id": finish_call.call_id,
+                    "name": finish_call.name,
+                    "arguments": {"summary": "no changes"},
+                }
+            },
+            messages=(CanonicalMessage("user", json.dumps({
+                "public_view": {"repository_snapshot": {"memory_ids": []}},
+            })),),
+            tools=formal_maintenance_tools(),
+        )
+
+        summary, _details = evaluate_formal_role_events([
+            selection,
+            action,
+            writing,
+            maintenance,
+        ])
+
+        self.assertTrue(summary["coverage_complete"])
+        self.assertEqual(summary["roles"]["selection"]["schema_valid_rate"], 1.0)
+        self.assertEqual(summary["roles"]["writing"]["validator_accept_rate"], 1.0)
+        self.assertFalse(summary["checks"]["selection.decision_success_rate"])
+        self.assertFalse(summary["checks"]["writing.decision_success_rate"])
+        self.assertFalse(summary["acceptance_pass"])
+
     def test_scores_all_four_roles_and_unknown_references(self) -> None:
         read_call = CanonicalToolCall(
             "call-read",
@@ -283,6 +445,10 @@ class FormalRoleProtocolTests(unittest.TestCase):
             )
 
         self.assertEqual(summary["n_events"], 1)
+        self.assertEqual(
+            stored["schema_version"],
+            "agentcli-formal-role-protocol-eval-v2",
+        )
         self.assertEqual(stored["roles"]["selection"]["schema_valid_rate"], 1.0)
         self.assertIn("Formal Role Protocol Evaluation", report)
         self.assertIn("UNAVAILABLE", report)
