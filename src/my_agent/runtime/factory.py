@@ -25,6 +25,7 @@ class AgentFactory:
         command_timeout: int,
         event_sink: EventSink | None = None,
         memory_manager: MemoryService | None = None,
+        memory_embedding_retriever: Any | None = None,
         hitl_handler: HitlHandler | None = None,
     ) -> None:
         self.config = config
@@ -33,6 +34,7 @@ class AgentFactory:
         self.command_timeout = command_timeout
         self.event_sink = event_sink
         self.memory_manager = memory_manager
+        self.memory_embedding_retriever = memory_embedding_retriever
         self.hitl_handler = hitl_handler
 
     def create(self, mode: AgentMode) -> AgentBase:
@@ -44,6 +46,7 @@ class AgentFactory:
                 command_timeout=self.command_timeout,
                 event_sink=self.event_sink,
                 memory_manager=self.memory_manager,
+                memory_embedding_retriever=self.memory_embedding_retriever,
                 hitl_handler=self.hitl_handler,
             )
         if mode == AgentMode.PLAN:
@@ -54,6 +57,7 @@ class AgentFactory:
                 command_timeout=self.command_timeout,
                 event_sink=self.event_sink,
                 memory_manager=self.memory_manager,
+                memory_embedding_retriever=self.memory_embedding_retriever,
                 hitl_handler=self.hitl_handler,
             )
         return ReActAgent(
@@ -63,5 +67,6 @@ class AgentFactory:
             command_timeout=self.command_timeout,
             event_sink=self.event_sink,
             memory_manager=self.memory_manager,
+            memory_embedding_retriever=self.memory_embedding_retriever,
             hitl_handler=self.hitl_handler,
         )

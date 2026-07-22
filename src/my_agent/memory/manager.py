@@ -169,6 +169,7 @@ class MemoryManager:
         repo_path: Path,
         session_id: str | None = None,
         trace_sink: Any | None = None,
+        embedding_retriever: Any | None = None,
     ) -> "MemoryManager":
         from my_agent.memory.factory import build_memory_manager
 
@@ -179,6 +180,7 @@ class MemoryManager:
             repo_path=repo_path,
             session_id=session_id,
             trace_sink=trace_sink,
+            embedding_retriever=embedding_retriever,
         )
 
     def require_formal_runtime_binding(

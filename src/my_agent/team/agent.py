@@ -66,6 +66,7 @@ class TeamAgent(AgentBase):
         worker_factory: Callable[[int], Any] | None = None,
         reviewer_factory: Callable[[str], Any] | None = None,
         memory_manager: MemoryService | None = None,
+        memory_embedding_retriever: Any | None = None,
         hitl_handler: HitlHandler | None = None,
     ) -> None:
         super().__init__(
@@ -75,6 +76,7 @@ class TeamAgent(AgentBase):
             command_timeout=command_timeout,
             event_sink=event_sink,
             memory_manager=memory_manager,
+            memory_embedding_retriever=memory_embedding_retriever,
             hitl_handler=hitl_handler,
         )
         self.planner = planner or TeamPlanner(llm, max_steps=config.team_max_steps)

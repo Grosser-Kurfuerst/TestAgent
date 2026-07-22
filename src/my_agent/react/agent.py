@@ -46,6 +46,7 @@ class ReActAgent(AgentBase):
         command_timeout: int,
         event_sink: EventSink | None = None,
         memory_manager: MemoryService | None = None,
+        memory_embedding_retriever: Any | None = None,
         hitl_handler: HitlHandler | None = None,
         role_prompt: str | None = None,
         run_label: str = "native_tool_calls",
@@ -57,6 +58,7 @@ class ReActAgent(AgentBase):
             command_timeout=command_timeout,
             event_sink=event_sink,
             memory_manager=memory_manager,
+            memory_embedding_retriever=memory_embedding_retriever,
             hitl_handler=hitl_handler,
         )
         self.role_prompt = role_prompt

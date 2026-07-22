@@ -46,6 +46,7 @@ class AgentBase(ABC):
         command_timeout: int,
         event_sink: EventSink | None = None,
         memory_manager: MemoryService | None = None,
+        memory_embedding_retriever: Any | None = None,
         hitl_handler: HitlHandler | None = None,
     ) -> None:
         self.config = config
@@ -54,6 +55,7 @@ class AgentBase(ABC):
         self.command_timeout = command_timeout
         self.event_sink = event_sink
         self.memory_manager = memory_manager
+        self.memory_embedding_retriever = memory_embedding_retriever
         self.hitl_handler = hitl_handler
 
     @abstractmethod
@@ -159,6 +161,7 @@ class AgentBase(ABC):
                 repo_path=Path(repo).resolve(),
                 session_id=state.run_id,
                 trace_sink=trace_sink,
+                embedding_retriever=self.memory_embedding_retriever,
             ),
             None,
         )

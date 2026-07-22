@@ -4,7 +4,7 @@ import json
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from my_agent.config import AgentConfig
 from my_agent.context import AgentContextManager, ContextOverBudgetError
@@ -52,6 +52,7 @@ class PlanExecuteAgent(AgentBase):
         state_store: PlanStore | None = None,
         require_approval: bool = False,
         memory_manager: MemoryService | None = None,
+        memory_embedding_retriever: Any | None = None,
         hitl_handler: HitlHandler | None = None,
     ) -> None:
         super().__init__(
@@ -61,6 +62,7 @@ class PlanExecuteAgent(AgentBase):
             command_timeout=command_timeout,
             event_sink=event_sink,
             memory_manager=memory_manager,
+            memory_embedding_retriever=memory_embedding_retriever,
             hitl_handler=hitl_handler,
         )
         self.review_handler = review_handler or _default_review_handler

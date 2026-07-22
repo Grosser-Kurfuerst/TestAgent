@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,6 +15,20 @@ from my_agent.memory.evolver.runtime import (
     DisabledEvolverRuntime,
     LegacyEvolverRuntime,
 )
+from my_agent.memory.experience.retrieval.embedding import EmbeddingRetriever
+from my_agent.policy.identity import policy_identity_manifest_payload
+from tests.training.opd_round_fixtures import FakeTrainablePolicy
+
+
+class _EmbeddingEncoder:
+    model_revision = "embedding-revision"
+    tokenizer_revision = "embedding-revision"
+
+    def encode_queries(self, texts):
+        return ((1.0, 0.0),) * len(texts)
+
+    def encode_documents(self, texts):
+        return ((1.0, 0.0),) * len(texts)
 
 
 class MemoryRuntimeStrategyTests(unittest.TestCase):
@@ -95,6 +110,59 @@ class MemoryRuntimeStrategyTests(unittest.TestCase):
         self.assertIsNot(forked.experience_retriever, manager.experience_retriever)
         self.assertIsNot(forked.evolver_selector, manager.evolver_selector)
         self.assertIsNot(forked.evolver_writer, manager.evolver_writer)
+
+    def test_formal_managers_fork_shared_embedding_retriever(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            policy = FakeTrainablePolicy()
+            identity_manifest = root / "policy_identity_manifest.json"
+            identity_manifest.write_text(
+                json.dumps(policy_identity_manifest_payload(policy.identity())),
+                encoding="utf-8",
+            )
+            config = AgentConfig(
+                provider="fake",
+                api_key="",
+                base_url=None,
+                model="fake",
+                temperature=0.0,
+                max_steps=8,
+                command_timeout=60,
+                trace_dir=root / "traces",
+                use_fake_llm=True,
+                memory_dir=root / "memory",
+                memory_evolver_mode="formal",
+                policy_base_revision="revision",
+                policy_tokenizer_revision="revision",
+                policy_identity_manifest=identity_manifest,
+                embedding_revision="embedding-revision",
+            )
+            shared = EmbeddingRetriever(_EmbeddingEncoder())
+
+            first = MemoryManager.from_config(
+                config=config,
+                llm=policy,
+                repo_path=repo,
+                embedding_retriever=shared,
+            )
+            second = MemoryManager.from_config(
+                config=config,
+                llm=policy,
+                repo_path=repo,
+                embedding_retriever=shared,
+            )
+
+        first_retriever = first.evolver_runtime.embedding_retriever
+        second_retriever = second.evolver_runtime.embedding_retriever
+        self.assertIsNot(first_retriever, shared)
+        self.assertIsNot(second_retriever, shared)
+        self.assertIsNot(first_retriever, second_retriever)
+        self.assertIs(first_retriever.encoder, shared.encoder)
+        self.assertIs(second_retriever.encoder, shared.encoder)
+        self.assertIs(first_retriever.cache, shared.cache)
+        self.assertIs(second_retriever.cache, shared.cache)
 
 
 def _config(

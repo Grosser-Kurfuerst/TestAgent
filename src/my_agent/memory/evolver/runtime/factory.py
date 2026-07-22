@@ -32,6 +32,7 @@ def build_evolver_runtime(
     store: ExperienceStore,
     project_key: str,
     trace_sink: Any | None,
+    embedding_retriever: EmbeddingRetriever | None = None,
 ) -> EvolverRuntime:
     mode = config.memory_evolver_mode
     if mode == "off":
@@ -71,11 +72,12 @@ def build_evolver_runtime(
         policy_identity = require_formal_policy(config, llm)
         if policy_identity is None:
             raise ValueError("formal memory evolver requires a validated policy identity")
-        retriever = (
-            LexicalExperienceRetriever()
-            if config.memory_evolver_retrieval_backend == "lexical_ablation"
-            else EmbeddingRetriever(TransformersEmbeddingEncoder.from_config(config))
-        )
+        if config.memory_evolver_retrieval_backend == "lexical_ablation":
+            retriever = LexicalExperienceRetriever()
+        elif embedding_retriever is not None:
+            retriever = embedding_retriever.fork()
+        else:
+            retriever = EmbeddingRetriever(TransformersEmbeddingEncoder.from_config(config))
         coordinator = EvolverCoordinator(
             store=store,
             project_key=project_key,

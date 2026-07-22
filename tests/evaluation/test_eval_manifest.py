@@ -6,12 +6,14 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from tests._path import add_src_to_path
 
 add_src_to_path()
 
 from my_agent.config import AgentConfig
+from my_agent.evaluation import manifest_benchmark as manifest_benchmark_module
 from my_agent.evaluation.manifest_benchmark import (
     CommandResult,
     ManifestEvalResult,
@@ -90,6 +92,104 @@ def write_agent_trace(trace_dir: Path, run_id: str) -> Path:
 
 
 class ManifestBenchmarkTests(unittest.TestCase):
+    def test_formal_manifest_builds_shared_policy_and_embedding_once(self) -> None:
+        class Encoder:
+            model_revision = "embed-revision"
+            tokenizer_revision = "embed-revision"
+
+            def encode_queries(self, texts):
+                return ((1.0, 0.0),) * len(texts)
+
+            def encode_documents(self, texts):
+                return ((1.0, 0.0),) * len(texts)
+
+        policy = object()
+        encoder = Encoder()
+        config = fake_config(
+            memory_evolver_mode="formal",
+            memory_evolver_retrieval_backend="embedding_cosine",
+        )
+        with (
+            patch.object(manifest_benchmark_module, "build_llm", return_value=policy) as build_policy,
+            patch.object(
+                manifest_benchmark_module.TransformersEmbeddingEncoder,
+                "from_config",
+                return_value=encoder,
+            ) as build_encoder,
+        ):
+            shared_policy, shared_retriever = (
+                manifest_benchmark_module._build_shared_runtime_resources(
+                    config,
+                    agent_runner=manifest_benchmark_module.run_agent,
+                )
+            )
+
+        self.assertIs(shared_policy, policy)
+        self.assertIsNotNone(shared_retriever)
+        self.assertIs(shared_retriever.encoder, encoder)
+        build_policy.assert_called_once_with(config)
+        build_encoder.assert_called_once_with(config)
+
+    def test_manifest_passes_same_shared_resources_to_each_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            write_repo(repo, value=0)
+            manifest = base / "tasks.json"
+            manifest.write_text(
+                json.dumps(
+                    [
+                        {
+                            "id": "task-one",
+                            "repo": str(repo),
+                            "task": "Fix VALUE.",
+                            "visible_test_command": [sys.executable, "visible_check.py"],
+                        },
+                        {
+                            "id": "task-two",
+                            "repo": str(repo),
+                            "task": "Fix VALUE.",
+                            "visible_test_command": [sys.executable, "visible_check.py"],
+                        },
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            policy = object()
+            retriever = object()
+            seen: list[tuple[object, object]] = []
+
+            def fake_agent_runner(**kwargs: object) -> object:
+                seen.append((kwargs["llm"], kwargs["memory_embedding_retriever"]))
+                work_repo = Path(kwargs["repo_path"])  # type: ignore[arg-type]
+                (work_repo / "solution.py").write_text("VALUE = 1\n", encoding="utf-8")
+                trace_dir = Path(kwargs["trace_dir"])  # type: ignore[arg-type]
+                run_id = f"run-{len(seen)}"
+                trace_path = write_agent_trace(trace_dir, run_id)
+                return SimpleNamespace(
+                    trace_path=trace_path,
+                    run_id=run_id,
+                    steps=1,
+                    done=True,
+                    stop_reason="finish_called",
+                )
+
+            with patch.object(
+                manifest_benchmark_module,
+                "_build_shared_runtime_resources",
+                return_value=(policy, retriever),
+            ) as build_resources:
+                result = run_manifest_benchmark(
+                    tasks_path=manifest,
+                    output_dir=base / "out",
+                    config=fake_config(base / "traces"),
+                    agent_runner=fake_agent_runner,
+                )
+
+        self.assertEqual(len(result.results), 2)
+        self.assertEqual(seen, [(policy, retriever), (policy, retriever)])
+        build_resources.assert_called_once()
+
     def test_load_manifest_tasks_keeps_public_shape_and_loads_settings(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)

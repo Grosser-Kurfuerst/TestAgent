@@ -22,9 +22,14 @@ from my_agent.context import (
     DEFAULT_TOOL_RESULT_CHARS,
 )
 from my_agent.evaluation.agent_benchmark import record_benchmark_result
+from my_agent.llm import AgentLLM, build_llm
 from my_agent.memory.evolver.coordinator import EvolverCoordinator
 from my_agent.memory.evolver.task_session import AgentEpisodeArtifact
 from my_agent.memory.experience.repository import ExperienceStore
+from my_agent.memory.experience.retrieval.embedding import (
+    EmbeddingRetriever,
+    TransformersEmbeddingEncoder,
+)
 from my_agent.observability.trace_metrics import collect_trace_metrics
 from my_agent.observability.tracing import TraceWriter
 from my_agent.policy.identity import canonical_sha256
@@ -242,6 +247,10 @@ def run_manifest_benchmark(
     timeout = command_timeout if command_timeout is not None else config.command_timeout
     run_config = replace(config, command_timeout=timeout, trace_dir=trace_root)
     cli_env = dict(env or {})
+    shared_policy, shared_embedding_retriever = _build_shared_runtime_resources(
+        run_config,
+        agent_runner=agent_runner,
+    )
 
     results: list[ManifestEvalResult] = []
     for index, task in enumerate(tasks, start=1):
@@ -261,6 +270,8 @@ def run_manifest_benchmark(
             command_timeout=timeout,
             cli_env=cli_env,
             agent_runner=agent_runner,
+            shared_policy=shared_policy,
+            shared_embedding_retriever=shared_embedding_retriever,
         )
         results.append(result)
         with results_path.open("a", encoding="utf-8") as file:
@@ -275,6 +286,20 @@ def run_manifest_benchmark(
         results_path=results_path,
         summary_path=summary_path,
     )
+
+
+def _build_shared_runtime_resources(
+    config: AgentConfig,
+    *,
+    agent_runner: AgentRunnerFn,
+) -> tuple[AgentLLM | None, EmbeddingRetriever | None]:
+    if config.memory_evolver_mode != "formal" or agent_runner is not run_agent:
+        return None, None
+    policy = build_llm(config)
+    retriever = None
+    if config.memory_evolver_retrieval_backend != "lexical_ablation":
+        retriever = EmbeddingRetriever(TransformersEmbeddingEncoder.from_config(config))
+    return policy, retriever
 
 
 def _formal_manifest_mode(mode: str, *, formal: bool) -> str:
@@ -569,6 +594,8 @@ def _run_manifest_task(
     command_timeout: int,
     cli_env: Mapping[str, str],
     agent_runner: AgentRunnerFn,
+    shared_policy: AgentLLM | None,
+    shared_embedding_retriever: EmbeddingRetriever | None,
 ) -> ManifestEvalResult:
     started = time.monotonic()
     task_id = str(task.get("id") or f"task_{index}")
@@ -674,15 +701,15 @@ def _run_manifest_task(
     state: Any | None = None
     error = ""
     try:
-        state = agent_runner(
-            repo_path=work_repo,
-            task=str(task.get("task") or ""),
-            test_command=_command_label(agent_test_command or visible_command),
-            config=task_config,
-            max_steps=_task_max_steps(task, max_steps, task_config.max_steps),
-            trace_dir=task_trace_dir,
-            mode=mode,
-            metadata={
+        runner_kwargs: dict[str, Any] = {
+            "repo_path": work_repo,
+            "task": str(task.get("task") or ""),
+            "test_command": _command_label(agent_test_command or visible_command),
+            "config": task_config,
+            "max_steps": _task_max_steps(task, max_steps, task_config.max_steps),
+            "trace_dir": task_trace_dir,
+            "mode": mode,
+            "metadata": {
                 "source_task": task_id,
                 "task_id": task_id,
                 "task_type": source or mode,
@@ -692,7 +719,12 @@ def _run_manifest_task(
                 "memory_project_key": task_config.memory_project_key,
                 "tags": tags,
             },
-        )
+        }
+        if shared_policy is not None:
+            runner_kwargs["llm"] = shared_policy
+        if shared_embedding_retriever is not None:
+            runner_kwargs["memory_embedding_retriever"] = shared_embedding_retriever
+        state = agent_runner(**runner_kwargs)
     except Exception as exc:  # noqa: BLE001 - evaluator records task-level agent failures.
         error = f"{type(exc).__name__}: {exc}"
 

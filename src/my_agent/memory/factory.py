@@ -23,6 +23,7 @@ def build_memory_manager(
     repo_path: Path,
     session_id: str | None = None,
     trace_sink: Any | None = None,
+    embedding_retriever: Any | None = None,
 ) -> MemoryManagerT:
     memory_dir = Path(config.memory_dir)
     memory_dir.mkdir(parents=True, exist_ok=True)
@@ -49,6 +50,7 @@ def build_memory_manager(
         store=experience_store,
         project_key=project_key,
         trace_sink=trace_sink,
+        embedding_retriever=embedding_retriever,
     )
     return manager_type(
         config=config,

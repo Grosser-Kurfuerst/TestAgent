@@ -27,6 +27,7 @@ class CodingAgentRuntime:
         command_timeout: int | None = None,
         event_sink: Callable[[Any], None] | None = None,
         memory_manager: MemoryService | None = None,
+        memory_embedding_retriever: Any | None = None,
         hitl_handler: HitlHandler | None = None,
     ):
         self.config = config or AgentConfig.from_env()
@@ -45,6 +46,7 @@ class CodingAgentRuntime:
         self.command_timeout = command_timeout or self.config.command_timeout
         self.event_sink = event_sink
         self.memory_manager = memory_manager
+        self.memory_embedding_retriever = memory_embedding_retriever
         self.hitl_handler = hitl_handler if hitl_handler is not None else _default_hitl_handler(self.config)
 
     def run(self, state: AgentState, *, mode: AgentMode | str | None = None) -> AgentState:
@@ -58,6 +60,7 @@ class CodingAgentRuntime:
             command_timeout=self.command_timeout,
             event_sink=self.event_sink,
             memory_manager=self.memory_manager,
+            memory_embedding_retriever=self.memory_embedding_retriever,
             hitl_handler=self.hitl_handler,
         ).create(selected)
         try:
@@ -77,6 +80,7 @@ def run_agent(
     event_sink: Callable[[Any], None] | None = None,
     mode: AgentMode | str | None = None,
     memory_manager: MemoryService | None = None,
+    memory_embedding_retriever: Any | None = None,
     hitl_handler: HitlHandler | None = None,
     cancellation_token: CancellationToken | None = None,
     metadata: dict[str, Any] | None = None,
@@ -98,6 +102,7 @@ def run_agent(
         trace_dir=trace_dir,
         event_sink=event_sink,
         memory_manager=memory_manager,
+        memory_embedding_retriever=memory_embedding_retriever,
         hitl_handler=hitl_handler,
     )
     return runtime.run(state, mode=selected_mode)
