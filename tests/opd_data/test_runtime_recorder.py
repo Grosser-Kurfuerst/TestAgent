@@ -516,6 +516,12 @@ class OpdRuntimeRecorderTests(unittest.TestCase):
             root = Path(tmp)
             dataset = root / "dataset"
             store = ExperienceStore.from_dir(root / "memory")
+            store.add(typed_experience(
+                "tip-a",
+                "Run focused tests before the full suite.",
+                ExperienceTier.TIP,
+                project_key="project-a",
+            ))
             policy = _RolePolicy()
             coordinator = EvolverCoordinator(
                 store=store,
@@ -589,6 +595,15 @@ class OpdRuntimeRecorderTests(unittest.TestCase):
         self.assertEqual(len(maintenance), 2)
         self.assertEqual(
             len([item for item in prepared.decisions if item.role == "selection"]),
+            0,
+        )
+        self.assertEqual(
+            len([
+                item
+                for item in prepared.exclusions
+                if item["role"] == "selection"
+                and item["reason"] == "missing_candidate_attribution"
+            ]),
             2,
         )
         self.assertEqual(tasks[0].trajectory.reward, outcomes[0].outcome.reward)

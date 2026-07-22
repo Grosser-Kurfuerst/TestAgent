@@ -23,6 +23,10 @@ from my_agent.evaluation.manifest_benchmark import (
     run_test_command,
     summarize_manifest_results,
 )
+from my_agent.evaluation.formal_role_protocol import (
+    evaluate_formal_role_events,
+    run_formal_role_protocol_evaluation,
+)
 from my_agent.evaluation.protocol_metrics import (
     METRIC_KEYS,
     build_detailed_results,
@@ -54,6 +58,7 @@ __all__ = [
     "compute_tool_accuracy",
     "detect_task_type",
     "evaluate_responses",
+    "evaluate_formal_role_events",
     "is_valid_json",
     "is_transient_llm_error",
     "load_response_file",
@@ -65,6 +70,7 @@ __all__ = [
     "run_benchmark",
     "run_import_test_fallback",
     "run_evaluation",
+    "run_formal_role_protocol_evaluation",
     "run_manifest_benchmark",
     "run_one_task",
     "run_pytest_or_fallback",
