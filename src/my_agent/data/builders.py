@@ -64,7 +64,7 @@ def build_mbpp(
                 "source": "MBPP",
                 "repo": f"{output.name}/{repo_path.relative_to(output).as_posix()}",
                 "task": f"Implement the solution.py skeleton so that all tests pass. Task description: {text}",
-                "test_command": "pytest -q",
+                "test_command": "python -m pytest -q",
                 "success_hint": "All generated pytest tests pass.",
             }
             sft_record = make_write_file_sample(

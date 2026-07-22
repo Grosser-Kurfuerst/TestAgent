@@ -178,12 +178,16 @@ class FormalEvolverRuntime:
             config.memory_evolver_selected_max_items,
             config.memory_evolver_selection_prompt_tokens,
             config.memory_evolver_maintenance_max_turns,
+            config.memory_evolver_generation_temperature,
+            config.memory_evolver_generation_top_p,
         )
         actual_limits = (
             coordinator.top_k_per_tier,
             coordinator.selected_max_items,
             coordinator.selection_token_budget,
             coordinator.maintenance_max_turns,
+            coordinator.generation_temperature,
+            coordinator.generation_top_p,
         )
         if actual_limits != expected_limits:
             raise ValueError(

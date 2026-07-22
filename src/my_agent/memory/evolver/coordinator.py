@@ -72,6 +72,8 @@ class EvolverCoordinator:
         top_k_per_tier: int = 50,
         selected_max_items: int = 20,
         selection_token_budget: int = 1_800,
+        generation_temperature: float = 1.0,
+        generation_top_p: float = 0.95,
         maintenance_max_turns: int = 8,
         maintenance_interval_tasks: int = 30,
         ledger_path: str | Path | None = None,
@@ -125,7 +127,12 @@ class EvolverCoordinator:
         if selector is not None:
             self.selector = selector
         elif policy is not None and self.decision_recorder is not None:
-            self.selector = LLMTaskSelectionPolicy(policy=policy, recorder=self.decision_recorder)
+            self.selector = LLMTaskSelectionPolicy(
+                policy=policy,
+                recorder=self.decision_recorder,
+                temperature=generation_temperature,
+                top_p=generation_top_p,
+            )
         else:
             self.selector = EmptyTaskSelectionPolicy()
         self.selection_service = SelectionService(self.selector)
@@ -137,6 +144,8 @@ class EvolverCoordinator:
                 recorder=self.decision_recorder,
                 store=store,
                 project_key=project_key,
+                temperature=generation_temperature,
+                top_p=generation_top_p,
             )
         else:
             self.writer = None
@@ -147,6 +156,8 @@ class EvolverCoordinator:
                 store=store,
                 project_key=project_key,
                 max_turns=maintenance_max_turns,
+                temperature=generation_temperature,
+                top_p=generation_top_p,
             )
             if policy is not None and self.decision_recorder is not None
             else None
@@ -155,6 +166,8 @@ class EvolverCoordinator:
         self.top_k_per_tier = top_k_per_tier
         self.selected_max_items = selected_max_items
         self.selection_token_budget = selection_token_budget
+        self.generation_temperature = float(generation_temperature)
+        self.generation_top_p = float(generation_top_p)
         self.maintenance_max_turns = maintenance_max_turns
         self.maintenance_interval_tasks = maintenance_interval_tasks
         self.maintenance_enabled = maintenance_enabled
@@ -312,7 +325,7 @@ class EvolverCoordinator:
             "candidates": [item.to_dict() for item in candidates],
             "selected_count": len(selected_ids),
             "selected_memory_ids": list(selected_ids),
-            "selection_calls": 1,
+            "selection_calls": 1 if candidates else 0,
             **self.retriever.last_metrics.to_trace_payload(),
         })
         return session

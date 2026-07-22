@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from tests._path import add_src_to_path
@@ -18,6 +19,24 @@ from my_agent.data import (
     swebench_to_sft,
     traces_to_sft,
 )
+
+
+class BenchmarkBuilderTests(unittest.TestCase):
+    def test_mbpp_tasks_use_module_pytest_command(self) -> None:
+        rows = [{
+            "task_id": 1,
+            "text": "Return one.",
+            "code": "def one():\n    return 1",
+            "test_list": ["assert one() == 1"],
+        }]
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "my_agent.data.builders.load_mbpp_rows",
+            return_value=rows,
+        ):
+            report = build_mbpp(tmp, limit=1)
+            task = _read_jsonl(report.tasks_path)[0]
+
+        self.assertEqual(task["test_command"], "python -m pytest -q")
 
 
 # ------- helpers -----------------------------------------------------

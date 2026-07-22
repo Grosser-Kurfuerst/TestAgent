@@ -24,14 +24,25 @@ class FormalConfigTests(unittest.TestCase):
         env = _formal_env()
         env["AGENTCLI_MEMORY_EVOLVER_COLLECTION_ROUND"] = "2"
         env["AGENTCLI_MEMORY_EVOLVER_DATASET_SPLIT"] = "validation"
+        env["AGENTCLI_MEMORY_EVOLVER_GENERATION_TEMPERATURE"] = "0"
+        env["AGENTCLI_MEMORY_EVOLVER_GENERATION_TOP_P"] = "1"
         config = AgentConfig.from_env(env, require_env_file=False)
 
         self.assertEqual(config.memory_evolver_mode, "formal")
         self.assertEqual(config.memory_evolver_candidate_top_k_per_tier, 50)
         self.assertEqual(config.memory_evolver_maintenance_interval_tasks, 30)
+        self.assertEqual(config.memory_evolver_generation_temperature, 0.0)
+        self.assertEqual(config.memory_evolver_generation_top_p, 1.0)
         self.assertEqual(config.memory_evolver_writing_top_fraction, 0.30)
         self.assertEqual(config.memory_evolver_collection_round, 2)
         self.assertEqual(config.memory_evolver_dataset_split, "validation")
+
+    def test_formal_config_rejects_zero_generation_top_p(self) -> None:
+        env = _formal_env()
+        env["AGENTCLI_MEMORY_EVOLVER_GENERATION_TOP_P"] = "0"
+
+        with self.assertRaisesRegex(ValueError, "generation top_p"):
+            AgentConfig.from_env(env, require_env_file=False)
 
     def test_formal_config_rejects_unknown_dataset_split(self) -> None:
         env = _formal_env()

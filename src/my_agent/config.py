@@ -97,6 +97,8 @@ class AgentConfig:
     # the pinned legacy baseline and are rejected when formal mode is loaded.
     memory_evolver_candidate_top_k_per_tier: int = 50
     memory_evolver_selection_prompt_tokens: int = 1_800
+    memory_evolver_generation_temperature: float = 1.0
+    memory_evolver_generation_top_p: float = 0.95
     memory_evolver_maintenance_interval_tasks: int = 30
     memory_evolver_maintenance_max_turns: int = 8
     memory_evolver_dataset_dir: Path | None = None
@@ -362,6 +364,21 @@ class AgentConfig:
                 ),
                 1_800,
                 1,
+            ),
+            memory_evolver_generation_temperature=_as_min_float(
+                values.get(
+                    "AGENTCLI_MEMORY_EVOLVER_GENERATION_TEMPERATURE",
+                    values.get("MY_AGENT_MEMORY_EVOLVER_GENERATION_TEMPERATURE"),
+                ),
+                1.0,
+                0.0,
+            ),
+            memory_evolver_generation_top_p=_as_probability(
+                values.get(
+                    "AGENTCLI_MEMORY_EVOLVER_GENERATION_TOP_P",
+                    values.get("MY_AGENT_MEMORY_EVOLVER_GENERATION_TOP_P"),
+                ),
+                0.95,
             ),
             memory_evolver_maintenance_interval_tasks=_as_min_int(
                 values.get(
@@ -786,6 +803,8 @@ def _validate_formal_evolver_config(
         raise ValueError("formal memory evolver requires policy and embedding model names")
     if config.policy_identity_manifest is None:
         raise ValueError("formal memory evolver requires policy_identity_manifest")
+    if config.memory_evolver_generation_top_p <= 0.0:
+        raise ValueError("formal memory evolver generation top_p must be in (0, 1]")
     ablation_contracts = {
         "": ("embedding_cosine", "llm", True),
         "no_attribution": ("embedding_cosine", "llm", True),

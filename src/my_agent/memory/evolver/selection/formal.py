@@ -61,6 +61,8 @@ class LLMTaskSelectionPolicy:
         if context is None:
             raise ValueError("formal selection requires a decision event context")
         formal_candidates = _formal_candidates(candidates)
+        if not formal_candidates:
+            return ()
         request = build_selection_request(
             task=task,
             candidates=formal_candidates,

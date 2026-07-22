@@ -92,6 +92,8 @@ def build_evolver_runtime(
             top_k_per_tier=config.memory_evolver_candidate_top_k_per_tier,
             selected_max_items=config.memory_evolver_selected_max_items,
             selection_token_budget=config.memory_evolver_selection_prompt_tokens,
+            generation_temperature=config.memory_evolver_generation_temperature,
+            generation_top_p=config.memory_evolver_generation_top_p,
             maintenance_interval_tasks=config.memory_evolver_maintenance_interval_tasks,
             maintenance_max_turns=config.memory_evolver_maintenance_max_turns,
             collection_round=config.memory_evolver_collection_round,

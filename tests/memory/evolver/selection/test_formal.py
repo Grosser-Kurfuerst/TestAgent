@@ -76,6 +76,29 @@ def _context() -> DecisionEventContext:
 
 
 class LLMTaskSelectionPolicyTests(unittest.TestCase):
+    def test_empty_candidates_skip_llm_generation(self) -> None:
+        policy = _Policy("should not be used")
+        events = []
+        selector = LLMTaskSelectionPolicy(
+            policy=policy,
+            recorder=DecisionEventRecorder(
+                policy=policy,
+                trace_sink=lambda event, payload: events.append((event, payload)),
+            ),
+        )
+
+        selected = selector.select(
+            task="task",
+            candidates=(),
+            token_budget=100,
+            max_items=20,
+            context=_context(),
+        )
+
+        self.assertEqual(selected, ())
+        self.assertEqual(policy.calls, 0)
+        self.assertEqual(events, [])
+
     def test_coordinator_wires_shared_policy_and_selects_once_per_task(self) -> None:
         output = json.dumps({
             "selected_skills": ["RETRIEVED_SKILL_01"],
@@ -112,6 +135,58 @@ class LLMTaskSelectionPolicyTests(unittest.TestCase):
 
         self.assertEqual(policy.calls, 1)
         self.assertEqual(session.selected_memory_ids, ("skill-a",))
+
+    def test_coordinator_uses_shared_generation_settings_for_memory_roles(self) -> None:
+        policy = _Policy("[]")
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator = EvolverCoordinator(
+                store=ExperienceStore.from_dir(tmp),
+                project_key="project-a",
+                policy_identity=_identity(),
+                policy=policy,
+                generation_temperature=0.0,
+                generation_top_p=1.0,
+            )
+
+        self.assertEqual(coordinator.selector.temperature, 0.0)
+        self.assertEqual(coordinator.selector.top_p, 1.0)
+        self.assertEqual(coordinator.writer.temperature, 0.0)
+        self.assertEqual(coordinator.writer.top_p, 1.0)
+        self.assertEqual(coordinator.maintainer.temperature, 0.0)
+        self.assertEqual(coordinator.maintainer.top_p, 1.0)
+
+    def test_empty_repository_records_zero_selection_calls(self) -> None:
+        policy = _Policy("should not be used")
+        events = []
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator = EvolverCoordinator(
+                store=ExperienceStore.from_dir(tmp),
+                project_key="project-a",
+                policy_identity=_identity(),
+                retriever=EmbeddingRetriever(_Encoder()),
+                policy=policy,
+                trace_sink=lambda event, payload: events.append((event, payload)),
+            )
+
+            session = coordinator.begin_task(
+                task="task",
+                task_id="task-1",
+                task_group="group-a",
+                trajectory_id="traj-1",
+                stream_id="stream-a",
+            )
+
+        started = next(
+            payload
+            for event, payload in events
+            if event == "memory.evolver_session_started"
+        )
+        self.assertEqual(session.candidate_snapshot, ())
+        self.assertEqual(session.selected_memory_ids, ())
+        self.assertEqual(policy.calls, 0)
+        self.assertEqual(started["candidate_count"], 0)
+        self.assertEqual(started["selected_count"], 0)
+        self.assertEqual(started["selection_calls"], 0)
 
     def test_selects_candidate_labels_once_and_records_exact_decision(self) -> None:
         output = json.dumps({
