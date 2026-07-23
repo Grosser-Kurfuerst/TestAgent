@@ -26,14 +26,20 @@ from my_agent.evaluation.memory_benchmark.adapters.docker_runtime import (
 )
 from my_agent.evaluation.memory_benchmark.backends import (
     AgentCliFourTierBackend,
+    Mem0Backend,
     NoMemoryBackend,
     memory_stream_project_key,
 )
 from my_agent.evaluation.memory_benchmark.contracts import (
     BenchmarkTask,
+    ExternalMemoryItem,
     MemoryBenchmarkTaskResult,
+    Mem0SearchResult,
+    Mem0WriteResult,
     OfficialEvaluatorResult,
     PreparedBenchmarkTask,
+    ProviderUsage,
+    PublicEpisode,
     write_official_result_atomic,
 )
 from my_agent.evaluation.memory_benchmark.runner import (
@@ -299,7 +305,7 @@ class FakeManifestRunner:
 def _run(
     tmp_path: Path,
     *,
-    backend: NoMemoryBackend | AgentCliFourTierBackend,
+    backend: NoMemoryBackend | AgentCliFourTierBackend | Mem0Backend,
     adapter: FakeAdapter,
     manifest_runner: Callable[..., ManifestBenchmarkResult],
     tasks: list[BenchmarkTask] | None = None,
@@ -748,3 +754,147 @@ def test_runner_refuses_nonempty_memory_directory_outside_stream(tmp_path: Path)
             backend_config_hash=HASH,
             manifest_runner=FakeManifestRunner(formal=False),
         )
+
+
+class FakeMem0StreamClient:
+    def __init__(
+        self,
+        persistence_dir: Path,
+        *,
+        fail_search_call: int = 0,
+        fail_add_call: int = 0,
+    ) -> None:
+        self.persistence_dir = persistence_dir
+        self.items: list[ExternalMemoryItem] = []
+        self.episodes: list[PublicEpisode] = []
+        self.search_calls = 0
+        self.add_calls = 0
+        self.fail_search_call = fail_search_call
+        self.fail_add_call = fail_add_call
+        self.closed = False
+
+    def search(self, query: str, *, stream_key: str, limit: int) -> Mem0SearchResult:
+        del query, stream_key
+        self.search_calls += 1
+        if self.search_calls == self.fail_search_call:
+            raise RuntimeError("fixture Mem0 search failed")
+        return Mem0SearchResult(
+            items=tuple(self.items[:limit]),
+            llm_usage=ProviderUsage(),
+            embedding_calls=1,
+            embedding_elapsed_sec=0.01,
+            elapsed_sec=0.02,
+        )
+
+    def add(self, episode: PublicEpisode, *, stream_key: str) -> Mem0WriteResult:
+        del stream_key
+        self.add_calls += 1
+        if self.add_calls == self.fail_add_call:
+            raise RuntimeError("fixture Mem0 add failed")
+        self.episodes.append(episode)
+        item = ExternalMemoryItem(
+            memory_id=f"memory-{self.add_calls}",
+            text=f"Reusable public outcome from {episode.task_id}: {episode.final_response}",
+        )
+        self.items.append(item)
+        return Mem0WriteResult(
+            written_ids=(item.memory_id,),
+            llm_usage=ProviderUsage(),
+            embedding_calls=1,
+            embedding_elapsed_sec=0.01,
+            elapsed_sec=0.02,
+        )
+
+    def count(self, *, stream_key: str) -> int:
+        del stream_key
+        return len(self.items)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_mem0_fake_eight_task_stream_retrieves_prior_task_and_records_unknown_usage(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "stream"
+    project_key = _project_key("mem0")
+    client = FakeMem0StreamClient(output / "memory" / "mem0")
+    backend = Mem0Backend(
+        stream_memory_dir=output / "memory",
+        stream_project_key=project_key,
+        client=client,
+    )
+    adapter = FakeAdapter()
+    manifest = FakeManifestRunner(formal=False, outcomes={"task-2": False})
+
+    result = _run(
+        tmp_path,
+        backend=backend,
+        adapter=adapter,
+        manifest_runner=manifest,
+        tasks=[_task(index) for index in range(1, 9)],
+    )
+
+    assert len(result.executions) == 8
+    assert result.executions[0].context.candidate_count == 0
+    assert result.executions[1].context.candidate_count == 1
+    assert "task-1" in result.executions[1].context.injected_text
+    assert client.search_calls == 8
+    assert client.add_calls == 8
+    assert client.episodes[1].resolved is False
+    assert client.episodes[1].failure_type == "official_evaluator_failed"
+    assert client.closed is True
+    rows = [
+        MemoryBenchmarkTaskResult.from_dict(json.loads(line))
+        for line in result.results_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(rows) == 8
+    assert all(row.arm == "mem0" for row in rows)
+    assert all(row.memory_usage_available is False for row in rows)
+    assert all(row.memory_total_tokens is None for row in rows)
+    assert all(row.system_total_tokens is None for row in rows)
+    assert rows[1].memory["candidate_count"] == 1
+    assert rows[1].memory["selected_count"] == 1
+
+
+@pytest.mark.parametrize(
+    ("fail_search_call", "fail_add_call", "expected_rows"),
+    [(2, 0, 1), (0, 1, 0)],
+)
+def test_mem0_search_or_add_failure_aborts_stream_without_pseudo_result(
+    tmp_path: Path,
+    fail_search_call: int,
+    fail_add_call: int,
+    expected_rows: int,
+) -> None:
+    output = tmp_path / "stream"
+    project_key = _project_key("mem0")
+    client = FakeMem0StreamClient(
+        output / "memory" / "mem0",
+        fail_search_call=fail_search_call,
+        fail_add_call=fail_add_call,
+    )
+    backend = Mem0Backend(
+        stream_memory_dir=output / "memory",
+        stream_project_key=project_key,
+        client=client,
+    )
+    adapter = FakeAdapter()
+
+    with pytest.raises(MemoryBenchmarkInfrastructureError, match="Mem0"):
+        _run(
+            tmp_path,
+            backend=backend,
+            adapter=adapter,
+            manifest_runner=FakeManifestRunner(formal=False),
+            tasks=[_task(1), _task(2)],
+        )
+
+    rows = [
+        line
+        for line in (output / "results.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(rows) == expected_rows
+    assert client.closed is True

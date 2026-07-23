@@ -519,6 +519,7 @@ class Mem0SearchResult:
     items: tuple[ExternalMemoryItem, ...]
     llm_usage: ProviderUsage
     embedding_calls: int
+    embedding_elapsed_sec: float
     elapsed_sec: float
 
     def __post_init__(self) -> None:
@@ -527,6 +528,10 @@ class Mem0SearchResult:
         if not isinstance(self.llm_usage, ProviderUsage):
             raise ValueError("llm_usage must be ProviderUsage")
         _require_non_negative(self.embedding_calls, field_name="embedding_calls")
+        _require_non_negative_float(
+            self.embedding_elapsed_sec,
+            field_name="embedding_elapsed_sec",
+        )
         _require_non_negative_float(self.elapsed_sec, field_name="elapsed_sec")
 
     def to_dict(self) -> dict[str, Any]:
@@ -534,6 +539,7 @@ class Mem0SearchResult:
             "items": [item.to_dict() for item in self.items],
             "llm_usage": self.llm_usage.to_dict(),
             "embedding_calls": self.embedding_calls,
+            "embedding_elapsed_sec": self.embedding_elapsed_sec,
             "elapsed_sec": self.elapsed_sec,
         }
 
@@ -555,6 +561,10 @@ class Mem0SearchResult:
             embedding_calls=_required_int(
                 data["embedding_calls"], field_name="embedding_calls"
             ),
+            embedding_elapsed_sec=_required_float(
+                data["embedding_elapsed_sec"],
+                field_name="embedding_elapsed_sec",
+            ),
             elapsed_sec=_required_float(data["elapsed_sec"], field_name="elapsed_sec"),
         )
 
@@ -564,6 +574,7 @@ class Mem0WriteResult:
     written_ids: tuple[str, ...]
     llm_usage: ProviderUsage
     embedding_calls: int
+    embedding_elapsed_sec: float
     elapsed_sec: float
 
     def __post_init__(self) -> None:
@@ -575,6 +586,10 @@ class Mem0WriteResult:
         if not isinstance(self.llm_usage, ProviderUsage):
             raise ValueError("llm_usage must be ProviderUsage")
         _require_non_negative(self.embedding_calls, field_name="embedding_calls")
+        _require_non_negative_float(
+            self.embedding_elapsed_sec,
+            field_name="embedding_elapsed_sec",
+        )
         _require_non_negative_float(self.elapsed_sec, field_name="elapsed_sec")
 
     def to_dict(self) -> dict[str, Any]:
@@ -582,6 +597,7 @@ class Mem0WriteResult:
             "written_ids": list(self.written_ids),
             "llm_usage": self.llm_usage.to_dict(),
             "embedding_calls": self.embedding_calls,
+            "embedding_elapsed_sec": self.embedding_elapsed_sec,
             "elapsed_sec": self.elapsed_sec,
         }
 
@@ -597,6 +613,10 @@ class Mem0WriteResult:
             embedding_calls=_required_int(
                 data["embedding_calls"], field_name="embedding_calls"
             ),
+            embedding_elapsed_sec=_required_float(
+                data["embedding_elapsed_sec"],
+                field_name="embedding_elapsed_sec",
+            ),
             elapsed_sec=_required_float(data["elapsed_sec"], field_name="elapsed_sec"),
         )
 
@@ -606,7 +626,9 @@ class BackendFinalizeResult:
     status: str
     written_ids: tuple[str, ...] = ()
     llm_usage: ProviderUsage = ProviderUsage()
+    usage_by_role: Mapping[str, ProviderUsage] = field(default_factory=dict)
     embedding_calls: int = 0
+    embedding_elapsed_sec: float = 0.0
     elapsed_sec: float = 0.0
     error: str = ""
 
@@ -619,7 +641,18 @@ class BackendFinalizeResult:
         )
         if not isinstance(self.llm_usage, ProviderUsage):
             raise ValueError("llm_usage must be ProviderUsage")
+        normalized_usage: dict[str, ProviderUsage] = {}
+        for role, usage in self.usage_by_role.items():
+            _require_non_empty(role, field_name="usage role")
+            if not isinstance(usage, ProviderUsage):
+                raise ValueError("usage_by_role values must be ProviderUsage")
+            normalized_usage[str(role)] = usage
+        object.__setattr__(self, "usage_by_role", normalized_usage)
         _require_non_negative(self.embedding_calls, field_name="embedding_calls")
+        _require_non_negative_float(
+            self.embedding_elapsed_sec,
+            field_name="embedding_elapsed_sec",
+        )
         _require_non_negative_float(self.elapsed_sec, field_name="elapsed_sec")
 
     def to_dict(self) -> dict[str, Any]:
@@ -627,7 +660,12 @@ class BackendFinalizeResult:
             "status": self.status,
             "written_ids": list(self.written_ids),
             "llm_usage": self.llm_usage.to_dict(),
+            "usage_by_role": {
+                role: usage.to_dict()
+                for role, usage in sorted(self.usage_by_role.items())
+            },
             "embedding_calls": self.embedding_calls,
+            "embedding_elapsed_sec": self.embedding_elapsed_sec,
             "elapsed_sec": self.elapsed_sec,
             "error": self.error,
         }
@@ -642,8 +680,21 @@ class BackendFinalizeResult:
             llm_usage=ProviderUsage.from_dict(
                 _required_mapping(data.get("llm_usage", {}), field_name="llm_usage")
             ),
+            usage_by_role={
+                str(role): ProviderUsage.from_dict(
+                    _required_mapping(usage, field_name=f"usage_by_role[{role}]")
+                )
+                for role, usage in _required_mapping(
+                    data.get("usage_by_role", {}),
+                    field_name="usage_by_role",
+                ).items()
+            },
             embedding_calls=_required_int(
                 data.get("embedding_calls", 0), field_name="embedding_calls"
+            ),
+            embedding_elapsed_sec=_required_float(
+                data.get("embedding_elapsed_sec", 0.0),
+                field_name="embedding_elapsed_sec",
             ),
             elapsed_sec=_required_float(
                 data.get("elapsed_sec", 0.0), field_name="elapsed_sec"

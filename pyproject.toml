@@ -32,6 +32,9 @@ opd-embed = [
   "torch>=2.7,<3",
   "transformers>=5.2,<=5.8",
 ]
+memory-benchmark = [
+  "mem0ai>=2.0.13,<3",
+]
 
 [project.scripts]
 my-agent = "my_agent.cli:main"

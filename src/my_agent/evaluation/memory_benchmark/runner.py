@@ -532,6 +532,17 @@ def _build_task_result(
         memory_total_tokens = 0
         memory_usage_available = True
         memory_usage_unavailable_reason = ""
+    elif arm == "mem0":
+        usage = backend_finalize.llm_usage
+        memory_prompt_tokens = usage.prompt_tokens
+        memory_completion_tokens = usage.completion_tokens
+        memory_total_tokens = usage.resolved_total_tokens
+        memory_usage_available = usage.available
+        memory_usage_unavailable_reason = (
+            ""
+            if usage.available
+            else "Mem0 provider did not return complete search/add LLM usage"
+        )
     else:
         memory_prompt_tokens = None
         memory_completion_tokens = None
@@ -569,17 +580,25 @@ def _build_task_result(
         memory_prompt_tokens=memory_prompt_tokens,
         memory_completion_tokens=memory_completion_tokens,
         memory_total_tokens=memory_total_tokens,
-        memory_tokens_by_role={},
+        memory_tokens_by_role=dict(backend_finalize.usage_by_role),
         actor_usage_available=actor_usage_available,
         memory_usage_available=memory_usage_available,
         memory_usage_unavailable_reason=memory_usage_unavailable_reason,
         system_total_tokens=system_total_tokens,
         embedding_calls=backend_finalize.embedding_calls,
-        embedding_elapsed_sec=0.0,
+        embedding_elapsed_sec=backend_finalize.embedding_elapsed_sec,
         elapsed_sec=manifest_result.elapsed_sec,
         memory={
-            "candidate_count": int(metrics.get("evolver_candidates_total", 0) or 0),
-            "selected_count": int(metrics.get("evolver_selected_total", 0) or 0),
+            "candidate_count": (
+                int(metrics.get("evolver_candidates_total", 0) or 0)
+                if arm == "agentcli_four_tier"
+                else context.candidate_count
+            ),
+            "selected_count": (
+                int(metrics.get("evolver_selected_total", 0) or 0)
+                if arm == "agentcli_four_tier"
+                else context.selected_count
+            ),
             "selected_content_tokens": context.selected_content_tokens,
             "injected_tokens": context.estimated_tokens,
             "written_count": len(backend_finalize.written_ids),

@@ -8,10 +8,23 @@ from my_agent.config import AgentConfig
 from my_agent.evaluation.manifest_benchmark import CommandResult, ManifestEvalResult
 from my_agent.evaluation.memory_benchmark.backends import (
     AgentCliFourTierBackend,
+    Mem0Backend,
     NoMemoryBackend,
     memory_stream_project_key,
 )
-from my_agent.evaluation.memory_benchmark.contracts import BenchmarkTask, PublicEpisode
+from my_agent.evaluation.memory_benchmark.contracts import (
+    BenchmarkTask,
+    ExternalMemoryItem,
+    Mem0SearchResult,
+    Mem0WriteResult,
+    ProviderUsage,
+    PublicEpisode,
+)
+from my_agent.evaluation.memory_benchmark.external_memory import (
+    ExternalContextMemoryManager,
+)
+from my_agent.memory.manager import MemoryManager
+from my_agent.memory.token import estimate_tokens
 from my_agent.policy.identity import canonical_sha256
 from my_agent.runtime import run_agent
 
@@ -205,3 +218,178 @@ def test_backend_rejects_mismatched_stream_identity(tmp_path: Path) -> None:
             stream_project_key="stream-key",
             context=backend.prepare_context(_task()),
         )
+
+
+class _FakeMem0Client:
+    def __init__(
+        self,
+        persistence_dir: Path,
+        *,
+        items: tuple[ExternalMemoryItem, ...] = (),
+        search_usage: ProviderUsage = ProviderUsage(),
+        add_usage: ProviderUsage = ProviderUsage(),
+    ) -> None:
+        self.persistence_dir = persistence_dir
+        self.items = list(items)
+        self.search_usage = search_usage
+        self.add_usage = add_usage
+        self.search_limits: list[int] = []
+        self.added: list[PublicEpisode] = []
+        self.closed = False
+
+    def search(self, query: str, *, stream_key: str, limit: int) -> Mem0SearchResult:
+        del query, stream_key
+        self.search_limits.append(limit)
+        return Mem0SearchResult(
+            items=tuple(self.items),
+            llm_usage=self.search_usage,
+            embedding_calls=1,
+            embedding_elapsed_sec=0.01,
+            elapsed_sec=0.02,
+        )
+
+    def add(self, episode: PublicEpisode, *, stream_key: str) -> Mem0WriteResult:
+        del stream_key
+        self.added.append(episode)
+        item = ExternalMemoryItem(
+            memory_id=f"written-{len(self.items) + 1}",
+            text=f"Stored public episode for {episode.task_id}",
+        )
+        self.items.append(item)
+        return Mem0WriteResult(
+            written_ids=(item.memory_id,),
+            llm_usage=self.add_usage,
+            embedding_calls=2,
+            embedding_elapsed_sec=0.02,
+            elapsed_sec=0.03,
+        )
+
+    def count(self, *, stream_key: str) -> int:
+        del stream_key
+        return len(self.items)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_mem0_backend_caps_candidates_items_and_selected_content(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "stream" / "memory"
+    items = tuple(
+        ExternalMemoryItem(memory_id=f"memory-{index}", text="x" * 360)
+        for index in range(60)
+    )
+    client = _FakeMem0Client(memory_dir / "mem0", items=items)
+    backend = Mem0Backend(
+        stream_memory_dir=memory_dir,
+        stream_project_key="memory-benchmark:run-1:42:lifelong_os:mem0",
+        client=client,
+    )
+
+    context = backend.prepare_context(_task())
+
+    assert client.search_limits == [50]
+    assert context.candidate_count == 50
+    assert context.selected_count == 20
+    assert context.selected_content_tokens == sum(
+        estimate_tokens(text) for text in context.selected_texts
+    )
+    assert context.selected_content_tokens <= 1_800
+    assert context.injected_text.startswith("Relevant selected external memory:")
+    assert "memory-50" not in context.injected_text
+
+
+def test_mem0_backend_writes_failure_episode_and_preserves_unknown_usage(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "stream" / "memory"
+    client = _FakeMem0Client(memory_dir / "mem0")
+    backend = Mem0Backend(
+        stream_memory_dir=memory_dir,
+        stream_project_key="memory-benchmark:run-1:42:lifelong_os:mem0",
+        client=client,
+    )
+    backend.prepare_context(_task())
+    failed_episode = PublicEpisode(
+        task_id="task-1",
+        instruction="Perform the task.",
+        actions=(),
+        final_response="Could not finish.",
+        resolved=False,
+        reward=0.0,
+        failure_type="official_evaluator_failed",
+    )
+    failed_result = _manifest_result(formal=False)
+    failed_result.resolved = False
+    failed_result.reward = 0.0
+    failed_result.failure_type = "official_evaluator_failed"
+
+    finalized = backend.finalize_task(failed_episode, failed_result)
+
+    assert client.added == [failed_episode]
+    assert finalized.status == "committed"
+    assert finalized.llm_usage.available is False
+    assert finalized.usage_by_role["search"].available is False
+    assert finalized.usage_by_role["add"].available is False
+    assert finalized.embedding_calls == 3
+    assert finalized.embedding_elapsed_sec == pytest.approx(0.03)
+    assert backend.snapshot().entry_count == 1
+
+
+@pytest.mark.parametrize("backend_name", ["no_memory", "mem0"])
+def test_non_formal_task_runner_shares_one_llm_with_memory_manager(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    backend_name: str,
+) -> None:
+    import my_agent.evaluation.memory_benchmark.backends as backends_module
+
+    memory_dir = tmp_path / "stream" / "memory"
+    project_key = f"memory-benchmark:run-1:42:lifelong_os:{backend_name}"
+    if backend_name == "mem0":
+        client = _FakeMem0Client(memory_dir / "mem0")
+        backend: NoMemoryBackend | Mem0Backend = Mem0Backend(
+            stream_memory_dir=memory_dir,
+            stream_project_key=project_key,
+            client=client,
+        )
+    else:
+        backend = NoMemoryBackend(
+            stream_memory_dir=memory_dir,
+            stream_project_key=project_key,
+        )
+    context = backend.prepare_context(_task())
+    config = backend.configure_task(
+        _config(tmp_path),
+        stream_memory_dir=memory_dir,
+        stream_project_key=project_key,
+        context=context,
+    )
+    llm = object()
+    build_calls: list[AgentConfig] = []
+    captured: dict[str, object] = {}
+
+    def fake_build_llm(task_config: AgentConfig) -> object:
+        build_calls.append(task_config)
+        return llm
+
+    def fake_run_agent(**kwargs: object) -> dict[str, object]:
+        captured.update(kwargs)
+        return dict(kwargs)
+
+    monkeypatch.setattr(backends_module, "build_llm", fake_build_llm)
+    monkeypatch.setattr(backends_module, "run_agent", fake_run_agent)
+
+    backend.build_agent_runner(context=context)(
+        repo_path=tmp_path,
+        task="Perform the task.",
+        config=config,
+        mode="react",
+    )
+
+    assert len(build_calls) == 1
+    assert captured["llm"] is llm
+    manager = captured["memory_manager"]
+    if backend_name == "mem0":
+        assert isinstance(manager, ExternalContextMemoryManager)
+        assert manager.inner.llm is llm
+    else:
+        assert isinstance(manager, MemoryManager)
+        assert manager.llm is llm
