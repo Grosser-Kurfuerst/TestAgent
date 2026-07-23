@@ -294,6 +294,17 @@ class FakeManifestRunner:
                     },
                     "memory_usage_available": True,
                     "memory_usage_unavailable_reason": "",
+                    "evolver_selected_content_tokens": 40,
+                    "evolver_injected_tokens": 48,
+                    "maintenance_runs": 1,
+                    "maintenance_applied_runs": 1,
+                    "maintenance_keep": 2,
+                    "maintenance_delete": 1,
+                    "maintenance_merge": 0,
+                    "maintenance_promote": 0,
+                    "maintenance_removed_entries": 1,
+                    "maintenance_added_entries": 0,
+                    "maintenance_failures": 0,
                 }
                 if self.formal_usage
                 else {}
@@ -489,6 +500,17 @@ def test_four_tier_task_result_uses_formal_decision_token_metrics(
     assert row.memory_total_tokens == 5
     assert row.system_total_tokens == 20
     assert row.memory_tokens_by_role["selection"].resolved_total_tokens == 5
+    assert row.memory["selected_content_tokens"] == 40
+    assert row.memory["injected_tokens"] == 48
+    assert row.memory["maintenance_runs"] == 1
+    assert row.memory["maintenance_actions"] == {
+        "keep": 2,
+        "delete": 1,
+        "merge": 0,
+        "promote": 0,
+        "removed_entries": 1,
+        "added_entries": 0,
+    }
 
 
 def test_no_memory_runner_integrates_with_real_manifest_path(tmp_path: Path) -> None:

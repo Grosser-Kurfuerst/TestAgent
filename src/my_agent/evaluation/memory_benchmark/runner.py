@@ -559,8 +559,16 @@ def _build_task_result(
             "selected_count": (
                 int(metrics.get("evolver_selected_total", 0) or 0) if arm == "agentcli_four_tier" else context.selected_count
             ),
-            "selected_content_tokens": context.selected_content_tokens,
-            "injected_tokens": context.estimated_tokens,
+            "selected_content_tokens": (
+                int(metrics.get("evolver_selected_content_tokens", 0) or 0)
+                if arm == "agentcli_four_tier"
+                else context.selected_content_tokens
+            ),
+            "injected_tokens": (
+                int(metrics.get("evolver_injected_tokens", 0) or 0)
+                if arm == "agentcli_four_tier"
+                else context.estimated_tokens
+            ),
             "written_count": len(backend_finalize.written_ids),
             "entries_before": memory_before.entry_count,
             "entries_after": memory_after.entry_count,
@@ -570,6 +578,25 @@ def _build_task_result(
             "repository_revision_after": memory_after.revision,
             "backend_finalize_status": backend_finalize.status,
             "maintenance_status": manifest_result.evolver_maintenance_status or "not_due",
+            "maintenance_runs": int(metrics.get("maintenance_runs", 0) or 0),
+            "maintenance_applied_runs": int(
+                metrics.get("maintenance_applied_runs", 0) or 0
+            ),
+            "maintenance_failures": int(
+                metrics.get("maintenance_failures", 0) or 0
+            ),
+            "maintenance_actions": {
+                "keep": int(metrics.get("maintenance_keep", 0) or 0),
+                "delete": int(metrics.get("maintenance_delete", 0) or 0),
+                "merge": int(metrics.get("maintenance_merge", 0) or 0),
+                "promote": int(metrics.get("maintenance_promote", 0) or 0),
+                "removed_entries": int(
+                    metrics.get("maintenance_removed_entries", 0) or 0
+                ),
+                "added_entries": int(
+                    metrics.get("maintenance_added_entries", 0) or 0
+                ),
+            },
         },
         trace_path=manifest_result.trace_path,
         action_log_path=str(prepared.action_log_path),

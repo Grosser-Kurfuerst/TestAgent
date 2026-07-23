@@ -13,6 +13,8 @@ from my_agent.observability.trace_metrics import (
     collect_trace_metrics,
     format_trace_metrics,
 )
+from my_agent.memory.token import estimate_tokens
+from my_agent.training.role_views import SELECTED_MEMORY_CONTEXT_HEADER
 
 
 class TraceMetricsEvolverTests(unittest.TestCase):
@@ -29,8 +31,20 @@ class TraceMetricsEvolverTests(unittest.TestCase):
                             "payload": {
                                 "candidate_count": 2,
                                 "candidates": [
-                                    {"memory_id": "tip-1", "tier": "tip"},
-                                    {"memory_id": "skill-1", "tier": "skill"},
+                                    {
+                                        "memory_id": "tip-1",
+                                        "tier": "tip",
+                                        "content": "Use the tip.",
+                                        "token_count": estimate_tokens("Use the tip."),
+                                    },
+                                    {
+                                        "memory_id": "skill-1",
+                                        "tier": "skill",
+                                        "content": "Reuse the skill safely.",
+                                        "token_count": estimate_tokens(
+                                            "Reuse the skill safely."
+                                        ),
+                                    },
                                 ],
                                 "selected_count": 1,
                                 "selected_memory_ids": ["skill-1"],
@@ -73,6 +87,17 @@ class TraceMetricsEvolverTests(unittest.TestCase):
         self.assertEqual(metrics.evolver_selected_total, 1)
         self.assertEqual(metrics.evolver_selected_ids, ("skill-1",))
         self.assertEqual(metrics.evolver_selected_by_tier, {"skill": 1})
+        self.assertEqual(
+            metrics.evolver_selected_content_tokens,
+            estimate_tokens("Reuse the skill safely."),
+        )
+        self.assertEqual(
+            metrics.evolver_injected_tokens,
+            estimate_tokens(
+                SELECTED_MEMORY_CONTEXT_HEADER
+                + "\n\n[skill-1 | skill]\nReuse the skill safely."
+            ),
+        )
         self.assertEqual(metrics.evolver_writer_started_events, 3)
         self.assertEqual(metrics.evolver_writer_saved_events, 1)
         self.assertEqual(metrics.evolver_writer_saved_total, 1)

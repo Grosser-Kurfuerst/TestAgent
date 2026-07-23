@@ -49,6 +49,9 @@ from my_agent.evaluation.memory_benchmark.runner import (
     MemoryBenchmarkStreamResult,
     run_memory_benchmark_stream,
 )
+from my_agent.evaluation.memory_benchmark.reporting import (
+    generate_memory_benchmark_report,
+)
 from my_agent.evaluation.memory_benchmark.source_lock import load_source_lock
 from my_agent.evaluation.policy_config import (
     configure_evaluation_policy,
@@ -168,9 +171,7 @@ def handle(args: argparse.Namespace, ctx: CliContext) -> int:
                 limit=args.limit,
             )
         else:
-            raise RuntimeError(
-                "memory-benchmark report is available after Iteration 11"
-            )
+            result = generate_memory_benchmark_report(args.run_dir)
     except (
         FileExistsError,
         FileNotFoundError,
@@ -1158,6 +1159,7 @@ def _validate_context_budget(
             int(config.memory["selected_max_items"]),
             int(config.memory["selected_content_max_tokens"]),
         )
+        synthetic_memory_tokens = estimate_tokens(memory_block)
         messages = [
             Message(role="system", content="AgentCli memory benchmark actor."),
             Message(role="system", content=memory_block),
@@ -1179,6 +1181,7 @@ def _validate_context_budget(
             raise ValueError("benchmark_action tool config is invalid")
         return {
             "fixed_with_memory_tokens": fixed_with_memory,
+            "synthetic_memory_tokens": synthetic_memory_tokens,
             "compression_trigger_tokens": trigger,
             "tool_count": len(tools),
         }

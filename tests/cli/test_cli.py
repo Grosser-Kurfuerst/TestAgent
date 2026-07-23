@@ -114,6 +114,28 @@ class CliTests(unittest.TestCase):
         self.assertEqual(run.seed, 42)
         self.assertEqual(report.memory_benchmark_command, "report")
 
+    @mock.patch(
+        "my_agent.cli.commands.memory_benchmark.generate_memory_benchmark_report"
+    )
+    def test_memory_benchmark_report_dispatches_to_reporting(
+        self,
+        generate_report: mock.Mock,
+    ) -> None:
+        generate_report.return_value = {
+            "status": "completed",
+            "protocol_hash": "sha256:" + "1" * 64,
+        }
+        stream = io.StringIO()
+
+        with contextlib.redirect_stdout(stream):
+            exit_code = main(
+                ["memory-benchmark", "report", "--run-dir", "fixture-run"]
+            )
+
+        self.assertEqual(exit_code, 0)
+        generate_report.assert_called_once_with("fixture-run")
+        self.assertIn('"status": "completed"', stream.getvalue())
+
     def test_load_sample_task(self) -> None:
         task = load_task(DEFAULT_TASK_FILE)
 

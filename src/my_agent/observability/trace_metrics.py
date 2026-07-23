@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any
 
 from my_agent.observability.maintenance_events import MaintenanceEventCounters
+from my_agent.memory.token import estimate_tokens
+from my_agent.training.role_views import SELECTED_MEMORY_CONTEXT_HEADER
 
 
 EDIT_TOOLS = {"replace_in_file", "write_file"}
@@ -51,6 +53,8 @@ class TraceMetrics:
     evolver_selected_total: int = 0
     evolver_selected_by_tier: dict[str, int] = field(default_factory=dict)
     evolver_selected_ids: tuple[str, ...] = ()
+    evolver_selected_content_tokens: int = 0
+    evolver_injected_tokens: int = 0
     evolver_selection_policies: dict[str, int] = field(default_factory=dict)
     evolver_writer_started_events: int = 0
     evolver_writer_saved_events: int = 0
@@ -113,6 +117,8 @@ class TraceMetrics:
             "evolver_selected_total": self.evolver_selected_total,
             "evolver_selected_by_tier": self.evolver_selected_by_tier,
             "evolver_selected_ids": list(self.evolver_selected_ids),
+            "evolver_selected_content_tokens": self.evolver_selected_content_tokens,
+            "evolver_injected_tokens": self.evolver_injected_tokens,
             "evolver_selection_policies": self.evolver_selection_policies,
             "evolver_writer_started_events": self.evolver_writer_started_events,
             "evolver_writer_saved_events": self.evolver_writer_saved_events,
@@ -142,6 +148,8 @@ class _EvolverEventMetrics:
     selected_total: int = 0
     selected_by_tier: Counter[str] = field(default_factory=Counter)
     selected_ids: list[str] = field(default_factory=list)
+    selected_content_tokens: int = 0
+    injected_tokens: int = 0
     selection_policies: Counter[str] = field(default_factory=Counter)
     writer_started_events: int = 0
     writer_saved_events: int = 0
@@ -356,6 +364,8 @@ def collect_trace_metrics(path: str | Path, *, recursive: bool = True) -> TraceM
         evolver_selected_total=evolver.selected_total,
         evolver_selected_by_tier=dict(sorted(evolver.selected_by_tier.items())),
         evolver_selected_ids=tuple(evolver.selected_ids),
+        evolver_selected_content_tokens=evolver.selected_content_tokens,
+        evolver_injected_tokens=evolver.injected_tokens,
         evolver_selection_policies=dict(sorted(evolver.selection_policies.items())),
         evolver_writer_started_events=evolver.writer_started_events,
         evolver_writer_saved_events=evolver.writer_saved_events,
@@ -570,6 +580,12 @@ def _collect_evolver_event_metrics(
                 )
                 metrics.selected_ids.extend(selected_ids)
                 metrics.selected_by_tier.update(_formal_selected_tiers(payload, selected_ids=selected_ids))
+                selected_content_tokens, injected_tokens = _formal_selected_token_metrics(
+                    payload,
+                    selected_ids=selected_ids,
+                )
+                metrics.selected_content_tokens += selected_content_tokens
+                metrics.injected_tokens += injected_tokens
         else:
             for event_name, payload in events:
                 if event_name == "memory.evolver_candidates":
@@ -588,6 +604,12 @@ def _collect_evolver_event_metrics(
                     )
                     metrics.selected_ids.extend(_string_list(payload.get("selected_ids")))
                     metrics.selected_by_tier.update(_tier_counts(payload.get("tiers")))
+                    metrics.selected_content_tokens += _non_negative_payload_int(
+                        payload.get("selected_content_tokens")
+                    )
+                    metrics.injected_tokens += _non_negative_payload_int(
+                        payload.get("tokens")
+                    )
                     policy = payload.get("selection_policy")
                     if isinstance(policy, str) and policy:
                         metrics.selection_policies[policy] += 1
@@ -642,6 +664,44 @@ def _formal_selected_tiers(
     return Counter(tiers_by_id[memory_id] for memory_id in selected_ids if memory_id in tiers_by_id)
 
 
+def _formal_selected_token_metrics(
+    payload: dict[str, Any],
+    *,
+    selected_ids: list[str],
+) -> tuple[int, int]:
+    candidates = payload.get("candidates")
+    if not isinstance(candidates, list):
+        return 0, 0
+    by_id: dict[str, dict[str, Any]] = {}
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        memory_id = candidate.get("memory_id")
+        if isinstance(memory_id, str) and memory_id:
+            by_id[memory_id] = candidate
+    selected = [by_id[memory_id] for memory_id in selected_ids if memory_id in by_id]
+    if len(selected) != len(selected_ids) or not selected:
+        return 0, 0
+    selected_content_tokens = 0
+    blocks = [SELECTED_MEMORY_CONTEXT_HEADER]
+    for candidate in selected:
+        content = candidate.get("content")
+        tier = candidate.get("tier")
+        memory_id = candidate.get("memory_id")
+        if not all(isinstance(value, str) for value in (content, tier, memory_id)):
+            return 0, 0
+        token_count = candidate.get("token_count")
+        selected_content_tokens += (
+            token_count
+            if isinstance(token_count, int)
+            and not isinstance(token_count, bool)
+            and token_count >= 0
+            else estimate_tokens(content)
+        )
+        blocks.append(f"[{memory_id} | {tier}]\n{content}")
+    return selected_content_tokens, estimate_tokens("\n\n".join(blocks))
+
+
 def _string_list(value: object) -> list[str]:
     if not isinstance(value, list):
         return []
@@ -656,6 +716,12 @@ def _payload_count(payload: dict[str, Any], *, count_key: str, fallback_keys: tu
         values = payload.get(key)
         if isinstance(values, list):
             return len(values)
+    return 0
+
+
+def _non_negative_payload_int(value: object) -> int:
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
     return 0
 
 
