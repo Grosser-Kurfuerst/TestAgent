@@ -175,9 +175,11 @@ def test_tracked_v2_config_loads_and_canonical_round_trips() -> None:
     assert MemoryBenchmarkConfig.from_dict(canonical_payload) == config
 
 
-def test_v1_config_is_explicitly_rejected() -> None:
+def test_v1_config_schema_is_explicitly_rejected() -> None:
+    payload = load_memory_benchmark_config(CONFIG_PATH).to_dict()
+    payload["schema_version"] = "memory-benchmark-config-v1"
     with pytest.raises(ValueError, match="unsupported memory benchmark config schema"):
-        load_memory_benchmark_config(Path("configs/memory_benchmark/v1.json"))
+        MemoryBenchmarkConfig.from_dict(payload)
 
 
 def test_config_rejects_absolute_paths_and_secret_fields() -> None:

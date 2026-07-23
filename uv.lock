@@ -1369,6 +1369,7 @@ dev = [
 memory-benchmark = [
     { name = "datasets" },
     { name = "mem0ai" },
+    { name = "openai" },
     { name = "scikit-learn", version = "1.7.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "scikit-learn", version = "1.9.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
 ]
@@ -1400,6 +1401,7 @@ requires-dist = [
     { name = "huggingface-hub", marker = "extra == 'opd-embed'", specifier = ">=0.33,<2" },
     { name = "huggingface-hub", marker = "extra == 'opd-train'", specifier = ">=0.33,<2" },
     { name = "mem0ai", marker = "extra == 'memory-benchmark'", specifier = ">=2.0.13,<3" },
+    { name = "openai", marker = "extra == 'memory-benchmark'", specifier = ">=2,<3" },
     { name = "peft", marker = "extra == 'opd-train'", specifier = ">=0.15,<1" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0.0" },
     { name = "python-dotenv", specifier = ">=1.0.0" },

@@ -466,7 +466,149 @@ uv run python scripts/eval_sft_humaneval_api.py \
 
 这个脚本使用 HumanEval 测试通过率做对比，不复用 `eval_sft_protocol.py` 的 JSON 合法性指标。
 
-## 11. 推荐测试顺序
+## 11. Memory benchmark（仅外部 API）
+
+Memory benchmark 比较 `no_memory`、`agentcli_four_tier` 和 `mem0` 三个 arm。该流程只使用 OpenAI-compatible 外部 API，不需要本地 checkpoint、identity manifest、Torch、Transformers、`opd-train` 或 `opd-embed` extra。
+
+### 11.1 安装
+
+在 memory-benchmark worktree 中执行：
+
+```bash
+cd /home/kurfuerst/Coding/work/Coding-Agent/AgentCli/memory-benchmark
+
+export UV_CACHE_DIR=/tmp/agentcli-uv-cache
+
+uv sync \
+  --extra dev \
+  --extra memory-benchmark
+```
+
+### 11.2 配置 Actor 与 embedding API
+
+可以直接复用现有主 worktree 的 `../AgentCli/.env`；如果希望为该 worktree 单独配置，也可以把它复制为当前目录的 `.env`，并相应修改后续命令的 `--env-file` 路径。三个 arm 的 Actor、Four-tier 的 selection/writing/maintenance 和 Mem0 内部 LLM 都使用 `MY_AGENT_MODEL`：
+
+```bash
+MY_AGENT_LLM_PROVIDER=openai
+MY_AGENT_API_KEY=sk-xxx
+MY_AGENT_BASE_URL=https://实际WorkspaceId.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
+MY_AGENT_MODEL=qwen-plus
+```
+
+Embedding 模型固定在 `configs/memory_benchmark/v2.json` 的 `embedding.model`，默认是 `text-embedding-v4`。默认复用 Actor 的 key 和 base URL；只有 embedding 使用不同凭据或 endpoint 时才设置：
+
+```bash
+MY_AGENT_EMBEDDING_API_KEY=sk-xxx
+MY_AGENT_EMBEDDING_BASE_URL=https://实际WorkspaceId.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
+```
+
+Embedding key 的实际优先级是：
+
+```text
+MY_AGENT_EMBEDDING_API_KEY
+-> DASHSCOPE_API_KEY
+-> MY_AGENT_API_KEY
+```
+
+如果使用阿里云百炼，必须把 URL 中的 `实际WorkspaceId` 替换成真实 Workspace ID，不能保留字面量 `{WorkspaceId}`。不再需要 `AGENTCLI_MEM0_CONFIG_PATH`；运行时会从同一套 Actor/embedding API 配置自动构造 Mem0 配置，API key 不会写入 protocol、backend config 或报告。
+
+### 11.3 准备 benchmark 数据
+
+先配置两个锁定 benchmark checkout：
+
+```bash
+export AGENTCLI_LIFELONG_AGENT_BENCH_ROOT=/absolute/path/to/LifelongAgentBench
+export AGENTCLI_INTERCODE_ROOT=/absolute/path/to/InterCode
+```
+
+然后生成确定性的本地 suite manifest：
+
+```bash
+uv run --env-file ../AgentCli/.env \
+  my-agent memory-benchmark prepare \
+  --config configs/memory_benchmark/v2.json
+```
+
+### 11.4 Preflight
+
+Preflight 会检查 prepared suite、source revision、Docker image digest、official evaluator、Actor chat/tool calling、embedding 向量维度、Mem0 初始化、上下文预算和干净的 Git commit：
+
+```bash
+uv run --env-file ../AgentCli/.env \
+  my-agent memory-benchmark preflight \
+  --config configs/memory_benchmark/v2.json \
+  --run-dir evaluationResults/memory_benchmark/qwen-api-pilot \
+  --benchmarks lifelong_os,intercode_bash \
+  --limit 8
+```
+
+正式运行前可检查：
+
+```text
+evaluationResults/memory_benchmark/qwen-api-pilot/preflight.json
+evaluationResults/memory_benchmark/qwen-api-pilot/protocol.json
+evaluationResults/memory_benchmark/qwen-api-pilot/arms/*/backend_config.json
+```
+
+这些公开文件只能包含 model、endpoint hash、embedding dimension 等 identity，不能包含 API key。
+
+### 11.5 八任务 smoke
+
+Smoke 会顺序运行三个 arm，并验证 No Memory 不增长、Four-tier 能写入和后续检索、Mem0 能 add/search、Four-tier maintenance cadence 生效，以及 Actor/embedding identity 一致：
+
+```bash
+uv run --env-file ../AgentCli/.env \
+  my-agent memory-benchmark smoke \
+  --config configs/memory_benchmark/v2.json \
+  --output-dir evaluationResults/memory_benchmark/qwen-api-smoke
+```
+
+### 11.6 Pilot、正式运行与报告
+
+先用每个 benchmark 8 个任务验证完整链路：
+
+```bash
+uv run --env-file ../AgentCli/.env \
+  my-agent memory-benchmark run \
+  --config configs/memory_benchmark/v2.json \
+  --run-dir evaluationResults/memory_benchmark/qwen-api-pilot \
+  --seed 42 \
+  --arms no_memory,agentcli_four_tier,mem0 \
+  --benchmarks lifelong_os,intercode_bash \
+  --limit 8
+```
+
+Pilot 通过后，新建不带 `--limit` 的正式 preflight run 目录：
+
+```bash
+uv run --env-file ../AgentCli/.env \
+  my-agent memory-benchmark preflight \
+  --config configs/memory_benchmark/v2.json \
+  --run-dir evaluationResults/memory_benchmark/qwen-api-run
+```
+
+然后分别运行配置中的 seed `42`、`43`、`44`，每次保持相同的 arm 和 benchmark selection，例如：
+
+```bash
+uv run --env-file ../AgentCli/.env \
+  my-agent memory-benchmark run \
+  --config configs/memory_benchmark/v2.json \
+  --run-dir evaluationResults/memory_benchmark/qwen-api-run \
+  --seed 42 \
+  --arms no_memory,agentcli_four_tier,mem0 \
+  --benchmarks lifelong_os,intercode_bash
+```
+
+同一个 `run-dir` 的 preflight selection 是不可变的，不能先用 `--limit 8` preflight 再移除 limit 继续正式运行。
+
+完成所有 arm 和 seed 后生成配对报告：
+
+```bash
+uv run my-agent memory-benchmark report \
+  --run-dir evaluationResults/memory_benchmark/qwen-api-run
+```
+
+## 12. 推荐测试顺序
 
 第一次验证建议按这个顺序：
 
@@ -494,7 +636,7 @@ uv run python run_agent.py run --max-steps 8 --trace-dir traces
 uv run python scripts/eval_mbpp.py --limit 3 --output-dir /tmp/mbpp_eval --max-steps 10
 ```
 
-## 12. 常见问题
+## 13. 常见问题
 
 ### `Configuration file not found`
 
