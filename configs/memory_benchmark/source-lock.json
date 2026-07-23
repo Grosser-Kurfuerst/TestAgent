@@ -1,0 +1,38 @@
+{
+  "schema_version": "memory-benchmark-source-lock-v1",
+  "sources": {
+    "intercode": {
+      "container_base_digest": "sha256:3131b4cc82a783df6c9df078f86e01819a13594b865c2cad47bd1bca2b7063bb",
+      "container_base_image": "ubuntu@sha256:3131b4cc82a783df6c9df078f86e01819a13594b865c2cad47bd1bca2b7063bb",
+      "container_build_path": "docker/nl2bash.Dockerfile",
+      "container_build_sha256": "sha256:c8b52b44cc276921f1b139d49562152792872c7b013261b748305a78d4230189",
+      "container_digest": "sha256:a5a3290680ed28300601d6b60ac3a03006f79b3579010c0a1c7992c084c1ac82",
+      "container_image": "intercode-nl2bash:c3e46d82",
+      "evaluator_entrypoint": "intercode.envs.bash.BashEnv.get_reward",
+      "license": "MIT",
+      "revision": "c3e46d827cfc9d4c704ec078f7abf9f41e3191d8",
+      "task_data_path": "data/nl2bash/nl2bash_fs_1.json",
+      "task_data_revision": "c3e46d827cfc9d4c704ec078f7abf9f41e3191d8",
+      "task_data_sha256": "sha256:60f88e1aacc7ebba535093f9890c5c33203f4e5f32958e0e94fbe90ec4f01c82",
+      "task_data_url": "https://github.com/princeton-nlp/intercode",
+      "url": "https://github.com/princeton-nlp/intercode"
+    },
+    "lifelong_agent_bench": {
+      "container_base_digest": "sha256:3131b4cc82a783df6c9df078f86e01819a13594b865c2cad47bd1bca2b7063bb",
+      "container_base_image": "ubuntu@sha256:3131b4cc82a783df6c9df078f86e01819a13594b865c2cad47bd1bca2b7063bb",
+      "container_build_path": "scripts/dockerfile/os_interaction/default",
+      "container_build_sha256": "sha256:f4e7b3d4298777fcc6b955e2853e7d38a8d50916b1853c3fefe6d0b3a0a2f1fe",
+      "container_digest": "sha256:a4018054966d9804f46658b7ce82312c417d22bdac87ab3b1f9dd7bb15a814a8",
+      "container_image": "local-os/default:d6f19b42",
+      "evaluator_entrypoint": "src.tasks.instance.os_interaction.task.OSInteraction._complete",
+      "license": "NOASSERTION",
+      "license_status": "not_declared_by_official_code_or_dataset_source",
+      "revision": "d6f19b42eb358d9150379f0c68c2985c5a867520",
+      "task_data_path": "os_interaction/train-00000-of-00001.parquet",
+      "task_data_revision": "75054b60177d4dcddb93b984413ff799b0a1fdbc",
+      "task_data_sha256": "sha256:61795fd6a0231fad9a509f8dbb8863bb0cdde1daa1db05e1b2e6dbb077946b13",
+      "task_data_url": "https://huggingface.co/datasets/csyq/LifelongAgentBench",
+      "url": "https://github.com/caixd-220529/LifelongAgentBench"
+    }
+  }
+}

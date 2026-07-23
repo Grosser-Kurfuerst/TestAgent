@@ -1,0 +1,23 @@
+{
+  "schema_version": "memory-benchmark-source-lock-v1",
+  "sources": {
+    "intercode": {
+      "container_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "container_image": "intercode-nl2bash:fixture",
+      "evaluator_entrypoint": "intercode.envs.bash.BashEnv.get_reward",
+      "license": "MIT",
+      "revision": "2222222222222222222222222222222222222222",
+      "task_data_path": "data/nl2bash/nl2bash_fs_1.json",
+      "url": "https://example.test/intercode"
+    },
+    "lifelong_agent_bench": {
+      "container_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "container_image": "local-os/default:fixture",
+      "evaluator_entrypoint": "src.tasks.instance.os_interaction.task.OSInteraction._complete",
+      "license": "NOASSERTION",
+      "revision": "1111111111111111111111111111111111111111",
+      "task_data_path": "os_interaction/train.parquet",
+      "url": "https://example.test/lifelong-agent-bench"
+    }
+  }
+}
