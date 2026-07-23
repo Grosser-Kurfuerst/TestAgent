@@ -7,6 +7,7 @@ import pytest
 
 from my_agent.config import AgentConfig
 from my_agent.context import AgentContextManager
+from my_agent.evaluation.memory_benchmark.api_config import ApiEndpoint
 from my_agent.evaluation.memory_benchmark.contracts import (
     MemoryContextSelection,
     Mem0SearchResult,
@@ -16,12 +17,16 @@ from my_agent.evaluation.memory_benchmark.contracts import (
 from my_agent.evaluation.memory_benchmark.external_memory import (
     ExternalContextMemoryManager,
     Mem0ClientAdapter,
+    build_memory_benchmark_mem0_config,
     localize_mem0_config,
+    memory_benchmark_mem0_backend_identity,
 )
+from my_agent.evaluation.memory_benchmark.protocol import load_memory_benchmark_config
 from my_agent.llm import FakeLLM
 from my_agent.llm.types import Message
 from my_agent.memory.api import MemoryService
 from my_agent.memory.manager import MemoryManager
+from my_agent.policy.identity import canonical_sha256
 
 
 def _config(tmp_path: Path) -> AgentConfig:
@@ -55,6 +60,73 @@ def _selection(text: str = "Remember the public command sequence.") -> MemoryCon
         estimated_tokens=20,
         retrieval_elapsed_sec=0.01,
     )
+
+
+def _endpoint(*, model: str, key: str, label: str) -> ApiEndpoint:
+    return ApiEndpoint(
+        api_key=key,
+        base_url=f"https://{label}.example.test/v1",
+        model=model,
+        endpoint_hash=canonical_sha256({"endpoint": label}),
+    )
+
+
+def test_mem0_config_is_derived_from_shared_api_endpoints() -> None:
+    actor = _endpoint(model="qwen-plus", key="actor-secret", label="actor")
+    embedding = _endpoint(
+        model="text-embedding-v4",
+        key="embedding-secret",
+        label="embedding",
+    )
+
+    config = build_memory_benchmark_mem0_config(
+        actor_endpoint=actor,
+        embedding_endpoint=embedding,
+        embedding_dimension=1_024,
+    )
+
+    assert config["llm"]["config"] == {
+        "model": actor.model,
+        "api_key": actor.api_key,
+        "openai_base_url": actor.base_url,
+    }
+    assert config["embedder"]["config"] == {
+        "model": embedding.model,
+        "api_key": embedding.api_key,
+        "openai_base_url": embedding.base_url,
+    }
+    assert config["vector_store"]["config"]["embedding_model_dims"] == 1_024
+
+
+def test_mem0_backend_identity_is_public_and_matches_shared_embedding() -> None:
+    actor = _endpoint(model="qwen-plus", key="actor-secret", label="actor")
+    embedding = _endpoint(
+        model="text-embedding-v4",
+        key="embedding-secret",
+        label="embedding",
+    )
+
+    identity = memory_benchmark_mem0_backend_identity(
+        actor_endpoint=actor,
+        embedding_endpoint=embedding,
+        embedding_dimension=1_024,
+        search_limit=50,
+        selected_max_items=20,
+        selected_content_max_tokens=1_800,
+        package_version="2.0.13",
+    )
+
+    assert identity["llm_model"] == actor.model
+    assert identity["embedding_model"] == embedding.model
+    assert identity["embedding_endpoint_hash"] == embedding.endpoint_hash
+    assert "actor-secret" not in str(identity)
+    assert "embedding-secret" not in str(identity)
+
+
+def test_v2_benchmark_config_has_no_mem0_config_path() -> None:
+    config = load_memory_benchmark_config("configs/memory_benchmark/v2.json")
+
+    assert "mem0_config" not in config.environment
 
 
 def _episode() -> PublicEpisode:

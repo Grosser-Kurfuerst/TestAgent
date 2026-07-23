@@ -12,6 +12,7 @@ from time import perf_counter
 from typing import Any, Iterator
 import os
 
+from my_agent.evaluation.memory_benchmark.api_config import ApiEndpoint
 from my_agent.evaluation.memory_benchmark.contracts import (
     ExternalMemoryItem,
     Mem0SearchResult,
@@ -26,6 +27,85 @@ from my_agent.memory.types import MemoryContext
 
 _LOCAL_VECTOR_STORES = frozenset({"faiss", "qdrant"})
 _REMOTE_QDRANT_FIELDS = ("client", "host", "port", "url", "api_key")
+MEMORY_BENCHMARK_BACKEND_CONFIG_SCHEMA_VERSION = (
+    "memory-benchmark-backend-config-v2"
+)
+
+
+def build_memory_benchmark_mem0_config(
+    *,
+    actor_endpoint: ApiEndpoint,
+    embedding_endpoint: ApiEndpoint,
+    embedding_dimension: int,
+) -> dict[str, Any]:
+    """Build the secret-bearing Mem0 runtime config from shared API endpoints."""
+
+    dimension = _positive_int(embedding_dimension, "embedding_dimension")
+    return {
+        "llm": {
+            "provider": "openai",
+            "config": {
+                "model": actor_endpoint.model,
+                "api_key": actor_endpoint.api_key,
+                "openai_base_url": actor_endpoint.base_url,
+            },
+        },
+        "embedder": {
+            "provider": "openai",
+            "config": {
+                "model": embedding_endpoint.model,
+                "api_key": embedding_endpoint.api_key,
+                "openai_base_url": embedding_endpoint.base_url,
+            },
+        },
+        "vector_store": {
+            "provider": "qdrant",
+            "config": {
+                "collection_name": "agentcli_memory_benchmark",
+                "embedding_model_dims": dimension,
+            },
+        },
+    }
+
+
+def memory_benchmark_mem0_backend_identity(
+    *,
+    actor_endpoint: ApiEndpoint,
+    embedding_endpoint: ApiEndpoint,
+    embedding_dimension: int,
+    search_limit: int,
+    selected_max_items: int,
+    selected_content_max_tokens: int,
+    package_version: str,
+) -> dict[str, Any]:
+    """Return the public Mem0 identity used for protocol hashing and reports."""
+
+    version = str(package_version).strip()
+    if not version:
+        raise ValueError("Mem0 package_version must be non-empty")
+    return {
+        "schema_version": MEMORY_BENCHMARK_BACKEND_CONFIG_SCHEMA_VERSION,
+        "arm": "mem0",
+        "llm_model": actor_endpoint.model,
+        "llm_endpoint_hash": actor_endpoint.endpoint_hash,
+        "embedding_model": embedding_endpoint.model,
+        "embedding_endpoint_hash": embedding_endpoint.endpoint_hash,
+        "embedding_dimension": _positive_int(
+            embedding_dimension, "embedding_dimension"
+        ),
+        "search_limit": _positive_int(search_limit, "search_limit"),
+        "selected_max_items": _bounded_positive_int(
+            selected_max_items,
+            "selected_max_items",
+            maximum=20,
+        ),
+        "selected_content_max_tokens": _bounded_positive_int(
+            selected_content_max_tokens,
+            "selected_content_max_tokens",
+            maximum=1_800,
+        ),
+        "package_version": version,
+    }
 
 
 class ExternalContextMemoryManager:
@@ -535,8 +615,24 @@ def _restore_environment(name: str, previous: str | None) -> None:
         os.environ[name] = previous
 
 
+def _positive_int(value: int, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{field_name} must be a positive integer")
+    return value
+
+
+def _bounded_positive_int(value: int, field_name: str, *, maximum: int) -> int:
+    normalized = _positive_int(value, field_name)
+    if normalized > maximum:
+        raise ValueError(f"{field_name} cannot exceed {maximum}")
+    return normalized
+
+
 __all__ = [
     "ExternalContextMemoryManager",
+    "MEMORY_BENCHMARK_BACKEND_CONFIG_SCHEMA_VERSION",
     "Mem0ClientAdapter",
+    "build_memory_benchmark_mem0_config",
     "localize_mem0_config",
+    "memory_benchmark_mem0_backend_identity",
 ]
