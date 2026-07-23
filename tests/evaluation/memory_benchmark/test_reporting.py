@@ -39,7 +39,7 @@ def _write_fake_run(root: Path) -> Path:
     }
     backend_configs = {
         arm: {
-            "schema_version": "memory-benchmark-backend-config-v1",
+            "schema_version": "memory-benchmark-backend-config-v2",
             "arm": arm,
             "mode": arm,
         }
@@ -119,7 +119,7 @@ def _write_fake_run(root: Path) -> Path:
     _write_json(
         run_dir / "preflight.json",
         {
-            "schema_version": "memory-benchmark-preflight-v1",
+            "schema_version": "memory-benchmark-preflight-v2",
             "status": "passed",
             "run_id": "fixture-run",
             "protocol_hash": protocol.protocol_hash,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 import json
 import subprocess
@@ -19,9 +20,15 @@ from my_agent.evaluation.memory_benchmark.adapters.docker_runtime import (
 from my_agent.evaluation.memory_benchmark.adapters.smoke import (
     SMOKE_EVALUATOR_HASH,
     SmokeAdapter,
+    _validate_smoke_arm,
     smoke_action_main,
     smoke_cli_main,
 )
+from my_agent.evaluation.memory_benchmark.api_config import ApiEndpoint
+from my_agent.evaluation.memory_benchmark.api_embedding import (
+    MemoryBenchmarkApiEmbeddingEncoder,
+)
+from my_agent.evaluation.memory_benchmark.api_policy import MemoryBenchmarkApiPolicy
 from my_agent.evaluation.memory_benchmark.backends import AgentCliFourTierBackend
 from my_agent.evaluation.memory_benchmark.contracts import load_official_evaluator_result
 from my_agent.evaluation.memory_benchmark.public_episode import build_public_episode
@@ -87,6 +94,29 @@ class _Encoder:
 
     def encode_documents(self, texts):
         return tuple((1.0, 0.0) for _ in texts)
+
+
+class _ApiEmbeddingClient:
+    def __init__(self) -> None:
+        self.embeddings = self
+
+    def create(self, *, model: str, input: list[str]) -> Any:
+        del model
+        return SimpleNamespace(
+            data=[
+                SimpleNamespace(index=index, embedding=[1.0, 0.0])
+                for index, _text in enumerate(input)
+            ]
+        )
+
+
+def _api_endpoint(model: str) -> ApiEndpoint:
+    return ApiEndpoint(
+        api_key="fixture-secret",
+        base_url="https://workspace.example.com/v1",
+        model=model,
+        endpoint_hash=canonical_sha256({"model": model, "endpoint": "fixture"}),
+    )
 
 
 class _AllSelector:
@@ -312,9 +342,16 @@ def test_four_tier_fixture_enters_candidate_snapshot_and_rendered_context(
 
 
 def test_smoke_backend_overrides_maintenance_interval(tmp_path: Path) -> None:
+    actor_endpoint = _api_endpoint("fixture-chat")
+    embedding_endpoint = _api_endpoint("fixture-embedding")
     backend = AgentCliFourTierBackend(
         stream_memory_dir=tmp_path / "memory",
         stream_project_key="smoke-project",
+        policy=MemoryBenchmarkApiPolicy(actor_endpoint, client=object()),
+        embedding_encoder=MemoryBenchmarkApiEmbeddingEncoder(
+            embedding_endpoint,
+            client=_ApiEmbeddingClient(),
+        ),
         maintenance_interval_tasks=4,
     )
     config = AgentConfig(
@@ -339,4 +376,39 @@ def test_smoke_backend_overrides_maintenance_interval(tmp_path: Path) -> None:
         context=context,
     )
 
-    assert resolved.memory_evolver_maintenance_interval_tasks == 4
+    assert backend.maintenance_interval_tasks == 4
+    assert resolved.memory_evolver_mode == "off"
+
+
+def test_smoke_four_tier_maintenance_metrics_come_from_backend_finalize() -> None:
+    executions = []
+    for index in range(8):
+        executions.append(
+            SimpleNamespace(
+                backend_finalize=SimpleNamespace(
+                    status="committed" if index == 0 else "no_write",
+                    metrics={
+                        "maintenance_runs": 1 if index == 3 else 0,
+                        "maintenance_failures": 0,
+                    },
+                ),
+                context=SimpleNamespace(candidate_count=1 if index >= 4 else 0),
+                memory_before=SimpleNamespace(
+                    revision=f"revision-{index}",
+                    entry_count=index,
+                ),
+                memory_after=SimpleNamespace(revision=f"revision-{index + 1}"),
+                manifest_result=SimpleNamespace(
+                    metrics={"maintenance_runs": 0, "maintenance_failures": 99}
+                ),
+            )
+        )
+
+    report = _validate_smoke_arm(
+        "agentcli_four_tier",
+        SimpleNamespace(executions=tuple(executions), results_path=Path("results.jsonl")),
+    )
+
+    assert report["status"] == "passed"
+    assert report["checks"]["maintenance_ran"] is True
+    assert report["checks"]["maintenance_failures_zero"] is True

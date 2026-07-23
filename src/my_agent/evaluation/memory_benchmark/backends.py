@@ -326,7 +326,6 @@ class AgentCliFourTierBackend(_LocalExperienceBackend):
             common,
             policy_adapter_path=None,
             policy_identity_manifest=None,
-            embedding_revision="",
         )
 
     def build_agent_runner(
@@ -683,10 +682,6 @@ def _build_task_agent_runner(
 
 
 def _build_benchmark_actor(config: AgentConfig) -> Any:
-    if config.policy_identity_manifest is not None:
-        from my_agent.policy.transformers_policy import TransformersPolicy
-
-        return TransformersPolicy.from_config(config)
     return build_llm(config)
 
 

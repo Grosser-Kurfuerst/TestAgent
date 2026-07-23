@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Callable
 import hashlib
 import json
 import subprocess
@@ -15,12 +16,13 @@ from my_agent.cli.commands.memory_benchmark import (
     run_preflighted_memory_benchmark,
 )
 from my_agent.config import AgentConfig
-from my_agent.policy.identity import (
-    PolicyIdentity,
-    canonical_json_bytes,
-    canonical_sha256,
-    policy_identity_manifest_payload,
+from my_agent.evaluation.memory_benchmark.api_config import ApiEndpoint
+from my_agent.evaluation.memory_benchmark.api_embedding import (
+    MemoryBenchmarkApiEmbeddingEncoder,
 )
+from my_agent.evaluation.memory_benchmark.api_policy import MemoryBenchmarkApiPolicy
+from my_agent.llm.types import ChatResponse, LLMToolCall
+from my_agent.policy.identity import canonical_sha256
 
 
 class _FakeDockerRuntime:
@@ -32,6 +34,79 @@ class _FakeDockerRuntime:
 
     def inspect_image(self, image: str) -> str:
         return self.digests[image]
+
+
+class _ProbeActor:
+    supports_tools = True
+
+    def chat(
+        self,
+        _messages: list[Any],
+        tools: list[dict[str, Any]] | None = None,
+    ) -> ChatResponse:
+        if tools is None:
+            return ChatResponse(content="OK", finish_reason="stop")
+        return ChatResponse(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[
+                LLMToolCall(
+                    id="call_probe",
+                    name="memory_benchmark_probe",
+                    arguments={},
+                    arguments_json="{}",
+                )
+            ],
+        )
+
+
+class _FailingProbeActor(_ProbeActor):
+    def chat(
+        self,
+        _messages: list[Any],
+        tools: list[dict[str, Any]] | None = None,
+    ) -> ChatResponse:
+        del tools
+        raise RuntimeError("fixture Actor API failure")
+
+
+class _FakeEmbeddingClient:
+    def __init__(self, dimension: int) -> None:
+        self.dimension = dimension
+        self.embeddings = self
+
+    def create(self, *, model: str, input: list[str]) -> Any:
+        del model
+        return SimpleNamespace(
+            data=[
+                SimpleNamespace(index=index, embedding=[float(index + 1)] * self.dimension)
+                for index, _text in enumerate(input)
+            ]
+        )
+
+
+def _actor_factory(_config: AgentConfig) -> _ProbeActor:
+    return _ProbeActor()
+
+
+def _embedding_factory(
+    dimension: int = 3,
+) -> Callable[[ApiEndpoint], MemoryBenchmarkApiEmbeddingEncoder]:
+    return lambda endpoint: MemoryBenchmarkApiEmbeddingEncoder(
+        endpoint,
+        client=_FakeEmbeddingClient(dimension),
+    )
+
+
+def _policy_factory(endpoint: ApiEndpoint) -> MemoryBenchmarkApiPolicy:
+    return MemoryBenchmarkApiPolicy(endpoint, client=SimpleNamespace())
+
+
+def _mem0_probe(config: dict[str, Any], _path: Path) -> str:
+    assert config["llm"]["config"]["model"] == "fixture-chat"
+    assert config["embedder"]["config"]["model"] == "text-embedding-v4"
+    assert config["vector_store"]["config"]["embedding_model_dims"] == 3
+    return "2.0.13"
 
 
 def _sha256_file(path: Path) -> str:
@@ -63,15 +138,15 @@ def _git_init(path: Path) -> str:
 
 def _base_config(root: Path) -> AgentConfig:
     return AgentConfig(
-        provider="fake",
-        api_key="",
-        base_url=None,
-        model="fake",
+        provider="openai",
+        api_key="fixture-secret",
+        base_url="https://workspace.example.com/compatible-mode/v1",
+        model="fixture-chat",
         temperature=0.0,
         max_steps=4,
         command_timeout=20,
         trace_dir=root / "traces",
-        use_fake_llm=True,
+        use_fake_llm=False,
     )
 
 
@@ -109,14 +184,14 @@ def _fixture_workspace(
     configs = repo / "configs" / "memory_benchmark"
     configs.mkdir(parents=True)
     tracked_config = json.loads(
-        (Path(__file__).parents[3] / "configs" / "memory_benchmark" / "v1.json").read_text(
+        (Path(__file__).parents[3] / "configs" / "memory_benchmark" / "v2.json").read_text(
             encoding="utf-8"
         )
     )
     tracked_config["benchmarks"]["lifelong_os"]["limit"] = 2
     tracked_config["benchmarks"]["intercode_bash"]["limit"] = 2
     tracked_config["seeds"] = [42]
-    config_path = configs / "v1.json"
+    config_path = configs / "v2.json"
     config_path.write_text(json.dumps(tracked_config), encoding="utf-8")
     lifelong_digest = canonical_sha256("lifelong-image")
     intercode_digest = canonical_sha256("intercode-image")
@@ -162,53 +237,15 @@ def _fixture_workspace(
     (repo / ".gitignore").write_text(
         "data/\nevaluationResults/\n", encoding="utf-8"
     )
-
-    mem0_config = tmp_path / "mem0.json"
-    mem0_config.write_text(
-        json.dumps(
-            {
-                "llm": {
-                    "provider": "openai",
-                    "config": {"model": "fixture-llm", "api_key": "secret"},
-                },
-                "embedder": {
-                    "provider": "openai",
-                    "config": {"model": "fixture-embed", "api_key": "secret"},
-                },
-                "vector_store": {"provider": "qdrant", "config": {}},
-            }
-        ),
-        encoding="utf-8",
-    )
-    identity = PolicyIdentity(
-        base_model="fixture/model",
-        base_revision="revision-1",
-        checkpoint_hash=canonical_sha256("checkpoint"),
-        adapter_hash=canonical_sha256("adapter"),
-        tokenizer_revision="tokenizer-1",
-        tokenizer_hash=canonical_sha256("tokenizer"),
-        chat_template_hash=canonical_sha256("template"),
-    )
-    identity_path = repo / "policy_identity_manifest.json"
-    identity_path.write_bytes(
-        canonical_json_bytes(policy_identity_manifest_payload(identity)) + b"\n"
-    )
-    checkpoint = repo / "checkpoint"
-    checkpoint.mkdir()
     _git_init(repo)
     env = {
         "AGENTCLI_LIFELONG_AGENT_BENCH_ROOT": str(lifelong),
         "AGENTCLI_INTERCODE_ROOT": str(intercode),
         "AGENTCLI_MEMORY_BENCHMARK_DATA_ROOT": str(repo / "data" / "memory_benchmark"),
-        "AGENTCLI_MEM0_CONFIG_PATH": str(mem0_config),
-        "AGENTCLI_BENCHMARK_EMBEDDING_REVISION": "embedding-revision-1",
     }
     return {
         "repo": repo,
         "config": config_path,
-        "identity": identity_path,
-        "policy_identity": identity,
-        "checkpoint": checkpoint,
         "env": env,
         "docker": _FakeDockerRuntime(
             {
@@ -219,88 +256,31 @@ def _fixture_workspace(
     }
 
 
-def _identity_validator(
-    _config: AgentConfig,
-    expected: PolicyIdentity,
-) -> PolicyIdentity:
-    return expected
-
-
-def test_prepare_is_deterministic_and_preflight_is_immutable(tmp_path: Path) -> None:
-    fixture = _fixture_workspace(tmp_path)
-
-    first = prepare_memory_benchmark_data(
-        config_path=fixture["config"], env=fixture["env"]
-    )
-    suite_path = Path(first["suite_manifest"])
-    first_bytes = suite_path.read_bytes()
-    second = prepare_memory_benchmark_data(
-        config_path=fixture["config"], env=fixture["env"]
-    )
-
-    assert first_bytes == suite_path.read_bytes()
-    assert first["benchmarks"] == second["benchmarks"]
-    run_dir = fixture["repo"] / "evaluationResults" / "pilot"
-    preflight = preflight_memory_benchmark(
+def _preflight(
+    fixture: dict[str, Any],
+    run_dir: Path,
+    *,
+    actor_factory: Callable[[AgentConfig], Any] = _actor_factory,
+) -> dict[str, Any]:
+    return preflight_memory_benchmark(
         config_path=fixture["config"],
         run_dir=run_dir,
-        checkpoint=fixture["checkpoint"],
-        identity_manifest=fixture["identity"],
         base_config=_base_config(fixture["repo"]),
         env=fixture["env"],
         benchmarks="intercode_bash",
         limit=1,
         docker_runtime=fixture["docker"],
-        policy_identity_validator=_identity_validator,
-    )
-    protocol_bytes = (run_dir / "protocol.json").read_bytes()
-    repeated = preflight_memory_benchmark(
-        config_path=fixture["config"],
-        run_dir=run_dir,
-        checkpoint=fixture["checkpoint"],
-        identity_manifest=fixture["identity"],
-        base_config=_base_config(fixture["repo"]),
-        env=fixture["env"],
-        benchmarks="intercode_bash",
-        limit=1,
-        docker_runtime=fixture["docker"],
-        policy_identity_validator=_identity_validator,
+        actor_factory=actor_factory,
+        embedding_encoder_factory=_embedding_factory(),
+        mem0_probe=_mem0_probe,
     )
 
-    assert preflight == repeated
-    assert preflight["pilot"] is True
-    assert protocol_bytes == (run_dir / "protocol.json").read_bytes()
-    protocol = json.loads(protocol_bytes)
-    assert protocol["pilot"] is True
-    assert protocol["ordered_task_ids_by_benchmark"] == {"intercode_bash": ["0"]}
-    backend = json.loads(
-        (run_dir / "arms" / "mem0" / "backend_config.json").read_text()
-    )
-    assert "api_key" not in json.dumps(backend)
 
-
-def test_run_rejects_selection_drift_and_existing_stream(tmp_path: Path) -> None:
-    fixture = _fixture_workspace(tmp_path)
-    prepare_memory_benchmark_data(config_path=fixture["config"], env=fixture["env"])
-    run_dir = fixture["repo"] / "evaluationResults" / "pilot"
-    preflight_memory_benchmark(
-        config_path=fixture["config"],
-        run_dir=run_dir,
-        checkpoint=fixture["checkpoint"],
-        identity_manifest=fixture["identity"],
-        base_config=_base_config(fixture["repo"]),
-        env=fixture["env"],
-        benchmarks="intercode_bash",
-        limit=1,
-        docker_runtime=fixture["docker"],
-        policy_identity_validator=_identity_validator,
-    )
-    calls: list[dict[str, Any]] = []
-
-    def fake_stream_runner(**kwargs: Any) -> Any:
+def _fake_stream_runner(calls: list[dict[str, Any]]) -> Callable[..., Any]:
+    def run(**kwargs: Any) -> Any:
         calls.append(dict(kwargs))
         output = Path(kwargs["output_dir"])
-        output.mkdir(parents=True)
+        output.mkdir(parents=True, exist_ok=True)
         results_path = output / "results.jsonl"
         results_path.write_text("", encoding="utf-8")
         executions = tuple(
@@ -315,19 +295,100 @@ def test_run_rejects_selection_drift_and_existing_stream(tmp_path: Path) -> None
             executions=executions,
         )
 
-    result = run_preflighted_memory_benchmark(
+    return run
+
+
+def _run(
+    fixture: dict[str, Any],
+    run_dir: Path,
+    *,
+    arms: str,
+    base_config: AgentConfig | None = None,
+    env: dict[str, str] | None = None,
+    embedding_dimension: int = 3,
+    mem0_version: str = "2.0.13",
+    stream_runner: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
+    return run_preflighted_memory_benchmark(
         config_path=fixture["config"],
         run_dir=run_dir,
-        checkpoint=fixture["checkpoint"],
-        identity_manifest=fixture["identity"],
         seed=42,
-        arms="no_memory,agentcli_four_tier,mem0",
-        base_config=_base_config(fixture["repo"]),
-        env=fixture["env"],
+        arms=arms,
+        base_config=base_config or _base_config(fixture["repo"]),
+        env=env or fixture["env"],
         benchmarks="intercode_bash",
         limit=1,
-        stream_runner=fake_stream_runner,
-        policy_identity_validator=_identity_validator,
+        stream_runner=stream_runner or _fake_stream_runner([]),
+        api_policy_factory=_policy_factory,
+        embedding_encoder_factory=_embedding_factory(embedding_dimension),
+        mem0_version_resolver=lambda: mem0_version,
+    )
+
+
+def test_prepare_is_deterministic_and_preflight_is_immutable(tmp_path: Path) -> None:
+    fixture = _fixture_workspace(tmp_path)
+    first = prepare_memory_benchmark_data(
+        config_path=fixture["config"], env=fixture["env"]
+    )
+    suite_path = Path(first["suite_manifest"])
+    first_bytes = suite_path.read_bytes()
+    second = prepare_memory_benchmark_data(
+        config_path=fixture["config"], env=fixture["env"]
+    )
+
+    assert first_bytes == suite_path.read_bytes()
+    assert first["benchmarks"] == second["benchmarks"]
+    run_dir = fixture["repo"] / "evaluationResults" / "pilot"
+    preflight = _preflight(fixture, run_dir)
+    protocol_bytes = (run_dir / "protocol.json").read_bytes()
+    repeated = _preflight(fixture, run_dir)
+
+    assert preflight == repeated
+    assert preflight["schema_version"] == "memory-benchmark-preflight-v2"
+    assert preflight["actor_api"]["model"] == "fixture-chat"
+    assert preflight["embedding_api"]["dimension"] == 3
+    assert protocol_bytes == (run_dir / "protocol.json").read_bytes()
+    protocol = json.loads(protocol_bytes)
+    assert protocol["pilot"] is True
+    assert protocol["ordered_task_ids_by_benchmark"] == {"intercode_bash": ["0"]}
+    four_tier = json.loads(
+        (run_dir / "arms" / "agentcli_four_tier" / "backend_config.json").read_text()
+    )
+    mem0 = json.loads(
+        (run_dir / "arms" / "mem0" / "backend_config.json").read_text()
+    )
+    serialized = json.dumps({"preflight": preflight, "four_tier": four_tier, "mem0": mem0})
+    assert "fixture-secret" not in serialized
+    assert "api_key" not in serialized
+    assert four_tier["policy_model"] == mem0["llm_model"] == "fixture-chat"
+    assert four_tier["embedding_model"] == mem0["embedding_model"]
+    assert four_tier["embedding_dimension"] == mem0["embedding_dimension"] == 3
+
+
+def test_preflight_probe_failure_does_not_write_protocol(tmp_path: Path) -> None:
+    fixture = _fixture_workspace(tmp_path)
+    prepare_memory_benchmark_data(config_path=fixture["config"], env=fixture["env"])
+    run_dir = fixture["repo"] / "evaluationResults" / "failed"
+
+    with pytest.raises(RuntimeError, match="fixture Actor API failure"):
+        _preflight(fixture, run_dir, actor_factory=lambda _config: _FailingProbeActor())
+
+    assert not (run_dir / "protocol.json").exists()
+    assert not (run_dir / "preflight.json").exists()
+
+
+def test_run_rejects_selection_drift_and_existing_stream(tmp_path: Path) -> None:
+    fixture = _fixture_workspace(tmp_path)
+    prepare_memory_benchmark_data(config_path=fixture["config"], env=fixture["env"])
+    run_dir = fixture["repo"] / "evaluationResults" / "pilot"
+    _preflight(fixture, run_dir)
+    calls: list[dict[str, Any]] = []
+
+    result = _run(
+        fixture,
+        run_dir,
+        arms="no_memory,agentcli_four_tier,mem0",
+        stream_runner=_fake_stream_runner(calls),
     )
 
     assert result["status"] == "completed"
@@ -336,84 +397,34 @@ def test_run_rejects_selection_drift_and_existing_stream(tmp_path: Path) -> None
     assert all(call["max_steps"] == 40 for call in calls)
     assert all(call["command_timeout"] == 120 for call in calls)
     with pytest.raises(FileExistsError, match="already exists"):
+        _run(fixture, run_dir, arms="no_memory")
+    with pytest.raises(ValueError, match="selection does not match preflight"):
         run_preflighted_memory_benchmark(
             config_path=fixture["config"],
             run_dir=run_dir,
-            checkpoint=fixture["checkpoint"],
-            identity_manifest=fixture["identity"],
-            seed=42,
-            arms="no_memory",
-            base_config=_base_config(fixture["repo"]),
-            env=fixture["env"],
-            benchmarks="intercode_bash",
-            limit=1,
-            stream_runner=fake_stream_runner,
-            policy_identity_validator=_identity_validator,
-        )
-    with pytest.raises(ValueError, match="selection does not match preflight|limit/pilot"):
-        run_preflighted_memory_benchmark(
-            config_path=fixture["config"],
-            run_dir=run_dir,
-            checkpoint=fixture["checkpoint"],
-            identity_manifest=fixture["identity"],
             seed=42,
             arms="no_memory",
             base_config=_base_config(fixture["repo"]),
             env=fixture["env"],
             benchmarks="lifelong_os",
             limit=1,
-            stream_runner=fake_stream_runner,
-            policy_identity_validator=_identity_validator,
+            embedding_encoder_factory=_embedding_factory(),
         )
     with pytest.raises(FileExistsError, match="scored seed output"):
-        preflight_memory_benchmark(
-            config_path=fixture["config"],
-            run_dir=run_dir,
-            checkpoint=fixture["checkpoint"],
-            identity_manifest=fixture["identity"],
-            base_config=_base_config(fixture["repo"]),
-            env=fixture["env"],
-            benchmarks="intercode_bash",
-            limit=1,
-            docker_runtime=fixture["docker"],
-            policy_identity_validator=_identity_validator,
-        )
+        _preflight(fixture, run_dir)
 
 
 def test_run_rejects_stale_protocol_hash(tmp_path: Path) -> None:
     fixture = _fixture_workspace(tmp_path)
     prepare_memory_benchmark_data(config_path=fixture["config"], env=fixture["env"])
     run_dir = fixture["repo"] / "evaluationResults" / "pilot"
-    preflight_memory_benchmark(
-        config_path=fixture["config"],
-        run_dir=run_dir,
-        checkpoint=fixture["checkpoint"],
-        identity_manifest=fixture["identity"],
-        base_config=_base_config(fixture["repo"]),
-        env=fixture["env"],
-        benchmarks="intercode_bash",
-        limit=1,
-        docker_runtime=fixture["docker"],
-        policy_identity_validator=_identity_validator,
-    )
+    _preflight(fixture, run_dir)
     (run_dir / "protocol_hash.txt").write_text(
         canonical_sha256("stale") + "\n", encoding="utf-8"
     )
 
     with pytest.raises(ValueError, match="protocol hash file"):
-        run_preflighted_memory_benchmark(
-            config_path=fixture["config"],
-            run_dir=run_dir,
-            checkpoint=fixture["checkpoint"],
-            identity_manifest=fixture["identity"],
-            seed=42,
-            arms="no_memory",
-            base_config=_base_config(fixture["repo"]),
-            env=fixture["env"],
-            benchmarks="intercode_bash",
-            limit=1,
-            policy_identity_validator=_identity_validator,
-        )
+        _run(fixture, run_dir, arms="no_memory")
 
 
 def test_preflight_rejects_unimportable_evaluator_entrypoint(tmp_path: Path) -> None:
@@ -421,128 +432,52 @@ def test_preflight_rejects_unimportable_evaluator_entrypoint(tmp_path: Path) -> 
     prepare_memory_benchmark_data(config_path=fixture["config"], env=fixture["env"])
 
     with pytest.raises(ImportError, match="evaluator entrypoint"):
-        preflight_memory_benchmark(
-            config_path=fixture["config"],
-            run_dir=fixture["repo"] / "evaluationResults" / "pilot",
-            checkpoint=fixture["checkpoint"],
-            identity_manifest=fixture["identity"],
-            base_config=_base_config(fixture["repo"]),
-            env=fixture["env"],
-            benchmarks="intercode_bash",
-            limit=1,
-            docker_runtime=fixture["docker"],
-            policy_identity_validator=_identity_validator,
-        )
+        _preflight(fixture, fixture["repo"] / "evaluationResults" / "pilot")
 
 
-def test_preflight_and_run_reject_policy_identity_mismatch(tmp_path: Path) -> None:
-    fixture = _fixture_workspace(tmp_path)
-    prepare_memory_benchmark_data(config_path=fixture["config"], env=fixture["env"])
-    mismatched = PolicyIdentity(
-        **{
-            **fixture["policy_identity"].to_dict(),
-            "adapter_hash": canonical_sha256("drifted-adapter"),
-        }
-    )
-
-    def mismatch_validator(
-        _config: AgentConfig,
-        _expected: PolicyIdentity,
-    ) -> PolicyIdentity:
-        return mismatched
-
-    run_dir = fixture["repo"] / "evaluationResults" / "pilot"
-    with pytest.raises(ValueError, match="policy identity no longer matches|mismatch"):
-        preflight_memory_benchmark(
-            config_path=fixture["config"],
-            run_dir=run_dir,
-            checkpoint=fixture["checkpoint"],
-            identity_manifest=fixture["identity"],
-            base_config=_base_config(fixture["repo"]),
-            env=fixture["env"],
-            benchmarks="intercode_bash",
-            limit=1,
-            docker_runtime=fixture["docker"],
-            policy_identity_validator=mismatch_validator,
-        )
-
-    preflight_memory_benchmark(
-        config_path=fixture["config"],
-        run_dir=run_dir,
-        checkpoint=fixture["checkpoint"],
-        identity_manifest=fixture["identity"],
-        base_config=_base_config(fixture["repo"]),
-        env=fixture["env"],
-        benchmarks="intercode_bash",
-        limit=1,
-        docker_runtime=fixture["docker"],
-        policy_identity_validator=_identity_validator,
-    )
-    with pytest.raises(ValueError, match="policy identity mismatch"):
-        run_preflighted_memory_benchmark(
-            config_path=fixture["config"],
-            run_dir=run_dir,
-            checkpoint=fixture["checkpoint"],
-            identity_manifest=fixture["identity"],
-            seed=42,
-            arms="no_memory",
-            base_config=_base_config(fixture["repo"]),
-            env=fixture["env"],
-            benchmarks="intercode_bash",
-            limit=1,
-            policy_identity_validator=mismatch_validator,
-        )
-
-
-def test_run_rejects_current_backend_config_drift(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("drift", "match"),
+    (
+        ("actor_model", "Actor API model"),
+        ("actor_endpoint", "Actor API endpoint"),
+        ("embedding_endpoint", "embedding API endpoint"),
+        ("embedding_dimension", "embedding API dimension"),
+        ("mem0_version", "current backend config"),
+    ),
+)
+def test_run_rejects_api_and_backend_drift(
+    tmp_path: Path,
+    drift: str,
+    match: str,
+) -> None:
     fixture = _fixture_workspace(tmp_path)
     prepare_memory_benchmark_data(config_path=fixture["config"], env=fixture["env"])
     run_dir = fixture["repo"] / "evaluationResults" / "pilot"
-    preflight_memory_benchmark(
-        config_path=fixture["config"],
-        run_dir=run_dir,
-        checkpoint=fixture["checkpoint"],
-        identity_manifest=fixture["identity"],
-        base_config=_base_config(fixture["repo"]),
-        env=fixture["env"],
-        benchmarks="intercode_bash",
-        limit=1,
-        docker_runtime=fixture["docker"],
-        policy_identity_validator=_identity_validator,
-    )
+    _preflight(fixture, run_dir)
+    base_config = _base_config(fixture["repo"])
+    env = dict(fixture["env"])
+    embedding_dimension = 3
+    mem0_version = "2.0.13"
+    arms = "mem0" if drift == "mem0_version" else "no_memory"
 
-    embedding_env = dict(fixture["env"])
-    embedding_env["AGENTCLI_BENCHMARK_EMBEDDING_REVISION"] = "embedding-revision-2"
-    with pytest.raises(ValueError, match="current backend config"):
-        run_preflighted_memory_benchmark(
-            config_path=fixture["config"],
-            run_dir=run_dir,
-            checkpoint=fixture["checkpoint"],
-            identity_manifest=fixture["identity"],
-            seed=42,
-            arms="agentcli_four_tier",
-            base_config=_base_config(fixture["repo"]),
-            env=embedding_env,
-            benchmarks="intercode_bash",
-            limit=1,
-            policy_identity_validator=_identity_validator,
-        )
+    if drift == "actor_model":
+        base_config = replace(base_config, model="drifted-chat")
+    elif drift == "actor_endpoint":
+        base_config = replace(base_config, base_url="https://other.example.com/v1")
+    elif drift == "embedding_endpoint":
+        env["MY_AGENT_EMBEDDING_BASE_URL"] = "https://embedding.example.com/v1"
+    elif drift == "embedding_dimension":
+        embedding_dimension = 4
+    else:
+        mem0_version = "2.0.14"
 
-    mem0_path = Path(fixture["env"]["AGENTCLI_MEM0_CONFIG_PATH"])
-    mem0_config = json.loads(mem0_path.read_text(encoding="utf-8"))
-    mem0_config["llm"]["config"]["model"] = "drifted-llm"
-    mem0_path.write_text(json.dumps(mem0_config), encoding="utf-8")
-    with pytest.raises(ValueError, match="current backend config"):
-        run_preflighted_memory_benchmark(
-            config_path=fixture["config"],
-            run_dir=run_dir,
-            checkpoint=fixture["checkpoint"],
-            identity_manifest=fixture["identity"],
-            seed=42,
-            arms="mem0",
-            base_config=_base_config(fixture["repo"]),
-            env=fixture["env"],
-            benchmarks="intercode_bash",
-            limit=1,
-            policy_identity_validator=_identity_validator,
+    with pytest.raises(ValueError, match=match):
+        _run(
+            fixture,
+            run_dir,
+            arms=arms,
+            base_config=base_config,
+            env=env,
+            embedding_dimension=embedding_dimension,
+            mem0_version=mem0_version,
         )

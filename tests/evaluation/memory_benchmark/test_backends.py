@@ -256,7 +256,7 @@ def test_backends_freeze_common_tool_and_isolation_config(
     if backend_name == "agentcli_four_tier":
         assert configured.policy_adapter_path is None
         assert configured.policy_identity_manifest is None
-        assert configured.embedding_revision == ""
+        assert configured.embedding_revision == "local-revision"
 
 
 def test_no_memory_context_and_finalize_are_known_zero(tmp_path: Path) -> None:
@@ -648,13 +648,11 @@ def test_non_formal_task_runner_shares_one_llm_with_memory_manager(
         assert manager.llm is llm
 
 
-def test_no_memory_runner_uses_frozen_transformers_actor_when_identity_is_set(
+def test_no_memory_runner_uses_provider_actor_even_when_legacy_identity_is_set(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import my_agent.evaluation.memory_benchmark.backends as backends_module
-    from my_agent.policy.transformers_policy import TransformersPolicy
-
     memory_dir = tmp_path / "stream" / "memory"
     backend = NoMemoryBackend(
         stream_memory_dir=memory_dir,
@@ -674,14 +672,9 @@ def test_no_memory_runner_uses_frozen_transformers_actor_when_identity_is_set(
     captured: dict[str, object] = {}
 
     monkeypatch.setattr(
-        TransformersPolicy,
-        "from_config",
-        classmethod(lambda cls, task_config: actor),
-    )
-    monkeypatch.setattr(
         backends_module,
         "build_llm",
-        lambda config: (_ for _ in ()).throw(AssertionError("provider actor used")),
+        lambda _config: actor,
     )
     monkeypatch.setattr(
         backends_module,

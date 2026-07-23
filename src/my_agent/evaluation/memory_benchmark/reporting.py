@@ -59,7 +59,7 @@ def _load_run_artifacts(run_dir: Path) -> _RunArtifacts:
     if recorded_protocol_hash != protocol.protocol_hash:
         raise ValueError("protocol hash file does not match protocol.json")
     preflight = _load_mapping(run_dir / "preflight.json")
-    if preflight.get("schema_version") != "memory-benchmark-preflight-v1":
+    if preflight.get("schema_version") != "memory-benchmark-preflight-v2":
         raise ValueError("unsupported memory benchmark preflight schema")
     if preflight.get("status") != "passed":
         raise ValueError("memory benchmark preflight has not passed")

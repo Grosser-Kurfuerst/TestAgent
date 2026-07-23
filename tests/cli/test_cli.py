@@ -61,10 +61,6 @@ class CliTests(unittest.TestCase):
                 "config.json",
                 "--run-dir",
                 "run",
-                "--checkpoint",
-                "checkpoint",
-                "--identity-manifest",
-                "identity.json",
                 "--benchmarks",
                 "intercode_bash",
                 "--limit",
@@ -77,10 +73,6 @@ class CliTests(unittest.TestCase):
                 "smoke",
                 "--config",
                 "config.json",
-                "--checkpoint",
-                "checkpoint",
-                "--identity-manifest",
-                "identity.json",
             ]
         )
         run = parser.parse_args(
@@ -91,10 +83,6 @@ class CliTests(unittest.TestCase):
                 "config.json",
                 "--run-dir",
                 "run",
-                "--checkpoint",
-                "checkpoint",
-                "--identity-manifest",
-                "identity.json",
                 "--seed",
                 "42",
                 "--arms",
@@ -113,6 +101,19 @@ class CliTests(unittest.TestCase):
         self.assertEqual(run.memory_benchmark_command, "run")
         self.assertEqual(run.seed, 42)
         self.assertEqual(report.memory_benchmark_command, "report")
+        with self.assertRaises(SystemExit):
+            parser.parse_args(
+                [
+                    "memory-benchmark",
+                    "preflight",
+                    "--config",
+                    "config.json",
+                    "--run-dir",
+                    "run",
+                    "--checkpoint",
+                    "checkpoint",
+                ]
+            )
 
     @mock.patch(
         "my_agent.cli.commands.memory_benchmark.generate_memory_benchmark_report"

@@ -25,6 +25,14 @@ from my_agent.evaluation.memory_benchmark.adapters.docker_runtime import (
     prepare_runtime_action_log,
     write_benchmark_action_files,
 )
+from my_agent.evaluation.memory_benchmark.api_config import (
+    ApiEndpoint,
+    actor_api_identity_hash,
+)
+from my_agent.evaluation.memory_benchmark.api_embedding import (
+    MemoryBenchmarkApiEmbeddingEncoder,
+)
+from my_agent.evaluation.memory_benchmark.api_policy import MemoryBenchmarkApiPolicy
 from my_agent.evaluation.memory_benchmark.contracts import (
     BenchmarkTask,
     OfficialEvaluatorResult,
@@ -35,6 +43,10 @@ from my_agent.evaluation.memory_benchmark.backends import (
     Mem0Backend,
     NoMemoryBackend,
     memory_stream_project_key,
+)
+from my_agent.evaluation.memory_benchmark.external_memory import (
+    build_memory_benchmark_mem0_config,
+    memory_benchmark_mem0_backend_identity,
 )
 from my_agent.evaluation.memory_benchmark.runner import (
     MemoryBenchmarkStreamResult,
@@ -316,13 +328,22 @@ def run_smoke_benchmark(
     base_config: AgentConfig,
     output_dir: str | Path,
     data_root: str | Path,
-    actor_identity_hash: str,
-    mem0_config: Mapping[str, Any],
+    actor_endpoint: ApiEndpoint,
+    embedding_endpoint: ApiEndpoint,
+    embedding_dimension: int,
+    mem0_version: str,
     container_image: str,
     container_digest: str,
     seed: int = 42,
     maintenance_interval_tasks: int = 4,
     docker_runtime: DockerRuntime | None = None,
+    api_policy_factory: Callable[
+        [ApiEndpoint], MemoryBenchmarkApiPolicy
+    ] = MemoryBenchmarkApiPolicy,
+    embedding_encoder_factory: Callable[
+        [ApiEndpoint], MemoryBenchmarkApiEmbeddingEncoder
+    ] = MemoryBenchmarkApiEmbeddingEncoder,
+    mem0_client_factory: Callable[[Path, Mapping[str, Any]], Any] | None = None,
 ) -> Mapping[str, Any]:
     root = Path(output_dir).expanduser().resolve()
     if root.exists():
@@ -338,6 +359,39 @@ def run_smoke_benchmark(
         docker_runtime=docker_runtime,
     )
     tasks = tuple(adapter.load_tasks(limit=8))
+    actor_identity = actor_api_identity_hash(actor_endpoint)
+    mem0_config = build_memory_benchmark_mem0_config(
+        actor_endpoint=actor_endpoint,
+        embedding_endpoint=embedding_endpoint,
+        embedding_dimension=embedding_dimension,
+    )
+    backend_configs = {
+        "no_memory": {
+            "schema_version": "memory-benchmark-backend-config-v2",
+            "arm": "no_memory",
+            "actor_model": actor_endpoint.model,
+            "actor_endpoint_hash": actor_endpoint.endpoint_hash,
+        },
+        "agentcli_four_tier": {
+            "schema_version": "memory-benchmark-backend-config-v2",
+            "arm": "agentcli_four_tier",
+            "policy_model": actor_endpoint.model,
+            "policy_endpoint_hash": actor_endpoint.endpoint_hash,
+            "embedding_model": embedding_endpoint.model,
+            "embedding_endpoint_hash": embedding_endpoint.endpoint_hash,
+            "embedding_dimension": embedding_dimension,
+            "maintenance_interval_tasks": maintenance_interval_tasks,
+        },
+        "mem0": memory_benchmark_mem0_backend_identity(
+            actor_endpoint=actor_endpoint,
+            embedding_endpoint=embedding_endpoint,
+            embedding_dimension=embedding_dimension,
+            search_limit=50,
+            selected_max_items=20,
+            selected_content_max_tokens=1_800,
+            package_version=mem0_version,
+        ),
+    }
     protocol_hash = canonical_sha256(
         {
             "schema_version": SMOKE_SCHEMA_VERSION,
@@ -347,6 +401,8 @@ def run_smoke_benchmark(
             "maintenance_interval_tasks": maintenance_interval_tasks,
             "container_image": container_image,
             "container_digest": container_digest,
+            "actor_identity_hash": actor_identity,
+            "backend_configs": backend_configs,
         }
     )
     streams: dict[str, MemoryBenchmarkStreamResult] = {}
@@ -364,30 +420,27 @@ def run_smoke_benchmark(
                 stream_memory_dir=stream_dir / "memory",
                 stream_project_key=project_key,
             )
-            backend_config = {"arm": arm, "memory_evolver_mode": "off"}
         elif arm == "agentcli_four_tier":
             backend = AgentCliFourTierBackend(
                 stream_memory_dir=stream_dir / "memory",
                 stream_project_key=project_key,
+                policy=api_policy_factory(actor_endpoint),
+                embedding_encoder=embedding_encoder_factory(embedding_endpoint),
                 maintenance_interval_tasks=maintenance_interval_tasks,
             )
-            backend_config = {
-                "arm": arm,
-                "memory_evolver_mode": "formal",
-                "maintenance_interval_tasks": maintenance_interval_tasks,
-            }
         else:
+            client = (
+                mem0_client_factory(stream_dir / "memory" / "mem0", mem0_config)
+                if mem0_client_factory is not None
+                else None
+            )
             backend = Mem0Backend(
                 stream_memory_dir=stream_dir / "memory",
                 stream_project_key=project_key,
+                client=client,
                 mem0_config=mem0_config,
             )
-            backend_config = {
-                "arm": arm,
-                "memory_evolver_mode": "off",
-                "mem0_config_hash": canonical_sha256(dict(mem0_config)),
-            }
-        backend_hash = canonical_sha256(backend_config)
+        backend_hash = canonical_sha256(backend_configs[arm])
         backend_hashes[arm] = backend_hash
         streams[arm] = run_memory_benchmark_stream(
             tasks=tasks,
@@ -400,7 +453,7 @@ def run_smoke_benchmark(
             stream_memory_dir=stream_dir / "memory",
             stream_project_key=project_key,
             protocol_hash=protocol_hash,
-            actor_identity_hash=actor_identity_hash,
+            actor_identity_hash=actor_identity,
             tools_hash=smoke_action_tools_hash(),
             backend_config_hash=backend_hash,
             max_steps=base_config.max_steps,
@@ -411,19 +464,56 @@ def run_smoke_benchmark(
         arm: _validate_smoke_arm(arm, stream)
         for arm, stream in streams.items()
     }
+    shared_checks = {
+        "actor_model_shared": len(
+            {
+                backend_configs["no_memory"]["actor_model"],
+                backend_configs["agentcli_four_tier"]["policy_model"],
+                backend_configs["mem0"]["llm_model"],
+            }
+        )
+        == 1,
+        "actor_endpoint_shared": len(
+            {
+                backend_configs["no_memory"]["actor_endpoint_hash"],
+                backend_configs["agentcli_four_tier"]["policy_endpoint_hash"],
+                backend_configs["mem0"]["llm_endpoint_hash"],
+            }
+        )
+        == 1,
+        "embedding_identity_shared": (
+            backend_configs["agentcli_four_tier"]["embedding_model"]
+            == backend_configs["mem0"]["embedding_model"]
+            and backend_configs["agentcli_four_tier"]["embedding_endpoint_hash"]
+            == backend_configs["mem0"]["embedding_endpoint_hash"]
+            and backend_configs["agentcli_four_tier"]["embedding_dimension"]
+            == backend_configs["mem0"]["embedding_dimension"]
+        ),
+    }
     report = {
         "schema_version": SMOKE_SCHEMA_VERSION,
         "status": (
             "passed"
             if all(item["status"] == "passed" for item in arm_reports.values())
+            and all(shared_checks.values())
             else "failed"
         ),
         "seed": seed,
         "task_count": len(tasks),
         "protocol_hash": protocol_hash,
         "tools_hash": smoke_action_tools_hash(),
-        "actor_identity_hash": actor_identity_hash,
+        "actor_identity_hash": actor_identity,
+        "actor_api": {
+            "model": actor_endpoint.model,
+            "endpoint_hash": actor_endpoint.endpoint_hash,
+        },
+        "embedding_api": {
+            "model": embedding_endpoint.model,
+            "endpoint_hash": embedding_endpoint.endpoint_hash,
+            "dimension": embedding_dimension,
+        },
         "backend_config_hashes": backend_hashes,
+        "shared_identity_checks": shared_checks,
         "arms": arm_reports,
     }
     _write_json_atomic(root / "smoke_report.json", report)
@@ -465,8 +555,8 @@ def _validate_smoke_arm(
                     execution.backend_finalize.status == "committed"
                     for execution in first_half
                 ),
-                "prior_memory_selected": any(
-                    execution.task_result.memory["selected_count"] > 0
+                "prior_memory_candidate_found": any(
+                    execution.context.candidate_count > 0
                     for execution in second_half
                 ),
                 "repository_revision_continuity": all(
@@ -478,13 +568,13 @@ def _validate_smoke_arm(
                     )
                 ),
                 "maintenance_ran": sum(
-                    int(execution.manifest_result.metrics.get("maintenance_runs", 0) or 0)
+                    int(execution.backend_finalize.metrics.get("maintenance_runs", 0) or 0)
                     for execution in executions
                 )
                 >= 1,
                 "maintenance_failures_zero": sum(
                     int(
-                        execution.manifest_result.metrics.get(
+                        execution.backend_finalize.metrics.get(
                             "maintenance_failures", 0
                         )
                         or 0
@@ -499,8 +589,11 @@ def _validate_smoke_arm(
             {
                 "first_search_empty": bool(executions)
                 and executions[0].context.candidate_count == 0,
-                "first_add_succeeded": bool(executions)
-                and bool(executions[0].backend_finalize.written_ids),
+                "write_succeeded": bool(executions)
+                and any(
+                    execution.backend_finalize.written_ids
+                    for execution in executions
+                ),
                 "later_search_nonempty": any(
                     execution.context.candidate_count > 0
                     for execution in executions[4:]

@@ -30,6 +30,16 @@ from my_agent.evaluation.memory_benchmark.adapters.intercode_bash import (
 )
 from my_agent.evaluation.memory_benchmark.adapters.lifelong_os import LifelongOSAdapter
 from my_agent.evaluation.memory_benchmark.adapters.smoke import run_smoke_benchmark
+from my_agent.evaluation.memory_benchmark.api_config import (
+    ApiEndpoint,
+    actor_api_identity_hash,
+    resolve_actor_endpoint,
+    resolve_embedding_endpoint,
+)
+from my_agent.evaluation.memory_benchmark.api_embedding import (
+    MemoryBenchmarkApiEmbeddingEncoder,
+)
+from my_agent.evaluation.memory_benchmark.api_policy import MemoryBenchmarkApiPolicy
 from my_agent.evaluation.memory_benchmark.backends import (
     AgentCliFourTierBackend,
     Mem0Backend,
@@ -37,7 +47,11 @@ from my_agent.evaluation.memory_benchmark.backends import (
     memory_stream_project_key,
 )
 from my_agent.evaluation.memory_benchmark.contracts import BenchmarkTask
-from my_agent.evaluation.memory_benchmark.external_memory import localize_mem0_config
+from my_agent.evaluation.memory_benchmark.external_memory import (
+    Mem0ClientAdapter,
+    build_memory_benchmark_mem0_config,
+    memory_benchmark_mem0_backend_identity,
+)
 from my_agent.evaluation.memory_benchmark.protocol import (
     MemoryBenchmarkConfig,
     MemoryBenchmarkProtocol,
@@ -53,39 +67,22 @@ from my_agent.evaluation.memory_benchmark.reporting import (
     generate_memory_benchmark_report,
 )
 from my_agent.evaluation.memory_benchmark.source_lock import load_source_lock
-from my_agent.evaluation.policy_config import (
-    configure_evaluation_policy,
-    validate_evaluation_policy_identity,
-)
+from my_agent.llm import build_llm
 from my_agent.llm.types import Message
 from my_agent.memory.token import estimate_tokens
 from my_agent.policy.identity import (
-    PolicyIdentity,
     canonical_json_bytes,
     canonical_sha256,
-    load_policy_identity_manifest,
-    require_matching_policy_identity,
 )
 from my_agent.tools import RepoTools
 
 
 PREPARED_SUITE_SCHEMA_VERSION = "memory-benchmark-prepared-suite-v1"
-PREFLIGHT_SCHEMA_VERSION = "memory-benchmark-preflight-v1"
+PREFLIGHT_SCHEMA_VERSION = "memory-benchmark-preflight-v2"
 STREAM_SUMMARY_SCHEMA_VERSION = "memory-benchmark-stream-summary-v1"
 
 _BENCHMARK_ORDER = ("lifelong_os", "intercode_bash")
 _ARM_ORDER = ("no_memory", "agentcli_four_tier", "mem0")
-_SECRET_KEY_MARKERS = (
-    "api_key",
-    "apikey",
-    "access_token",
-    "auth_token",
-    "password",
-    "client_secret",
-    "credential",
-)
-
-
 def add_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
     parser = subparsers.add_parser(
         "memory-benchmark",
@@ -104,7 +101,7 @@ def add_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) 
         "preflight",
         help="Freeze and validate one immutable memory benchmark run protocol.",
     )
-    _add_policy_arguments(preflight)
+    preflight.add_argument("--config", required=True)
     preflight.add_argument("--run-dir", required=True)
     _add_development_selection_arguments(preflight)
     preflight.set_defaults(_handler=handle)
@@ -113,7 +110,7 @@ def add_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) 
         "smoke",
         help="Run the deterministic eight-task memory functionality smoke stream.",
     )
-    _add_policy_arguments(smoke)
+    smoke.add_argument("--config", required=True)
     smoke.add_argument("--output-dir")
     smoke.set_defaults(_handler=handle)
 
@@ -121,7 +118,7 @@ def add_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) 
         "run",
         help="Run preflighted benchmark streams without overwriting prior results.",
     )
-    _add_policy_arguments(run)
+    run.add_argument("--config", required=True)
     run.add_argument("--run-dir", required=True)
     run.add_argument("--seed", required=True, type=int)
     run.add_argument("--arms", required=True)
@@ -148,8 +145,6 @@ def handle(args: argparse.Namespace, ctx: CliContext) -> int:
             result = preflight_memory_benchmark(
                 config_path=args.config,
                 run_dir=args.run_dir,
-                checkpoint=args.checkpoint,
-                identity_manifest=args.identity_manifest,
                 base_config=ctx.config_from_env(require_env_file=False),
                 env=ctx.env,
                 benchmarks=args.benchmarks,
@@ -161,8 +156,6 @@ def handle(args: argparse.Namespace, ctx: CliContext) -> int:
             result = run_preflighted_memory_benchmark(
                 config_path=args.config,
                 run_dir=args.run_dir,
-                checkpoint=args.checkpoint,
-                identity_manifest=args.identity_manifest,
                 seed=args.seed,
                 arms=args.arms,
                 base_config=ctx.config_from_env(require_env_file=False),
@@ -245,16 +238,16 @@ def preflight_memory_benchmark(
     *,
     config_path: str | Path,
     run_dir: str | Path,
-    checkpoint: str | Path,
-    identity_manifest: str | Path,
     base_config: AgentConfig,
     env: Mapping[str, str],
     benchmarks: str | Sequence[str] | None = None,
     limit: int | None = None,
     docker_runtime: DockerRuntime | None = None,
-    policy_identity_validator: Callable[
-        [AgentConfig, PolicyIdentity], PolicyIdentity
-    ] = validate_evaluation_policy_identity,
+    actor_factory: Callable[[AgentConfig], Any] = build_llm,
+    embedding_encoder_factory: Callable[
+        [ApiEndpoint], MemoryBenchmarkApiEmbeddingEncoder
+    ] = MemoryBenchmarkApiEmbeddingEncoder,
+    mem0_probe: Callable[[Mapping[str, Any], Path], str] | None = None,
 ) -> dict[str, Any]:
     config_file, repo_root, config = _load_config_context(config_path)
     selected_benchmarks, limits, pilot = _selection(config, benchmarks, limit)
@@ -287,31 +280,6 @@ def preflight_memory_benchmark(
     if official_tasks != prepared_tasks:
         raise ValueError("prepared benchmark tasks do not match the locked official sources")
 
-    configured_agent = _configure_benchmark_agent(
-        base_config,
-        config,
-        checkpoint=checkpoint,
-        identity_manifest=identity_manifest,
-        env=env,
-    )
-    expected_identity = load_policy_identity_manifest(identity_manifest)
-    identity = policy_identity_validator(configured_agent, expected_identity)
-    require_matching_policy_identity(expected_identity, identity)
-    mem0_enabled = "mem0" in config.enabled_arms
-    mem0_config = _load_mem0_config(config, env) if mem0_enabled else {}
-    mem0_version = _validate_mem0_config(mem0_config) if mem0_enabled else ""
-    backend_configs = _backend_configs(
-        config,
-        embedding_revision=configured_agent.embedding_revision,
-        mem0_config=mem0_config,
-        mem0_version=mem0_version,
-        arms=config.enabled_arms,
-    )
-    backend_hashes = {
-        arm: backend_config_hash(payload)
-        for arm, payload in backend_configs.items()
-    }
-
     runtime = docker_runtime or DockerRuntime()
     docker_version = runtime.preflight()
     sources = _mapping(source_lock.get("sources"), "source lock sources")
@@ -343,6 +311,53 @@ def preflight_memory_benchmark(
             checkout_root=checkout_roots[suite.source],
         )
 
+    configured_agent = _configure_benchmark_agent(base_config, config)
+    actor_endpoint = resolve_actor_endpoint(configured_agent)
+    embedding_endpoint = resolve_embedding_endpoint(
+        actor=actor_endpoint,
+        benchmark_config=config,
+        env=env,
+    )
+    actor = actor_factory(configured_agent)
+    _probe_actor_api(actor)
+    embedding_encoder = embedding_encoder_factory(embedding_endpoint)
+    vectors = embedding_encoder.encode_queries(("memory benchmark preflight",))
+    if len(vectors) != 1 or not vectors[0]:
+        raise RuntimeError("embedding API preflight did not return one non-empty vector")
+    embedding_dimension = len(vectors[0])
+    mem0_enabled = "mem0" in config.enabled_arms
+    mem0_config = (
+        build_memory_benchmark_mem0_config(
+            actor_endpoint=actor_endpoint,
+            embedding_endpoint=embedding_endpoint,
+            embedding_dimension=embedding_dimension,
+        )
+        if mem0_enabled
+        else {}
+    )
+    probe_mem0 = mem0_probe or _probe_mem0_config
+    mem0_version = (
+        probe_mem0(
+            mem0_config,
+            Path(run_dir).expanduser().resolve().parent / ".preflight-mem0",
+        )
+        if mem0_enabled
+        else ""
+    )
+    backend_configs = _backend_configs(
+        config,
+        actor_endpoint=actor_endpoint,
+        embedding_endpoint=embedding_endpoint,
+        embedding_dimension=embedding_dimension,
+        mem0_version=mem0_version,
+        arms=config.enabled_arms,
+    )
+    backend_hashes = {
+        arm: backend_config_hash(payload)
+        for arm, payload in backend_configs.items()
+    }
+    actor_identity_hash = actor_api_identity_hash(actor_endpoint)
+
     context_check = _validate_context_budget(configured_agent, config)
     agentcli_commit = _git_clean_commit(repo_root)
     uv_lock_hash = _sha256_file(repo_root / "uv.lock")
@@ -365,7 +380,7 @@ def preflight_memory_benchmark(
             for name, tasks in official_tasks.items()
         },
         source_lock_hash=source_lock_hash,
-        actor_identity_hash=identity.identity_hash,
+        actor_identity_hash=actor_identity_hash,
         tools_hash=benchmark_action_tools_hash(),
         evaluator_hashes=evaluator_hashes,
         docker_image_digests=docker_digests,
@@ -419,13 +434,24 @@ def preflight_memory_benchmark(
         "benchmarks": list(selected_benchmarks),
         "limits": dict(limits),
         "pilot": pilot,
-        "checkpoint_identity_hash": identity.identity_hash,
+        "actor_api": {
+            "model": actor_endpoint.model,
+            "endpoint_hash": actor_endpoint.endpoint_hash,
+            "chat_probe": "passed",
+            "tools_probe": "passed",
+        },
+        "embedding_api": {
+            "model": embedding_endpoint.model,
+            "endpoint_hash": embedding_endpoint.endpoint_hash,
+            "dimension": embedding_dimension,
+            "probe": "passed",
+        },
         "checks": {
             "prepared_suite": "passed",
             "source_revisions": "passed",
             "docker": "passed",
             "docker_server_version": docker_version,
-            "mem0": "passed",
+            "mem0": "passed" if mem0_enabled else "disabled",
             "context_budget": context_check,
             "disk_space": "passed",
         },
@@ -446,8 +472,6 @@ def run_preflighted_memory_benchmark(
     *,
     config_path: str | Path,
     run_dir: str | Path,
-    checkpoint: str | Path,
-    identity_manifest: str | Path,
     seed: int,
     arms: str | Sequence[str],
     base_config: AgentConfig,
@@ -455,9 +479,14 @@ def run_preflighted_memory_benchmark(
     benchmarks: str | Sequence[str] | None = None,
     limit: int | None = None,
     stream_runner: Callable[..., MemoryBenchmarkStreamResult] = run_memory_benchmark_stream,
-    policy_identity_validator: Callable[
-        [AgentConfig, PolicyIdentity], PolicyIdentity
-    ] = validate_evaluation_policy_identity,
+    api_policy_factory: Callable[
+        [ApiEndpoint], MemoryBenchmarkApiPolicy
+    ] = MemoryBenchmarkApiPolicy,
+    embedding_encoder_factory: Callable[
+        [ApiEndpoint], MemoryBenchmarkApiEmbeddingEncoder
+    ] = MemoryBenchmarkApiEmbeddingEncoder,
+    mem0_client_factory: Callable[[Path, Mapping[str, Any]], Any] | None = None,
+    mem0_version_resolver: Callable[[], str] | None = None,
 ) -> dict[str, Any]:
     if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
         raise ValueError("seed must be a non-negative integer")
@@ -524,25 +553,50 @@ def run_preflighted_memory_benchmark(
         runtime_root=run_path / ".runtime",
     )
     _validate_tasks_against_protocol(tasks_by_benchmark, protocol)
-    configured_agent = _configure_benchmark_agent(
-        base_config,
-        config,
-        checkpoint=checkpoint,
-        identity_manifest=identity_manifest,
+    configured_agent = _configure_benchmark_agent(base_config, config)
+    actor_endpoint = resolve_actor_endpoint(configured_agent)
+    embedding_endpoint = resolve_embedding_endpoint(
+        actor=actor_endpoint,
+        benchmark_config=config,
         env=env,
     )
-    expected_identity = load_policy_identity_manifest(identity_manifest)
-    identity = policy_identity_validator(configured_agent, expected_identity)
-    require_matching_policy_identity(expected_identity, identity)
-    if identity.identity_hash != protocol.actor_identity_hash:
-        raise ValueError("policy identity no longer matches preflight protocol")
+    _validate_api_identity_against_preflight(
+        preflight,
+        actor_endpoint=actor_endpoint,
+        embedding_endpoint=embedding_endpoint,
+    )
+    if actor_api_identity_hash(actor_endpoint) != protocol.actor_identity_hash:
+        raise ValueError("Actor API identity no longer matches preflight protocol")
+    embedding_encoder = embedding_encoder_factory(embedding_endpoint)
+    vectors = embedding_encoder.encode_queries(("memory benchmark run",))
+    if len(vectors) != 1 or not vectors[0]:
+        raise RuntimeError("embedding API run probe did not return one non-empty vector")
+    embedding_dimension = len(vectors[0])
+    expected_embedding = _mapping(
+        preflight.get("embedding_api"), "preflight embedding_api"
+    )
+    if embedding_dimension != int(expected_embedding.get("dimension", 0)):
+        raise ValueError("embedding API dimension no longer matches preflight")
     mem0_requested = "mem0" in requested_arms
-    mem0_config = _load_mem0_config(config, env) if mem0_requested else {}
-    mem0_version = _validate_mem0_config(mem0_config) if mem0_requested else ""
+    mem0_config = (
+        build_memory_benchmark_mem0_config(
+            actor_endpoint=actor_endpoint,
+            embedding_endpoint=embedding_endpoint,
+            embedding_dimension=embedding_dimension,
+        )
+        if mem0_requested
+        else {}
+    )
+    mem0_version = (
+        (mem0_version_resolver or _mem0_package_version)()
+        if mem0_requested
+        else ""
+    )
     current_backend_configs = _backend_configs(
         config,
-        embedding_revision=configured_agent.embedding_revision,
-        mem0_config=mem0_config,
+        actor_endpoint=actor_endpoint,
+        embedding_endpoint=embedding_endpoint,
+        embedding_dimension=embedding_dimension,
         mem0_version=mem0_version,
         arms=requested_arms,
     )
@@ -574,6 +628,11 @@ def run_preflighted_memory_benchmark(
                 stream_memory_dir=stream_memory_dir,
                 stream_project_key=stream_project_key,
                 mem0_config=mem0_config,
+                actor_endpoint=actor_endpoint,
+                embedding_endpoint=embedding_endpoint,
+                api_policy_factory=api_policy_factory,
+                embedding_encoder_factory=embedding_encoder_factory,
+                mem0_client_factory=mem0_client_factory,
             )
             adapter = _build_adapter(
                 benchmark,
@@ -619,17 +678,24 @@ def run_preflighted_memory_benchmark(
 
 
 def _run_smoke(args: argparse.Namespace, ctx: CliContext) -> dict[str, Any]:
-    config_file, repo_root, config = _load_config_context(args.config)
+    _config_file, repo_root, config = _load_config_context(args.config)
     base_config = _configure_benchmark_agent(
         ctx.config_from_env(require_env_file=False),
         config,
-        checkpoint=args.checkpoint,
-        identity_manifest=args.identity_manifest,
+    )
+    actor_endpoint = resolve_actor_endpoint(base_config)
+    embedding_endpoint = resolve_embedding_endpoint(
+        actor=actor_endpoint,
+        benchmark_config=config,
         env=ctx.env,
     )
-    identity = load_policy_identity_manifest(args.identity_manifest)
+    _probe_actor_api(build_llm(base_config))
+    embedding_encoder = MemoryBenchmarkApiEmbeddingEncoder(embedding_endpoint)
+    vectors = embedding_encoder.encode_queries(("memory benchmark smoke",))
+    if len(vectors) != 1 or not vectors[0]:
+        raise RuntimeError("embedding API smoke probe did not return one non-empty vector")
+    embedding_dimension = len(vectors[0])
     data_root = _data_root(config, ctx.env, repo_root)
-    mem0_config = _load_mem0_config(config, ctx.env)
     source_lock = load_source_lock(repo_root / config.source_lock_path)
     sources = _mapping(source_lock.get("sources"), "source lock sources")
     smoke_source_name = str(config.smoke.get("container_source", "lifelong_agent_bench"))
@@ -648,8 +714,10 @@ def _run_smoke(args: argparse.Namespace, ctx: CliContext) -> dict[str, Any]:
         base_config=base_config,
         output_dir=output_dir,
         data_root=data_root,
-        actor_identity_hash=identity.identity_hash,
-        mem0_config=mem0_config,
+        actor_endpoint=actor_endpoint,
+        embedding_endpoint=embedding_endpoint,
+        embedding_dimension=embedding_dimension,
+        mem0_version=_mem0_package_version(),
         container_image=_required_string(
             smoke_source.get("container_image"), "smoke container image"
         ),
@@ -666,27 +734,19 @@ def _run_smoke(args: argparse.Namespace, ctx: CliContext) -> dict[str, Any]:
 def _configure_benchmark_agent(
     base_config: AgentConfig,
     config: MemoryBenchmarkConfig,
-    *,
-    checkpoint: str | Path,
-    identity_manifest: str | Path,
-    env: Mapping[str, str],
 ) -> AgentConfig:
-    configured = configure_evaluation_policy(
-        base_config,
-        checkpoint=checkpoint,
-        identity_manifest=identity_manifest,
-    )
-    embedding_revision_env = config.embedding["revision_env"]
-    embedding_revision = str(env.get(embedding_revision_env, "")).strip()
-    if not embedding_revision:
-        raise ValueError(
-            f"memory benchmark requires frozen embedding revision via "
-            f"{embedding_revision_env}"
-        )
+    if not isinstance(base_config, AgentConfig):
+        raise ValueError("base_config must be an AgentConfig")
+    if base_config.provider.strip().casefold() != "openai":
+        raise ValueError("memory benchmark requires the openai provider")
+    if base_config.use_fake_llm:
+        raise ValueError("memory benchmark does not allow the fake LLM provider")
+    _required_string(base_config.api_key, "Actor API key")
+    _required_string(base_config.base_url, "Actor base URL")
+    _required_string(base_config.model, "Actor model")
     runtime = config.runtime
-    memory = config.memory
     return replace(
-        configured,
+        base_config,
         context_window=int(runtime["context_window"]),
         response_reserve_tokens=int(runtime["response_reserve_tokens"]),
         compression_buffer_tokens=int(runtime["compression_buffer_tokens"]),
@@ -698,25 +758,10 @@ def _configure_benchmark_agent(
         max_steps=int(runtime["max_steps"]),
         command_timeout=int(runtime["command_timeout_seconds"]),
         temperature=float(runtime["actor_temperature"]),
-        memory_evolver_generation_temperature=float(memory["generation_temperature"]),
-        memory_evolver_generation_top_p=float(memory["generation_top_p"]),
-        memory_evolver_candidate_top_k_per_tier=int(
-            memory["agentcli_candidate_top_k_per_tier"]
-        ),
-        memory_evolver_selected_max_items=int(memory["selected_max_items"]),
-        memory_evolver_selection_prompt_tokens=int(
-            memory["selected_content_max_tokens"]
-        ),
-        memory_evolver_maintenance_interval_tasks=int(
-            memory["agentcli_maintenance_interval_tasks"]
-        ),
-        memory_evolver_maintenance_enabled=bool(
-            memory["agentcli_maintenance_enabled"]
-        ),
-        memory_evolver_retrieval_backend=str(memory["agentcli_retrieval_backend"]),
-        memory_evolver_selection_backend=str(memory["agentcli_selection_backend"]),
         embedding_model=config.embedding["model"],
-        embedding_revision=embedding_revision,
+        memory_evolver_mode="off",
+        policy_adapter_path=None,
+        policy_identity_manifest=None,
         context_window_explicit=True,
         response_reserve_tokens_explicit=True,
         compression_buffer_tokens_explicit=True,
@@ -726,6 +771,91 @@ def _configure_benchmark_agent(
         memory_context_tokens_explicit=True,
         memory_tool_result_chars_explicit=True,
     )
+
+
+def _probe_actor_api(actor: Any) -> None:
+    if not bool(getattr(actor, "supports_tools", False)):
+        raise RuntimeError("Actor API does not advertise tool support")
+    chat_response = actor.chat(
+        [
+            Message(
+                role="user",
+                content="Reply with the single word OK for an API connectivity probe.",
+            )
+        ]
+    )
+    if not str(getattr(chat_response, "content", "")).strip():
+        raise RuntimeError("Actor API chat probe returned empty content")
+
+    probe_tool_name = "memory_benchmark_probe"
+    tools_response = actor.chat(
+        [
+            Message(
+                role="user",
+                content=(
+                    "Call the memory_benchmark_probe tool exactly once with an empty "
+                    "JSON object."
+                ),
+            )
+        ],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": probe_tool_name,
+                    "description": "Confirm that tool calling is available.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        ],
+    )
+    tool_calls = tuple(getattr(tools_response, "tool_calls", ()) or ())
+    if len(tool_calls) != 1 or getattr(tool_calls[0], "name", "") != probe_tool_name:
+        raise RuntimeError("Actor API tools probe did not call memory_benchmark_probe")
+
+
+def _probe_mem0_config(config: Mapping[str, Any], persistence_hint: Path) -> str:
+    persistence_hint.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix=f".{persistence_hint.name}-",
+        dir=persistence_hint.parent,
+    ) as temporary_dir:
+        client = Mem0ClientAdapter(
+            persistence_dir=Path(temporary_dir),
+            config=config,
+        )
+        client.close()
+    return _mem0_package_version()
+
+
+def _mem0_package_version() -> str:
+    version = importlib.metadata.version("mem0ai").strip()
+    if not version:
+        raise RuntimeError("Mem0 package version is empty")
+    return version
+
+
+def _validate_api_identity_against_preflight(
+    preflight: Mapping[str, Any],
+    *,
+    actor_endpoint: ApiEndpoint,
+    embedding_endpoint: ApiEndpoint,
+) -> None:
+    actor = _mapping(preflight.get("actor_api"), "preflight actor_api")
+    if actor.get("model") != actor_endpoint.model:
+        raise ValueError("Actor API model no longer matches preflight")
+    if actor.get("endpoint_hash") != actor_endpoint.endpoint_hash:
+        raise ValueError("Actor API endpoint no longer matches preflight")
+
+    embedding = _mapping(preflight.get("embedding_api"), "preflight embedding_api")
+    if embedding.get("model") != embedding_endpoint.model:
+        raise ValueError("embedding API model no longer matches preflight")
+    if embedding.get("endpoint_hash") != embedding_endpoint.endpoint_hash:
+        raise ValueError("embedding API endpoint no longer matches preflight")
 
 
 def _load_config_context(
@@ -768,17 +898,6 @@ def _data_root(
         if value
         else (repo_root / "data" / "memory_benchmark").resolve()
     )
-
-
-def _load_mem0_config(
-    config: MemoryBenchmarkConfig,
-    env: Mapping[str, str],
-) -> Mapping[str, Any]:
-    env_name = config.environment["mem0_config"]
-    value = str(env.get(env_name, "")).strip()
-    if not value:
-        raise ValueError(f"memory benchmark requires Mem0 config via {env_name}")
-    return _load_mapping(Path(value).expanduser().resolve())
 
 
 def _load_official_tasks(
@@ -842,6 +961,15 @@ def _build_backend(
     stream_memory_dir: Path,
     stream_project_key: str,
     mem0_config: Mapping[str, Any],
+    actor_endpoint: ApiEndpoint,
+    embedding_endpoint: ApiEndpoint,
+    api_policy_factory: Callable[
+        [ApiEndpoint], MemoryBenchmarkApiPolicy
+    ] = MemoryBenchmarkApiPolicy,
+    embedding_encoder_factory: Callable[
+        [ApiEndpoint], MemoryBenchmarkApiEmbeddingEncoder
+    ] = MemoryBenchmarkApiEmbeddingEncoder,
+    mem0_client_factory: Callable[[Path, Mapping[str, Any]], Any] | None = None,
 ) -> NoMemoryBackend | AgentCliFourTierBackend | Mem0Backend:
     if arm == "no_memory":
         return NoMemoryBackend(
@@ -852,14 +980,34 @@ def _build_backend(
         return AgentCliFourTierBackend(
             stream_memory_dir=stream_memory_dir,
             stream_project_key=stream_project_key,
+            policy=api_policy_factory(actor_endpoint),
+            embedding_encoder=embedding_encoder_factory(embedding_endpoint),
+            candidate_top_k_per_tier=int(
+                config.memory["agentcli_candidate_top_k_per_tier"]
+            ),
+            selected_max_items=int(config.memory["selected_max_items"]),
+            selected_content_max_tokens=int(
+                config.memory["selected_content_max_tokens"]
+            ),
+            generation_temperature=float(config.memory["generation_temperature"]),
+            generation_top_p=float(config.memory["generation_top_p"]),
             maintenance_interval_tasks=int(
                 config.memory["agentcli_maintenance_interval_tasks"]
             ),
+            maintenance_enabled=bool(
+                config.memory["agentcli_maintenance_enabled"]
+            ),
         )
     if arm == "mem0":
+        client = (
+            mem0_client_factory(stream_memory_dir / "mem0", mem0_config)
+            if mem0_client_factory is not None
+            else None
+        )
         return Mem0Backend(
             stream_memory_dir=stream_memory_dir,
             stream_project_key=stream_project_key,
+            client=client,
             mem0_config=mem0_config,
             search_limit=int(config.memory["mem0_search_limit"]),
             selected_max_items=int(config.memory["selected_max_items"]),
@@ -994,8 +1142,9 @@ def _selected_prepared_tasks(
 def _backend_configs(
     config: MemoryBenchmarkConfig,
     *,
-    embedding_revision: str,
-    mem0_config: Mapping[str, Any],
+    actor_endpoint: ApiEndpoint,
+    embedding_endpoint: ApiEndpoint,
+    embedding_dimension: int,
     mem0_version: str,
     arms: Sequence[str],
 ) -> dict[str, dict[str, Any]]:
@@ -1005,25 +1154,26 @@ def _backend_configs(
             config.memory["selected_content_max_tokens"]
         ),
     }
-    configs = {
+    configs: dict[str, dict[str, Any]] = {
         "no_memory": {
-            "schema_version": "memory-benchmark-backend-config-v1",
+            "schema_version": "memory-benchmark-backend-config-v2",
             "arm": "no_memory",
             **dict(config.arms["no_memory"]),
             **shared_limits,
         },
         "agentcli_four_tier": {
-            "schema_version": "memory-benchmark-backend-config-v1",
+            "schema_version": "memory-benchmark-backend-config-v2",
             "arm": "agentcli_four_tier",
             **dict(config.arms["agentcli_four_tier"]),
             **shared_limits,
-            "embedding_model": config.embedding["model"],
-            "embedding_revision": embedding_revision,
+            "policy_model": actor_endpoint.model,
+            "policy_endpoint_hash": actor_endpoint.endpoint_hash,
+            "embedding_model": embedding_endpoint.model,
+            "embedding_endpoint_hash": embedding_endpoint.endpoint_hash,
+            "embedding_dimension": embedding_dimension,
             "candidate_top_k_per_tier": int(
                 config.memory["agentcli_candidate_top_k_per_tier"]
             ),
-            "retrieval_backend": config.memory["agentcli_retrieval_backend"],
-            "selection_backend": config.memory["agentcli_selection_backend"],
             "generation_temperature": float(config.memory["generation_temperature"]),
             "generation_top_p": float(config.memory["generation_top_p"]),
             "maintenance_interval_tasks": int(
@@ -1033,38 +1183,23 @@ def _backend_configs(
                 config.memory["agentcli_maintenance_enabled"]
             ),
         },
-        "mem0": {
-            "schema_version": "memory-benchmark-backend-config-v1",
-            "arm": "mem0",
-            **dict(config.arms["mem0"]),
-            **shared_limits,
-            "search_limit": int(config.memory["mem0_search_limit"]),
-            "package_version": mem0_version,
-            "config": _sanitize_external_config(mem0_config),
-        },
     }
+    if "mem0" in arms:
+        configs["mem0"] = memory_benchmark_mem0_backend_identity(
+            actor_endpoint=actor_endpoint,
+            embedding_endpoint=embedding_endpoint,
+            embedding_dimension=embedding_dimension,
+            search_limit=int(config.memory["mem0_search_limit"]),
+            selected_max_items=int(config.memory["selected_max_items"]),
+            selected_content_max_tokens=int(
+                config.memory["selected_content_max_tokens"]
+            ),
+            package_version=mem0_version,
+        )
     unknown = sorted(set(arms) - set(configs))
     if unknown:
         raise ValueError(f"unknown backend config arms: {unknown}")
     return {arm: configs[arm] for arm in _ARM_ORDER if arm in arms}
-
-
-def _validate_mem0_config(config: Mapping[str, Any]) -> str:
-    version = importlib.metadata.version("mem0ai")
-    for component in ("llm", "embedder"):
-        payload = _mapping(config.get(component), f"Mem0 {component}")
-        provider = _required_string(payload.get("provider"), f"Mem0 {component} provider")
-        provider_config = _mapping(
-            payload.get("config"), f"Mem0 {component} config"
-        )
-        model = str(
-            provider_config.get("model") or provider_config.get("model_name") or ""
-        ).strip()
-        if not provider or not model:
-            raise ValueError(f"Mem0 {component} provider and model must be explicit")
-    with tempfile.TemporaryDirectory() as tmp:
-        localize_mem0_config(config, Path(tmp) / "mem0")
-    return version
 
 
 def _validate_evaluator_entrypoint(
@@ -1101,29 +1236,6 @@ def _validate_evaluator_entrypoint(
     finally:
         sys.path[:] = original_sys_path
     raise ImportError(f"evaluator entrypoint cannot be imported: {entrypoint}")
-
-
-def _sanitize_external_config(value: Any, *, key: str = "") -> Any:
-    normalized_key = key.casefold().replace("-", "_")
-    if any(marker in normalized_key for marker in _SECRET_KEY_MARKERS):
-        return None
-    if isinstance(value, Mapping):
-        return {
-            str(item_key): sanitized
-            for item_key, item_value in sorted(value.items(), key=lambda item: str(item[0]))
-            if (
-                sanitized := _sanitize_external_config(
-                    item_value,
-                    key=str(item_key),
-                )
-            )
-            is not None
-        }
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
-        return [_sanitize_external_config(item) for item in value]
-    if isinstance(value, str) and (Path(value).is_absolute() or value.startswith("~")):
-        return "<run-local>"
-    return value
 
 
 def _validate_context_budget(
@@ -1404,12 +1516,6 @@ def _required_string(value: object, field_name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field_name} must be non-empty")
     return value.strip()
-
-
-def _add_policy_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--config", required=True)
-    parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--identity-manifest", required=True)
 
 
 def _add_development_selection_arguments(parser: argparse.ArgumentParser) -> None:
