@@ -172,6 +172,25 @@ class AgentCliFourTierBackend(_LocalExperienceBackend):
 
     name = "agentcli_four_tier"
 
+    def __init__(
+        self,
+        *,
+        stream_memory_dir: str | Path,
+        stream_project_key: str,
+        maintenance_interval_tasks: int = 30,
+    ) -> None:
+        super().__init__(
+            stream_memory_dir=stream_memory_dir,
+            stream_project_key=stream_project_key,
+        )
+        if (
+            isinstance(maintenance_interval_tasks, bool)
+            or not isinstance(maintenance_interval_tasks, int)
+            or maintenance_interval_tasks < 1
+        ):
+            raise ValueError("maintenance_interval_tasks must be a positive integer")
+        self.maintenance_interval_tasks = maintenance_interval_tasks
+
     def prepare_context(self, task: BenchmarkTask) -> MemoryContextSelection:
         if not isinstance(task, BenchmarkTask):
             raise ValueError("task must be a BenchmarkTask")
@@ -208,7 +227,7 @@ class AgentCliFourTierBackend(_LocalExperienceBackend):
             memory_evolver_candidate_top_k_per_tier=50,
             memory_evolver_selected_max_items=20,
             memory_evolver_selection_prompt_tokens=1_800,
-            memory_evolver_maintenance_interval_tasks=30,
+            memory_evolver_maintenance_interval_tasks=self.maintenance_interval_tasks,
             memory_evolver_maintenance_enabled=True,
         )
 
@@ -480,7 +499,11 @@ def _build_task_agent_runner(
         task_config = replace(config, memory_evolver_mode="off")
         repo_path = Path(call_kwargs["repo_path"]).resolve()
         supplied_llm = call_kwargs.pop("llm", None)
-        task_llm = supplied_llm if supplied_llm is not None else build_llm(task_config)
+        task_llm = (
+            supplied_llm
+            if supplied_llm is not None
+            else _build_benchmark_actor(task_config)
+        )
         inner_memory = MemoryManager.from_config(
             config=task_config,
             llm=task_llm,
@@ -496,6 +519,14 @@ def _build_task_agent_runner(
         return run_agent(**call_kwargs)
 
     return task_agent_runner
+
+
+def _build_benchmark_actor(config: AgentConfig) -> Any:
+    if config.policy_identity_manifest is not None:
+        from my_agent.policy.transformers_policy import TransformersPolicy
+
+        return TransformersPolicy.from_config(config)
+    return build_llm(config)
 
 
 def _render_mem0_context(ids: list[str], texts: list[str]) -> str:

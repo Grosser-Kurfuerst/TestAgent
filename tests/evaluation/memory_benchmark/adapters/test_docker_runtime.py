@@ -104,8 +104,10 @@ def test_docker_preflight_requires_a_server_version() -> None:
     ]
 
 
-def test_docker_runtime_uses_argv_lists_and_validates_locked_image() -> None:
+def test_docker_runtime_uses_argv_lists_and_validates_locked_image(tmp_path: Path) -> None:
     labels = _labels()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
 
     def handler(argv: list[str]) -> Any:
         if argv[1:4] == ["image", "inspect", "--format"]:
@@ -129,6 +131,8 @@ def test_docker_runtime_uses_argv_lists_and_validates_locked_image() -> None:
         seed=42,
         benchmark="lifelong_os",
         task_id="task-1",
+        bind_mounts={workspace: "/workspace"},
+        working_directory="/workspace",
     )
     runtime.cleanup_container(container)
 
@@ -140,7 +144,39 @@ def test_docker_runtime_uses_argv_lists_and_validates_locked_image() -> None:
     create_argv = next(argv for argv, _ in runner.calls if argv[1] == "create")
     assert create_argv[-3:] == [HASH, "sleep", "infinity"]
     assert "fixture:locked" not in create_argv
+    assert ["--workdir", "/workspace"] == create_argv[
+        create_argv.index("--workdir") : create_argv.index("--workdir") + 2
+    ]
+    assert (
+        f"type=bind,source={workspace.resolve()},target=/workspace" in create_argv
+    )
     assert any(argv[1] == "rm" and "--force" in argv for argv, _ in runner.calls)
+
+
+def test_docker_runtime_rejects_unsafe_bind_mounts(tmp_path: Path) -> None:
+    runtime = DockerRuntime(command_runner=RecordingRunner(lambda _argv: _completed()))
+
+    with pytest.raises(ValueError, match="source must be absolute"):
+        runtime.create_container(
+            image="fixture:locked",
+            expected_digest=HASH,
+            run_id="run-1",
+            seed=42,
+            benchmark="smoke",
+            task_id="task-1",
+            bind_mounts={Path("relative"): "/workspace"},
+        )
+
+    with pytest.raises(ValueError, match="absolute non-root"):
+        runtime.create_container(
+            image="fixture:locked",
+            expected_digest=HASH,
+            run_id="run-1",
+            seed=42,
+            benchmark="smoke",
+            task_id="task-1",
+            bind_mounts={tmp_path: "workspace"},
+        )
 
 
 def test_docker_runtime_rejects_image_id_mismatch_before_create() -> None:
@@ -558,3 +594,55 @@ def test_real_docker_tasks_do_not_share_container_state(tmp_path: Path) -> None:
         assert result.stdout.strip() == "ok"
     finally:
         runtime.cleanup_container(second)
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(
+    not (
+        os.environ.get("AGENTCLI_MEMORY_BENCHMARK_TEST_IMAGE")
+        and os.environ.get("AGENTCLI_MEMORY_BENCHMARK_TEST_IMAGE_DIGEST")
+    ),
+    reason="set a locally prepared image and its sha256 image ID to run Docker integration",
+)
+def test_real_docker_workspace_mount_hides_host_scorer_state(tmp_path: Path) -> None:
+    image = os.environ["AGENTCLI_MEMORY_BENCHMARK_TEST_IMAGE"]
+    digest = os.environ["AGENTCLI_MEMORY_BENCHMARK_TEST_IMAGE_DIGEST"]
+    workspace = tmp_path / "repo" / "workspace"
+    workspace.mkdir(parents=True)
+    hidden_state = tmp_path / "adapter_state.json"
+    hidden_state.write_text('{"expected_files":{"secret":"value"}}\n', encoding="utf-8")
+    runtime = DockerRuntime()
+    container = runtime.create_container(
+        image=image,
+        expected_digest=digest,
+        run_id="integration",
+        seed=42,
+        benchmark="smoke",
+        task_id="hidden-boundary",
+        bind_mounts={workspace: "/workspace"},
+        working_directory="/workspace",
+    )
+    try:
+        attack = runtime.execute_action(
+            container,
+            "cat ../../adapter_state.json",
+            action_log_path=tmp_path / "attack.jsonl",
+            timeout_seconds=10,
+            max_output_chars=1000,
+        )
+        write = runtime.execute_action(
+            container,
+            "printf ok > result.txt",
+            action_log_path=tmp_path / "attack.jsonl",
+            timeout_seconds=10,
+            max_output_chars=1000,
+        )
+        assert not attack.ok
+        assert "expected_files" not in attack.stdout
+        assert write.ok
+        assert (workspace / "result.txt").read_text(encoding="utf-8") == "ok"
+        assert hidden_state.read_text(encoding="utf-8") == (
+            '{"expected_files":{"secret":"value"}}\n'
+        )
+    finally:
+        runtime.cleanup_container(container)

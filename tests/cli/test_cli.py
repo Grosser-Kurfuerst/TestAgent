@@ -48,6 +48,25 @@ def write_runtime_repo(repo: Path) -> None:
 
 
 class CliTests(unittest.TestCase):
+    def test_build_parser_includes_memory_benchmark_smoke(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "memory-benchmark",
+                "smoke",
+                "--config",
+                "configs/memory_benchmark/v1.json",
+                "--checkpoint",
+                "checkpoint",
+                "--identity-manifest",
+                "policy_identity_manifest.json",
+            ]
+        )
+
+        self.assertEqual(args.command, "memory-benchmark")
+        self.assertEqual(args.memory_benchmark_command, "smoke")
+        self.assertEqual(args.checkpoint, "checkpoint")
+        self.assertEqual(args.identity_manifest, "policy_identity_manifest.json")
+
     def test_load_sample_task(self) -> None:
         task = load_task(DEFAULT_TASK_FILE)
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -393,3 +394,55 @@ def test_non_formal_task_runner_shares_one_llm_with_memory_manager(
     else:
         assert isinstance(manager, MemoryManager)
         assert manager.llm is llm
+
+
+def test_no_memory_runner_uses_frozen_transformers_actor_when_identity_is_set(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import my_agent.evaluation.memory_benchmark.backends as backends_module
+    from my_agent.policy.transformers_policy import TransformersPolicy
+
+    memory_dir = tmp_path / "stream" / "memory"
+    backend = NoMemoryBackend(
+        stream_memory_dir=memory_dir,
+        stream_project_key="memory-benchmark:run-1:42:lifelong_os:no_memory",
+    )
+    context = backend.prepare_context(_task())
+    config = backend.configure_task(
+        replace(
+            _config(tmp_path),
+            policy_identity_manifest=tmp_path / "policy_identity_manifest.json",
+        ),
+        stream_memory_dir=memory_dir,
+        stream_project_key=backend.stream_project_key,
+        context=context,
+    )
+    actor = object()
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        TransformersPolicy,
+        "from_config",
+        classmethod(lambda cls, task_config: actor),
+    )
+    monkeypatch.setattr(
+        backends_module,
+        "build_llm",
+        lambda config: (_ for _ in ()).throw(AssertionError("provider actor used")),
+    )
+    monkeypatch.setattr(
+        backends_module,
+        "run_agent",
+        lambda **kwargs: captured.update(kwargs) or kwargs,
+    )
+
+    backend.build_agent_runner(context=context)(
+        repo_path=tmp_path,
+        task="Perform the task.",
+        config=config,
+        mode="react",
+    )
+
+    assert captured["llm"] is actor
+    assert captured["memory_manager"].llm is actor

@@ -81,6 +81,7 @@
   "actor_sampling_seed_supported": false,
   "smoke": {
     "task_count": 8,
-    "maintenance_interval_tasks": 4
+    "maintenance_interval_tasks": 4,
+    "container_source": "lifelong_agent_bench"
   }
 }

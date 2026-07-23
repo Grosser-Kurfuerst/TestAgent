@@ -173,8 +173,19 @@ class DockerRuntime:
         benchmark: str,
         task_id: str,
         keepalive_argv: Sequence[str] = ("sleep", "infinity"),
+        bind_mounts: Mapping[str | Path, str] | None = None,
+        working_directory: str | None = None,
     ) -> DockerContainer:
         require_sha256(expected_digest, field_name="expected_digest")
+        normalized_mounts = _normalized_bind_mounts(bind_mounts)
+        normalized_workdir = (
+            _absolute_container_path(
+                working_directory,
+                field_name="working_directory",
+            )
+            if working_directory is not None
+            else None
+        )
         actual_digest = self.inspect_image(image)
         if actual_digest != expected_digest:
             raise DockerRuntimeError(
@@ -196,6 +207,15 @@ class DockerRuntime:
         argv = [self.docker_executable, "create", "--name", name]
         for key, value in sorted(labels.items()):
             argv.extend(["--label", f"{key}={value}"])
+        for source, target in normalized_mounts.items():
+            argv.extend(
+                [
+                    "--mount",
+                    f"type=bind,source={source},target={target}",
+                ]
+            )
+        if normalized_workdir is not None:
+            argv.extend(["--workdir", normalized_workdir])
         argv.append(actual_digest)
         argv.extend(str(part) for part in keepalive_argv)
         created = self._run(argv, timeout=60)
@@ -523,6 +543,35 @@ def _fsync_directory(path: Path) -> None:
 def _safe_container_component(value: object) -> str:
     normalized = _CONTAINER_COMPONENT_RE.sub("-", str(value).strip()).strip("-.")
     return normalized or "task"
+
+
+def _normalized_bind_mounts(
+    mounts: Mapping[str | Path, str] | None,
+) -> dict[str, str]:
+    normalized: dict[str, str] = {}
+    for source, target in (mounts or {}).items():
+        host_path = Path(source).expanduser()
+        if not host_path.is_absolute():
+            raise ValueError("bind mount source must be absolute")
+        host_path = host_path.resolve()
+        if not host_path.exists():
+            raise ValueError(f"bind mount source does not exist: {host_path}")
+        container_path = _absolute_container_path(
+            target,
+            field_name="bind mount target",
+        )
+        if container_path in normalized.values():
+            raise ValueError(f"duplicate bind mount target: {container_path}")
+        normalized[str(host_path)] = container_path
+    return dict(sorted(normalized.items()))
+
+
+def _absolute_container_path(value: str, *, field_name: str) -> str:
+    if not isinstance(value, str) or not value.startswith("/") or value == "/":
+        raise ValueError(f"{field_name} must be an absolute non-root container path")
+    if ".." in Path(value).parts:
+        raise ValueError(f"{field_name} cannot contain parent traversal")
+    return value
 
 
 def _positive_int(value: Any, field_name: str) -> int:

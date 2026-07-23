@@ -14,12 +14,14 @@ from my_agent.evaluation.memory_benchmark.adapters.docker_runtime import (
     prepare_runtime_action_log,
     write_benchmark_action_files,
 )
+from my_agent.evaluation.memory_benchmark.adapters.smoke import SmokeAdapter
 
 __all__ = [
     "BenchmarkActionState",
     "BenchmarkAdapter",
     "DockerContainer",
     "DockerRuntime",
+    "SmokeAdapter",
     "benchmark_action_main",
     "benchmark_action_tools_hash",
     "execute_official_scorer",

@@ -10,6 +10,7 @@ from my_agent.cli.commands import (
     eval as eval_manifest,
     mcp,
     memory,
+    memory_benchmark,
     opd,
     repo,
     run,
@@ -32,6 +33,7 @@ COMMAND_MODULES = (
     tools,
     mcp,
     memory,
+    memory_benchmark,
     data,
     opd,
 )
