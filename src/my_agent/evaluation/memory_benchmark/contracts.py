@@ -7,9 +7,12 @@ from dataclasses import dataclass, field
 from math import isfinite
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
+import json
+import os
 import re
 
-from my_agent.policy.identity import require_sha256
+from my_agent.policy.identity import canonical_json_bytes, require_sha256
 
 
 OFFICIAL_RESULT_SCHEMA_VERSION = "memory-benchmark-official-result-v1"
@@ -361,6 +364,75 @@ class OfficialEvaluatorResult:
             reward=_required_float(data["reward"], field_name="reward"),
             status=str(data["status"]),
         )
+
+
+def write_official_result_atomic(
+    path: str | Path,
+    result: OfficialEvaluatorResult,
+) -> Path:
+    """Durably replace one official scorer result without exposing partial JSON."""
+
+    if not isinstance(result, OfficialEvaluatorResult):
+        raise ValueError("result must be an OfficialEvaluatorResult")
+    target = Path(path).expanduser().resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.name}.{os.getpid()}.{uuid4().hex}.tmp")
+    try:
+        with temporary.open("xb") as handle:
+            handle.write(canonical_json_bytes(result.to_dict()) + b"\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+        _fsync_directory(target.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return target
+
+
+def load_official_evaluator_result(
+    path: str | Path,
+    *,
+    expected_task_id: str,
+    expected_evaluator_hash: str,
+    returncode: int,
+) -> OfficialEvaluatorResult:
+    """Load a final scorer result and bind it to command return-code semantics."""
+
+    if returncode not in {0, 1}:
+        raise ValueError(f"official evaluator returned infrastructure code {returncode}")
+    target = Path(path).expanduser().resolve()
+    payload = json.loads(target.read_text(encoding="utf-8"))
+    if not isinstance(payload, Mapping):
+        raise ValueError("official evaluator result must be a JSON object")
+    expected_fields = {
+        "schema_version",
+        "task_id",
+        "evaluator_hash",
+        "resolved",
+        "reward",
+        "status",
+    }
+    if set(payload) != expected_fields:
+        raise ValueError("official evaluator result fields do not match the v1 schema")
+    official = OfficialEvaluatorResult.from_dict(payload)
+    if official.task_id != expected_task_id:
+        raise ValueError("official evaluator result task_id mismatch")
+    if official.evaluator_hash != expected_evaluator_hash:
+        raise ValueError("official evaluator result evaluator_hash mismatch")
+    if official.resolved is not (returncode == 0):
+        raise ValueError("official evaluator result conflicts with scorer return code")
+    return official
+
+
+def _fsync_directory(path: Path) -> None:
+    try:
+        descriptor = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 @dataclass(frozen=True)
@@ -993,4 +1065,6 @@ __all__ = [
     "ProviderUsage",
     "PublicEpisode",
     "TASK_RESULT_SCHEMA_VERSION",
+    "load_official_evaluator_result",
+    "write_official_result_atomic",
 ]

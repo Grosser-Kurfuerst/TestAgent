@@ -42,6 +42,9 @@ build-backend = "setuptools.build_meta"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+  "integration: requires locally prepared external runtime dependencies",
+]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = ["E402"]

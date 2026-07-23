@@ -22,7 +22,7 @@ from my_agent.context import (
     DEFAULT_TOOL_RESULT_CHARS,
 )
 from my_agent.evaluation.agent_benchmark import record_benchmark_result
-from my_agent.evaluation.memory_benchmark.contracts import OfficialEvaluatorResult
+from my_agent.evaluation.memory_benchmark.contracts import load_official_evaluator_result
 from my_agent.llm import AgentLLM, build_llm
 from my_agent.memory.evolver.coordinator import EvolverCoordinator
 from my_agent.memory.evolver.task_session import AgentEpisodeArtifact
@@ -1133,10 +1133,10 @@ def _run_external_state_task(
                 )
                 final_hidden = _without_command_output(raw_final_hidden)
                 try:
-                    official = _load_external_official_result(
+                    official = load_official_evaluator_result(
                         official_result_path,
-                        task_id=task_id,
-                        evaluator_hash=evaluator_hash,
+                        expected_task_id=task_id,
+                        expected_evaluator_hash=evaluator_hash,
                         returncode=raw_final_hidden.returncode,
                     )
                 except (OSError, ValueError, json.JSONDecodeError) as exc:
@@ -1392,39 +1392,6 @@ def _external_official_result_path(
     if not relative.parts:
         raise ValueError("external_state official_result_path must name a file")
     return resolved
-
-
-def _load_external_official_result(
-    path: Path,
-    *,
-    task_id: str,
-    evaluator_hash: str,
-    returncode: int,
-) -> OfficialEvaluatorResult:
-    if returncode not in {0, 1}:
-        raise ValueError(f"official evaluator returned infrastructure code {returncode}")
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, Mapping):
-        raise ValueError("official evaluator result must be a JSON object")
-    expected_fields = {
-        "schema_version",
-        "task_id",
-        "evaluator_hash",
-        "resolved",
-        "reward",
-        "status",
-    }
-    if set(payload) != expected_fields:
-        raise ValueError("official evaluator result fields do not match the v1 schema")
-    official = OfficialEvaluatorResult.from_dict(payload)
-    if official.task_id != task_id:
-        raise ValueError("official evaluator result task_id mismatch")
-    if official.evaluator_hash != evaluator_hash:
-        raise ValueError("official evaluator result evaluator_hash mismatch")
-    expected_resolved = returncode == 0
-    if official.resolved is not expected_resolved:
-        raise ValueError("official evaluator result conflicts with scorer return code")
-    return official
 
 
 def _without_command_output(result: CommandResult) -> CommandResult:
