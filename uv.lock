@@ -1369,6 +1369,8 @@ dev = [
 memory-benchmark = [
     { name = "datasets" },
     { name = "mem0ai" },
+    { name = "scikit-learn", version = "1.7.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "scikit-learn", version = "1.9.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
 ]
 opd-embed = [
     { name = "huggingface-hub" },
@@ -1404,6 +1406,7 @@ requires-dist = [
     { name = "pyyaml", marker = "extra == 'opd-train'", specifier = ">=6,<7" },
     { name = "safetensors", marker = "extra == 'opd-embed'", specifier = ">=0.5,<1" },
     { name = "safetensors", marker = "extra == 'opd-train'", specifier = ">=0.5,<1" },
+    { name = "scikit-learn", marker = "extra == 'memory-benchmark'", specifier = ">=1.7,<2" },
     { name = "sentence-transformers", marker = "extra == 'opd-embed'", specifier = ">=5,<6" },
     { name = "torch", marker = "extra == 'opd-embed'", specifier = ">=2.7,<3" },
     { name = "torch", marker = "extra == 'opd-train'", specifier = ">=2.7,<3" },

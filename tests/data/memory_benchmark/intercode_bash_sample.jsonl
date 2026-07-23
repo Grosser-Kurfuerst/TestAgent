@@ -1,0 +1,2 @@
+{"gold":"printf INTERCODE_GOLD_SECRET_ONE","query":"Print the final checksum summary for the sample Java files."}
+{"gold":"touch /testbed/INTERCODE_GOLD_SECRET_TWO","query":"Create the requested marker file under /testbed."}
