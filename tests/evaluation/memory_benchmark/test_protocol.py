@@ -17,7 +17,7 @@ from my_agent.evaluation.memory_benchmark.protocol import (
 from my_agent.policy.identity import canonical_sha256
 
 
-CONFIG_PATH = Path("configs/memory_benchmark/v1.json")
+CONFIG_PATH = Path("configs/memory_benchmark/v2.json")
 
 
 def _hash(label: str) -> str:
@@ -166,13 +166,18 @@ def test_duplicate_task_ids_and_invalid_budgets_are_rejected() -> None:
         replace(_protocol(), max_steps=0)
 
 
-def test_tracked_v1_config_loads_and_canonical_round_trips() -> None:
+def test_tracked_v2_config_loads_and_canonical_round_trips() -> None:
     config = load_memory_benchmark_config(CONFIG_PATH)
     canonical_payload = json.loads(canonical_config_bytes(config))
 
     assert config.enabled_arms == ("agentcli_four_tier", "mem0", "no_memory")
     assert config.benchmarks["lifelong_os"].source_split == "train"
     assert MemoryBenchmarkConfig.from_dict(canonical_payload) == config
+
+
+def test_v1_config_is_explicitly_rejected() -> None:
+    with pytest.raises(ValueError, match="unsupported memory benchmark config schema"):
+        load_memory_benchmark_config(Path("configs/memory_benchmark/v1.json"))
 
 
 def test_config_rejects_absolute_paths_and_secret_fields() -> None:

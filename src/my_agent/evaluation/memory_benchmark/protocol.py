@@ -18,14 +18,13 @@ from my_agent.policy.identity import (
 )
 
 
-MEMORY_BENCHMARK_CONFIG_SCHEMA_VERSION = "memory-benchmark-config-v1"
+MEMORY_BENCHMARK_CONFIG_SCHEMA_VERSION = "memory-benchmark-config-v2"
 MEMORY_BENCHMARK_PROTOCOL_SCHEMA_VERSION = "memory-benchmark-protocol-v1"
 
 REQUIRED_ENVIRONMENT_VARIABLES = {
     "lifelong_agent_bench_root": "AGENTCLI_LIFELONG_AGENT_BENCH_ROOT",
     "intercode_root": "AGENTCLI_INTERCODE_ROOT",
     "data_root": "AGENTCLI_MEMORY_BENCHMARK_DATA_ROOT",
-    "mem0_config": "AGENTCLI_MEM0_CONFIG_PATH",
 }
 REQUIRED_ARMS = frozenset({"no_memory", "agentcli_four_tier", "mem0"})
 REQUIRED_BENCHMARKS = frozenset({"lifelong_os", "intercode_bash"})
@@ -107,7 +106,7 @@ class MemoryBenchmarkConfig:
         _require_relative_path(self.output_root, field_name="output_root")
         environment = _string_mapping(self.environment, field_name="environment")
         if environment != REQUIRED_ENVIRONMENT_VARIABLES:
-            raise ValueError("memory benchmark environment variables do not match v1 contract")
+            raise ValueError("memory benchmark environment variables do not match v2 contract")
         object.__setattr__(self, "environment", environment)
 
         benchmarks = dict(self.benchmarks)
@@ -121,6 +120,8 @@ class MemoryBenchmarkConfig:
         if set(arms) != REQUIRED_ARMS:
             raise ValueError("config must define exactly the three comparison arms")
         for name, settings in arms.items():
+            if set(settings) != {"enabled"}:
+                raise ValueError(f"arm {name} only supports the enabled field")
             if not isinstance(settings.get("enabled"), bool):
                 raise ValueError(f"arm {name} requires a boolean enabled field")
         if not any(settings["enabled"] for settings in arms.values()):
@@ -131,8 +132,8 @@ class MemoryBenchmarkConfig:
         _validate_runtime_config(runtime)
         object.__setattr__(self, "runtime", runtime)
         embedding = _string_mapping(self.embedding, field_name="embedding")
-        if set(embedding) != {"model", "revision_env"}:
-            raise ValueError("embedding config requires model and revision_env")
+        if set(embedding) != {"model"}:
+            raise ValueError("embedding config requires exactly the model field")
         object.__setattr__(self, "embedding", embedding)
         memory = dict(self.memory)
         _validate_memory_config(memory)
@@ -197,7 +198,7 @@ class MemoryBenchmarkConfig:
             "smoke",
         }
         if set(data) != expected_fields:
-            raise ValueError("memory benchmark config fields do not match the v1 schema")
+            raise ValueError("memory benchmark config fields do not match the v2 schema")
         raw_benchmarks = _required_mapping(data.get("benchmarks"), field_name="benchmarks")
         raw_arms = _required_mapping(data.get("arms"), field_name="arms")
         raw_seeds = data.get("seeds")
@@ -595,6 +596,18 @@ def _validate_runtime_config(runtime: Mapping[str, Any]) -> None:
 
 
 def _validate_memory_config(memory: Mapping[str, Any]) -> None:
+    expected_fields = {
+        "generation_temperature",
+        "generation_top_p",
+        "selected_max_items",
+        "selected_content_max_tokens",
+        "agentcli_candidate_top_k_per_tier",
+        "agentcli_maintenance_interval_tasks",
+        "agentcli_maintenance_enabled",
+        "mem0_search_limit",
+    }
+    if set(memory) != expected_fields:
+        raise ValueError("memory config fields do not match the v2 schema")
     for field_name in (
         "selected_max_items",
         "selected_content_max_tokens",
@@ -607,6 +620,8 @@ def _validate_memory_config(memory: Mapping[str, Any]) -> None:
         raise ValueError("memory.selected_max_items cannot exceed 20")
     if memory["selected_content_max_tokens"] > 1800:
         raise ValueError("memory.selected_content_max_tokens cannot exceed 1800")
+    if not isinstance(memory["agentcli_maintenance_enabled"], bool):
+        raise ValueError("memory.agentcli_maintenance_enabled must be a bool")
     generation_temperature = _required_float(
         memory.get("generation_temperature"),
         field_name="memory.generation_temperature",
