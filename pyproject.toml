@@ -33,6 +33,7 @@ opd-embed = [
   "transformers>=5.2,<=5.8",
 ]
 memory-benchmark = [
+  "datasets>=5,<6",
   "mem0ai>=2.0.13,<3",
 ]
 

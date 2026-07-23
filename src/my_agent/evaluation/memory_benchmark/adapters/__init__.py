@@ -14,6 +14,7 @@ from my_agent.evaluation.memory_benchmark.adapters.docker_runtime import (
     prepare_runtime_action_log,
     write_benchmark_action_files,
 )
+from my_agent.evaluation.memory_benchmark.adapters.lifelong_os import LifelongOSAdapter
 from my_agent.evaluation.memory_benchmark.adapters.smoke import SmokeAdapter
 
 __all__ = [
@@ -21,6 +22,7 @@ __all__ = [
     "BenchmarkAdapter",
     "DockerContainer",
     "DockerRuntime",
+    "LifelongOSAdapter",
     "SmokeAdapter",
     "benchmark_action_main",
     "benchmark_action_tools_hash",

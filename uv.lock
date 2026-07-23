@@ -1367,6 +1367,7 @@ dev = [
     { name = "pytest" },
 ]
 memory-benchmark = [
+    { name = "datasets" },
     { name = "mem0ai" },
 ]
 opd-embed = [
@@ -1391,6 +1392,7 @@ opd-train = [
 requires-dist = [
     { name = "accelerate", marker = "extra == 'opd-train'", specifier = ">=1.8,<2" },
     { name = "datasets", marker = "extra == 'data'", specifier = ">=5.0.0" },
+    { name = "datasets", marker = "extra == 'memory-benchmark'", specifier = ">=5,<6" },
     { name = "datasets", marker = "extra == 'opd-train'", specifier = ">=5,<6" },
     { name = "filelock", specifier = ">=3.18,<4" },
     { name = "huggingface-hub", marker = "extra == 'opd-embed'", specifier = ">=0.33,<2" },

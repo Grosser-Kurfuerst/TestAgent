@@ -422,7 +422,44 @@ def execute_benchmark_action(
 ) -> DockerActionResult:
     if not isinstance(command, str) or not command.strip():
         raise ValueError("benchmark action command must be non-empty")
-    argv = [docker_executable, "exec", state.container_name, "bash", "-lc", command]
+    result = execute_container_command(
+        state.container_name,
+        command,
+        timeout_seconds=state.timeout_seconds,
+        max_output_chars=state.max_output_chars,
+        command_runner=command_runner,
+        docker_executable=docker_executable,
+    )
+    _append_action_log(state.runtime_action_log_path, command=command, result=result)
+    return result
+
+
+def execute_container_command(
+    container_name: str,
+    command: str,
+    *,
+    timeout_seconds: int,
+    max_output_chars: int,
+    command_runner: Callable[..., Any] = subprocess.run,
+    docker_executable: str = "docker",
+    login_shell: bool = True,
+) -> DockerActionResult:
+    if not isinstance(container_name, str) or not container_name.strip():
+        raise ValueError("container_name must be non-empty")
+    if not isinstance(command, str) or not command.strip():
+        raise ValueError("container command must be non-empty")
+    timeout_seconds = _positive_int(timeout_seconds, "timeout_seconds")
+    max_output_chars = _positive_int(max_output_chars, "max_output_chars")
+    if not isinstance(login_shell, bool):
+        raise ValueError("login_shell must be a bool")
+    argv = [
+        docker_executable,
+        "exec",
+        container_name,
+        "bash",
+        "-lc" if login_shell else "-c",
+        command,
+    ]
     started = time.monotonic()
     timed_out = False
     try:
@@ -432,7 +469,7 @@ def execute_benchmark_action(
             check=False,
             capture_output=True,
             text=True,
-            timeout=state.timeout_seconds,
+            timeout=timeout_seconds,
         )
         returncode = int(completed.returncode)
         stdout = str(completed.stdout or "")
@@ -442,7 +479,7 @@ def execute_benchmark_action(
         returncode = 124
         stdout = _timeout_text(exc.stdout)
         stderr = _timeout_text(exc.stderr) or (
-            f"Command timed out after {state.timeout_seconds}s."
+            f"Command timed out after {timeout_seconds}s."
         )
     except FileNotFoundError as exc:
         returncode = 127
@@ -451,12 +488,11 @@ def execute_benchmark_action(
     elapsed = time.monotonic() - started
     result = DockerActionResult(
         returncode=returncode,
-        stdout=_truncate_output(stdout, state.max_output_chars),
-        stderr=_truncate_output(stderr, state.max_output_chars),
+        stdout=_truncate_output(stdout, max_output_chars),
+        stderr=_truncate_output(stderr, max_output_chars),
         timed_out=timed_out,
         elapsed_sec=elapsed,
     )
-    _append_action_log(state.runtime_action_log_path, command=command, result=result)
     return result
 
 
@@ -612,6 +648,7 @@ __all__ = [
     "benchmark_action_tools_hash",
     "benchmark_container_name",
     "execute_benchmark_action",
+    "execute_container_command",
     "finalize_action_log",
     "prepare_runtime_action_log",
     "write_benchmark_action_files",

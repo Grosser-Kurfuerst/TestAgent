@@ -29,6 +29,7 @@ from my_agent.evaluation.memory_benchmark.adapters.docker_runtime import (
     benchmark_action_tools_hash,
     benchmark_container_name,
     execute_benchmark_action,
+    execute_container_command,
     finalize_action_log,
     prepare_runtime_action_log,
     write_benchmark_action_files,
@@ -311,6 +312,23 @@ def test_action_log_is_append_only_ordered_and_output_bounded(tmp_path: Path) ->
     assert all(len(record["stderr"]) <= 12 for record in records)
     assert all(call[0][:4] == ["docker", "exec", "fixture-container", "bash"] for call in runner.calls)
     assert all(call[1]["shell"] is False for call in runner.calls)
+
+
+def test_hidden_container_command_does_not_write_public_action_log(tmp_path: Path) -> None:
+    action_log = tmp_path / "actions.jsonl"
+    runner = RecordingRunner(lambda _argv: _completed(stdout="hidden evaluator output"))
+
+    result = execute_container_command(
+        "container-1",
+        "test -f /hidden/expected",
+        timeout_seconds=10,
+        max_output_chars=100,
+        command_runner=runner,
+    )
+
+    assert result.ok
+    assert result.stdout == "hidden evaluator output"
+    assert not action_log.exists()
 
 
 def test_action_timeout_is_logged_as_returncode_124(tmp_path: Path) -> None:
