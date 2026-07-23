@@ -17,6 +17,7 @@ from my_agent.evaluation import manifest_benchmark as manifest_benchmark_module
 from my_agent.evaluation.manifest_benchmark import (
     CommandResult,
     ManifestEvalResult,
+    ManifestInfrastructureError,
     _config_for_eval_env,
     _config_env_values,
     _load_manifest,
@@ -24,7 +25,12 @@ from my_agent.evaluation.manifest_benchmark import (
     run_manifest_benchmark,
     summarize_manifest_results,
 )
+from my_agent.memory.evolver.task_session import AgentEpisodeArtifact, TaskEvolverSession
+from my_agent.memory.experience_store import ExperienceStore
 from my_agent.memory.manager import MemoryManager
+from my_agent.observability.tracing import TraceWriter
+from my_agent.policy.identity import PolicyIdentity, canonical_sha256
+from my_agent.schema import AgentState
 from my_agent.tools import RepoTools
 from tests.memory.experience.fixtures import save_typed_experience
 
@@ -89,6 +95,127 @@ def write_agent_trace(trace_dir: Path, run_id: str) -> Path:
         encoding="utf-8",
     )
     return trace_path
+
+
+def external_task(
+    base: Path,
+    repo: Path,
+    *,
+    returncode: int = 0,
+    resolved: bool = True,
+    reward: float = 1.0,
+    status: str = "ok",
+    write_result: bool = True,
+    evaluator_hash: str | None = None,
+    result_task_id: str = "external-1",
+    result_evaluator_hash: str | None = None,
+    initial_returncode: int = 0,
+    raw_result_text: str | None = None,
+) -> tuple[dict[str, object], Path, Path]:
+    base.mkdir(parents=True, exist_ok=True)
+    official_path = base / "task-output" / "official_result.json"
+    events_path = base / "external_events.txt"
+    resolved_evaluator_hash = evaluator_hash or canonical_sha256({"evaluator": "fixture"})
+    result_hash = result_evaluator_hash or resolved_evaluator_hash
+    payload = {
+        "schema_version": "memory-benchmark-official-result-v1",
+        "task_id": result_task_id,
+        "evaluator_hash": result_hash,
+        "resolved": resolved,
+        "reward": reward,
+        "status": status,
+    }
+    scorer_parts = [
+        "from pathlib import Path",
+        f"open({str(events_path)!r}, 'a', encoding='utf-8').write('evaluator\\n')",
+        "print('hidden evaluator output')",
+    ]
+    if write_result:
+        scorer_parts.extend(
+            [
+                f"p = Path({str(official_path)!r})",
+                "p.parent.mkdir(parents=True, exist_ok=True)",
+                f"p.write_text({(raw_result_text if raw_result_text is not None else json.dumps(payload))!r}, encoding='utf-8')",
+            ]
+        )
+    scorer_parts.append(f"raise SystemExit({returncode})")
+    task = {
+        "id": "external-1",
+        "task_group": "external:fixture",
+        "source": "unit",
+        "repo": str(repo),
+        "task": "Operate the external environment.",
+        "evaluation_kind": "external_state",
+        "initial_environment_command": [
+            sys.executable,
+            "-c",
+            (
+                f"open({str(events_path)!r}, 'a', encoding='utf-8').write('initial\\n'); "
+                f"raise SystemExit({initial_returncode})"
+            ),
+        ],
+        "agent_test_command": None,
+        "hidden_test_command": [sys.executable, "-c", "; ".join(scorer_parts)],
+        "official_result_path": str(official_path),
+        "evaluator_name": "fixture-evaluator",
+        "evaluator_version": "fixture-v1",
+        "evaluator_hash": resolved_evaluator_hash,
+    }
+    return task, official_path, events_path
+
+
+def external_agent_runner(events_path: Path, *, stop_reason: str = "finish_called"):
+    def runner(**kwargs: object) -> object:
+        with events_path.open("a", encoding="utf-8") as file:
+            file.write("agent\n")
+        trace_dir = Path(kwargs["trace_dir"])  # type: ignore[arg-type]
+        trace_path = write_agent_trace(trace_dir, "run-external")
+        return SimpleNamespace(
+            trace_path=trace_path,
+            run_id="run-external",
+            steps=1,
+            done=True,
+            stop_reason=stop_reason,
+            final_answer="external final answer",
+        )
+
+    return runner
+
+
+def formal_external_state(kwargs: dict[str, object], identity: PolicyIdentity) -> AgentState:
+    work_repo = Path(kwargs["repo_path"])  # type: ignore[arg-type]
+    metadata = dict(kwargs["metadata"])  # type: ignore[arg-type]
+    state = AgentState.initial(work_repo, str(kwargs["task"]), metadata=metadata)
+    writer = TraceWriter.create(Path(kwargs["trace_dir"]), state.run_id)  # type: ignore[arg-type]
+    state.trace_path = writer.path
+    state.done = True
+    state.stop_reason = "assistant_final"
+    state.final_answer = "done"
+    config = kwargs["config"]
+    if not isinstance(config, AgentConfig):
+        raise AssertionError("formal external runner requires AgentConfig")
+    repository_revision = ExperienceStore.from_dir(config.memory_dir).revision()
+    session = TaskEvolverSession(
+        task_id=str(metadata["task_id"]),
+        task_group=str(metadata["task_group"]),
+        trajectory_id=state.run_id,
+        stream_id=str(metadata["stream_id"]),
+        memory_project_key="project-a",
+        policy_identity=identity,
+        repository_revision=repository_revision,
+        candidate_snapshot_hash=canonical_sha256([]),
+        selected_memory_ids=(),
+        rendered_memory_context="",
+        candidate_snapshot=(),
+    )
+    state.evolver_episode = AgentEpisodeArtifact(
+        session,
+        writer.path,
+        state.stop_reason,
+        state.final_answer,
+        (),
+    )
+    return state
 
 
 class ManifestBenchmarkTests(unittest.TestCase):
@@ -558,6 +685,10 @@ class ManifestBenchmarkTests(unittest.TestCase):
         self.assertFalse(result.results[0].task_valid)
         self.assertEqual(result.summary["invalid_initial_pass"], 1)
         record = result.results[0].to_dict()
+        self.assertEqual(record["evaluation_kind"], "patch")
+        self.assertIsNone(record["initial_environment"])
+        self.assertEqual(record["agent_final_answer"], "")
+        self.assertEqual(record["official_result_path"], "")
         self.assertEqual(record["memory_mode"], "per_task")
         self.assertEqual(record["stream_id"], "already-fixed")
         self.assertEqual(record["memory_project_key"], "")
@@ -568,6 +699,427 @@ class ManifestBenchmarkTests(unittest.TestCase):
         self.assertEqual(record["memory_entries_total_before"], 0)
         self.assertEqual(record["memory_entries_total_after"], 0)
         self.assertEqual(record["memory_total_growth"], 0)
+
+    def test_external_state_runs_environment_agent_and_evaluator_once_in_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            write_repo(repo, value=0)
+            task, official_path, events_path = external_task(base, repo)
+            manifest = base / "external.json"
+            manifest.write_text(json.dumps({"tasks": [task]}), encoding="utf-8")
+            runner_calls: list[dict[str, object]] = []
+
+            def runner(**kwargs: object) -> object:
+                runner_calls.append(dict(kwargs))
+                return external_agent_runner(events_path)(**kwargs)
+
+            result = run_manifest_benchmark(
+                tasks_path=manifest,
+                output_dir=base / "out",
+                config=fake_config(base / "traces"),
+                agent_runner=runner,
+            )
+            events = events_path.read_text(encoding="utf-8").splitlines()
+            trace_payload = Path(result.results[0].trace_path).read_text(encoding="utf-8")
+
+        item = result.results[0]
+        self.assertEqual(events, ["initial", "agent", "evaluator"])
+        self.assertEqual(len(runner_calls), 1)
+        self.assertEqual(runner_calls[0]["test_command"], "")
+        self.assertTrue(item.resolved)
+        self.assertTrue(item.task_valid)
+        self.assertTrue(item.outcome_finalized)
+        self.assertEqual(item.evaluation_kind, "external_state")
+        self.assertTrue(item.initial_visible.skipped)
+        self.assertTrue(item.initial_environment.ok)
+        self.assertTrue(item.patch_apply_ok)
+        self.assertEqual(item.changed_files, [])
+        self.assertEqual(item.agent_final_answer, "external final answer")
+        self.assertEqual(item.official_result_path, str(official_path))
+        self.assertEqual(item.final_hidden.output, "")
+        self.assertNotIn("hidden evaluator output", trace_payload)
+
+    def test_external_environment_failure_skips_agent_and_evaluator(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            write_repo(repo, value=0)
+            task, official_path, events_path = external_task(
+                base,
+                repo,
+                initial_returncode=2,
+            )
+            manifest = base / "external.json"
+            manifest.write_text(json.dumps(task), encoding="utf-8")
+
+            def forbidden_runner(**_: object) -> object:
+                raise AssertionError("agent must not run after environment setup failure")
+
+            with self.assertRaises(ManifestInfrastructureError) as raised:
+                run_manifest_benchmark(
+                    tasks_path=manifest,
+                    output_dir=base / "out",
+                    config=fake_config(base / "traces"),
+                    agent_runner=forbidden_runner,
+                )
+            events = events_path.read_text(encoding="utf-8").splitlines()
+            official_exists = official_path.exists()
+            partial_summary = json.loads(raised.exception.summary_path.read_text(encoding="utf-8"))
+
+        item = raised.exception.result
+        self.assertEqual(events, ["initial"])
+        self.assertFalse(official_exists)
+        self.assertFalse(item.task_valid)
+        self.assertFalse(item.outcome_finalized)
+        self.assertEqual(item.failure_type, "environment_setup_failed")
+        self.assertEqual(partial_summary["scored"], 0)
+
+    def test_external_legal_failure_is_scored_and_preserves_reward(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            write_repo(repo, value=0)
+            task, _, events_path = external_task(
+                base,
+                repo,
+                returncode=1,
+                resolved=False,
+                reward=0.35,
+            )
+            manifest = base / "external.json"
+            manifest.write_text(json.dumps(task), encoding="utf-8")
+            result = run_manifest_benchmark(
+                tasks_path=manifest,
+                output_dir=base / "out",
+                config=fake_config(base / "traces"),
+                agent_runner=external_agent_runner(events_path),
+            )
+
+        item = result.results[0]
+        self.assertFalse(item.resolved)
+        self.assertTrue(item.task_valid)
+        self.assertTrue(item.outcome_finalized)
+        self.assertEqual(item.reward, 0.35)
+        self.assertEqual(item.failure_type, "official_evaluator_failed")
+        self.assertEqual(item.final_hidden.returncode, 1)
+        self.assertEqual(result.summary["scored"], 1)
+
+    def test_external_evaluator_infrastructure_error_fails_closed_and_removes_stale_result(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            write_repo(repo, value=0)
+            task, official_path, events_path = external_task(
+                base,
+                repo,
+                returncode=2,
+                write_result=False,
+            )
+            official_path.parent.mkdir(parents=True)
+            official_path.write_text("stale", encoding="utf-8")
+            manifest = base / "external.json"
+            manifest.write_text(json.dumps(task), encoding="utf-8")
+            with self.assertRaises(ManifestInfrastructureError) as raised:
+                run_manifest_benchmark(
+                    tasks_path=manifest,
+                    output_dir=base / "out",
+                    config=fake_config(base / "traces"),
+                    agent_runner=external_agent_runner(events_path),
+                )
+            official_exists = official_path.exists()
+            partial_summary = json.loads(raised.exception.summary_path.read_text(encoding="utf-8"))
+
+        item = raised.exception.result
+        self.assertFalse(official_exists)
+        self.assertEqual(item.failure_type, "evaluator_error")
+        self.assertFalse(item.outcome_finalized)
+        self.assertEqual(partial_summary["scored"], 0)
+
+    def test_external_missing_or_invalid_official_result_fails_closed(self) -> None:
+        cases = (
+            {"write_result": False},
+            {"raw_result_text": "{"},
+            {"status": "error"},
+            {"result_task_id": "other-task"},
+            {"result_evaluator_hash": canonical_sha256({"wrong": True})},
+            {"resolved": False},
+            {"reward": 2.0},
+        )
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp)
+                repo = base / "repo"
+                write_repo(repo, value=0)
+                task, _, events_path = external_task(base, repo, **case)
+                manifest = base / "external.json"
+                manifest.write_text(json.dumps(task), encoding="utf-8")
+                with self.assertRaises(ManifestInfrastructureError) as raised:
+                    run_manifest_benchmark(
+                        tasks_path=manifest,
+                        output_dir=base / "out",
+                        config=fake_config(base / "traces"),
+                        agent_runner=external_agent_runner(events_path),
+                    )
+
+                self.assertEqual(raised.exception.result.failure_type, "evaluator_error")
+                self.assertFalse(raised.exception.result.outcome_finalized)
+
+    def test_external_llm_failed_skips_evaluator_and_formal_finalize(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            write_repo(repo, value=0)
+            task, official_path, events_path = external_task(base, repo)
+            manifest = base / "external.json"
+            manifest.write_text(json.dumps(task), encoding="utf-8")
+            with self.assertRaises(ManifestInfrastructureError) as raised:
+                run_manifest_benchmark(
+                    tasks_path=manifest,
+                    output_dir=base / "out",
+                    config=fake_config(base / "traces"),
+                    agent_runner=external_agent_runner(events_path, stop_reason="llm_failed"),
+                )
+            events = events_path.read_text(encoding="utf-8").splitlines()
+            official_exists = official_path.exists()
+
+        item = raised.exception.result
+        self.assertEqual(events, ["initial", "agent"])
+        self.assertFalse(official_exists)
+        self.assertEqual(item.failure_type, "agent_infrastructure_failed")
+        self.assertFalse(item.outcome_finalized)
+
+    def test_external_infrastructure_failure_aborts_before_next_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            write_repo(repo, value=0)
+            first, _, first_events = external_task(
+                base / "first",
+                repo,
+                returncode=2,
+                write_result=False,
+            )
+            second, _, second_events = external_task(
+                base / "second",
+                repo,
+                result_task_id="external-2",
+            )
+            second["id"] = "external-2"
+            manifest = base / "external.json"
+            manifest.write_text(json.dumps({"tasks": [first, second]}), encoding="utf-8")
+            agent_calls: list[str] = []
+
+            def runner(**kwargs: object) -> object:
+                task_id = str(kwargs["metadata"]["task_id"])  # type: ignore[index]
+                agent_calls.append(task_id)
+                events_path = first_events if task_id == "external-1" else second_events
+                return external_agent_runner(events_path)(**kwargs)
+
+            with self.assertRaises(ManifestInfrastructureError) as raised:
+                run_manifest_benchmark(
+                    tasks_path=manifest,
+                    output_dir=base / "out",
+                    config=fake_config(base / "traces"),
+                    agent_runner=runner,
+                )
+            persisted = read_jsonl(raised.exception.results_path)
+            second_events_exists = second_events.exists()
+
+        self.assertEqual(agent_calls, ["external-1"])
+        self.assertEqual(len(persisted), 1)
+        self.assertEqual(persisted[0]["failure_type"], "evaluator_error")
+        self.assertFalse(second_events_exists)
+
+    def test_external_official_result_path_must_stay_inside_manifest_task_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            write_repo(repo, value=0)
+            task, _, _ = external_task(base, repo)
+            task["official_result_path"] = str(base.parent / "outside.json")
+            manifest = base / "external.json"
+            manifest.write_text(json.dumps(task), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "inside the task output"):
+                run_manifest_benchmark(
+                    tasks_path=manifest,
+                    output_dir=base / "out",
+                    config=fake_config(base / "traces"),
+                    agent_runner=lambda **_: None,
+                )
+
+    def test_external_formal_finalize_receives_official_reward(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            write_repo(repo, value=0)
+            task, _, events_path = external_task(
+                base,
+                repo,
+                returncode=1,
+                resolved=False,
+                reward=0.4,
+            )
+            manifest = base / "external.json"
+            manifest.write_text(json.dumps({"tasks": [task]}), encoding="utf-8")
+            captured_outcomes: list[object] = []
+
+            class FakeCoordinator:
+                def __init__(self, **_: object) -> None:
+                    pass
+
+                def finalize_task(self, _episode: object, outcome: object) -> object:
+                    captured_outcomes.append(outcome)
+                    return SimpleNamespace(
+                        writer_status="no_write",
+                        written_memory_ids=(),
+                        repository_revision_after="revision-1",
+                        cadence_id=None,
+                        maintenance_status=None,
+                    )
+
+            identity = PolicyIdentity(
+                "model",
+                "model-revision",
+                "sha256:" + "1" * 64,
+                None,
+                "tokenizer-revision",
+                "sha256:" + "2" * 64,
+                "sha256:" + "3" * 64,
+            )
+
+            def formal_runner(**kwargs: object) -> AgentState:
+                with events_path.open("a", encoding="utf-8") as file:
+                    file.write("agent\n")
+                return formal_external_state(dict(kwargs), identity)
+
+            config = fake_config(
+                base / "traces",
+                memory_evolver_mode="formal",
+                policy_base_revision="model-revision",
+                policy_tokenizer_revision="tokenizer-revision",
+                policy_identity_manifest=base / "identity.json",
+                embedding_revision="embedding-revision",
+            )
+            with patch.object(
+                manifest_benchmark_module,
+                "EvolverCoordinator",
+                FakeCoordinator,
+            ):
+                result = run_manifest_benchmark(
+                    tasks_path=manifest,
+                    output_dir=base / "out",
+                    config=config,
+                    agent_runner=formal_runner,
+                )
+
+        self.assertEqual(len(captured_outcomes), 1)
+        self.assertEqual(captured_outcomes[0].reward, 0.4)
+        self.assertFalse(captured_outcomes[0].resolved)
+        self.assertEqual(result.results[0].reward, 0.4)
+
+    def test_external_formal_finalize_failure_is_unscored_and_aborts_stream(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            write_repo(repo, value=0)
+            first, _, first_events = external_task(base / "first", repo)
+            second, _, second_events = external_task(
+                base / "second",
+                repo,
+                result_task_id="external-2",
+            )
+            second["id"] = "external-2"
+            manifest = base / "external.json"
+            manifest.write_text(json.dumps({"tasks": [first, second]}), encoding="utf-8")
+            identity = PolicyIdentity(
+                "model",
+                "model-revision",
+                "sha256:" + "1" * 64,
+                None,
+                "tokenizer-revision",
+                "sha256:" + "2" * 64,
+                "sha256:" + "3" * 64,
+            )
+            agent_calls: list[str] = []
+
+            class RaisingCoordinator:
+                def __init__(self, **_: object) -> None:
+                    pass
+
+                def finalize_task(self, _episode: object, _outcome: object) -> object:
+                    raise RuntimeError("finalize failed")
+
+            def runner(**kwargs: object) -> AgentState:
+                metadata = dict(kwargs["metadata"])  # type: ignore[arg-type]
+                task_id = str(metadata["task_id"])
+                agent_calls.append(task_id)
+                events_path = first_events if task_id == "external-1" else second_events
+                with events_path.open("a", encoding="utf-8") as file:
+                    file.write("agent\n")
+                return formal_external_state(dict(kwargs), identity)
+
+            config = fake_config(
+                base / "traces",
+                memory_evolver_mode="formal",
+                policy_base_revision="model-revision",
+                policy_tokenizer_revision="tokenizer-revision",
+                policy_identity_manifest=base / "identity.json",
+                embedding_revision="embedding-revision",
+            )
+            with (
+                patch.object(
+                    manifest_benchmark_module,
+                    "EvolverCoordinator",
+                    RaisingCoordinator,
+                ),
+                self.assertRaises(ManifestInfrastructureError) as raised,
+            ):
+                run_manifest_benchmark(
+                    tasks_path=manifest,
+                    output_dir=base / "out",
+                    config=config,
+                    agent_runner=runner,
+                )
+            partial_summary = json.loads(
+                raised.exception.summary_path.read_text(encoding="utf-8")
+            )
+            trace_events = read_jsonl(Path(raised.exception.result.trace_path))
+            benchmark_event = [
+                event for event in trace_events if event["event"] == "benchmark_result"
+            ][-1]
+            persisted = read_jsonl(raised.exception.results_path)
+            second_events_exists = second_events.exists()
+
+        self.assertEqual(agent_calls, ["external-1"])
+        self.assertEqual(raised.exception.result.failure_type, "evolver_finalize_failed")
+        self.assertTrue(raised.exception.result.outcome_finalized)
+        self.assertEqual(partial_summary["scored"], 0)
+        self.assertFalse(benchmark_event["payload"]["scored"])
+        self.assertEqual(len(persisted), 1)
+        self.assertFalse(second_events_exists)
+
+    def test_empty_tool_config_paths_survive_eval_env_reparse(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            home = base / "home"
+            default_tools = home / ".config" / "agentcli" / "tools.json"
+            default_tools.parent.mkdir(parents=True)
+            default_tools.write_text('{"version": 1, "tools": []}', encoding="utf-8")
+            config = fake_config(base / "traces", tool_config_paths=())
+            with patch.dict("os.environ", {"HOME": str(home)}):
+                resolved = _config_for_eval_env(
+                    config,
+                    {},
+                    trace_dir=base / "task-traces",
+                    memory_dir=base / "task-memory",
+                    command_timeout=20,
+                )
+
+        self.assertEqual(resolved.tool_config_paths, ())
 
     def test_manifest_runner_passes_writer_context_metadata_to_agent_runner(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

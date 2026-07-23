@@ -22,6 +22,7 @@ from my_agent.context import (
     DEFAULT_TOOL_RESULT_CHARS,
 )
 from my_agent.evaluation.agent_benchmark import record_benchmark_result
+from my_agent.evaluation.memory_benchmark.contracts import OfficialEvaluatorResult
 from my_agent.llm import AgentLLM, build_llm
 from my_agent.memory.evolver.coordinator import EvolverCoordinator
 from my_agent.memory.evolver.task_session import AgentEpisodeArtifact
@@ -32,7 +33,7 @@ from my_agent.memory.experience.retrieval.embedding import (
 )
 from my_agent.observability.trace_metrics import collect_trace_metrics
 from my_agent.observability.tracing import TraceWriter
-from my_agent.policy.identity import canonical_sha256
+from my_agent.policy.identity import canonical_sha256, require_sha256
 from my_agent.runtime import run_agent
 from my_agent.schema import TraceEvent
 from my_agent.training.contracts import AuthoritativeTaskOutcome, EvaluatorIdentity
@@ -49,6 +50,13 @@ MEMORY_MODES = {
     MEMORY_MODE_SHARED_STREAM,
     MEMORY_MODE_SHARED_BY_GROUP,
 }
+EVALUATION_KIND_PATCH = "patch"
+EVALUATION_KIND_EXTERNAL_STATE = "external_state"
+EVALUATION_KINDS = {EVALUATION_KIND_PATCH, EVALUATION_KIND_EXTERNAL_STATE}
+_AGENT_INFRASTRUCTURE_STOP_REASONS = frozenset(
+    {"llm_failed", "context_over_budget", "cancelled"}
+)
+_AGENT_FINAL_ANSWER_MAX_CHARS = 12_000
 
 
 @dataclass(frozen=True)
@@ -94,6 +102,10 @@ class ManifestEvalResult:
     task_valid: bool
     failure_type: str
     initial_visible: CommandResult
+    evaluation_kind: str = EVALUATION_KIND_PATCH
+    initial_environment: CommandResult | None = None
+    agent_final_answer: str = ""
+    official_result_path: str = ""
     source: str = "local"
     task_group: str = ""
     reward: float = 0.0
@@ -144,6 +156,12 @@ class ManifestEvalResult:
             "resolved": self.resolved,
             "task_valid": self.task_valid,
             "failure_type": self.failure_type,
+            "evaluation_kind": self.evaluation_kind,
+            "initial_environment": (
+                self.initial_environment.to_dict() if self.initial_environment else None
+            ),
+            "agent_final_answer": self.agent_final_answer,
+            "official_result_path": self.official_result_path,
             "source": self.source,
             "task_group": self.task_group,
             "reward": self.reward,
@@ -211,6 +229,24 @@ class ManifestBenchmarkResult:
         )
 
 
+class ManifestInfrastructureError(RuntimeError):
+    """Raised after persisting an external-state infrastructure failure."""
+
+    def __init__(
+        self,
+        result: ManifestEvalResult,
+        *,
+        results_path: Path,
+        summary_path: Path,
+    ) -> None:
+        super().__init__(
+            f"manifest task {result.task_id!r} aborted after {result.failure_type or 'infrastructure failure'}"
+        )
+        self.result = result
+        self.results_path = results_path
+        self.summary_path = summary_path
+
+
 def run_manifest_benchmark(
     *,
     tasks_path: str | Path,
@@ -276,6 +312,17 @@ def run_manifest_benchmark(
         results.append(result)
         with results_path.open("a", encoding="utf-8") as file:
             file.write(json.dumps(result.to_dict(), ensure_ascii=False) + "\n")
+        if _must_abort_manifest_after(result):
+            summary = summarize_manifest_results(results)
+            summary_path.write_text(
+                json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            raise ManifestInfrastructureError(
+                result,
+                results_path=results_path,
+                summary_path=summary_path,
+            )
 
     summary = summarize_manifest_results(results)
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -300,6 +347,12 @@ def _build_shared_runtime_resources(
     if config.memory_evolver_retrieval_backend != "lexical_ablation":
         retriever = EmbeddingRetriever(TransformersEmbeddingEncoder.from_config(config))
     return policy, retriever
+
+
+def _must_abort_manifest_after(result: ManifestEvalResult) -> bool:
+    if result.evaluation_kind != EVALUATION_KIND_EXTERNAL_STATE:
+        return False
+    return not result.outcome_finalized or result.failure_type == "evolver_finalize_failed"
 
 
 def _formal_manifest_mode(mode: str, *, formal: bool) -> str:
@@ -356,6 +409,7 @@ def _prepare_manifest_tasks(
     prepared: list[dict[str, Any]] = []
     for index, task in enumerate(tasks, start=1):
         item = dict(task)
+        item["evaluation_kind"] = _evaluation_kind_value(item.get("evaluation_kind"))
         task_group = str(item.get("task_group") or "").strip()
         if not task_group and settings.task_group_fallback == "source":
             task_group = str(item.get("source") or "").strip()
@@ -374,6 +428,16 @@ def _task_group_fallback(value: object) -> str:
     normalized = str(value or "").strip().lower()
     if normalized not in {"", "source"}:
         raise ValueError("task_group_fallback must be empty or 'source'")
+    return normalized
+
+
+def _evaluation_kind_value(value: object) -> str:
+    normalized = str(value or EVALUATION_KIND_PATCH).strip().lower()
+    if normalized not in EVALUATION_KINDS:
+        expected = ", ".join(sorted(EVALUATION_KINDS))
+        raise ValueError(
+            f"Unsupported evaluation_kind: {normalized!r}. Expected one of: {expected}."
+        )
     return normalized
 
 
@@ -476,7 +540,7 @@ def _first_nonblank(*values: object) -> str:
 
 def summarize_manifest_results(results: Sequence[ManifestEvalResult]) -> dict[str, Any]:
     total = len(results)
-    scored = sum(1 for result in results if result.task_valid)
+    scored = sum(1 for result in results if _is_scored_result(result))
     resolved = sum(1 for result in results if result.resolved)
     failure_counts: dict[str, int] = {}
     memory_modes: dict[str, int] = {}
@@ -508,7 +572,7 @@ def summarize_manifest_results(results: Sequence[ManifestEvalResult]) -> dict[st
                 },
             )
             stream["total"] = int(stream["total"]) + 1
-            stream["scored"] = int(stream["scored"]) + (1 if result.task_valid else 0)
+            stream["scored"] = int(stream["scored"]) + (1 if _is_scored_result(result) else 0)
             stream["resolved"] = int(stream["resolved"]) + (1 if result.resolved else 0)
             stream["memory_entries_after"] = result.memory_entries_after
             stream["memory_entries_total_after"] = result.memory_entries_total_after
@@ -568,6 +632,14 @@ def _stream_summary_keys(results: Sequence[ManifestEvalResult]) -> dict[int, str
     return keys
 
 
+def _is_scored_result(result: ManifestEvalResult) -> bool:
+    return (
+        result.task_valid
+        and result.outcome_finalized
+        and result.failure_type != "evolver_finalize_failed"
+    )
+
+
 def _stream_summary_identity(result: ManifestEvalResult) -> tuple[str, str, str, str]:
     return (
         result.memory_mode,
@@ -599,6 +671,7 @@ def _run_manifest_task(
 ) -> ManifestEvalResult:
     started = time.monotonic()
     task_id = str(task.get("id") or f"task_{index}")
+    evaluation_kind = _evaluation_kind_value(task.get("evaluation_kind"))
     source = str(task.get("source") or "local")
     task_group = str(task.get("task_group") or "").strip()
     tags = _string_list(task.get("tags"))
@@ -647,12 +720,40 @@ def _run_manifest_task(
             ).strip().lower(),
         )
     before_counts = _memory_counts(task_config.memory_dir, project_key=task_config.memory_project_key)
+    if evaluation_kind == EVALUATION_KIND_EXTERNAL_STATE:
+        return _run_external_state_task(
+            task,
+            task_id=task_id,
+            source=source,
+            task_group=task_group,
+            tags=tags,
+            safe_id=safe_id,
+            manifest_path=manifest_path,
+            patch_root=patch_root,
+            memory_stream=memory_stream,
+            task_config=task_config,
+            before_counts=before_counts,
+            baseline_repo=baseline_repo,
+            initial_repo=initial_repo,
+            work_repo=work_repo,
+            task_trace_dir=task_trace_dir,
+            command_env=command_env,
+            env_overrides=env_overrides,
+            mode=mode,
+            max_steps=max_steps,
+            command_timeout=command_timeout,
+            agent_runner=agent_runner,
+            shared_policy=shared_policy,
+            shared_embedding_retriever=shared_embedding_retriever,
+            started=started,
+        )
     agent_test_command = task.get("agent_test_command") or task.get("test_command")
     visible_command = task.get("visible_test_command") or agent_test_command
     hidden_command = task.get("hidden_test_command")
     evaluator_name = "manifest"
     evaluator_version = "manifest-evaluator-v1"
     evaluator_hash = canonical_sha256({
+        "evaluation_kind": evaluation_kind,
         "visible_test_command": _command_label(visible_command),
         "hidden_test_command": _command_label(hidden_command),
         "expected_changed_files": expected_changed_files,
@@ -840,6 +941,8 @@ def _run_manifest_task(
         task_valid=True,
         failure_type=failure_type,
         initial_visible=initial_visible,
+        evaluation_kind=evaluation_kind,
+        agent_final_answer=_agent_final_answer(state),
         source=source,
         task_group=task_group,
         reward=1.0 if authoritative_resolved else 0.0,
@@ -879,7 +982,7 @@ def _run_manifest_task(
             benchmark="manifest",
             task_id=task_id,
             status=result.status,
-            scored=result.task_valid,
+            scored=_is_scored_result(result),
             test_command=_command_label(visible_command),
             test_output=final_visible.output if final_visible else error,
             task_valid=result.task_valid,
@@ -895,6 +998,294 @@ def _run_manifest_task(
             visible_test_command=_command_label(visible_command),
             visible_test_output=final_visible.output if final_visible else None,
             initial_visible_output=initial_visible.output,
+            memory_mode=result.memory_mode,
+            stream_id=result.stream_id,
+            memory_dir=result.memory_dir,
+            memory_project_key=result.memory_project_key,
+            memory_entries_before=result.memory_entries_before,
+            memory_entries_after=result.memory_entries_after,
+            memory_growth=result.memory_growth,
+            memory_entries_total_before=result.memory_entries_total_before,
+            memory_entries_total_after=result.memory_entries_total_after,
+            memory_total_growth=result.memory_total_growth,
+        )
+    return result
+
+
+def _run_external_state_task(
+    task: Mapping[str, Any],
+    *,
+    task_id: str,
+    source: str,
+    task_group: str,
+    tags: list[str],
+    safe_id: str,
+    manifest_path: Path,
+    patch_root: Path,
+    memory_stream: MemoryStreamResolution,
+    task_config: AgentConfig,
+    before_counts: Mapping[str, int],
+    baseline_repo: Path,
+    initial_repo: Path,
+    work_repo: Path,
+    task_trace_dir: Path,
+    command_env: Mapping[str, str],
+    env_overrides: Mapping[str, str],
+    mode: str,
+    max_steps: int | None,
+    command_timeout: int,
+    agent_runner: AgentRunnerFn,
+    shared_policy: AgentLLM | None,
+    shared_embedding_retriever: EmbeddingRetriever | None,
+    started: float,
+) -> ManifestEvalResult:
+    initial_command = _required_external_command(
+        task.get("initial_environment_command"),
+        field_name="initial_environment_command",
+    )
+    hidden_command = _required_external_command(
+        task.get("hidden_test_command"),
+        field_name="hidden_test_command",
+    )
+    if task.get("agent_test_command") or task.get("test_command") or task.get(
+        "visible_test_command"
+    ):
+        raise ValueError("external_state tasks must not expose an agent test command")
+    evaluator_name, evaluator_version, evaluator_hash = _external_evaluator_identity(task)
+    official_result_path = _external_official_result_path(task, manifest_path=manifest_path)
+    initial_visible = CommandResult(
+        command="",
+        ok=True,
+        returncode=0,
+        skipped=True,
+    )
+    initial_environment = run_test_command(
+        initial_command,
+        cwd=initial_repo,
+        timeout=command_timeout,
+        env=command_env,
+    )
+    state: Any | None = None
+    error = ""
+    failure_type = ""
+    task_valid = initial_environment.ok
+    outcome_finalized = False
+    resolved = False
+    reward = 0.0
+    final_hidden: CommandResult | None = None
+    evolver_writer_status = ""
+    written_memory_ids: list[str] = []
+    repository_revision_after_writer = ""
+    evolver_cadence_id = ""
+    evolver_maintenance_status = ""
+
+    if not initial_environment.ok:
+        failure_type = "environment_setup_failed"
+        error = initial_environment.output
+    else:
+        try:
+            runner_kwargs: dict[str, Any] = {
+                "repo_path": work_repo,
+                "task": str(task.get("task") or ""),
+                "test_command": "",
+                "config": task_config,
+                "max_steps": _task_max_steps(task, max_steps, task_config.max_steps),
+                "trace_dir": task_trace_dir,
+                "mode": mode,
+                "metadata": {
+                    "source_task": task_id,
+                    "task_id": task_id,
+                    "task_type": source or mode,
+                    "task_group": task_group,
+                    "stream_id": memory_stream.stream_id,
+                    "memory_mode": memory_stream.memory_mode,
+                    "memory_project_key": task_config.memory_project_key,
+                    "tags": tags,
+                },
+            }
+            if shared_policy is not None:
+                runner_kwargs["llm"] = shared_policy
+            if shared_embedding_retriever is not None:
+                runner_kwargs["memory_embedding_retriever"] = shared_embedding_retriever
+            state = agent_runner(**runner_kwargs)
+        except Exception as exc:  # noqa: BLE001 - evaluator records infrastructure failures.
+            error = f"{type(exc).__name__}: {exc}"
+
+        stop_reason = str(getattr(state, "stop_reason", "") or "")
+        if error or state is None or stop_reason in _AGENT_INFRASTRUCTURE_STOP_REASONS:
+            failure_type = "agent_infrastructure_failed"
+            if not error:
+                detail = stop_reason or "missing agent state"
+                error = f"AgentInfrastructureError: {detail}"
+        else:
+            try:
+                official_result_path.parent.mkdir(parents=True, exist_ok=True)
+                official_result_path.unlink(missing_ok=True)
+            except OSError as exc:
+                error = f"{type(exc).__name__}: {exc}"
+                failure_type = "evaluator_error"
+            if not failure_type:
+                raw_final_hidden = run_test_command(
+                    hidden_command,
+                    cwd=work_repo,
+                    timeout=command_timeout,
+                    env=command_env,
+                )
+                final_hidden = _without_command_output(raw_final_hidden)
+                try:
+                    official = _load_external_official_result(
+                        official_result_path,
+                        task_id=task_id,
+                        evaluator_hash=evaluator_hash,
+                        returncode=raw_final_hidden.returncode,
+                    )
+                except (OSError, ValueError, json.JSONDecodeError) as exc:
+                    error = f"{type(exc).__name__}: {exc}"
+                    failure_type = "evaluator_error"
+                else:
+                    resolved = official.resolved
+                    reward = official.reward
+                    outcome_finalized = True
+                    failure_type = "" if resolved else "official_evaluator_failed"
+
+    authoritative_resolved = resolved
+    if outcome_finalized and task_config.memory_evolver_mode == "formal":
+        episode = getattr(state, "evolver_episode", None) if state is not None else None
+        if not isinstance(episode, AgentEpisodeArtifact):
+            error = error or "RuntimeError: formal task did not produce AgentEpisodeArtifact"
+            resolved = False
+            failure_type = "evolver_finalize_failed"
+        else:
+            try:
+                final_store = ExperienceStore.from_dir(task_config.memory_dir)
+                final_store.load()
+                finalize_writer = TraceWriter(episode.trace_path)
+
+                def trace_sink(event, payload):
+                    finalize_writer.append(
+                        TraceEvent(
+                            event=event,
+                            payload=payload,
+                            run_id=str(getattr(state, "run_id", task_id)),
+                        )
+                    )
+
+                active_coordinator = getattr(state, "evolver_coordinator", None)
+                if isinstance(active_coordinator, EvolverCoordinator):
+                    active_coordinator.set_trace_sink(trace_sink)
+                    coordinator = active_coordinator
+                else:
+                    coordinator = EvolverCoordinator(
+                        store=final_store,
+                        project_key=episode.session.memory_project_key,
+                        policy_identity=episode.session.policy_identity,
+                        trace_sink=trace_sink,
+                    )
+                finalize_result = coordinator.finalize_task(
+                    episode,
+                    AuthoritativeTaskOutcome(
+                        task_id=task_id,
+                        task_group=task_group,
+                        task_valid=True,
+                        resolved=authoritative_resolved,
+                        reward=reward,
+                        evaluator=EvaluatorIdentity(
+                            evaluator_name,
+                            evaluator_version,
+                            evaluator_hash,
+                        ),
+                        outcome_finalized=True,
+                    ),
+                )
+                evolver_writer_status = finalize_result.writer_status
+                written_memory_ids = list(finalize_result.written_memory_ids)
+                repository_revision_after_writer = finalize_result.repository_revision_after
+                evolver_cadence_id = finalize_result.cadence_id or ""
+                evolver_maintenance_status = finalize_result.maintenance_status or ""
+            except Exception as exc:  # noqa: BLE001 - formal collection must fail closed
+                error = f"{type(exc).__name__}: {exc}"
+                resolved = False
+                failure_type = "evolver_finalize_failed"
+
+    changed_files = compare_changed_files(baseline_repo, work_repo)
+    patch_text = build_patch_diff(baseline_repo, work_repo, changed_files)
+    patch_path = patch_root / f"{safe_id}.diff"
+    patch_path.write_text(patch_text, encoding="utf-8")
+    trace_path = str(getattr(state, "trace_path", "") or "")
+    metrics = _metrics_for_trace(trace_path, task_trace_dir)
+    after_counts = _memory_counts(
+        task_config.memory_dir,
+        project_key=task_config.memory_project_key,
+    )
+    memory_fields = _memory_result_fields(
+        memory_stream=memory_stream,
+        memory_dir=task_config.memory_dir,
+        memory_project_key=task_config.memory_project_key,
+        before_counts=before_counts,
+        after_counts=after_counts,
+    )
+    result = ManifestEvalResult(
+        task_id=task_id,
+        status="passed" if resolved else "failed",
+        resolved=resolved,
+        task_valid=task_valid,
+        failure_type=failure_type,
+        initial_visible=initial_visible,
+        evaluation_kind=EVALUATION_KIND_EXTERNAL_STATE,
+        initial_environment=initial_environment,
+        agent_final_answer=_agent_final_answer(state),
+        official_result_path=str(official_result_path),
+        source=source,
+        task_group=task_group,
+        reward=reward,
+        evaluator_name=evaluator_name,
+        evaluator_version=evaluator_version,
+        evaluator_hash=evaluator_hash,
+        outcome_finalized=outcome_finalized,
+        evolver_writer_status=evolver_writer_status,
+        written_memory_ids=written_memory_ids,
+        repository_revision_after_writer=repository_revision_after_writer,
+        evolver_cadence_id=evolver_cadence_id,
+        evolver_maintenance_status=evolver_maintenance_status,
+        mode=mode,
+        tags=tags,
+        env_overrides=dict(env_overrides),
+        resolved_config=_config_snapshot(task_config),
+        initial_hidden=None,
+        final_visible=None,
+        final_hidden=final_hidden,
+        patch_apply_ok=True,
+        changed_files=changed_files,
+        patch_lines=len(patch_text.splitlines()),
+        patch_path=str(patch_path),
+        trace_path=trace_path,
+        metrics=metrics,
+        **memory_fields,
+        agent_steps=int(getattr(state, "steps", 0) or 0),
+        agent_done=bool(getattr(state, "done", False)),
+        agent_stop_reason=str(getattr(state, "stop_reason", "") or ""),
+        error=error,
+        elapsed_sec=time.monotonic() - started,
+    )
+    if state is not None:
+        record_benchmark_result(
+            state,
+            benchmark="manifest",
+            task_id=task_id,
+            status=result.status,
+            scored=_is_scored_result(result),
+            test_command="",
+            test_output=error,
+            task_valid=task_valid,
+            initial_visible_ok=True,
+            initial_hidden_ok=None,
+            visible_ok=resolved if outcome_finalized else None,
+            hidden_ok=None,
+            resolved=resolved,
+            failure_type=failure_type,
+            patch_apply_ok=True,
+            changed_files=changed_files,
+            patch_lines=result.patch_lines,
             memory_mode=result.memory_mode,
             stream_id=result.stream_id,
             memory_dir=result.memory_dir,
@@ -955,6 +1346,100 @@ def run_test_command(
             output=f"Command not found: {exc}",
             elapsed_sec=time.monotonic() - started,
         )
+
+
+def _required_external_command(value: object, *, field_name: str) -> str | Sequence[str]:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        raise ValueError(f"external_state task requires {field_name}")
+    if isinstance(value, str):
+        return value
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        if not value:
+            raise ValueError(f"external_state task requires {field_name}")
+        return [str(part) for part in value]
+    raise ValueError(f"external_state {field_name} must be a string or argv array")
+
+
+def _external_evaluator_identity(task: Mapping[str, Any]) -> tuple[str, str, str]:
+    evaluator_name = str(task.get("evaluator_name") or "").strip()
+    evaluator_version = str(task.get("evaluator_version") or "").strip()
+    evaluator_hash = str(task.get("evaluator_hash") or "").strip()
+    if not evaluator_name or not evaluator_version:
+        raise ValueError("external_state task requires evaluator_name and evaluator_version")
+    require_sha256(evaluator_hash, field_name="external_state evaluator_hash")
+    return evaluator_name, evaluator_version, evaluator_hash
+
+
+def _external_official_result_path(
+    task: Mapping[str, Any],
+    *,
+    manifest_path: Path,
+) -> Path:
+    raw_path = task.get("official_result_path")
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        raise ValueError("external_state task requires official_result_path")
+    path = Path(raw_path).expanduser()
+    if not path.is_absolute():
+        path = manifest_path.parent / path
+    resolved = path.resolve()
+    task_output_root = manifest_path.parent.resolve()
+    try:
+        relative = resolved.relative_to(task_output_root)
+    except ValueError as exc:
+        raise ValueError(
+            "external_state official_result_path must remain inside the task output"
+        ) from exc
+    if not relative.parts:
+        raise ValueError("external_state official_result_path must name a file")
+    return resolved
+
+
+def _load_external_official_result(
+    path: Path,
+    *,
+    task_id: str,
+    evaluator_hash: str,
+    returncode: int,
+) -> OfficialEvaluatorResult:
+    if returncode not in {0, 1}:
+        raise ValueError(f"official evaluator returned infrastructure code {returncode}")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, Mapping):
+        raise ValueError("official evaluator result must be a JSON object")
+    expected_fields = {
+        "schema_version",
+        "task_id",
+        "evaluator_hash",
+        "resolved",
+        "reward",
+        "status",
+    }
+    if set(payload) != expected_fields:
+        raise ValueError("official evaluator result fields do not match the v1 schema")
+    official = OfficialEvaluatorResult.from_dict(payload)
+    if official.task_id != task_id:
+        raise ValueError("official evaluator result task_id mismatch")
+    if official.evaluator_hash != evaluator_hash:
+        raise ValueError("official evaluator result evaluator_hash mismatch")
+    expected_resolved = returncode == 0
+    if official.resolved is not expected_resolved:
+        raise ValueError("official evaluator result conflicts with scorer return code")
+    return official
+
+
+def _without_command_output(result: CommandResult) -> CommandResult:
+    return CommandResult(
+        command=result.command,
+        ok=result.ok,
+        returncode=result.returncode,
+        output="",
+        elapsed_sec=result.elapsed_sec,
+        skipped=result.skipped,
+    )
+
+
+def _agent_final_answer(state: Any | None) -> str:
+    return str(getattr(state, "final_answer", "") or "")[:_AGENT_FINAL_ANSWER_MAX_CHARS]
 
 
 def compare_changed_files(baseline: Path, changed: Path) -> list[str]:
@@ -1192,6 +1677,7 @@ def _config_for_eval_env(
         memory_evolver_tier_caps=dict(config.memory_evolver_tier_caps),
         memory_evolver_tier_weights=dict(config.memory_evolver_tier_weights),
         tool_env_overrides=overrides,
+        tool_config_paths=tuple(config.tool_config_paths),
     )
 
 
