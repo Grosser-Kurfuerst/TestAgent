@@ -193,6 +193,8 @@ class CliTests(unittest.TestCase):
                 "AGENTCLI_MEMORY_EVOLVER_MODE": "formal",
                 "AGENTCLI_MEMORY_EVOLVER_CANDIDATE_TOP_K_PER_TIER": "16",
                 "AGENTCLI_MEMORY_EVOLVER_SELECTION_PROMPT_TOKENS": "512",
+                "AGENTCLI_MEMORY_EVOLVER_GENERATION_TEMPERATURE": "0",
+                "AGENTCLI_MEMORY_EVOLVER_GENERATION_TOP_P": "1",
                 "AGENTCLI_MEMORY_EVOLVER_MAINTENANCE_INTERVAL_TASKS": "8",
                 "AGENTCLI_MEMORY_EVOLVER_MAINTENANCE_MAX_TURNS": "2",
                 "AGENTCLI_MEMORY_EVOLVER_DATASET_DIR": "/tmp/opd-datasets",
@@ -216,6 +218,8 @@ class CliTests(unittest.TestCase):
         self.assertEqual(config.memory_evolver_mode, "formal")
         self.assertEqual(config.memory_evolver_candidate_top_k_per_tier, 16)
         self.assertEqual(config.memory_evolver_selection_prompt_tokens, 512)
+        self.assertEqual(config.memory_evolver_generation_temperature, 0.0)
+        self.assertEqual(config.memory_evolver_generation_top_p, 1.0)
         self.assertEqual(config.memory_evolver_maintenance_interval_tasks, 8)
         self.assertEqual(config.memory_evolver_maintenance_max_turns, 2)
         self.assertEqual(config.memory_evolver_dataset_dir, Path("/tmp/opd-datasets"))
