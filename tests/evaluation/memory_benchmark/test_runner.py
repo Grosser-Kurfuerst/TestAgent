@@ -199,10 +199,12 @@ class FakeManifestRunner:
         formal: bool,
         outcomes: dict[str, bool] | None = None,
         infrastructure_task: str = "",
+        formal_usage: bool = False,
     ) -> None:
         self.formal = formal
         self.outcomes = dict(outcomes or {})
         self.infrastructure_task = infrastructure_task
+        self.formal_usage = formal_usage
         self.calls: list[dict[str, Any]] = []
         self.visible_counts_before: list[int] = []
 
@@ -246,11 +248,7 @@ class FakeManifestRunner:
             status="passed" if resolved else "failed",
             resolved=resolved,
             task_valid=True,
-            failure_type=(
-                "evaluator_error"
-                if infrastructure
-                else ("" if resolved else "official_evaluator_failed")
-            ),
+            failure_type=("evaluator_error" if infrastructure else ("" if resolved else "official_evaluator_failed")),
             initial_visible=CommandResult("", True, 0, skipped=True),
             evaluation_kind="external_state",
             agent_final_answer=f"finished {task_id}",
@@ -277,6 +275,29 @@ class FakeManifestRunner:
             agent_done=True,
             agent_stop_reason="assistant_final",
             error="fixture infrastructure error" if infrastructure else "",
+            metrics=(
+                {
+                    "llm_iterations": 1,
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "total_tokens": 15,
+                    "actor_usage_available": True,
+                    "memory_prompt_tokens": 3,
+                    "memory_completion_tokens": 2,
+                    "memory_total_tokens": 5,
+                    "memory_tokens_by_role": {
+                        "selection": {
+                            "prompt_tokens": 3,
+                            "completion_tokens": 2,
+                            "total_tokens": 5,
+                        }
+                    },
+                    "memory_usage_available": True,
+                    "memory_usage_unavailable_reason": "",
+                }
+                if self.formal_usage
+                else {}
+            ),
         )
         output_dir = Path(kwargs["output_dir"])
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -375,7 +396,10 @@ def test_no_memory_stream_preserves_order_react_mode_and_zero_growth(
         manifest_runner=manifest,
     )
 
-    assert [execution.task.task_id for execution in result.executions] == ["task-1", "task-2"]
+    assert [execution.task.task_id for execution in result.executions] == [
+        "task-1",
+        "task-2",
+    ]
     assert adapter.prepared_ids == ["task-1", "task-2"]
     assert adapter.cleaned_ids == ["task-1", "task-2"]
     assert [call["mode"] for call in manifest.calls] == ["react", "react"]
@@ -401,7 +425,9 @@ def test_no_memory_stream_preserves_order_react_mode_and_zero_growth(
         assert execution.public_episode_path.exists()
 
 
-def test_four_tier_stream_reuses_repository_and_original_agent_runner(tmp_path: Path) -> None:
+def test_four_tier_stream_reuses_repository_and_original_agent_runner(
+    tmp_path: Path,
+) -> None:
     output = tmp_path / "stream"
     project_key = _project_key("agentcli_four_tier")
     backend = AgentCliFourTierBackend(
@@ -432,14 +458,37 @@ def test_four_tier_stream_reuses_repository_and_original_agent_runner(tmp_path: 
     assert [row.order_index for row in rows] == [1, 2]
     assert all(row.arm == "agentcli_four_tier" for row in rows)
     assert all(not row.memory_usage_available for row in rows)
-    derived = json.loads(
-        (output / "tasks" / "0002_task-2" / "derived_manifest.json").read_text(
-            encoding="utf-8"
-        )
-    )
+    derived = json.loads((output / "tasks" / "0002_task-2" / "derived_manifest.json").read_text(encoding="utf-8"))
     env = derived["tasks"][0]["env_overrides"]
     assert env["AGENTCLI_MEMORY_DIR"] == str((output / "memory").resolve())
     assert env["AGENTCLI_MEMORY_PROJECT_KEY"] == project_key
+
+
+def test_four_tier_task_result_uses_formal_decision_token_metrics(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "stream"
+    backend = AgentCliFourTierBackend(
+        stream_memory_dir=output / "memory",
+        stream_project_key=_project_key("agentcli_four_tier"),
+    )
+
+    result = _run(
+        tmp_path,
+        backend=backend,
+        adapter=FakeAdapter(),
+        manifest_runner=FakeManifestRunner(formal=True, formal_usage=True),
+        tasks=[_task(1)],
+    )
+
+    row = result.executions[0].task_result
+    assert row.actor_usage_available is True
+    assert row.memory_usage_available is True
+    assert row.memory_prompt_tokens == 3
+    assert row.memory_completion_tokens == 2
+    assert row.memory_total_tokens == 5
+    assert row.system_total_tokens == 20
+    assert row.memory_tokens_by_role["selection"].resolved_total_tokens == 5
 
 
 def test_no_memory_runner_integrates_with_real_manifest_path(tmp_path: Path) -> None:
@@ -518,13 +567,18 @@ def test_normal_task_failure_continues_the_stream(tmp_path: Path) -> None:
         manifest_runner=manifest,
     )
 
-    assert [execution.manifest_result.resolved for execution in result.executions] == [False, True]
+    assert [execution.manifest_result.resolved for execution in result.executions] == [
+        False,
+        True,
+    ]
     assert adapter.cleaned_ids == ["task-1", "task-2"]
     rows = [json.loads(line) for line in result.results_path.read_text().splitlines()]
     assert [row["failure_type"] for row in rows] == ["official_evaluator_failed", ""]
 
 
-def test_fake_eight_task_ab_stream_keeps_expected_repository_behavior(tmp_path: Path) -> None:
+def test_fake_eight_task_ab_stream_keeps_expected_repository_behavior(
+    tmp_path: Path,
+) -> None:
     tasks = [_task(index) for index in range(1, 9)]
     no_root = tmp_path / "no-memory"
     no_output = no_root / "stream"
@@ -568,7 +622,9 @@ def test_fake_eight_task_ab_stream_keeps_expected_repository_behavior(tmp_path: 
     )
 
 
-def test_infrastructure_failure_aborts_before_next_task_and_cleans_up(tmp_path: Path) -> None:
+def test_infrastructure_failure_aborts_before_next_task_and_cleans_up(
+    tmp_path: Path,
+) -> None:
     output = tmp_path / "stream"
     backend = NoMemoryBackend(
         stream_memory_dir=output / "memory",
@@ -628,7 +684,9 @@ def test_evaluator_infrastructure_failure_never_calls_formal_backend_finalize(
     assert ExperienceStore.from_dir(output / "memory").all() == []
 
 
-def test_cleanup_failure_aborts_stream_after_preserving_primary_artifacts(tmp_path: Path) -> None:
+def test_cleanup_failure_aborts_stream_after_preserving_primary_artifacts(
+    tmp_path: Path,
+) -> None:
     output = tmp_path / "stream"
     backend = NoMemoryBackend(
         stream_memory_dir=output / "memory",
@@ -651,7 +709,9 @@ def test_cleanup_failure_aborts_stream_after_preserving_primary_artifacts(tmp_pa
     assert (output / "results.jsonl").read_text(encoding="utf-8") == ""
 
 
-def test_runner_rejects_out_of_order_tasks_before_preparing_any_task(tmp_path: Path) -> None:
+def test_runner_rejects_out_of_order_tasks_before_preparing_any_task(
+    tmp_path: Path,
+) -> None:
     output = tmp_path / "stream"
     backend = NoMemoryBackend(
         stream_memory_dir=output / "memory",
@@ -727,7 +787,9 @@ def test_runner_refuses_to_overwrite_existing_stream_directory(tmp_path: Path) -
         )
 
 
-def test_runner_refuses_nonempty_memory_directory_outside_stream(tmp_path: Path) -> None:
+def test_runner_refuses_nonempty_memory_directory_outside_stream(
+    tmp_path: Path,
+) -> None:
     output = tmp_path / "stream"
     wrong_memory = tmp_path / "existing-memory"
     wrong_memory.mkdir()
@@ -891,10 +953,6 @@ def test_mem0_search_or_add_failure_aborts_stream_without_pseudo_result(
             tasks=[_task(1), _task(2)],
         )
 
-    rows = [
-        line
-        for line in (output / "results.jsonl").read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
+    rows = [line for line in (output / "results.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
     assert len(rows) == expected_rows
     assert client.closed is True

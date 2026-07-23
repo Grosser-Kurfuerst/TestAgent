@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
-import json
 import os
 import re
 
@@ -30,8 +29,9 @@ from my_agent.evaluation.memory_benchmark.contracts import (
     MemoryContextSelection,
     MemoryRepositorySnapshot,
     PreparedBenchmarkTask,
-    PublicEpisode,
+    ProviderUsage,
 )
+from my_agent.evaluation.memory_benchmark.public_episode import build_public_episode
 from my_agent.policy.identity import canonical_json_bytes, require_sha256
 
 
@@ -84,9 +84,7 @@ class MemoryBenchmarkInfrastructureError(RuntimeError):
         self.task = task
         self.failures = tuple(failures)
         self.manifest_result = manifest_result
-        details = "; ".join(
-            f"{stage}={type(error).__name__}: {error}" for stage, error in self.failures
-        )
+        details = "; ".join(f"{stage}={type(error).__name__}: {error}" for stage, error in self.failures)
         super().__init__(f"memory benchmark task {task.task_id!r} aborted: {details}")
 
 
@@ -289,7 +287,7 @@ def _execute_prepared_task(
         _validate_manifest_result(task, manifest_result)
         adapter.finalize_task_artifacts(prepared)
         artifacts_finalized = True
-        episode = _build_public_episode(prepared, manifest_result)
+        episode = build_public_episode(prepared, manifest_result)
         public_episode_path = task_dir / "public_episode.json"
         _write_json_atomic(public_episode_path, episode.to_dict())
         backend_finalize = backend.finalize_task(episode, manifest_result)
@@ -414,34 +412,6 @@ def _validate_manifest_result(task: BenchmarkTask, result: ManifestEvalResult) -
         raise RuntimeError(f"manifest infrastructure failure: {detail}: {result.error}")
 
 
-def _build_public_episode(
-    prepared: PreparedBenchmarkTask,
-    result: ManifestEvalResult,
-) -> PublicEpisode:
-    actions: list[Mapping[str, Any]] = []
-    if not prepared.action_log_path.exists():
-        raise FileNotFoundError(f"final action log is missing: {prepared.action_log_path}")
-    for line_number, line in enumerate(
-        prepared.action_log_path.read_text(encoding="utf-8").splitlines(),
-        start=1,
-    ):
-        if not line.strip():
-            continue
-        payload = json.loads(line)
-        if not isinstance(payload, Mapping):
-            raise ValueError(f"action log line {line_number} must be a JSON object")
-        actions.append(dict(payload))
-    return PublicEpisode(
-        task_id=prepared.task.task_id,
-        instruction=prepared.public_prompt,
-        actions=tuple(actions),
-        final_response=result.agent_final_answer,
-        resolved=result.resolved,
-        reward=result.reward,
-        failure_type=result.failure_type,
-    )
-
-
 def _validate_benchmark_task_config(config: AgentConfig, *, backend_name: str) -> None:
     if not config.memory_enabled:
         raise RuntimeError("memory benchmark task must keep MemoryManager enabled")
@@ -451,9 +421,7 @@ def _validate_benchmark_task_config(config: AgentConfig, *, backend_name: str) -
         raise RuntimeError("plugins, MCP, and HITL must be disabled for memory benchmark")
     expected_mode = "formal" if backend_name == "agentcli_four_tier" else "off"
     if config.memory_evolver_mode != expected_mode:
-        raise RuntimeError(
-            f"backend {backend_name!r} requires memory_evolver_mode={expected_mode!r}"
-        )
+        raise RuntimeError(f"backend {backend_name!r} requires memory_evolver_mode={expected_mode!r}")
 
 
 def _validate_prepared_paths(prepared: PreparedBenchmarkTask, *, task_dir: Path) -> None:
@@ -513,47 +481,43 @@ def _build_task_result(
     raw_actor_prompt = int(metrics.get("prompt_tokens", 0) or 0)
     raw_actor_completion = int(metrics.get("completion_tokens", 0) or 0)
     raw_actor_total = int(metrics.get("total_tokens", 0) or 0)
-    actor_usage_available = (
-        int(metrics.get("llm_iterations", 0) or 0) > 0
-        and raw_actor_total > 0
+    actor_usage_available = bool(
+        metrics.get(
+            "actor_usage_available",
+            int(metrics.get("llm_iterations", 0) or 0) > 0 and raw_actor_total > 0,
+        )
     )
-    actor_prompt_tokens = (
-        raw_actor_prompt if actor_usage_available else None
-    )
-    actor_completion_tokens = (
-        raw_actor_completion if actor_usage_available else None
-    )
-    actor_total_tokens = (
-        raw_actor_total if actor_usage_available else None
-    )
+    actor_prompt_tokens = raw_actor_prompt if actor_usage_available else None
+    actor_completion_tokens = raw_actor_completion if actor_usage_available else None
+    actor_total_tokens = raw_actor_total if actor_usage_available else None
     if arm == "no_memory":
         memory_prompt_tokens = 0
         memory_completion_tokens = 0
         memory_total_tokens = 0
         memory_usage_available = True
         memory_usage_unavailable_reason = ""
+        memory_tokens_by_role: dict[str, ProviderUsage] = {}
     elif arm == "mem0":
         usage = backend_finalize.llm_usage
         memory_prompt_tokens = usage.prompt_tokens
         memory_completion_tokens = usage.completion_tokens
         memory_total_tokens = usage.resolved_total_tokens
         memory_usage_available = usage.available
-        memory_usage_unavailable_reason = (
-            ""
-            if usage.available
-            else "Mem0 provider did not return complete search/add LLM usage"
-        )
+        memory_usage_unavailable_reason = "" if usage.available else "Mem0 provider did not return complete search/add LLM usage"
+        memory_tokens_by_role = dict(backend_finalize.usage_by_role)
     else:
-        memory_prompt_tokens = None
-        memory_completion_tokens = None
-        memory_total_tokens = None
-        memory_usage_available = False
-        memory_usage_unavailable_reason = "formal memory decision usage is not available"
-    system_total_tokens = (
-        actor_total_tokens + memory_total_tokens
-        if actor_usage_available and memory_usage_available
-        else None
-    )
+        memory_tokens_by_role = _trace_provider_usages(metrics.get("memory_tokens_by_role"))
+        memory_usage_available = bool(metrics.get("memory_usage_available", False))
+        memory_prompt_tokens = _optional_metric_int(metrics.get("memory_prompt_tokens"))
+        memory_completion_tokens = _optional_metric_int(metrics.get("memory_completion_tokens"))
+        memory_total_tokens = _optional_metric_int(metrics.get("memory_total_tokens"))
+        memory_usage_unavailable_reason = str(metrics.get("memory_usage_unavailable_reason") or "")
+        if memory_usage_available and memory_total_tokens is None:
+            memory_usage_available = False
+            memory_usage_unavailable_reason = "formal memory trace did not provide a resolved total token count"
+        elif not memory_usage_available and not memory_usage_unavailable_reason:
+            memory_usage_unavailable_reason = "formal memory decision usage is not available"
+    system_total_tokens = actor_total_tokens + memory_total_tokens if actor_usage_available and memory_usage_available else None
     return MemoryBenchmarkTaskResult(
         run_id=run_id,
         seed=seed,
@@ -580,7 +544,7 @@ def _build_task_result(
         memory_prompt_tokens=memory_prompt_tokens,
         memory_completion_tokens=memory_completion_tokens,
         memory_total_tokens=memory_total_tokens,
-        memory_tokens_by_role=dict(backend_finalize.usage_by_role),
+        memory_tokens_by_role=memory_tokens_by_role,
         actor_usage_available=actor_usage_available,
         memory_usage_available=memory_usage_available,
         memory_usage_unavailable_reason=memory_usage_unavailable_reason,
@@ -590,14 +554,10 @@ def _build_task_result(
         elapsed_sec=manifest_result.elapsed_sec,
         memory={
             "candidate_count": (
-                int(metrics.get("evolver_candidates_total", 0) or 0)
-                if arm == "agentcli_four_tier"
-                else context.candidate_count
+                int(metrics.get("evolver_candidates_total", 0) or 0) if arm == "agentcli_four_tier" else context.candidate_count
             ),
             "selected_count": (
-                int(metrics.get("evolver_selected_total", 0) or 0)
-                if arm == "agentcli_four_tier"
-                else context.selected_count
+                int(metrics.get("evolver_selected_total", 0) or 0) if arm == "agentcli_four_tier" else context.selected_count
             ),
             "selected_content_tokens": context.selected_content_tokens,
             "injected_tokens": context.estimated_tokens,
@@ -620,7 +580,30 @@ def _build_task_result(
     )
 
 
-def _validate_ordered_tasks(tasks: Sequence[BenchmarkTask]) -> tuple[BenchmarkTask, ...]:
+def _trace_provider_usages(value: object) -> dict[str, ProviderUsage]:
+    if not isinstance(value, Mapping):
+        return {}
+    usages: dict[str, ProviderUsage] = {}
+    for role, raw_usage in value.items():
+        if not isinstance(role, str) or not role or not isinstance(raw_usage, Mapping):
+            continue
+        usages[role] = ProviderUsage(
+            prompt_tokens=_optional_metric_int(raw_usage.get("prompt_tokens")),
+            completion_tokens=_optional_metric_int(raw_usage.get("completion_tokens")),
+            total_tokens=_optional_metric_int(raw_usage.get("total_tokens")),
+        )
+    return usages
+
+
+def _optional_metric_int(value: object) -> int | None:
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return None
+
+
+def _validate_ordered_tasks(
+    tasks: Sequence[BenchmarkTask],
+) -> tuple[BenchmarkTask, ...]:
     ordered = tuple(tasks)
     if any(not isinstance(task, BenchmarkTask) for task in ordered):
         raise ValueError("tasks must contain only BenchmarkTask values")
