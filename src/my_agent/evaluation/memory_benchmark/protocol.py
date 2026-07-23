@@ -270,6 +270,7 @@ class MemoryBenchmarkProtocol:
     selected_content_max_tokens: int
     maintenance_interval_tasks: int
     actor_sampling_seed_supported: bool
+    pilot: bool = False
 
     def __post_init__(self) -> None:
         task_ids = {
@@ -374,6 +375,8 @@ class MemoryBenchmarkProtocol:
             raise ValueError("memory_generation_top_p must be in (0, 1]")
         if not isinstance(self.actor_sampling_seed_supported, bool):
             raise ValueError("actor_sampling_seed_supported must be a bool")
+        if not isinstance(self.pilot, bool):
+            raise ValueError("pilot must be a bool")
 
     @property
     def protocol_hash(self) -> str:
@@ -416,6 +419,7 @@ class MemoryBenchmarkProtocol:
             "selected_content_max_tokens": self.selected_content_max_tokens,
             "maintenance_interval_tasks": self.maintenance_interval_tasks,
             "actor_sampling_seed_supported": self.actor_sampling_seed_supported,
+            "pilot": self.pilot,
         }
 
     @classmethod
@@ -539,6 +543,7 @@ class MemoryBenchmarkProtocol:
                 data.get("actor_sampling_seed_supported"),
                 field_name="actor_sampling_seed_supported",
             ),
+            pilot=_required_bool(data.get("pilot", False), field_name="pilot"),
         )
 
 

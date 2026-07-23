@@ -82,7 +82,15 @@ def test_same_protocol_has_stable_hash_and_round_trips() -> None:
 
     assert restored == protocol
     assert restored.protocol_hash == protocol.protocol_hash
-    assert "run_seed" not in protocol.to_dict()
+
+
+def test_pilot_flag_changes_protocol_hash_and_round_trips() -> None:
+    formal = _protocol()
+    pilot = replace(formal, pilot=True)
+
+    assert pilot.protocol_hash != formal.protocol_hash
+    assert MemoryBenchmarkProtocol.from_dict(pilot.to_dict()) == pilot
+    assert "run_seed" not in pilot.to_dict()
 
 
 def test_protocol_mappings_cannot_mutate_after_hashing() -> None:

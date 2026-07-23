@@ -48,24 +48,71 @@ def write_runtime_repo(repo: Path) -> None:
 
 
 class CliTests(unittest.TestCase):
-    def test_build_parser_includes_memory_benchmark_smoke(self) -> None:
-        args = build_parser().parse_args(
+    def test_build_parser_includes_memory_benchmark_workflow(self) -> None:
+        parser = build_parser()
+        prepare = parser.parse_args(
+            ["memory-benchmark", "prepare", "--config", "config.json"]
+        )
+        preflight = parser.parse_args(
+            [
+                "memory-benchmark",
+                "preflight",
+                "--config",
+                "config.json",
+                "--run-dir",
+                "run",
+                "--checkpoint",
+                "checkpoint",
+                "--identity-manifest",
+                "identity.json",
+                "--benchmarks",
+                "intercode_bash",
+                "--limit",
+                "2",
+            ]
+        )
+        smoke = parser.parse_args(
             [
                 "memory-benchmark",
                 "smoke",
                 "--config",
-                "configs/memory_benchmark/v1.json",
+                "config.json",
                 "--checkpoint",
                 "checkpoint",
                 "--identity-manifest",
-                "policy_identity_manifest.json",
+                "identity.json",
             ]
         )
+        run = parser.parse_args(
+            [
+                "memory-benchmark",
+                "run",
+                "--config",
+                "config.json",
+                "--run-dir",
+                "run",
+                "--checkpoint",
+                "checkpoint",
+                "--identity-manifest",
+                "identity.json",
+                "--seed",
+                "42",
+                "--arms",
+                "no_memory,agentcli_four_tier,mem0",
+            ]
+        )
+        report = parser.parse_args(
+            ["memory-benchmark", "report", "--run-dir", "run"]
+        )
 
-        self.assertEqual(args.command, "memory-benchmark")
-        self.assertEqual(args.memory_benchmark_command, "smoke")
-        self.assertEqual(args.checkpoint, "checkpoint")
-        self.assertEqual(args.identity_manifest, "policy_identity_manifest.json")
+        self.assertEqual(prepare.memory_benchmark_command, "prepare")
+        self.assertEqual(preflight.memory_benchmark_command, "preflight")
+        self.assertEqual(preflight.benchmarks, "intercode_bash")
+        self.assertEqual(preflight.limit, 2)
+        self.assertEqual(smoke.memory_benchmark_command, "smoke")
+        self.assertEqual(run.memory_benchmark_command, "run")
+        self.assertEqual(run.seed, 42)
+        self.assertEqual(report.memory_benchmark_command, "report")
 
     def test_load_sample_task(self) -> None:
         task = load_task(DEFAULT_TASK_FILE)
