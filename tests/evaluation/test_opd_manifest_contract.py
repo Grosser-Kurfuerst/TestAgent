@@ -39,6 +39,8 @@ class OpdManifestContractTests(unittest.TestCase):
                 "AGENTCLI_POLICY_TOKENIZER_REVISION": "tokenizer-revision-1",
                 "AGENTCLI_POLICY_IDENTITY_MANIFEST": "/tmp/policy-identity.json",
                 "AGENTCLI_EMBEDDING_REVISION": "embedding-revision-1",
+                "AGENTCLI_MEMORY_EVOLVER_GENERATION_TEMPERATURE": "0",
+                "AGENTCLI_MEMORY_EVOLVER_GENERATION_TOP_P": "1",
             },
             require_env_file=False,
         )
@@ -49,6 +51,8 @@ class OpdManifestContractTests(unittest.TestCase):
         self.assertEqual(values["AGENTCLI_POLICY_BASE_REVISION"], "model-revision-1")
         self.assertEqual(values["AGENTCLI_POLICY_IDENTITY_MANIFEST"], "/tmp/policy-identity.json")
         self.assertEqual(values["AGENTCLI_EMBEDDING_REVISION"], "embedding-revision-1")
+        self.assertEqual(values["AGENTCLI_MEMORY_EVOLVER_GENERATION_TEMPERATURE"], "0.0")
+        self.assertEqual(values["AGENTCLI_MEMORY_EVOLVER_GENERATION_TOP_P"], "1.0")
 
         with tempfile.TemporaryDirectory() as tmp:
             resolved = _config_for_eval_env(
@@ -60,6 +64,8 @@ class OpdManifestContractTests(unittest.TestCase):
             )
         self.assertEqual(resolved.memory_evolver_mode, "formal")
         self.assertEqual(resolved.policy_base_revision, "model-revision-1")
+        self.assertEqual(resolved.memory_evolver_generation_temperature, 0.0)
+        self.assertEqual(resolved.memory_evolver_generation_top_p, 1.0)
 
     def test_formal_eval_config_round_trip_preserves_runtime_ablation(self) -> None:
         cases = (

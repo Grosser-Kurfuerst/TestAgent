@@ -1144,6 +1144,14 @@ def _config_for_eval_env(
             "MY_AGENT_MEMORY_EVOLVER_SELECTION_PROMPT_TOKENS",
         ),
         (
+            "AGENTCLI_MEMORY_EVOLVER_GENERATION_TEMPERATURE",
+            "MY_AGENT_MEMORY_EVOLVER_GENERATION_TEMPERATURE",
+        ),
+        (
+            "AGENTCLI_MEMORY_EVOLVER_GENERATION_TOP_P",
+            "MY_AGENT_MEMORY_EVOLVER_GENERATION_TOP_P",
+        ),
+        (
             "AGENTCLI_MEMORY_EVOLVER_MAINTENANCE_INTERVAL_TASKS",
             "MY_AGENT_MEMORY_EVOLVER_MAINTENANCE_INTERVAL_TASKS",
         ),
@@ -1312,6 +1320,12 @@ def _config_env_values(config: AgentConfig) -> dict[str, str]:
             ),
             "AGENTCLI_MEMORY_EVOLVER_SELECTION_PROMPT_TOKENS": str(
                 config.memory_evolver_selection_prompt_tokens
+            ),
+            "AGENTCLI_MEMORY_EVOLVER_GENERATION_TEMPERATURE": str(
+                config.memory_evolver_generation_temperature
+            ),
+            "AGENTCLI_MEMORY_EVOLVER_GENERATION_TOP_P": str(
+                config.memory_evolver_generation_top_p
             ),
             "AGENTCLI_MEMORY_EVOLVER_MAINTENANCE_INTERVAL_TASKS": str(
                 config.memory_evolver_maintenance_interval_tasks
