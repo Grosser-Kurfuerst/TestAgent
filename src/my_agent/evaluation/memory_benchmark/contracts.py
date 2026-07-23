@@ -630,6 +630,7 @@ class BackendFinalizeResult:
     embedding_calls: int = 0
     embedding_elapsed_sec: float = 0.0
     elapsed_sec: float = 0.0
+    metrics: Mapping[str, Any] = field(default_factory=dict)
     error: str = ""
 
     def __post_init__(self) -> None:
@@ -654,6 +655,7 @@ class BackendFinalizeResult:
             field_name="embedding_elapsed_sec",
         )
         _require_non_negative_float(self.elapsed_sec, field_name="elapsed_sec")
+        object.__setattr__(self, "metrics", dict(self.metrics))
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -667,6 +669,7 @@ class BackendFinalizeResult:
             "embedding_calls": self.embedding_calls,
             "embedding_elapsed_sec": self.embedding_elapsed_sec,
             "elapsed_sec": self.elapsed_sec,
+            "metrics": dict(self.metrics),
             "error": self.error,
         }
 
@@ -699,6 +702,7 @@ class BackendFinalizeResult:
             elapsed_sec=_required_float(
                 data.get("elapsed_sec", 0.0), field_name="elapsed_sec"
             ),
+            metrics=_required_mapping(data.get("metrics", {}), field_name="metrics"),
             error=str(data.get("error", "")),
         )
 

@@ -30,6 +30,11 @@ from my_agent.evaluation.memory_benchmark.backends import (
     NoMemoryBackend,
     memory_stream_project_key,
 )
+from my_agent.evaluation.memory_benchmark.api_config import ApiEndpoint
+from my_agent.evaluation.memory_benchmark.api_embedding import (
+    MemoryBenchmarkApiEmbeddingEncoder,
+)
+from my_agent.evaluation.memory_benchmark.api_policy import MemoryBenchmarkApiPolicy
 from my_agent.evaluation.memory_benchmark.contracts import (
     BenchmarkTask,
     ExternalMemoryItem,
@@ -118,6 +123,108 @@ def _project_key(arm: str) -> str:
         seed=42,
         benchmark="lifelong_os",
         arm=arm,
+    )
+
+
+class _FourTierEmbeddingApi:
+    def create(self, *, model: str, input: list[str]) -> SimpleNamespace:
+        assert model == "text-embedding-v4"
+        return SimpleNamespace(
+            data=[
+                SimpleNamespace(index=index, embedding=[1.0, 0.0])
+                for index, _text in enumerate(input)
+            ]
+        )
+
+
+class _FourTierCompletions:
+    def __init__(self) -> None:
+        self.writing_calls = 0
+
+    def create(self, **kwargs: object) -> SimpleNamespace:
+        messages = kwargs["messages"]
+        assert isinstance(messages, list)
+        system = str(messages[0]["content"])
+        tool_calls: list[SimpleNamespace] = []
+        if system.startswith("Select zero or more"):
+            user = json.loads(str(messages[1]["content"]))
+            allowed = user["allowed_labels_by_tier"]
+            selected = {tier: [] for tier in ("skill", "tip", "tool", "trajectory")}
+            for tier in selected:
+                if allowed[tier]:
+                    selected[tier] = [allowed[tier][0]]
+                    break
+            content = json.dumps(
+                {
+                    "selected_skills": selected["skill"],
+                    "selected_tips": selected["tip"],
+                    "selected_tools": selected["tool"],
+                    "selected_trajectories": selected["trajectory"],
+                    "reasoning": "fixture",
+                }
+            )
+        elif system.startswith("Extract only reusable"):
+            self.writing_calls += 1
+            content = (
+                '[{"tier":"tip","content":"Reuse the verified benchmark action pattern.",'
+                '"payload":{"category":"benchmark","severity":"info",'
+                '"trigger":"when executing a similar benchmark task"},'
+                '"confidence":0.9,"reason":"supported by the public episode"}]'
+                if self.writing_calls == 1
+                else "[]"
+            )
+        else:
+            content = ""
+            tool_calls = [
+                SimpleNamespace(
+                    id="finish-1",
+                    function=SimpleNamespace(
+                        name="finish", arguments='{"summary":"fixture"}'
+                    ),
+                )
+            ]
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content=content, tool_calls=tool_calls),
+                    finish_reason="tool_calls" if tool_calls else "stop",
+                )
+            ],
+            usage=SimpleNamespace(
+                prompt_tokens=10,
+                completion_tokens=2,
+                total_tokens=12,
+            ),
+        )
+
+
+def _four_tier_backend(
+    memory_dir: Path,
+    *,
+    maintenance_interval_tasks: int = 30,
+) -> AgentCliFourTierBackend:
+    endpoint = ApiEndpoint(
+        api_key="secret",
+        base_url="https://example.test/v1",
+        model="qwen-plus",
+        endpoint_hash=HASH,
+    )
+    policy = MemoryBenchmarkApiPolicy(
+        endpoint,
+        client=SimpleNamespace(
+            chat=SimpleNamespace(completions=_FourTierCompletions())
+        ),
+    )
+    embedding = MemoryBenchmarkApiEmbeddingEncoder(
+        replace(endpoint, model="text-embedding-v4"),
+        client=SimpleNamespace(embeddings=_FourTierEmbeddingApi()),
+    )
+    return AgentCliFourTierBackend(
+        stream_memory_dir=memory_dir,
+        stream_project_key=_project_key("agentcli_four_tier"),
+        policy=policy,
+        embedding_encoder=embedding,
+        maintenance_interval_tasks=maintenance_interval_tasks,
     )
 
 
@@ -436,17 +543,14 @@ def test_no_memory_stream_preserves_order_react_mode_and_zero_growth(
         assert execution.public_episode_path.exists()
 
 
-def test_four_tier_stream_reuses_repository_and_original_agent_runner(
+def test_four_tier_stream_reuses_repository_and_external_context_runner(
     tmp_path: Path,
 ) -> None:
     output = tmp_path / "stream"
     project_key = _project_key("agentcli_four_tier")
-    backend = AgentCliFourTierBackend(
-        stream_memory_dir=output / "memory",
-        stream_project_key=project_key,
-    )
+    backend = _four_tier_backend(output / "memory")
     adapter = FakeAdapter()
-    manifest = FakeManifestRunner(formal=True)
+    manifest = FakeManifestRunner(formal=False)
 
     result = _run(
         tmp_path,
@@ -456,8 +560,8 @@ def test_four_tier_stream_reuses_repository_and_original_agent_runner(
     )
 
     assert manifest.visible_counts_before == [0, 1]
-    assert all(call["agent_runner"] is run_agent for call in manifest.calls)
-    assert result.executions[0].backend_finalize.written_ids == ("memory-task-1",)
+    assert all(call["agent_runner"] is not run_agent for call in manifest.calls)
+    assert len(result.executions[0].backend_finalize.written_ids) == 1
     assert result.executions[0].memory_after.entry_count == 1
     assert result.executions[1].memory_before.revision == result.executions[0].memory_after.revision
     assert result.executions[1].memory_after.entry_count == 1
@@ -468,47 +572,46 @@ def test_four_tier_stream_reuses_repository_and_original_agent_runner(
     ]
     assert [row.order_index for row in rows] == [1, 2]
     assert all(row.arm == "agentcli_four_tier" for row in rows)
-    assert all(not row.memory_usage_available for row in rows)
+    assert all(row.memory_usage_available for row in rows)
+    assert rows[1].memory["candidate_count"] == 1
+    assert rows[1].memory["selected_count"] == 1
     derived = json.loads((output / "tasks" / "0002_task-2" / "derived_manifest.json").read_text(encoding="utf-8"))
     env = derived["tasks"][0]["env_overrides"]
     assert env["AGENTCLI_MEMORY_DIR"] == str((output / "memory").resolve())
     assert env["AGENTCLI_MEMORY_PROJECT_KEY"] == project_key
 
 
-def test_four_tier_task_result_uses_formal_decision_token_metrics(
+def test_four_tier_task_result_uses_backend_api_metrics(
     tmp_path: Path,
 ) -> None:
     output = tmp_path / "stream"
-    backend = AgentCliFourTierBackend(
-        stream_memory_dir=output / "memory",
-        stream_project_key=_project_key("agentcli_four_tier"),
-    )
+    backend = _four_tier_backend(output / "memory")
 
     result = _run(
         tmp_path,
         backend=backend,
         adapter=FakeAdapter(),
-        manifest_runner=FakeManifestRunner(formal=True, formal_usage=True),
+        manifest_runner=FakeManifestRunner(formal=False, formal_usage=True),
         tasks=[_task(1)],
     )
 
     row = result.executions[0].task_result
     assert row.actor_usage_available is True
     assert row.memory_usage_available is True
-    assert row.memory_prompt_tokens == 3
+    assert row.memory_prompt_tokens == 10
     assert row.memory_completion_tokens == 2
-    assert row.memory_total_tokens == 5
-    assert row.system_total_tokens == 20
-    assert row.memory_tokens_by_role["selection"].resolved_total_tokens == 5
-    assert row.memory["selected_content_tokens"] == 40
-    assert row.memory["injected_tokens"] == 48
-    assert row.memory["maintenance_runs"] == 1
+    assert row.memory_total_tokens == 12
+    assert row.system_total_tokens == 27
+    assert row.memory_tokens_by_role["writing"].resolved_total_tokens == 12
+    assert row.memory["selected_content_tokens"] == 0
+    assert row.memory["injected_tokens"] == 0
+    assert row.memory["maintenance_runs"] == 0
     assert row.memory["maintenance_actions"] == {
-        "keep": 2,
-        "delete": 1,
+        "keep": 0,
+        "delete": 0,
         "merge": 0,
         "promote": 0,
-        "removed_entries": 1,
+        "removed_entries": 0,
         "added_entries": 0,
     }
 
@@ -618,15 +721,12 @@ def test_fake_eight_task_ab_stream_keeps_expected_repository_behavior(
 
     formal_root = tmp_path / "four-tier"
     formal_output = formal_root / "stream"
-    formal_backend = AgentCliFourTierBackend(
-        stream_memory_dir=formal_output / "memory",
-        stream_project_key=_project_key("agentcli_four_tier"),
-    )
+    formal_backend = _four_tier_backend(formal_output / "memory")
     formal_result = _run(
         formal_root,
         backend=formal_backend,
         adapter=FakeAdapter(),
-        manifest_runner=FakeManifestRunner(formal=True),
+        manifest_runner=FakeManifestRunner(formal=False),
         tasks=tasks,
     )
 
@@ -675,20 +775,16 @@ def test_evaluator_infrastructure_failure_never_calls_formal_backend_finalize(
     tmp_path: Path,
 ) -> None:
     output = tmp_path / "stream"
+    backend = _four_tier_backend(output / "memory")
+    finalize_calls = 0
+    original_finalize = backend.finalize_task
 
-    class CountingBackend(AgentCliFourTierBackend):
-        def __init__(self, **kwargs: Any) -> None:
-            super().__init__(**kwargs)
-            self.finalize_calls = 0
+    def counting_finalize(episode: PublicEpisode, result: ManifestEvalResult):
+        nonlocal finalize_calls
+        finalize_calls += 1
+        return original_finalize(episode, result)
 
-        def finalize_task(self, episode, result):
-            self.finalize_calls += 1
-            return super().finalize_task(episode, result)
-
-    backend = CountingBackend(
-        stream_memory_dir=output / "memory",
-        stream_project_key=_project_key("agentcli_four_tier"),
-    )
+    backend.finalize_task = counting_finalize  # type: ignore[method-assign]
     adapter = FakeAdapter()
 
     with pytest.raises(MemoryBenchmarkInfrastructureError):
@@ -697,12 +793,12 @@ def test_evaluator_infrastructure_failure_never_calls_formal_backend_finalize(
             backend=backend,
             adapter=adapter,
             manifest_runner=FakeManifestRunner(
-                formal=True,
+                formal=False,
                 infrastructure_task="task-1",
             ),
         )
 
-    assert backend.finalize_calls == 0
+    assert finalize_calls == 0
     assert ExperienceStore.from_dir(output / "memory").all() == []
 
 

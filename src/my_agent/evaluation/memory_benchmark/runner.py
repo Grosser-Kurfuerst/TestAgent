@@ -44,6 +44,13 @@ _INFRASTRUCTURE_FAILURE_TYPES = frozenset(
         "evolver_finalize_failed",
     }
 )
+_FOUR_TIER_INITIALIZATION_FILES = frozenset(
+    {
+        "evolver_state.sqlite3",
+        "evolver_state.sqlite3-shm",
+        "evolver_state.sqlite3-wal",
+    }
+)
 
 ManifestRunnerFn = Callable[..., ManifestBenchmarkResult]
 
@@ -131,12 +138,18 @@ def run_memory_benchmark_stream(
     if not actor_sampling_seed_supported and actor_sampling_seed_effective is not None:
         raise ValueError("unsupported actor sampling seed cannot be effective")
     stream_dir = Path(output_dir).expanduser().resolve()
-    if stream_dir.exists():
-        raise FileExistsError(f"memory benchmark stream output already exists: {stream_dir}")
     memory_dir = Path(stream_memory_dir).expanduser().resolve()
     if memory_dir != stream_dir / "memory":
         raise ValueError("stream_memory_dir must be the stream output memory directory")
-    if memory_dir.exists() and any(memory_dir.iterdir()):
+    if stream_dir.exists() and not _is_backend_initialized_empty_stream(
+        stream_dir,
+        memory_dir=memory_dir,
+    ):
+        raise FileExistsError(f"memory benchmark stream output already exists: {stream_dir}")
+    if memory_dir.exists() and any(memory_dir.iterdir()) and not (
+        backend.name == "agentcli_four_tier"
+        and _is_four_tier_initialized_memory_dir(memory_dir)
+    ):
         raise FileExistsError(f"stream memory directory is not empty: {memory_dir}")
     expected_project_key = memory_stream_project_key(
         run_id=run_id,
@@ -146,7 +159,7 @@ def run_memory_benchmark_stream(
     )
     if stream_project_key != expected_project_key:
         raise ValueError("stream_project_key does not match run/seed/benchmark/arm isolation")
-    stream_dir.mkdir(parents=True)
+    stream_dir.mkdir(parents=True, exist_ok=True)
     task_root = stream_dir / "tasks"
     task_root.mkdir()
     results_path = stream_dir / "results.jsonl"
@@ -419,7 +432,7 @@ def _validate_benchmark_task_config(config: AgentConfig, *, backend_name: str) -
         raise RuntimeError("memory benchmark task must use only project benchmark tools")
     if config.enable_project_plugins or config.mcp_enabled or config.hitl_enabled:
         raise RuntimeError("plugins, MCP, and HITL must be disabled for memory benchmark")
-    expected_mode = "formal" if backend_name == "agentcli_four_tier" else "off"
+    expected_mode = "off"
     if config.memory_evolver_mode != expected_mode:
         raise RuntimeError(f"backend {backend_name!r} requires memory_evolver_mode={expected_mode!r}")
 
@@ -442,6 +455,30 @@ def _validate_prepared_paths(prepared: PreparedBenchmarkTask, *, task_dir: Path)
     expected_public_state = repo / ".agentcli" / "benchmark_state.json"
     if prepared.public_tool_state_path.resolve() != expected_public_state:
         raise ValueError("public_tool_state_path must use .agentcli/benchmark_state.json")
+
+
+def _is_backend_initialized_empty_stream(
+    stream_dir: Path,
+    *,
+    memory_dir: Path,
+) -> bool:
+    entries = tuple(stream_dir.iterdir())
+    return (
+        entries == (memory_dir,)
+        and memory_dir.is_dir()
+        and (
+            not any(memory_dir.iterdir())
+            or _is_four_tier_initialized_memory_dir(memory_dir)
+        )
+    )
+
+
+def _is_four_tier_initialized_memory_dir(memory_dir: Path) -> bool:
+    entries = tuple(memory_dir.iterdir())
+    return bool(entries) and all(
+        entry.is_file() and entry.name in _FOUR_TIER_INITIALIZATION_FILES
+        for entry in entries
+    )
 
 
 def _no_memory_trace_activity(metrics: Mapping[str, Any]) -> bool:
@@ -497,26 +534,18 @@ def _build_task_result(
         memory_usage_available = True
         memory_usage_unavailable_reason = ""
         memory_tokens_by_role: dict[str, ProviderUsage] = {}
-    elif arm == "mem0":
+    else:
         usage = backend_finalize.llm_usage
         memory_prompt_tokens = usage.prompt_tokens
         memory_completion_tokens = usage.completion_tokens
         memory_total_tokens = usage.resolved_total_tokens
         memory_usage_available = usage.available
-        memory_usage_unavailable_reason = "" if usage.available else "Mem0 provider did not return complete search/add LLM usage"
+        memory_usage_unavailable_reason = (
+            ""
+            if usage.available
+            else f"{arm} provider did not return complete memory LLM usage"
+        )
         memory_tokens_by_role = dict(backend_finalize.usage_by_role)
-    else:
-        memory_tokens_by_role = _trace_provider_usages(metrics.get("memory_tokens_by_role"))
-        memory_usage_available = bool(metrics.get("memory_usage_available", False))
-        memory_prompt_tokens = _optional_metric_int(metrics.get("memory_prompt_tokens"))
-        memory_completion_tokens = _optional_metric_int(metrics.get("memory_completion_tokens"))
-        memory_total_tokens = _optional_metric_int(metrics.get("memory_total_tokens"))
-        memory_usage_unavailable_reason = str(metrics.get("memory_usage_unavailable_reason") or "")
-        if memory_usage_available and memory_total_tokens is None:
-            memory_usage_available = False
-            memory_usage_unavailable_reason = "formal memory trace did not provide a resolved total token count"
-        elif not memory_usage_available and not memory_usage_unavailable_reason:
-            memory_usage_unavailable_reason = "formal memory decision usage is not available"
     system_total_tokens = actor_total_tokens + memory_total_tokens if actor_usage_available and memory_usage_available else None
     return MemoryBenchmarkTaskResult(
         run_id=run_id,
@@ -553,22 +582,10 @@ def _build_task_result(
         embedding_elapsed_sec=backend_finalize.embedding_elapsed_sec,
         elapsed_sec=manifest_result.elapsed_sec,
         memory={
-            "candidate_count": (
-                int(metrics.get("evolver_candidates_total", 0) or 0) if arm == "agentcli_four_tier" else context.candidate_count
-            ),
-            "selected_count": (
-                int(metrics.get("evolver_selected_total", 0) or 0) if arm == "agentcli_four_tier" else context.selected_count
-            ),
-            "selected_content_tokens": (
-                int(metrics.get("evolver_selected_content_tokens", 0) or 0)
-                if arm == "agentcli_four_tier"
-                else context.selected_content_tokens
-            ),
-            "injected_tokens": (
-                int(metrics.get("evolver_injected_tokens", 0) or 0)
-                if arm == "agentcli_four_tier"
-                else context.estimated_tokens
-            ),
+            "candidate_count": context.candidate_count,
+            "selected_count": context.selected_count,
+            "selected_content_tokens": context.selected_content_tokens,
+            "injected_tokens": context.estimated_tokens,
             "written_count": len(backend_finalize.written_ids),
             "entries_before": memory_before.entry_count,
             "entries_after": memory_after.entry_count,
@@ -577,24 +594,38 @@ def _build_task_result(
             "repository_revision_before": memory_before.revision,
             "repository_revision_after": memory_after.revision,
             "backend_finalize_status": backend_finalize.status,
-            "maintenance_status": manifest_result.evolver_maintenance_status or "not_due",
-            "maintenance_runs": int(metrics.get("maintenance_runs", 0) or 0),
+            "maintenance_status": str(
+                backend_finalize.metrics.get("maintenance_status") or "not_due"
+            ),
+            "maintenance_runs": int(
+                backend_finalize.metrics.get("maintenance_runs", 0) or 0
+            ),
             "maintenance_applied_runs": int(
-                metrics.get("maintenance_applied_runs", 0) or 0
+                backend_finalize.metrics.get("maintenance_applied_runs", 0) or 0
             ),
             "maintenance_failures": int(
-                metrics.get("maintenance_failures", 0) or 0
+                backend_finalize.metrics.get("maintenance_failures", 0) or 0
             ),
             "maintenance_actions": {
-                "keep": int(metrics.get("maintenance_keep", 0) or 0),
-                "delete": int(metrics.get("maintenance_delete", 0) or 0),
-                "merge": int(metrics.get("maintenance_merge", 0) or 0),
-                "promote": int(metrics.get("maintenance_promote", 0) or 0),
+                "keep": int(
+                    backend_finalize.metrics.get("maintenance_keep", 0) or 0
+                ),
+                "delete": int(
+                    backend_finalize.metrics.get("maintenance_delete", 0) or 0
+                ),
+                "merge": int(
+                    backend_finalize.metrics.get("maintenance_merge", 0) or 0
+                ),
+                "promote": int(
+                    backend_finalize.metrics.get("maintenance_promote", 0) or 0
+                ),
                 "removed_entries": int(
-                    metrics.get("maintenance_removed_entries", 0) or 0
+                    backend_finalize.metrics.get("maintenance_removed_entries", 0)
+                    or 0
                 ),
                 "added_entries": int(
-                    metrics.get("maintenance_added_entries", 0) or 0
+                    backend_finalize.metrics.get("maintenance_added_entries", 0)
+                    or 0
                 ),
             },
         },

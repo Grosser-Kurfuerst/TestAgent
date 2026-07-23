@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -13,6 +14,11 @@ from my_agent.evaluation.memory_benchmark.backends import (
     NoMemoryBackend,
     memory_stream_project_key,
 )
+from my_agent.evaluation.memory_benchmark.api_config import ApiEndpoint
+from my_agent.evaluation.memory_benchmark.api_embedding import (
+    MemoryBenchmarkApiEmbeddingEncoder,
+)
+from my_agent.evaluation.memory_benchmark.api_policy import MemoryBenchmarkApiPolicy
 from my_agent.evaluation.memory_benchmark.contracts import (
     BenchmarkTask,
     ExternalMemoryItem,
@@ -73,9 +79,14 @@ def _manifest_result(*, formal: bool) -> ManifestEvalResult:
         failure_type="",
         initial_visible=CommandResult("", True, 0, skipped=True),
         evaluation_kind="external_state",
+        task_group="lifelong_os:os",
         reward=1.0,
+        evaluator_name="fixture",
+        evaluator_version="v1",
         evaluator_hash=HASH,
         outcome_finalized=True,
+        trace_path="trace.jsonl",
+        agent_stop_reason="assistant_final",
         evolver_writer_status="committed" if formal else "",
         written_memory_ids=["memory-1"] if formal else [],
     )
@@ -93,25 +104,139 @@ def _episode() -> PublicEpisode:
     )
 
 
-@pytest.mark.parametrize(
-    ("backend_type", "expected_mode"),
-    [(NoMemoryBackend, "off"), (AgentCliFourTierBackend, "formal")],
-)
+class _EmbeddingApi:
+    def create(self, *, model: str, input: list[str]) -> SimpleNamespace:
+        assert model == "text-embedding-v4"
+        return SimpleNamespace(
+            data=[
+                SimpleNamespace(index=index, embedding=[1.0, 0.0])
+                for index, _text in enumerate(input)
+            ]
+        )
+
+
+class _PolicyCompletions:
+    def __init__(self) -> None:
+        self.writing_calls = 0
+        self.requests: list[dict[str, object]] = []
+
+    def create(self, **kwargs: object) -> SimpleNamespace:
+        self.requests.append(kwargs)
+        messages = kwargs["messages"]
+        assert isinstance(messages, list)
+        system = str(messages[0]["content"])
+        tool_calls: list[SimpleNamespace] = []
+        if system.startswith("Select zero or more"):
+            user = __import__("json").loads(str(messages[1]["content"]))
+            allowed = user["allowed_labels_by_tier"]
+            selected = {tier: [] for tier in ("skill", "tip", "tool", "trajectory")}
+            for tier in selected:
+                if allowed[tier]:
+                    selected[tier] = [allowed[tier][0]]
+                    break
+            content = __import__("json").dumps(
+                {
+                    "selected_skills": selected["skill"],
+                    "selected_tips": selected["tip"],
+                    "selected_tools": selected["tool"],
+                    "selected_trajectories": selected["trajectory"],
+                    "reasoning": "fixture",
+                }
+            )
+        elif system.startswith("Extract only reusable"):
+            self.writing_calls += 1
+            content = (
+                '[{"tier":"tip","content":"Reuse the verified benchmark action pattern.",'
+                '"payload":{"category":"benchmark","severity":"info",'
+                '"trigger":"when executing a similar benchmark task"},'
+                '"confidence":0.9,"reason":"supported by the public episode"}]'
+                if self.writing_calls == 1
+                else "[]"
+            )
+        else:
+            content = ""
+            tool_calls = [
+                SimpleNamespace(
+                    id="finish-1",
+                    function=SimpleNamespace(
+                        name="finish", arguments='{"summary":"fixture"}'
+                    ),
+                )
+            ]
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content=content, tool_calls=tool_calls),
+                    finish_reason="tool_calls" if tool_calls else "stop",
+                )
+            ],
+            usage=SimpleNamespace(
+                prompt_tokens=10,
+                completion_tokens=2,
+                total_tokens=12,
+            ),
+        )
+
+
+def _four_tier_backend(
+    tmp_path: Path,
+    *,
+    stream_project_key: str = "stream-key",
+    maintenance_interval_tasks: int = 30,
+) -> AgentCliFourTierBackend:
+    endpoint = ApiEndpoint(
+        api_key="secret",
+        base_url="https://example.test/v1",
+        model="qwen-plus",
+        endpoint_hash=HASH,
+    )
+    completions = _PolicyCompletions()
+    policy = MemoryBenchmarkApiPolicy(
+        endpoint,
+        client=SimpleNamespace(
+            chat=SimpleNamespace(completions=completions)
+        ),
+    )
+    embedding = MemoryBenchmarkApiEmbeddingEncoder(
+        replace(endpoint, model="text-embedding-v4"),
+        client=SimpleNamespace(embeddings=_EmbeddingApi()),
+    )
+    return AgentCliFourTierBackend(
+        stream_memory_dir=tmp_path / "memory",
+        stream_project_key=stream_project_key,
+        policy=policy,
+        embedding_encoder=embedding,
+        maintenance_interval_tasks=maintenance_interval_tasks,
+    )
+
+
+@pytest.mark.parametrize("backend_name", ["no_memory", "agentcli_four_tier"])
 def test_backends_freeze_common_tool_and_isolation_config(
     tmp_path: Path,
-    backend_type: type[NoMemoryBackend] | type[AgentCliFourTierBackend],
-    expected_mode: str,
+    backend_name: str,
 ) -> None:
     memory_dir = tmp_path / "stream" / "memory"
     project_key = "memory-benchmark:run-1:42:lifelong_os:test"
-    backend = backend_type(
-        stream_memory_dir=memory_dir,
-        stream_project_key=project_key,
+    backend = (
+        NoMemoryBackend(
+            stream_memory_dir=memory_dir,
+            stream_project_key=project_key,
+        )
+        if backend_name == "no_memory"
+        else _four_tier_backend(
+            tmp_path / "stream",
+            stream_project_key=project_key,
+        )
     )
     context = backend.prepare_context(_task())
 
     configured = backend.configure_task(
-        _config(tmp_path),
+        replace(
+            _config(tmp_path),
+            policy_adapter_path=tmp_path / "adapter",
+            policy_identity_manifest=tmp_path / "identity.json",
+            embedding_revision="local-revision",
+        ),
         stream_memory_dir=memory_dir,
         stream_project_key=project_key,
         context=context,
@@ -119,7 +244,7 @@ def test_backends_freeze_common_tool_and_isolation_config(
 
     assert configured.agent_mode == "react"
     assert configured.memory_enabled is True
-    assert configured.memory_evolver_mode == expected_mode
+    assert configured.memory_evolver_mode == "off"
     assert configured.memory_dir == memory_dir.resolve()
     assert configured.memory_project_key == project_key
     assert configured.enable_project_tools is True
@@ -128,6 +253,10 @@ def test_backends_freeze_common_tool_and_isolation_config(
     assert configured.mcp_enabled is False
     assert configured.mcp_enable_project_servers is False
     assert configured.hitl_enabled is False
+    if backend_name == "agentcli_four_tier":
+        assert configured.policy_adapter_path is None
+        assert configured.policy_identity_manifest is None
+        assert configured.embedding_revision == ""
 
 
 def test_no_memory_context_and_finalize_are_known_zero(tmp_path: Path) -> None:
@@ -160,31 +289,154 @@ def test_no_memory_rejects_reported_persistent_writes(tmp_path: Path) -> None:
         backend.finalize_task(_episode(), _manifest_result(formal=True))
 
 
-def test_four_tier_uses_native_deferred_context_and_original_runner(tmp_path: Path) -> None:
-    backend = AgentCliFourTierBackend(
-        stream_memory_dir=tmp_path / "memory",
-        stream_project_key="stream-key",
-    )
+def test_four_tier_prepares_context_once_and_requires_finalize(tmp_path: Path) -> None:
+    backend = _four_tier_backend(tmp_path)
 
     context = backend.prepare_context(_task())
 
     assert context.candidate_count == 0
     assert context.selected_count == 0
-    assert backend.build_agent_runner(context=context) is run_agent
+    assert backend.build_agent_runner(context=context) is not run_agent
+    with pytest.raises(RuntimeError, match="not been finalized"):
+        backend.prepare_context(_task())
 
 
-def test_four_tier_finalize_only_reads_manifest_owned_result(tmp_path: Path) -> None:
-    backend = AgentCliFourTierBackend(
-        stream_memory_dir=tmp_path / "memory",
-        stream_project_key="stream-key",
-    )
+def test_four_tier_finalize_writes_only_after_authoritative_result(tmp_path: Path) -> None:
+    backend = _four_tier_backend(tmp_path)
+    backend.prepare_context(_task())
+    unfinalized = _manifest_result(formal=False)
+    unfinalized.outcome_finalized = False
 
-    finalized = backend.finalize_task(_episode(), _manifest_result(formal=True))
+    with pytest.raises(RuntimeError, match="unfinalized"):
+        backend.finalize_task(_episode(), unfinalized)
+    assert backend.snapshot().entry_count == 0
+
+    finalized = backend.finalize_task(_episode(), _manifest_result(formal=False))
 
     assert finalized.status == "committed"
-    assert finalized.written_ids == ("memory-1",)
-    assert finalized.llm_usage.available is False
-    assert backend.snapshot().entry_count == 0
+    assert len(finalized.written_ids) == 1
+    assert finalized.llm_usage.available is True
+    assert finalized.usage_by_role["writing"].resolved_total_tokens == 12
+    assert finalized.embedding_calls == 1
+    assert backend.snapshot().entry_count == 1
+
+
+def test_four_tier_second_task_retrieves_first_task_memory(tmp_path: Path) -> None:
+    backend = _four_tier_backend(tmp_path)
+    backend.prepare_context(_task())
+    first = backend.finalize_task(_episode(), _manifest_result(formal=False))
+
+    task_two = replace(
+        _task(),
+        task_id="task-2",
+        order_index=2,
+        instruction="Perform a similar task.",
+    )
+    context = backend.prepare_context(task_two)
+
+    assert context.candidate_count == 1
+    assert context.selected_count == 1
+    assert context.selected_ids == first.written_ids
+    assert context.selected_texts == (
+        "Reuse the verified benchmark action pattern.",
+    )
+
+
+def test_four_tier_writes_failed_authoritative_outcome(tmp_path: Path) -> None:
+    backend = _four_tier_backend(tmp_path)
+    backend.prepare_context(_task())
+    episode = replace(
+        _episode(),
+        final_response="Could not finish.",
+        resolved=False,
+        reward=0.0,
+        failure_type="official_evaluator_failed",
+    )
+    result = _manifest_result(formal=False)
+    result.resolved = False
+    result.reward = 0.0
+    result.failure_type = "official_evaluator_failed"
+
+    finalized = backend.finalize_task(episode, result)
+
+    assert finalized.status == "committed"
+    assert backend.snapshot().entry_count == 1
+
+
+def test_four_tier_maintenance_interval_is_owned_by_backend(tmp_path: Path) -> None:
+    backend = _four_tier_backend(tmp_path, maintenance_interval_tasks=2)
+    backend.prepare_context(_task())
+    backend.finalize_task(_episode(), _manifest_result(formal=False))
+
+    task_two = replace(
+        _task(),
+        task_id="task-2",
+        order_index=2,
+        instruction="Perform a similar task.",
+    )
+    episode_two = replace(
+        _episode(),
+        task_id="task-2",
+        instruction=task_two.instruction,
+    )
+    result_two = _manifest_result(formal=False)
+    result_two.task_id = "task-2"
+    backend.prepare_context(task_two)
+
+    finalized = backend.finalize_task(episode_two, result_two)
+
+    assert finalized.metrics["maintenance_runs"] == 1
+    assert finalized.metrics["maintenance_applied_runs"] == 1
+    assert finalized.metrics["maintenance_status"] == "noop"
+
+
+def test_four_tier_actor_never_loads_local_transformers_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import my_agent.evaluation.memory_benchmark.backends as backends_module
+    from my_agent.policy.transformers_policy import TransformersPolicy
+
+    backend = _four_tier_backend(tmp_path)
+    context = backend.prepare_context(_task())
+    configured = backend.configure_task(
+        replace(
+            _config(tmp_path),
+            policy_identity_manifest=tmp_path / "identity.json",
+        ),
+        stream_memory_dir=backend.stream_memory_dir,
+        stream_project_key=backend.stream_project_key,
+        context=context,
+    )
+    actor = object()
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        TransformersPolicy,
+        "from_config",
+        classmethod(
+            lambda cls, config: (_ for _ in ()).throw(
+                AssertionError("local Transformers policy loaded")
+            )
+        ),
+    )
+    monkeypatch.setattr(backends_module, "build_llm", lambda config: actor)
+    monkeypatch.setattr(
+        backends_module,
+        "run_agent",
+        lambda **kwargs: captured.update(kwargs) or kwargs,
+    )
+
+    backend.build_agent_runner(context=context)(
+        repo_path=tmp_path,
+        task="Perform the task.",
+        config=configured,
+        mode="react",
+    )
+
+    assert captured["llm"] is actor
+    assert isinstance(captured["memory_manager"], ExternalContextMemoryManager)
+    backend.close()
 
 
 def test_stream_project_key_isolates_arm_seed_and_benchmark() -> None:

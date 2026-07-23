@@ -6,6 +6,7 @@ from collections import Counter
 from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Protocol
 
 from my_agent.config import AgentConfig
@@ -19,16 +20,30 @@ from my_agent.evaluation.memory_benchmark.contracts import (
     ProviderUsage,
     PublicEpisode,
 )
+from my_agent.evaluation.memory_benchmark.api_embedding import (
+    ApiEmbeddingMetrics,
+    MemoryBenchmarkApiEmbeddingEncoder,
+)
+from my_agent.evaluation.memory_benchmark.api_policy import (
+    ApiPolicyMetrics,
+    ApiPolicyRoleMetrics,
+    MemoryBenchmarkApiPolicy,
+)
 from my_agent.evaluation.memory_benchmark.external_memory import (
     ExternalContextMemoryManager,
     Mem0ClientAdapter,
 )
 from my_agent.llm import build_llm
 from my_agent.memory.experience import ExperienceStore, ExperienceTier
+from my_agent.memory.experience.retrieval.embedding import EmbeddingRetriever
+from my_agent.memory.evolver.coordinator import EvolverCoordinator
+from my_agent.memory.evolver.task_session import AgentEpisodeArtifact, TaskEvolverSession
+from my_agent.memory.evolver.writing.contracts import ExperienceWriteStep
 from my_agent.memory.manager import MemoryManager
 from my_agent.memory.token import estimate_tokens
 from my_agent.policy.identity import canonical_sha256
 from my_agent.runtime import run_agent
+from my_agent.training.contracts import AuthoritativeTaskOutcome, EvaluatorIdentity
 
 
 MEM0_CONTEXT_HEADER = "Relevant selected external memory:"
@@ -168,7 +183,7 @@ class NoMemoryBackend(_LocalExperienceBackend):
 
 
 class AgentCliFourTierBackend(_LocalExperienceBackend):
-    """Delegate native four-tier selection and finalization to formal runtime."""
+    """Own the API-backed four-tier lifecycle outside the manifest runtime."""
 
     name = "agentcli_four_tier"
 
@@ -177,33 +192,118 @@ class AgentCliFourTierBackend(_LocalExperienceBackend):
         *,
         stream_memory_dir: str | Path,
         stream_project_key: str,
+        policy: MemoryBenchmarkApiPolicy,
+        embedding_encoder: MemoryBenchmarkApiEmbeddingEncoder,
+        candidate_top_k_per_tier: int = 50,
+        selected_max_items: int = 20,
+        selected_content_max_tokens: int = 1_800,
+        generation_temperature: float = 1.0,
+        generation_top_p: float = 0.95,
         maintenance_interval_tasks: int = 30,
+        maintenance_enabled: bool = True,
     ) -> None:
         super().__init__(
             stream_memory_dir=stream_memory_dir,
             stream_project_key=stream_project_key,
         )
-        if (
-            isinstance(maintenance_interval_tasks, bool)
-            or not isinstance(maintenance_interval_tasks, int)
-            or maintenance_interval_tasks < 1
+        if self.stream_memory_dir.exists() and any(self.stream_memory_dir.iterdir()):
+            raise FileExistsError(
+                "four-tier stream memory directory must be empty before initialization"
+            )
+        for field_name, value in (
+            ("candidate_top_k_per_tier", candidate_top_k_per_tier),
+            ("selected_max_items", selected_max_items),
+            ("selected_content_max_tokens", selected_content_max_tokens),
+            ("maintenance_interval_tasks", maintenance_interval_tasks),
         ):
-            raise ValueError("maintenance_interval_tasks must be a positive integer")
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{field_name} must be a positive integer")
+        if selected_max_items > 20:
+            raise ValueError("selected_max_items cannot exceed 20")
+        if selected_content_max_tokens > 1_800:
+            raise ValueError("selected_content_max_tokens cannot exceed 1800")
+        if not isinstance(maintenance_enabled, bool):
+            raise ValueError("maintenance_enabled must be a bool")
+        if not isinstance(policy, MemoryBenchmarkApiPolicy):
+            raise ValueError("four-tier backend requires MemoryBenchmarkApiPolicy")
+        if not isinstance(embedding_encoder, MemoryBenchmarkApiEmbeddingEncoder):
+            raise ValueError(
+                "four-tier backend requires MemoryBenchmarkApiEmbeddingEncoder"
+            )
+        self.policy = policy
+        self.embedding_encoder = embedding_encoder
         self.maintenance_interval_tasks = maintenance_interval_tasks
+        self.store = ExperienceStore.from_dir(self.stream_memory_dir)
+        self.embedding_retriever = EmbeddingRetriever(embedding_encoder)
+        self.coordinator = EvolverCoordinator(
+            store=self.store,
+            project_key=self.stream_project_key,
+            policy_identity=policy.identity(),
+            retriever=self.embedding_retriever,
+            policy=policy,
+            dataset_dir=None,
+            top_k_per_tier=candidate_top_k_per_tier,
+            selected_max_items=selected_max_items,
+            selection_token_budget=selected_content_max_tokens,
+            generation_temperature=generation_temperature,
+            generation_top_p=generation_top_p,
+            maintenance_interval_tasks=maintenance_interval_tasks,
+            maintenance_enabled=maintenance_enabled,
+        )
+        self.coordinator.require_formal_role_bindings(policy)
+        self._pending_session: TaskEvolverSession | None = None
+        self._pending_policy_snapshot: ApiPolicyMetrics | None = None
+        self._pending_embedding_snapshot: ApiEmbeddingMetrics | None = None
+        self._pending_events: list[tuple[str, Mapping[str, Any]]] = []
+        self._pending_retrieval_elapsed_sec = 0.0
 
     def prepare_context(self, task: BenchmarkTask) -> MemoryContextSelection:
         if not isinstance(task, BenchmarkTask):
             raise ValueError("task must be a BenchmarkTask")
-        # Formal runtime owns the one and only selector call for this task.
+        if self._pending_session is not None:
+            raise RuntimeError("previous four-tier task has not been finalized")
+        self._pending_events = []
+        self.coordinator.set_trace_sink(
+            lambda event, payload: self._pending_events.append(
+                (event, dict(payload))
+            )
+        )
+        self._pending_policy_snapshot = self.policy.metrics_snapshot()
+        self._pending_embedding_snapshot = self.embedding_encoder.metrics_snapshot()
+        trajectory_id = canonical_sha256(
+            {
+                "stream_project_key": self.stream_project_key,
+                "task_id": task.task_id,
+                "order_index": task.order_index,
+            }
+        )
+        started = perf_counter()
+        try:
+            session = self.coordinator.begin_task(
+                task=task.instruction,
+                task_id=task.task_id,
+                task_group=task.task_group,
+                trajectory_id=trajectory_id,
+                stream_id=f"{task.benchmark}:{task.subset}",
+            )
+            memory_context = self.coordinator.context_for_session(session)
+        except Exception:
+            self._clear_pending()
+            raise
+        elapsed = max(0.0, perf_counter() - started)
+        self._pending_session = session
+        self._pending_retrieval_elapsed_sec = elapsed
+        candidates = {item.memory_id: item for item in session.candidate_snapshot}
+        selected = tuple(candidates[memory_id] for memory_id in session.selected_memory_ids)
         return MemoryContextSelection(
             backend=self.name,
-            candidate_count=0,
-            selected_ids=(),
-            selected_texts=(),
-            selected_content_tokens=0,
-            injected_text="",
-            estimated_tokens=0,
-            retrieval_elapsed_sec=0.0,
+            candidate_count=len(session.candidate_snapshot),
+            selected_ids=session.selected_memory_ids,
+            selected_texts=tuple(item.content for item in selected),
+            selected_content_tokens=sum(item.token_count for item in selected),
+            injected_text=memory_context.injected_text,
+            estimated_tokens=memory_context.estimated_tokens,
+            retrieval_elapsed_sec=elapsed,
         )
 
     def configure_task(
@@ -220,15 +320,13 @@ class AgentCliFourTierBackend(_LocalExperienceBackend):
             base_config,
             memory_dir=self.stream_memory_dir,
             memory_project_key=self.stream_project_key,
-            memory_evolver_mode="formal",
+            memory_evolver_mode="off",
         )
         return replace(
             common,
-            memory_evolver_candidate_top_k_per_tier=50,
-            memory_evolver_selected_max_items=20,
-            memory_evolver_selection_prompt_tokens=1_800,
-            memory_evolver_maintenance_interval_tasks=self.maintenance_interval_tasks,
-            memory_evolver_maintenance_enabled=True,
+            policy_adapter_path=None,
+            policy_identity_manifest=None,
+            embedding_revision="",
         )
 
     def build_agent_runner(
@@ -237,8 +335,7 @@ class AgentCliFourTierBackend(_LocalExperienceBackend):
         context: MemoryContextSelection,
     ) -> AgentRunnerFn:
         self._validate_context(context)
-        # Identity is significant: manifest runner uses it to share formal resources.
-        return run_agent
+        return _build_task_agent_runner(external_context=context)
 
     def finalize_task(
         self,
@@ -249,14 +346,78 @@ class AgentCliFourTierBackend(_LocalExperienceBackend):
             raise ValueError("four-tier finalize requires public episode and manifest result")
         if not result.outcome_finalized:
             raise RuntimeError("four-tier backend cannot finalize an unfinalized outcome")
-        if result.failure_type == "evolver_finalize_failed":
-            raise RuntimeError("formal memory finalize failed inside manifest runner")
-        if not result.evolver_writer_status:
-            raise RuntimeError("formal manifest result is missing evolver_writer_status")
-        return BackendFinalizeResult(
-            status=result.evolver_writer_status,
-            written_ids=tuple(result.written_memory_ids),
-        )
+        session = self._pending_session
+        if session is None:
+            raise RuntimeError("four-tier finalize requires a pending task session")
+        if episode.task_id != session.task_id or result.task_id != session.task_id:
+            raise RuntimeError("four-tier finalize task does not match pending session")
+        if result.task_group != session.task_group:
+            raise RuntimeError("four-tier finalize task group does not match pending session")
+        policy_snapshot = self._pending_policy_snapshot
+        embedding_snapshot = self._pending_embedding_snapshot
+        if policy_snapshot is None or embedding_snapshot is None:
+            raise RuntimeError("four-tier pending metrics snapshots are missing")
+        started = perf_counter()
+        try:
+            finalize_result = self.coordinator.finalize_task(
+                AgentEpisodeArtifact(
+                    session=session,
+                    trace_path=Path(result.trace_path),
+                    stop_reason=result.agent_stop_reason,
+                    final_answer=episode.final_response,
+                    tool_history=_public_episode_steps(episode),
+                    task=episode.instruction,
+                ),
+                AuthoritativeTaskOutcome(
+                    task_id=result.task_id,
+                    task_group=result.task_group,
+                    task_valid=result.task_valid,
+                    resolved=result.resolved,
+                    reward=result.reward,
+                    evaluator=EvaluatorIdentity(
+                        result.evaluator_name,
+                        result.evaluator_version,
+                        result.evaluator_hash,
+                    ),
+                    outcome_finalized=True,
+                ),
+            )
+            policy_metrics = self.policy.metrics_since(policy_snapshot)
+            embedding_metrics = self.embedding_encoder.metrics_since(
+                embedding_snapshot
+            )
+            usage_by_role = _policy_usages(policy_metrics)
+            combined_usage = _combine_provider_usage(*usage_by_role.values())
+            maintenance_metrics = _four_tier_maintenance_metrics(
+                self._pending_events,
+                status=finalize_result.maintenance_status,
+            )
+            return BackendFinalizeResult(
+                status=finalize_result.writer_status,
+                written_ids=finalize_result.written_memory_ids,
+                llm_usage=combined_usage,
+                usage_by_role=usage_by_role,
+                embedding_calls=embedding_metrics.calls,
+                embedding_elapsed_sec=embedding_metrics.elapsed_sec,
+                elapsed_sec=(
+                    self._pending_retrieval_elapsed_sec
+                    + max(0.0, perf_counter() - started)
+                ),
+                metrics=maintenance_metrics,
+            )
+        finally:
+            self._clear_pending()
+
+    def close(self) -> None:
+        self.coordinator.set_trace_sink(None)
+        self._clear_pending()
+
+    def _clear_pending(self) -> None:
+        self._pending_session = None
+        self._pending_policy_snapshot = None
+        self._pending_embedding_snapshot = None
+        self._pending_events = []
+        self._pending_retrieval_elapsed_sec = 0.0
 
 
 class Mem0Backend:
@@ -560,6 +721,97 @@ def _combine_provider_usage(*usages: ProviderUsage) -> ProviderUsage:
         completion_tokens=completion_tokens,
         total_tokens=sum(usage.resolved_total_tokens or 0 for usage in usages),
     )
+
+
+def _policy_usages(metrics: ApiPolicyMetrics) -> dict[str, ProviderUsage]:
+    usages: dict[str, ProviderUsage] = {}
+    for role, role_metrics in metrics.by_role.items():
+        if role_metrics.calls < 1:
+            continue
+        usages[role] = _policy_role_usage(role_metrics)
+    return usages
+
+
+def _policy_role_usage(metrics: ApiPolicyRoleMetrics) -> ProviderUsage:
+    if not metrics.usage_available:
+        return ProviderUsage()
+    return ProviderUsage(
+        prompt_tokens=metrics.prompt_tokens,
+        completion_tokens=metrics.completion_tokens,
+        total_tokens=metrics.total_tokens,
+    )
+
+
+def _public_episode_steps(
+    episode: PublicEpisode,
+) -> tuple[ExperienceWriteStep, ...]:
+    steps: list[ExperienceWriteStep] = []
+    for action in episode.actions:
+        sequence = int(action["sequence"])
+        returncode = int(action["returncode"])
+        timed_out = bool(action["timed_out"])
+        stdout = str(action.get("stdout", ""))
+        stderr = str(action.get("stderr", ""))
+        output = "\n".join(part for part in (stdout, stderr) if part)[:4_000]
+        steps.append(
+            ExperienceWriteStep(
+                step_num=sequence,
+                tool="benchmark_action",
+                arguments={"command": str(action["command"])},
+                ok=returncode == 0 and not timed_out,
+                output=output,
+                blocked=False,
+                error_code=(
+                    "timeout"
+                    if timed_out
+                    else "" if returncode == 0 else f"returncode_{returncode}"
+                ),
+            )
+        )
+    return tuple(steps)
+
+
+def _four_tier_maintenance_metrics(
+    events: list[tuple[str, Mapping[str, Any]]],
+    *,
+    status: str | None,
+) -> dict[str, Any]:
+    cadence_events = [
+        payload
+        for event, payload in events
+        if event == "memory.evolver_maintenance_cadence"
+    ]
+    operations = Counter()
+    for event, payload in events:
+        if event != "opd.decision" or payload.get("role") != "maintenance":
+            continue
+        parsed_output = payload.get("parsed_output")
+        if not isinstance(parsed_output, Mapping):
+            continue
+        tool_call = parsed_output.get("tool_call")
+        if isinstance(tool_call, Mapping):
+            name = str(tool_call.get("name") or "")
+            if name in {"keep", "delete", "merge", "promote"}:
+                operations[name] += 1
+    maintenance_status = status or "not_due"
+    applied = sum(
+        1 for payload in cadence_events if payload.get("status") in {"committed", "noop"}
+    )
+    failures = sum(
+        1
+        for payload in cadence_events
+        if payload.get("status") not in {"committed", "noop"}
+    )
+    return {
+        "maintenance_status": maintenance_status,
+        "maintenance_runs": len(cadence_events),
+        "maintenance_applied_runs": applied,
+        "maintenance_failures": failures,
+        "maintenance_keep": operations["keep"],
+        "maintenance_delete": operations["delete"],
+        "maintenance_merge": operations["merge"],
+        "maintenance_promote": operations["promote"],
+    }
 
 
 def _required_stream_project_key(value: str) -> str:
