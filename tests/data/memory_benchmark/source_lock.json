@@ -4,7 +4,7 @@
     "intercode": {
       "container_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
       "container_image": "intercode-nl2bash:fixture",
-      "evaluator_entrypoint": "intercode.envs.bash.BashEnv.get_reward",
+      "evaluator_entrypoint": "intercode.envs.BashEnv.get_reward",
       "license": "MIT",
       "revision": "2222222222222222222222222222222222222222",
       "task_data_path": "data/nl2bash/nl2bash_fs_1.json",

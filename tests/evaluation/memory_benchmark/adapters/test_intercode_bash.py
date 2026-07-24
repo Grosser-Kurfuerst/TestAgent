@@ -87,7 +87,7 @@ def _source(path: Path) -> dict[str, str]:
         "task_data_sha256": _sha256_file(path),
         "container_image": "intercode-nl2bash:locked",
         "container_digest": IMAGE_DIGEST,
-        "evaluator_entrypoint": "intercode.envs.bash.BashEnv.get_reward",
+        "evaluator_entrypoint": "intercode.envs.BashEnv.get_reward",
     }
 
 

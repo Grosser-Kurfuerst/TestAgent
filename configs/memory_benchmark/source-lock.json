@@ -8,7 +8,7 @@
       "container_build_sha256": "sha256:c8b52b44cc276921f1b139d49562152792872c7b013261b748305a78d4230189",
       "container_digest": "sha256:a5a3290680ed28300601d6b60ac3a03006f79b3579010c0a1c7992c084c1ac82",
       "container_image": "intercode-nl2bash:c3e46d82",
-      "evaluator_entrypoint": "intercode.envs.bash.BashEnv.get_reward",
+      "evaluator_entrypoint": "intercode.envs.BashEnv.get_reward",
       "license": "MIT",
       "revision": "c3e46d827cfc9d4c704ec078f7abf9f41e3191d8",
       "task_data_path": "data/nl2bash/nl2bash_fs_1.json",
