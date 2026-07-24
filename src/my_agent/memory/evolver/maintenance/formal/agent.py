@@ -45,6 +45,13 @@ from my_agent.training.decision_log import (
 from my_agent.training.role_views import CanonicalMessage, TaskOutcomeRef
 
 
+MAX_DECISION_CORRECTION_RETRIES = 2
+DECISION_CORRECTION_MESSAGE = (
+    "The previous response was invalid. "
+    "Issue exactly one valid maintenance tool call and no prose."
+)
+
+
 @dataclass(frozen=True)
 class FormalMaintenanceResult:
     status: str
@@ -113,6 +120,8 @@ class FormalMaintenanceAgent:
         )
         messages = list(maintenance_initial_messages(public))
         staged: list[MaintenanceOperation] = []
+        retry_of: str | None = None
+        correction_retries = 0
         for turn_index in range(self.max_turns):
             parsed_commands: list[MaintenanceToolCommand] = []
             request = build_maintenance_request(
@@ -150,8 +159,10 @@ class FormalMaintenanceAgent:
                 logged = self.recorder.generate(
                     request,
                     context=context,
+                    retry_of=retry_of,
                     parse_response=parse_response,
                 )
+                retry_of = None
                 command = parsed_commands[0]
                 messages.append(CanonicalMessage(
                     "assistant",
@@ -196,7 +207,27 @@ class FormalMaintenanceAgent:
                     canonical_json_bytes(observation).decode("utf-8"),
                     tool_call_id=command.call_id,
                 ))
-            except (DecisionAttemptError, MaintenancePlanError, ValueError) as exc:
+            except DecisionAttemptError as exc:
+                if (
+                    correction_retries < MAX_DECISION_CORRECTION_RETRIES
+                    and turn_index + 1 < self.max_turns
+                ):
+                    correction_retries += 1
+                    retry_of = exc.decision_id
+                    messages.append(CanonicalMessage("user", DECISION_CORRECTION_MESSAGE))
+                    continue
+                return FormalMaintenanceResult(
+                    status="aborted",
+                    maintenance_id=maintenance_id,
+                    plan_id="",
+                    transaction_id="",
+                    turns=turn_index + 1,
+                    operation_ids=tuple(operation.operation_id for operation in staged),
+                    before_revision=snapshot.revision,
+                    after_revision=self.store.revision(),
+                    error=f"{type(exc.cause).__name__}: {exc.cause}",
+                )
+            except (MaintenancePlanError, ValueError) as exc:
                 return FormalMaintenanceResult(
                     status="aborted",
                     maintenance_id=maintenance_id,

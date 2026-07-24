@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+import json
 
 import pytest
 
@@ -12,6 +13,7 @@ from my_agent.evaluation.memory_benchmark.backends import (
     AgentCliFourTierBackend,
     Mem0Backend,
     NoMemoryBackend,
+    _four_tier_maintenance_metrics,
     memory_stream_project_key,
 )
 from my_agent.evaluation.memory_benchmark.api_config import ApiEndpoint
@@ -388,6 +390,47 @@ def test_four_tier_maintenance_interval_is_owned_by_backend(tmp_path: Path) -> N
     assert finalized.metrics["maintenance_runs"] == 1
     assert finalized.metrics["maintenance_applied_runs"] == 1
     assert finalized.metrics["maintenance_status"] == "noop"
+    backend_events = [
+        json.loads(line)
+        for line in (tmp_path / "backend_events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    cadence = [
+        event["payload"]
+        for event in backend_events
+        if event["event"] == "memory.evolver_maintenance_cadence"
+    ]
+    assert len(cadence) == 1
+    assert cadence[0]["turns"] == 1
+    assert cadence[0]["operation_ids"] == []
+    assert cadence[0]["error"] == ""
+
+
+def test_four_tier_maintenance_metrics_expose_abort_error() -> None:
+    metrics = _four_tier_maintenance_metrics(
+        [
+            (
+                "memory.evolver_maintenance_cadence",
+                {
+                    "status": "aborted",
+                    "turns": 3,
+                    "operation_ids": ["op-1"],
+                    "error": (
+                        "ValueError: formal maintenance requires exactly one tool call "
+                        "per assistant turn"
+                    ),
+                },
+            )
+        ],
+        status="aborted",
+    )
+
+    assert metrics["maintenance_status"] == "aborted"
+    assert metrics["maintenance_failures"] == 1
+    assert metrics["maintenance_turns"] == 3
+    assert metrics["maintenance_operation_ids"] == ["op-1"]
+    assert "exactly one tool call" in metrics["maintenance_error"]
 
 
 def test_four_tier_actor_never_loads_local_transformers_policy(

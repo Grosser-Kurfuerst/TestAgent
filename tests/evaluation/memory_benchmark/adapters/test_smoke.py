@@ -6,6 +6,7 @@ from typing import Any
 import json
 import subprocess
 
+import my_agent.evaluation.memory_benchmark.adapters.smoke as smoke_module
 from my_agent.config import AgentConfig
 from my_agent.evaluation.manifest_benchmark import CommandResult, ManifestEvalResult
 from my_agent.evaluation.memory_benchmark.adapters.docker_runtime import (
@@ -21,6 +22,7 @@ from my_agent.evaluation.memory_benchmark.adapters.smoke import (
     SMOKE_EVALUATOR_HASH,
     SmokeAdapter,
     _validate_smoke_arm,
+    run_smoke_benchmark,
     smoke_action_main,
     smoke_cli_main,
 )
@@ -378,6 +380,83 @@ def test_smoke_backend_overrides_maintenance_interval(tmp_path: Path) -> None:
 
     assert backend.maintenance_interval_tasks == 4
     assert resolved.memory_evolver_mode == "off"
+
+
+def test_run_smoke_passes_generation_config_to_four_tier_backend(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    class _Backend:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+    def four_tier_backend(**kwargs: Any) -> _Backend:
+        captured.update(kwargs)
+        return _Backend("agentcli_four_tier")
+
+    def stream_runner(**kwargs: Any) -> Any:
+        output_dir = Path(kwargs["output_dir"])
+        output_dir.mkdir(parents=True, exist_ok=True)
+        results_path = output_dir / "results.jsonl"
+        results_path.touch()
+        return SimpleNamespace(executions=(), results_path=results_path)
+
+    monkeypatch.setattr(
+        smoke_module,
+        "NoMemoryBackend",
+        lambda **_kwargs: _Backend("no_memory"),
+    )
+    monkeypatch.setattr(smoke_module, "AgentCliFourTierBackend", four_tier_backend)
+    monkeypatch.setattr(
+        smoke_module,
+        "Mem0Backend",
+        lambda **_kwargs: _Backend("mem0"),
+    )
+    monkeypatch.setattr(smoke_module, "run_memory_benchmark_stream", stream_runner)
+    monkeypatch.setattr(
+        smoke_module,
+        "_validate_smoke_arm",
+        lambda arm, stream: {
+            "status": "passed",
+            "checks": {},
+            "results_path": str(stream.results_path),
+        },
+    )
+    actor_endpoint = _api_endpoint("fixture-chat")
+    embedding_endpoint = _api_endpoint("fixture-embedding")
+
+    report = run_smoke_benchmark(
+        base_config=AgentConfig(
+            provider="fake",
+            api_key="",
+            base_url=None,
+            model="fake",
+            temperature=0.0,
+            max_steps=4,
+            command_timeout=20,
+            trace_dir=tmp_path / "traces",
+            use_fake_llm=True,
+        ),
+        output_dir=tmp_path / "output",
+        data_root=tmp_path / "data",
+        actor_endpoint=actor_endpoint,
+        embedding_endpoint=embedding_endpoint,
+        embedding_dimension=2,
+        mem0_version="2.0.13",
+        container_image="ubuntu:locked",
+        container_digest=IMAGE_DIGEST,
+        generation_temperature=0.2,
+        generation_top_p=1.0,
+        docker_runtime=_FakeDockerRuntime(),
+        api_policy_factory=lambda _endpoint: object(),
+        embedding_encoder_factory=lambda _endpoint: object(),
+    )
+
+    assert report["status"] == "passed"
+    assert captured["generation_temperature"] == 0.2
+    assert captured["generation_top_p"] == 1.0
 
 
 def test_smoke_four_tier_maintenance_metrics_come_from_backend_finalize() -> None:

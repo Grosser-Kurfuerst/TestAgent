@@ -138,6 +138,8 @@ def test_policy_converts_messages_tools_and_generation_parameters() -> None:
     assert request["messages"][2]["tool_calls"][0]["id"] == "prior-call"  # type: ignore[index]
     assert request["messages"][3]["tool_call_id"] == "prior-call"  # type: ignore[index]
     assert request["tools"][0]["function"]["parameters"]["type"] == "object"  # type: ignore[index]
+    assert "tool_choice" not in request
+    assert "parallel_tool_calls" not in request
 
 
 def test_selection_and_writing_json_responses_are_preserved() -> None:
@@ -175,6 +177,9 @@ def test_maintenance_tool_calls_round_trip_across_two_turns() -> None:
         CanonicalToolCall("call-1", "apply_memory_ops", '{"keep":[]}'),
     )
     assert second.raw_completion == "done"
+    for request in client.completions.requests:
+        assert request["tool_choice"] == "required"
+        assert request["parallel_tool_calls"] is False
     second_payload = client.completions.requests[1]["messages"]  # type: ignore[index]
     assert second_payload[1]["tool_calls"][0]["id"] == "call-1"
     assert second_payload[2]["tool_call_id"] == "call-1"

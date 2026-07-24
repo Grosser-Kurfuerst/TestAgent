@@ -84,6 +84,9 @@ class MemoryBenchmarkApiPolicy:
         tools = _openai_tools(request.tools)
         if tools:
             kwargs["tools"] = tools
+            if request.role == "maintenance":
+                kwargs["tool_choice"] = "required"
+                kwargs["parallel_tool_calls"] = False
         started = self._clock()
         usage_available = False
         usage = ChatUsage()

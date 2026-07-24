@@ -10,6 +10,8 @@ import subprocess
 
 import pytest
 
+import my_agent.cli.commands.memory_benchmark as memory_benchmark_command
+from my_agent.cli.common import CliContext
 from my_agent.cli.commands.memory_benchmark import (
     preflight_memory_benchmark,
     prepare_memory_benchmark_data,
@@ -363,6 +365,55 @@ def test_prepare_is_deterministic_and_preflight_is_immutable(tmp_path: Path) -> 
     assert four_tier["policy_model"] == mem0["llm_model"] == "fixture-chat"
     assert four_tier["embedding_model"] == mem0["embedding_model"]
     assert four_tier["embedding_dimension"] == mem0["embedding_dimension"] == 3
+
+
+def test_smoke_cli_passes_memory_generation_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture_workspace(tmp_path)
+    captured: dict[str, Any] = {}
+    env = {
+        **fixture["env"],
+        "MY_AGENT_LLM_PROVIDER": "openai",
+        "MY_AGENT_API_KEY": "fixture-secret",
+        "MY_AGENT_BASE_URL": "https://workspace.example.com/compatible-mode/v1",
+        "MY_AGENT_MODEL": "fixture-chat",
+    }
+
+    class _EmbeddingProbe:
+        def __init__(self, _endpoint: ApiEndpoint) -> None:
+            pass
+
+        def encode_queries(self, _texts: tuple[str, ...]) -> tuple[tuple[float, ...], ...]:
+            return ((1.0, 0.0, 0.0),)
+
+    monkeypatch.setattr(memory_benchmark_command, "build_llm", lambda _config: _ProbeActor())
+    monkeypatch.setattr(
+        memory_benchmark_command,
+        "MemoryBenchmarkApiEmbeddingEncoder",
+        _EmbeddingProbe,
+    )
+    monkeypatch.setattr(
+        memory_benchmark_command,
+        "_mem0_package_version",
+        lambda: "2.0.13",
+    )
+    monkeypatch.setattr(
+        memory_benchmark_command,
+        "run_smoke_benchmark",
+        lambda **kwargs: captured.update(kwargs) or {"status": "passed"},
+    )
+    ctx = CliContext(run_agent=lambda **_kwargs: None, agent_repl_cls=object, env=env)
+
+    result = memory_benchmark_command._run_smoke(
+        SimpleNamespace(config=fixture["config"], output_dir=tmp_path / "smoke-output"),
+        ctx,
+    )
+
+    assert result["status"] == "passed"
+    assert captured["generation_temperature"] == 0.2
+    assert captured["generation_top_p"] == 1.0
 
 
 def test_preflight_probe_failure_does_not_write_protocol(tmp_path: Path) -> None:

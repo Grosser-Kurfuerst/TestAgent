@@ -15,8 +15,14 @@ from my_agent.memory.evolver.maintenance.cadence.ledger import (
     load_formal_maintenance_history,
     stable_cadence_id,
 )
+from my_agent.memory.evolver.maintenance.cadence.scheduler import (
+    MaintenanceCadenceScheduler,
+)
 from my_agent.memory.evolver.coordinator import EvolverCoordinator
-from my_agent.memory.evolver.maintenance.formal.agent import FormalMaintenanceAgent
+from my_agent.memory.evolver.maintenance.formal.agent import (
+    FormalMaintenanceAgent,
+    FormalMaintenanceResult,
+)
 from my_agent.memory.evolver.maintenance.formal.tools import (
     MaintenanceToolCommand,
     build_delete_operation,
@@ -112,6 +118,54 @@ def _call(name: str, arguments: dict) -> CanonicalToolCall:
 
 
 class CadenceLedgerTests(unittest.TestCase):
+    def test_maintenance_trace_retains_abort_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ExperienceStore.from_dir(tmp)
+            ledger = CadenceLedger(Path(tmp) / "evolver_state.sqlite3", interval_tasks=1)
+            advance = _completion(
+                ledger,
+                stream_id="stream-a",
+                project_key="project-a",
+                task_id="task-1",
+            )
+            assert advance.cadence is not None
+            traces = []
+            revision = store.revision()
+            scheduler = MaintenanceCadenceScheduler(
+                store=store,
+                ledger=ledger,
+                history_path=Path(tmp) / MAINTENANCE_HISTORY_FILENAME,
+                project_key="project-a",
+                maintenance_enabled=True,
+                run_maintenance=lambda **_kwargs: FormalMaintenanceResult(
+                    status="aborted",
+                    maintenance_id=advance.cadence.cadence_id,
+                    plan_id="",
+                    transaction_id="",
+                    turns=3,
+                    operation_ids=("op-1",),
+                    before_revision=revision,
+                    after_revision=revision,
+                    error=(
+                        "ValueError: formal maintenance requires exactly one tool call "
+                        "per assistant turn"
+                    ),
+                ),
+                trace_sink=lambda event, payload: traces.append((event, payload)),
+            )
+
+            status = scheduler.run_or_reconcile(advance.cadence)
+
+        cadence_trace = next(
+            payload
+            for event, payload in traces
+            if event == "memory.evolver_maintenance_cadence"
+        )
+        self.assertEqual(status, "aborted")
+        self.assertEqual(cadence_trace["turns"], 3)
+        self.assertEqual(cadence_trace["operation_ids"], ["op-1"])
+        self.assertIn("exactly one tool call", cadence_trace["error"])
+
     def test_cadence_context_contains_the_complete_boundary_window(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             ledger = CadenceLedger(Path(tmp) / "evolver_state.sqlite3", interval_tasks=3)

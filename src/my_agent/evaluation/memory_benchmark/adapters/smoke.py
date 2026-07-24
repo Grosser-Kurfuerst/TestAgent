@@ -334,6 +334,8 @@ def run_smoke_benchmark(
     mem0_version: str,
     container_image: str,
     container_digest: str,
+    generation_temperature: float = 0.2,
+    generation_top_p: float = 1.0,
     seed: int = 42,
     maintenance_interval_tasks: int = 4,
     docker_runtime: DockerRuntime | None = None,
@@ -381,6 +383,8 @@ def run_smoke_benchmark(
             "embedding_endpoint_hash": embedding_endpoint.endpoint_hash,
             "embedding_dimension": embedding_dimension,
             "maintenance_interval_tasks": maintenance_interval_tasks,
+            "generation_temperature": generation_temperature,
+            "generation_top_p": generation_top_p,
         },
         "mem0": memory_benchmark_mem0_backend_identity(
             actor_endpoint=actor_endpoint,
@@ -426,6 +430,8 @@ def run_smoke_benchmark(
                 stream_project_key=project_key,
                 policy=api_policy_factory(actor_endpoint),
                 embedding_encoder=embedding_encoder_factory(embedding_endpoint),
+                generation_temperature=generation_temperature,
+                generation_top_p=generation_top_p,
                 maintenance_interval_tasks=maintenance_interval_tasks,
             )
         else:

@@ -8,6 +8,7 @@ from dataclasses import replace
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Protocol
+import os
 
 from my_agent.config import AgentConfig
 from my_agent.evaluation.manifest_benchmark import AgentRunnerFn, ManifestEvalResult
@@ -41,12 +42,13 @@ from my_agent.memory.evolver.task_session import AgentEpisodeArtifact, TaskEvolv
 from my_agent.memory.evolver.writing.contracts import ExperienceWriteStep
 from my_agent.memory.manager import MemoryManager
 from my_agent.memory.token import estimate_tokens
-from my_agent.policy.identity import canonical_sha256
+from my_agent.policy.identity import canonical_json_bytes, canonical_sha256
 from my_agent.runtime import run_agent
 from my_agent.training.contracts import AuthoritativeTaskOutcome, EvaluatorIdentity
 
 
 MEM0_CONTEXT_HEADER = "Relevant selected external memory:"
+BACKEND_EVENT_SCHEMA_VERSION = "memory-benchmark-backend-event-v1"
 
 
 class MemoryBenchmarkBackend(Protocol):
@@ -233,6 +235,7 @@ class AgentCliFourTierBackend(_LocalExperienceBackend):
         self.policy = policy
         self.embedding_encoder = embedding_encoder
         self.maintenance_interval_tasks = maintenance_interval_tasks
+        self.backend_events_path = self.stream_memory_dir.parent / "backend_events.jsonl"
         self.store = ExperienceStore.from_dir(self.stream_memory_dir)
         self.embedding_retriever = EmbeddingRetriever(embedding_encoder)
         self.coordinator = EvolverCoordinator(
@@ -390,6 +393,11 @@ class AgentCliFourTierBackend(_LocalExperienceBackend):
             maintenance_metrics = _four_tier_maintenance_metrics(
                 self._pending_events,
                 status=finalize_result.maintenance_status,
+            )
+            _append_backend_events(
+                self.backend_events_path,
+                task_id=session.task_id,
+                events=self._pending_events,
             )
             return BackendFinalizeResult(
                 status=finalize_result.writer_status,
@@ -789,6 +797,7 @@ def _four_tier_maintenance_metrics(
             if name in {"keep", "delete", "merge", "promote"}:
                 operations[name] += 1
     maintenance_status = status or "not_due"
+    latest_cadence = cadence_events[-1] if cadence_events else {}
     applied = sum(
         1 for payload in cadence_events if payload.get("status") in {"committed", "noop"}
     )
@@ -799,6 +808,9 @@ def _four_tier_maintenance_metrics(
     )
     return {
         "maintenance_status": maintenance_status,
+        "maintenance_error": str(latest_cadence.get("error") or ""),
+        "maintenance_turns": int(latest_cadence.get("turns") or 0),
+        "maintenance_operation_ids": list(latest_cadence.get("operation_ids") or ()),
         "maintenance_runs": len(cadence_events),
         "maintenance_applied_runs": applied,
         "maintenance_failures": failures,
@@ -807,6 +819,39 @@ def _four_tier_maintenance_metrics(
         "maintenance_merge": operations["merge"],
         "maintenance_promote": operations["promote"],
     }
+
+
+def _append_backend_events(
+    path: Path,
+    *,
+    task_id: str,
+    events: list[tuple[str, Mapping[str, Any]]],
+) -> None:
+    if not events:
+        return
+    payload = b"".join(
+        canonical_json_bytes(
+            {
+                "schema_version": BACKEND_EVENT_SCHEMA_VERSION,
+                "task_id": task_id,
+                "event": event,
+                "payload": dict(event_payload),
+            }
+        )
+        + b"\n"
+        for event, event_payload in events
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    try:
+        written = os.write(descriptor, payload)
+        if written != len(payload):
+            raise OSError(
+                f"short append to {path}: wrote {written} of {len(payload)} bytes"
+            )
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _required_stream_project_key(value: str) -> str:

@@ -606,6 +606,9 @@ def test_four_tier_task_result_uses_backend_api_metrics(
     assert row.memory["selected_content_tokens"] == 0
     assert row.memory["injected_tokens"] == 0
     assert row.memory["maintenance_runs"] == 0
+    assert row.memory["maintenance_error"] == ""
+    assert row.memory["maintenance_turns"] == 0
+    assert row.memory["maintenance_operation_ids"] == []
     assert row.memory["maintenance_actions"] == {
         "keep": 0,
         "delete": 0,

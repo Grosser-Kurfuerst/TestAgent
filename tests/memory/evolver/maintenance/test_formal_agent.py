@@ -43,7 +43,7 @@ def _cadence_id() -> str:
 
 
 class _Policy:
-    def __init__(self, calls: list[CanonicalToolCall]) -> None:
+    def __init__(self, calls: list[CanonicalToolCall | None]) -> None:
         self.calls = list(calls)
         self.requests = []
 
@@ -57,11 +57,15 @@ class _Policy:
         self.requests.append(request)
         call = self.calls.pop(0)
         return DecisionResponse(
-            raw_completion=f"<tool_call>{call.arguments_json}</tool_call>",
+            raw_completion=(
+                "plain text without a tool call"
+                if call is None
+                else f"<tool_call>{call.arguments_json}</tool_call>"
+            ),
             prompt_token_ids=(1,),
             completion_token_ids=(2,),
             assistant_loss_mask=(1,),
-            parsed_tool_calls=(call,),
+            parsed_tool_calls=() if call is None else (call,),
             identity=self.identity(),
         )
 
@@ -98,6 +102,64 @@ class FormalMaintenanceAgentTests(unittest.TestCase):
         self.assertIn("repository is empty", request.messages[0].content)
         self.assertIn("exactly one tool call", request.messages[0].content)
         self.assertIn("never invent memory IDs", request.messages[0].content)
+
+    def test_invalid_output_is_corrected_once_then_finish_is_noop(self) -> None:
+        policy = _Policy([None, _call("finish", {"summary": "corrected"})])
+        events = []
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ExperienceStore.from_dir(tmp)
+            recorder = DecisionEventRecorder(
+                policy=policy,
+                trace_sink=lambda event, payload: events.append((event, payload)),
+            )
+            agent = FormalMaintenanceAgent(
+                policy=policy,
+                recorder=recorder,
+                store=store,
+                project_key="project-a",
+            )
+
+            result = agent.run(
+                maintenance_id=_cadence_id(),
+                attempt_id="attempt-a",
+                stream_id="stream-a",
+                task_group="group-a",
+            )
+
+        decisions = [payload for event, payload in events if event == "opd.decision"]
+        self.assertEqual(result.status, "noop")
+        self.assertEqual(result.turns, 2)
+        self.assertEqual([item["status"] for item in decisions], ["invalid_output", "success"])
+        self.assertEqual(decisions[1]["retry_of"], decisions[0]["decision_id"])
+        self.assertEqual(policy.requests[1].messages[-1].role, "user")
+        self.assertIn(
+            "exactly one valid maintenance tool call",
+            policy.requests[1].messages[-1].content,
+        )
+
+    def test_invalid_output_aborts_after_two_correction_retries(self) -> None:
+        policy = _Policy([None, None, None])
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ExperienceStore.from_dir(tmp)
+            agent = FormalMaintenanceAgent(
+                policy=policy,
+                recorder=DecisionEventRecorder(policy=policy),
+                store=store,
+                project_key="project-a",
+            )
+
+            result = agent.run(
+                maintenance_id=_cadence_id(),
+                attempt_id="attempt-a",
+                stream_id="stream-a",
+                task_group="group-a",
+            )
+
+        self.assertEqual(result.status, "aborted")
+        self.assertEqual(result.turns, 3)
+        self.assertEqual(len(policy.requests), 3)
+        self.assertIn("ValueError", result.error)
+        self.assertIn("exactly one tool call", result.error)
 
     def test_tools_exclude_promote(self) -> None:
         self.assertEqual(

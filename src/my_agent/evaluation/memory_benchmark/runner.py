@@ -597,6 +597,15 @@ def _build_task_result(
             "maintenance_status": str(
                 backend_finalize.metrics.get("maintenance_status") or "not_due"
             ),
+            "maintenance_error": str(
+                backend_finalize.metrics.get("maintenance_error") or ""
+            ),
+            "maintenance_turns": int(
+                backend_finalize.metrics.get("maintenance_turns", 0) or 0
+            ),
+            "maintenance_operation_ids": list(
+                backend_finalize.metrics.get("maintenance_operation_ids") or ()
+            ),
             "maintenance_runs": int(
                 backend_finalize.metrics.get("maintenance_runs", 0) or 0
             ),

@@ -724,6 +724,8 @@ def _run_smoke(args: argparse.Namespace, ctx: CliContext) -> dict[str, Any]:
         container_digest=_required_string(
             smoke_source.get("container_digest"), "smoke container digest"
         ),
+        generation_temperature=float(config.memory["generation_temperature"]),
+        generation_top_p=float(config.memory["generation_top_p"]),
         seed=42,
         maintenance_interval_tasks=int(
             config.smoke.get("maintenance_interval_tasks", 4)

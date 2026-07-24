@@ -204,6 +204,9 @@ class MaintenanceCadenceScheduler:
             "maintenance_plan_id": result.plan_id or None,
             "maintenance_transaction_id": result.transaction_id or None,
             "repository_revision_after": result.after_revision,
+            "turns": result.turns,
+            "operation_ids": list(result.operation_ids),
+            "error": result.error,
         })
         return result.status
 

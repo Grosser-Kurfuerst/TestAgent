@@ -47,8 +47,8 @@
     "model": "text-embedding-v4"
   },
   "memory": {
-    "generation_temperature": 1.0,
-    "generation_top_p": 0.95,
+    "generation_temperature": 0.2,
+    "generation_top_p": 1.0,
     "selected_max_items": 20,
     "selected_content_max_tokens": 1800,
     "agentcli_candidate_top_k_per_tier": 50,
