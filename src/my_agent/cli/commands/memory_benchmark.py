@@ -642,6 +642,7 @@ def run_preflighted_memory_benchmark(
                 run_id=str(preflight["run_id"]),
                 runtime_root=run_path / ".runtime",
             )
+            adapter.load_tasks(limit=requested_limits[benchmark])
             result = stream_runner(
                 tasks=tasks_by_benchmark[benchmark],
                 adapter=adapter,

@@ -280,6 +280,9 @@ def _preflight(
 
 def _fake_stream_runner(calls: list[dict[str, Any]]) -> Callable[..., Any]:
     def run(**kwargs: Any) -> Any:
+        assert set(kwargs["adapter"]._records) == {
+            task.task_id for task in kwargs["tasks"]
+        }
         calls.append(dict(kwargs))
         output = Path(kwargs["output_dir"])
         output.mkdir(parents=True, exist_ok=True)
