@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from time import perf_counter
+from time import perf_counter, sleep
 from typing import Any
 from uuid import uuid4
 import os
@@ -53,10 +53,12 @@ _FOUR_TIER_INITIALIZATION_FILES = frozenset(
     }
 )
 _LLM_TASK_MAX_RETRIES = 3
+_LLM_TASK_RETRY_BACKOFF_SECONDS = (5.0, 15.0, 30.0)
 _LLM_RETRY_SCHEMA_VERSION = "memory-benchmark-llm-retry-v1"
 
 ManifestRunnerFn = Callable[..., ManifestBenchmarkResult]
 ProgressReporterFn = Callable[[str], None]
+RetrySleeperFn = Callable[[float], None]
 
 
 @dataclass(frozen=True)
@@ -120,6 +122,7 @@ def run_memory_benchmark_stream(
     command_timeout: int | None = None,
     manifest_runner: ManifestRunnerFn = run_manifest_benchmark,
     progress: ProgressReporterFn | None = None,
+    retry_sleeper: RetrySleeperFn = sleep,
 ) -> MemoryBenchmarkStreamResult:
     ordered_tasks = _validate_ordered_tasks(tasks)
     if not ordered_tasks:
@@ -258,7 +261,8 @@ def run_memory_benchmark_stream(
                             f"task {task_position}/{task_count} task_id={task.task_id} "
                             f"attempt {attempt}/{_LLM_TASK_MAX_RETRIES + 1} llm_failed; "
                             + (
-                                f"retrying {attempt}/{_LLM_TASK_MAX_RETRIES}"
+                                f"retrying {attempt}/{_LLM_TASK_MAX_RETRIES} "
+                                f"after {_LLM_TASK_RETRY_BACKOFF_SECONDS[attempt - 1]:.1f}s"
                                 if will_retry
                                 else "retries exhausted"
                             )
@@ -272,6 +276,7 @@ def run_memory_benchmark_stream(
                         will_retry=will_retry,
                     )
                     if will_retry:
+                        retry_sleeper(_LLM_TASK_RETRY_BACKOFF_SECONDS[attempt - 1])
                         continue
                     raise MemoryBenchmarkInfrastructureError(
                         task,

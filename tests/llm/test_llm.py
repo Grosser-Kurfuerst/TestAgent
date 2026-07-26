@@ -228,6 +228,53 @@ class LLMTests(unittest.TestCase):
 
         self.assertEqual(output, "ok")
 
+    def test_openai_chat_retries_socket_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / ".env"
+            env_file.write_text(
+                "MY_AGENT_LLM_PROVIDER=openai\nMY_AGENT_API_KEY=test-key\n",
+                encoding="utf-8",
+            )
+            config = AgentConfig.from_env(env_file=env_file)
+        client = OpenAICompatibleLLM(config, timeout=3, max_retries=1)
+
+        with mock.patch(
+            "urllib.request.urlopen",
+            side_effect=[
+                TimeoutError("timed out"),
+                _FakeResponse({"choices": [{"message": {"content": "ok"}}]}),
+            ],
+        ) as urlopen:
+            with mock.patch("time.sleep") as retry_sleep:
+                output = client._chat([{"role": "user", "content": "hello"}])
+
+        self.assertEqual(output, "ok")
+        self.assertEqual(urlopen.call_count, 2)
+        retry_sleep.assert_called_once_with(0.25)
+
+    def test_openai_chat_wraps_exhausted_socket_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / ".env"
+            env_file.write_text(
+                "MY_AGENT_LLM_PROVIDER=openai\nMY_AGENT_API_KEY=test-key\n",
+                encoding="utf-8",
+            )
+            config = AgentConfig.from_env(env_file=env_file)
+        client = OpenAICompatibleLLM(config, timeout=3, max_retries=1)
+
+        with mock.patch(
+            "urllib.request.urlopen",
+            side_effect=TimeoutError("timed out"),
+        ) as urlopen:
+            with mock.patch("time.sleep"):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "LLM request timed out: timed out",
+                ):
+                    client._chat([{"role": "user", "content": "hello"}])
+
+        self.assertEqual(urlopen.call_count, 2)
+
     def test_fake_llm_implements_standard_chat_interface(self) -> None:
         llm = FakeLLM(chat_responses=[ChatResponse(content="done", finish_reason="stop")])
 

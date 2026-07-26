@@ -172,6 +172,10 @@ class OpenAICompatibleLLM:
                 last_error = f"LLM request failed: {exc.reason}"
                 if attempt == attempts - 1:
                     raise RuntimeError(last_error) from exc
+            except TimeoutError as exc:
+                last_error = f"LLM request timed out: {exc}"
+                if attempt == attempts - 1:
+                    raise RuntimeError(last_error) from exc
             time.sleep(min(0.25 * (2**attempt), 1.0))
         raise RuntimeError(last_error or "LLM request failed.")
 
