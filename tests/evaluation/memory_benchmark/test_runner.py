@@ -1080,15 +1080,16 @@ def test_runner_rejects_adapter_task_identity_mismatch_and_still_cleans_up(
     assert adapter.cleaned_ids == ["task-2"]
 
 
-def test_runner_refuses_to_overwrite_existing_stream_directory(tmp_path: Path) -> None:
+def test_runner_refuses_existing_stream_without_resume_metadata(tmp_path: Path) -> None:
     output = tmp_path / "stream"
     output.mkdir()
+    (output / "unexpected.txt").write_text("stale\n", encoding="utf-8")
     backend = NoMemoryBackend(
         stream_memory_dir=output / "memory",
         stream_project_key=_project_key("no_memory"),
     )
 
-    with pytest.raises(FileExistsError, match="already exists"):
+    with pytest.raises(FileExistsError, match="not resumable"):
         run_memory_benchmark_stream(
             tasks=[_task(1)],
             adapter=FakeAdapter(),
@@ -1104,6 +1105,176 @@ def test_runner_refuses_to_overwrite_existing_stream_directory(tmp_path: Path) -
             tools_hash=HASH,
             backend_config_hash=HASH,
             manifest_runner=FakeManifestRunner(formal=False),
+        )
+
+
+def test_no_memory_stream_resumes_from_next_task_and_archives_failed_artifacts(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "stream"
+    first = _run(
+        tmp_path,
+        backend=NoMemoryBackend(
+            stream_memory_dir=output / "memory",
+            stream_project_key=_project_key("no_memory"),
+        ),
+        adapter=FakeAdapter(),
+        manifest_runner=FakeManifestRunner(formal=False),
+        tasks=[_task(1)],
+    )
+    stale_task_dir = output / "tasks" / "0002_task-2"
+    stale_task_dir.mkdir()
+    (stale_task_dir / "partial.txt").write_text("interrupted\n", encoding="utf-8")
+    adapter = FakeAdapter()
+    progress: list[str] = []
+
+    resumed = _run(
+        tmp_path,
+        backend=NoMemoryBackend(
+            stream_memory_dir=output / "memory",
+            stream_project_key=_project_key("no_memory"),
+        ),
+        adapter=adapter,
+        manifest_runner=FakeManifestRunner(formal=False),
+        tasks=[_task(1), _task(2)],
+        progress=progress.append,
+    )
+
+    assert [result.task_id for result in first.task_results] == ["task-1"]
+    assert [execution.task.task_id for execution in resumed.executions] == ["task-2"]
+    assert [result.task_id for result in resumed.task_results] == ["task-1", "task-2"]
+    assert adapter.prepared_ids == ["task-2"]
+    assert progress[0].endswith("completed=1/2 next_task_id=task-2")
+    assert (
+        output
+        / "resume_artifacts"
+        / "resume_01"
+        / "0002_task-2"
+        / "partial.txt"
+    ).exists()
+
+
+def test_completed_stream_is_skipped_automatically(tmp_path: Path) -> None:
+    output = tmp_path / "stream"
+    _run(
+        tmp_path,
+        backend=NoMemoryBackend(
+            stream_memory_dir=output / "memory",
+            stream_project_key=_project_key("no_memory"),
+        ),
+        adapter=FakeAdapter(),
+        manifest_runner=FakeManifestRunner(formal=False),
+    )
+    adapter = FakeAdapter()
+    progress: list[str] = []
+
+    resumed = _run(
+        tmp_path,
+        backend=NoMemoryBackend(
+            stream_memory_dir=output / "memory",
+            stream_project_key=_project_key("no_memory"),
+        ),
+        adapter=adapter,
+        manifest_runner=FakeManifestRunner(formal=False),
+        progress=progress.append,
+    )
+
+    assert resumed.executions == ()
+    assert [result.task_id for result in resumed.task_results] == ["task-1", "task-2"]
+    assert adapter.prepared_ids == []
+    assert progress == [
+        "resume arm=no_memory benchmark=lifelong_os completed=2/2; "
+        "already completed; skipped"
+    ]
+
+
+def test_four_tier_stream_resumes_with_repository_revision_continuity(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "stream"
+    first = _run(
+        tmp_path,
+        backend=_four_tier_backend(output / "memory"),
+        adapter=FakeAdapter(),
+        manifest_runner=FakeManifestRunner(formal=False),
+        tasks=[_task(1)],
+    )
+    expected_revision = first.task_results[-1].memory["repository_revision_after"]
+
+    resumed = _run(
+        tmp_path,
+        backend=_four_tier_backend(output / "memory"),
+        adapter=FakeAdapter(),
+        manifest_runner=FakeManifestRunner(formal=False),
+        tasks=[_task(1), _task(2)],
+    )
+
+    assert [execution.task.task_id for execution in resumed.executions] == ["task-2"]
+    assert resumed.executions[0].memory_before.revision == expected_revision
+    assert [result.task_id for result in resumed.task_results] == ["task-1", "task-2"]
+
+
+def test_resume_rejects_results_that_are_not_the_expected_task_prefix(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "stream"
+    first = _run(
+        tmp_path,
+        backend=NoMemoryBackend(
+            stream_memory_dir=output / "memory",
+            stream_project_key=_project_key("no_memory"),
+        ),
+        adapter=FakeAdapter(),
+        manifest_runner=FakeManifestRunner(formal=False),
+        tasks=[_task(1)],
+    )
+    payload = first.task_results[0].to_dict()
+    payload["task_id"] = "task-2"
+    first.results_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="not a valid task prefix"):
+        _run(
+            tmp_path,
+            backend=NoMemoryBackend(
+                stream_memory_dir=output / "memory",
+                stream_project_key=_project_key("no_memory"),
+            ),
+            adapter=FakeAdapter(),
+            manifest_runner=FakeManifestRunner(formal=False),
+            tasks=[_task(1), _task(2)],
+        )
+
+
+def test_resume_rejects_memory_state_that_drifted_after_last_result(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "stream"
+    _run(
+        tmp_path,
+        backend=_four_tier_backend(output / "memory"),
+        adapter=FakeAdapter(),
+        manifest_runner=FakeManifestRunner(formal=False),
+        tasks=[_task(1)],
+    )
+    store = ExperienceStore.from_dir(output / "memory")
+    store.append_all_atomically(
+        (
+            _tip_memory(
+                "unexpected-memory",
+                "Unexpected memory state",
+                project_key=_project_key("agentcli_four_tier"),
+                source_task="external",
+            ),
+        )
+    )
+
+    with pytest.raises(ValueError, match="does not match the last completed task"):
+        _run(
+            tmp_path,
+            backend=_four_tier_backend(output / "memory"),
+            adapter=FakeAdapter(),
+            manifest_runner=FakeManifestRunner(formal=False),
+            tasks=[_task(1), _task(2)],
         )
 
 

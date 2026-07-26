@@ -214,10 +214,6 @@ class AgentCliFourTierBackend(_LocalExperienceBackend):
             stream_memory_dir=stream_memory_dir,
             stream_project_key=stream_project_key,
         )
-        if self.stream_memory_dir.exists() and any(self.stream_memory_dir.iterdir()):
-            raise FileExistsError(
-                "four-tier stream memory directory must be empty before initialization"
-            )
         for field_name, value in (
             ("candidate_top_k_per_tier", candidate_top_k_per_tier),
             ("selected_max_items", selected_max_items),

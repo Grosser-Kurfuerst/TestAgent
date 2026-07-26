@@ -8,6 +8,7 @@ from pathlib import Path
 from time import perf_counter, sleep
 from typing import Any
 from uuid import uuid4
+import json
 import os
 import re
 
@@ -82,6 +83,7 @@ class MemoryBenchmarkStreamResult:
     output_dir: Path
     results_path: Path
     executions: tuple[MemoryBenchmarkTaskExecution, ...]
+    task_results: tuple[MemoryBenchmarkTaskResult, ...]
 
 
 class MemoryBenchmarkInfrastructureError(RuntimeError):
@@ -149,16 +151,6 @@ def run_memory_benchmark_stream(
     memory_dir = Path(stream_memory_dir).expanduser().resolve()
     if memory_dir != stream_dir / "memory":
         raise ValueError("stream_memory_dir must be the stream output memory directory")
-    if stream_dir.exists() and not _is_backend_initialized_empty_stream(
-        stream_dir,
-        memory_dir=memory_dir,
-    ):
-        raise FileExistsError(f"memory benchmark stream output already exists: {stream_dir}")
-    if memory_dir.exists() and any(memory_dir.iterdir()) and not (
-        backend.name == "agentcli_four_tier"
-        and _is_four_tier_initialized_memory_dir(memory_dir)
-    ):
-        raise FileExistsError(f"stream memory directory is not empty: {memory_dir}")
     expected_project_key = memory_stream_project_key(
         run_id=run_id,
         seed=seed,
@@ -167,16 +159,75 @@ def run_memory_benchmark_stream(
     )
     if stream_project_key != expected_project_key:
         raise ValueError("stream_project_key does not match run/seed/benchmark/arm isolation")
+    stream_was_initialized = stream_dir.exists() and _is_backend_initialized_empty_stream(
+        stream_dir,
+        memory_dir=memory_dir,
+    )
     stream_dir.mkdir(parents=True, exist_ok=True)
     task_root = stream_dir / "tasks"
-    task_root.mkdir()
     results_path = stream_dir / "results.jsonl"
-    results_path.touch(exist_ok=False)
+    if not results_path.exists():
+        if any(stream_dir.iterdir()) and not stream_was_initialized:
+            raise FileExistsError(
+                f"memory benchmark stream output is not resumable: {stream_dir}"
+            )
+        task_root.mkdir(exist_ok=True)
+        results_path.touch(exist_ok=False)
+    elif not task_root.is_dir():
+        raise ValueError("resumable memory benchmark stream is missing its tasks directory")
+    existing_results = _load_task_results(results_path)
+    _validate_resume_results(
+        existing_results,
+        tasks=ordered_tasks,
+        run_id=run_id,
+        seed=seed,
+        arm=backend.name,
+        protocol_hash=protocol_hash,
+        actor_identity_hash=actor_identity_hash,
+        tools_hash=tools_hash,
+        backend_config_hash=backend_config_hash,
+        actor_sampling_seed_supported=actor_sampling_seed_supported,
+        actor_sampling_seed_effective=actor_sampling_seed_effective,
+    )
+    _validate_resume_snapshot(backend.snapshot(), existing_results)
+    completed_count = len(existing_results)
+    task_count = len(ordered_tasks)
+    if completed_count == task_count:
+        _emit_progress(
+            progress,
+            (
+                f"resume arm={backend.name} benchmark={ordered_tasks[0].benchmark} "
+                f"completed={completed_count}/{task_count}; already completed; skipped"
+            ),
+        )
+    elif completed_count:
+        next_task = ordered_tasks[completed_count]
+        _archive_incomplete_task_artifacts(
+            stream_dir=stream_dir,
+            task_root=task_root,
+            task=next_task,
+        )
+        _emit_progress(
+            progress,
+            (
+                f"resume arm={backend.name} benchmark={next_task.benchmark} "
+                f"completed={completed_count}/{task_count} next_task_id={next_task.task_id}"
+            ),
+        )
+    else:
+        _archive_incomplete_task_artifacts(
+            stream_dir=stream_dir,
+            task_root=task_root,
+            task=ordered_tasks[0],
+        )
     executions: list[MemoryBenchmarkTaskExecution] = []
+    task_results = list(existing_results)
     stream_failure: BaseException | None = None
     try:
-        task_count = len(ordered_tasks)
-        for task_position, task in enumerate(ordered_tasks, start=1):
+        for task_position, task in enumerate(
+            ordered_tasks[completed_count:],
+            start=completed_count + 1,
+        ):
             task_started = perf_counter()
             task_name = f"{task.order_index:04d}_{_safe_id(task.task_id)}"
             task_dir = task_root / task_name
@@ -301,6 +352,7 @@ def run_memory_benchmark_stream(
                     manifest_result=execution.manifest_result,
                 ) from exc
             executions.append(execution)
+            task_results.append(execution.task_result)
             _emit_progress(
                 progress,
                 (
@@ -328,6 +380,7 @@ def run_memory_benchmark_stream(
         output_dir=stream_dir,
         results_path=results_path,
         executions=tuple(executions),
+        task_results=tuple(task_results),
     )
 
 
@@ -581,6 +634,123 @@ def _is_four_tier_initialized_memory_dir(memory_dir: Path) -> bool:
         entry.is_file() and entry.name in _FOUR_TIER_INITIALIZATION_FILES
         for entry in entries
     )
+
+
+def _load_task_results(path: Path) -> tuple[MemoryBenchmarkTaskResult, ...]:
+    results: list[MemoryBenchmarkTaskResult] = []
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+            if not isinstance(payload, Mapping):
+                raise ValueError("task result must be a JSON object")
+            results.append(MemoryBenchmarkTaskResult.from_dict(payload))
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"invalid memory benchmark result at {path}:{line_number}: {exc}"
+            ) from exc
+    return tuple(results)
+
+
+def _validate_resume_results(
+    results: Sequence[MemoryBenchmarkTaskResult],
+    *,
+    tasks: Sequence[BenchmarkTask],
+    run_id: str,
+    seed: int,
+    arm: str,
+    protocol_hash: str,
+    actor_identity_hash: str,
+    tools_hash: str,
+    backend_config_hash: str,
+    actor_sampling_seed_supported: bool,
+    actor_sampling_seed_effective: int | None,
+) -> None:
+    if len(results) > len(tasks):
+        raise ValueError("existing memory benchmark results exceed the configured task count")
+    for position, (result, task) in enumerate(zip(results, tasks, strict=False), start=1):
+        expected = {
+            "run_id": run_id,
+            "seed": seed,
+            "arm": arm,
+            "benchmark": task.benchmark,
+            "subset": task.subset,
+            "task_id": task.task_id,
+            "order_index": task.order_index,
+            "task_content_hash": task.content_hash,
+            "actor_identity_hash": actor_identity_hash,
+            "tools_hash": tools_hash,
+            "evaluator_hash": _required_spec_string(task.evaluator_spec, "hash"),
+            "protocol_hash": protocol_hash,
+            "backend_config_hash": backend_config_hash,
+            "actor_sampling_seed_supported": actor_sampling_seed_supported,
+            "actor_sampling_seed_effective": actor_sampling_seed_effective,
+            "outcome_finalized": True,
+        }
+        for field_name, expected_value in expected.items():
+            if getattr(result, field_name) != expected_value:
+                raise ValueError(
+                    "existing memory benchmark results are not a valid task prefix: "
+                    f"row {position} field {field_name!r} does not match"
+                )
+
+
+def _validate_resume_snapshot(
+    snapshot: MemoryRepositorySnapshot,
+    results: Sequence[MemoryBenchmarkTaskResult],
+) -> None:
+    if not results:
+        if snapshot.entry_count != 0:
+            raise ValueError("memory repository is non-empty but results.jsonl has no tasks")
+        return
+    memory = results[-1].memory
+    expected_revision = memory.get("repository_revision_after")
+    expected_entries = memory.get("entries_after")
+    expected_tier_counts = memory.get("tier_counts_after")
+    if (
+        not isinstance(expected_revision, str)
+        or isinstance(expected_entries, bool)
+        or not isinstance(expected_entries, int)
+        or not isinstance(expected_tier_counts, Mapping)
+    ):
+        raise ValueError("last memory benchmark result has an invalid repository snapshot")
+    normalized_tier_counts = {
+        str(tier): count for tier, count in expected_tier_counts.items()
+    }
+    if (
+        snapshot.revision != expected_revision
+        or snapshot.entry_count != expected_entries
+        or dict(snapshot.tier_counts) != normalized_tier_counts
+    ):
+        raise ValueError("memory repository does not match the last completed task result")
+
+
+def _archive_incomplete_task_artifacts(
+    *,
+    stream_dir: Path,
+    task_root: Path,
+    task: BenchmarkTask,
+) -> None:
+    task_name = f"{task.order_index:04d}_{_safe_id(task.task_id)}"
+    artifacts = sorted(
+        (
+            entry
+            for entry in task_root.iterdir()
+            if entry.name == task_name or entry.name.startswith(f"{task_name}_retry_")
+        ),
+        key=lambda path: path.name,
+    )
+    if not artifacts:
+        return
+    resume_root = stream_dir / "resume_artifacts"
+    resume_index = 1
+    while (resume_root / f"resume_{resume_index:02d}").exists():
+        resume_index += 1
+    archive_dir = resume_root / f"resume_{resume_index:02d}"
+    archive_dir.mkdir(parents=True)
+    for artifact in artifacts:
+        artifact.rename(archive_dir / artifact.name)
 
 
 def _no_memory_trace_activity(metrics: Mapping[str, Any]) -> bool:

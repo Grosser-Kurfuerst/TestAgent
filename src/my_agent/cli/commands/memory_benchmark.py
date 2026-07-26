@@ -617,10 +617,6 @@ def run_preflighted_memory_benchmark(
         for benchmark in requested_benchmarks:
             stream_position += 1
             target = run_path / "arms" / arm / f"seed_{seed}" / benchmark
-            if target.exists():
-                raise FileExistsError(
-                    f"memory benchmark stream output already exists: {target}"
-                )
             stream_memory_dir = target / "memory"
             stream_project_key = memory_stream_project_key(
                 run_id=str(preflight["run_id"]),
@@ -1433,16 +1429,14 @@ def _stream_summary(
     *,
     protocol_hash: str,
 ) -> dict[str, Any]:
-    executions = tuple(result.executions)
+    task_results = tuple(result.task_results)
     return {
         "schema_version": STREAM_SUMMARY_SCHEMA_VERSION,
         "arm": result.arm,
         "seed": result.seed,
         "benchmark": result.benchmark,
-        "task_count": len(executions),
-        "resolved": sum(
-            1 for execution in executions if execution.task_result.resolved
-        ),
+        "task_count": len(task_results),
+        "resolved": sum(1 for task_result in task_results if task_result.resolved),
         "protocol_hash": protocol_hash,
         "results_path": str(result.results_path),
     }

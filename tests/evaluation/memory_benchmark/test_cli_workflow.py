@@ -298,6 +298,7 @@ def _fake_stream_runner(calls: list[dict[str, Any]]) -> Callable[..., Any]:
             benchmark=kwargs["tasks"][0].benchmark,
             results_path=results_path,
             executions=executions,
+            task_results=tuple(execution.task_result for execution in executions),
         )
 
     return run
@@ -471,7 +472,7 @@ def test_preflight_probe_failure_does_not_write_protocol(tmp_path: Path) -> None
     assert not (run_dir / "preflight.json").exists()
 
 
-def test_run_rejects_selection_drift_and_existing_stream(tmp_path: Path) -> None:
+def test_run_allows_existing_stream_and_rejects_selection_drift(tmp_path: Path) -> None:
     fixture = _fixture_workspace(tmp_path)
     prepare_memory_benchmark_data(config_path=fixture["config"], env=fixture["env"])
     run_dir = fixture["repo"] / "evaluationResults" / "pilot"
@@ -498,8 +499,9 @@ def test_run_rejects_selection_drift_and_existing_stream(tmp_path: Path) -> None
     assert progress[-1].startswith(
         "stream 3/3 seed=42 arm=no_memory benchmark=intercode_bash completed resolved=1/1 elapsed="
     )
-    with pytest.raises(FileExistsError, match="already exists"):
-        _run(fixture, run_dir, arms="no_memory")
+    resumed = _run(fixture, run_dir, arms="no_memory", stream_runner=_fake_stream_runner(calls))
+    assert resumed["status"] == "completed"
+    assert len(calls) == 4
     with pytest.raises(ValueError, match="selection does not match preflight"):
         run_preflighted_memory_benchmark(
             config_path=fixture["config"],
