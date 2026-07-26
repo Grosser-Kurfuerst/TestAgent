@@ -306,14 +306,17 @@ class FakeManifestRunner:
         formal: bool,
         outcomes: dict[str, bool] | None = None,
         infrastructure_task: str = "",
+        llm_failures_before_success: dict[str, int] | None = None,
         formal_usage: bool = False,
     ) -> None:
         self.formal = formal
         self.outcomes = dict(outcomes or {})
         self.infrastructure_task = infrastructure_task
+        self.llm_failures_before_success = dict(llm_failures_before_success or {})
         self.formal_usage = formal_usage
         self.calls: list[dict[str, Any]] = []
         self.visible_counts_before: list[int] = []
+        self.attempt_counts: dict[str, int] = {}
 
     def __call__(self, **kwargs: Any) -> ManifestBenchmarkResult:
         manifest_path = Path(kwargs["tasks_path"])
@@ -325,10 +328,13 @@ class FakeManifestRunner:
         store = ExperienceStore.from_dir(config.memory_dir)
         visible_before = store.all(project_key=config.memory_project_key)
         self.visible_counts_before.append(len(visible_before))
+        attempt = self.attempt_counts.get(task_id, 0) + 1
+        self.attempt_counts[task_id] = attempt
         written_ids: list[str] = []
         writer_status = ""
         infrastructure = task_id == self.infrastructure_task
-        if self.formal and not infrastructure:
+        llm_failure = attempt <= self.llm_failures_before_success.get(task_id, 0)
+        if self.formal and not infrastructure and not llm_failure:
             if task_id == "task-1":
                 memory = _tip_memory(
                     "memory-task-1",
@@ -355,7 +361,15 @@ class FakeManifestRunner:
             status="passed" if resolved else "failed",
             resolved=resolved,
             task_valid=True,
-            failure_type=("evaluator_error" if infrastructure else ("" if resolved else "official_evaluator_failed")),
+            failure_type=(
+                "agent_infrastructure_failed"
+                if llm_failure
+                else (
+                    "evaluator_error"
+                    if infrastructure
+                    else ("" if resolved else "official_evaluator_failed")
+                )
+            ),
             initial_visible=CommandResult("", True, 0, skipped=True),
             evaluation_kind="external_state",
             agent_final_answer=f"finished {task_id}",
@@ -365,7 +379,7 @@ class FakeManifestRunner:
             evaluator_name="fixture",
             evaluator_version="v1",
             evaluator_hash=HASH,
-            outcome_finalized=not infrastructure,
+            outcome_finalized=not infrastructure and not llm_failure,
             evolver_writer_status=writer_status,
             written_memory_ids=written_ids,
             repository_revision_after_writer=store.revision(),
@@ -380,8 +394,12 @@ class FakeManifestRunner:
             memory_growth=len(written_ids),
             agent_steps=1,
             agent_done=True,
-            agent_stop_reason="assistant_final",
-            error="fixture infrastructure error" if infrastructure else "",
+            agent_stop_reason="llm_failed" if llm_failure else "assistant_final",
+            error=(
+                f"TimeoutError: fixture LLM timeout on attempt {attempt}"
+                if llm_failure
+                else ("fixture infrastructure error" if infrastructure else "")
+            ),
             metrics=(
                 {
                     "llm_iterations": 1,
@@ -702,6 +720,115 @@ def test_normal_task_failure_continues_the_stream(tmp_path: Path) -> None:
     assert adapter.cleaned_ids == ["task-1", "task-2"]
     rows = [json.loads(line) for line in result.results_path.read_text().splitlines()]
     assert [row["failure_type"] for row in rows] == ["official_evaluator_failed", ""]
+
+
+def test_llm_failure_retries_three_times_from_clean_task_environments(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "stream"
+    backend = NoMemoryBackend(
+        stream_memory_dir=output / "memory",
+        stream_project_key=_project_key("no_memory"),
+    )
+    adapter = FakeAdapter()
+    manifest = FakeManifestRunner(
+        formal=False,
+        llm_failures_before_success={"task-1": 3},
+    )
+
+    result = _run(
+        tmp_path,
+        backend=backend,
+        adapter=adapter,
+        manifest_runner=manifest,
+    )
+
+    assert adapter.prepared_ids == [
+        "task-1",
+        "task-1",
+        "task-1",
+        "task-1",
+        "task-2",
+    ]
+    assert adapter.cleaned_ids == [
+        "task-1",
+        "task-1",
+        "task-1",
+        "task-1",
+        "task-2",
+    ]
+    assert manifest.attempt_counts == {"task-1": 4, "task-2": 1}
+    assert [execution.task.task_id for execution in result.executions] == [
+        "task-1",
+        "task-2",
+    ]
+    task_root = output / "tasks"
+    assert (task_root / "0001_task-1_retry_01" / "actions.jsonl").exists()
+    assert (task_root / "0001_task-1_retry_02" / "actions.jsonl").exists()
+    assert (task_root / "0001_task-1_retry_03" / "actions.jsonl").exists()
+    history = json.loads(
+        (task_root / "0001_task-1" / "llm_retry_history.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert history["schema_version"] == "memory-benchmark-llm-retry-v1"
+    assert history["max_retries"] == 3
+    assert history["max_attempts"] == 4
+    assert [item["attempt"] for item in history["attempts"]] == [1, 2, 3]
+    assert all(item["will_retry"] is True for item in history["attempts"])
+    assert all(item["agent_stop_reason"] == "llm_failed" for item in history["attempts"])
+
+
+def test_llm_failure_after_three_retries_records_all_attempts_and_aborts(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "stream"
+    backend = NoMemoryBackend(
+        stream_memory_dir=output / "memory",
+        stream_project_key=_project_key("no_memory"),
+    )
+    adapter = FakeAdapter()
+    manifest = FakeManifestRunner(
+        formal=False,
+        llm_failures_before_success={"task-1": 4},
+    )
+
+    with pytest.raises(MemoryBenchmarkInfrastructureError) as raised:
+        _run(
+            tmp_path,
+            backend=backend,
+            adapter=adapter,
+            manifest_runner=manifest,
+        )
+
+    assert [stage for stage, _failure in raised.value.failures] == [
+        "llm_attempt_1",
+        "llm_attempt_2",
+        "llm_attempt_3",
+        "llm_attempt_4",
+    ]
+    assert raised.value.manifest_result is not None
+    assert raised.value.manifest_result.agent_stop_reason == "llm_failed"
+    assert adapter.prepared_ids == ["task-1"] * 4
+    assert adapter.cleaned_ids == ["task-1"] * 4
+    assert manifest.attempt_counts == {"task-1": 4}
+    history = json.loads(
+        (
+            output
+            / "tasks"
+            / "0001_task-1"
+            / "llm_retry_history.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert [item["attempt"] for item in history["attempts"]] == [1, 2, 3, 4]
+    assert [item["will_retry"] for item in history["attempts"]] == [
+        True,
+        True,
+        True,
+        False,
+    ]
+    assert all("fixture LLM timeout" in item["error"] for item in history["attempts"])
+    assert (output / "results.jsonl").read_text(encoding="utf-8") == ""
 
 
 def test_fake_eight_task_ab_stream_keeps_expected_repository_behavior(

@@ -51,6 +51,8 @@ _FOUR_TIER_INITIALIZATION_FILES = frozenset(
         "evolver_state.sqlite3-wal",
     }
 )
+_LLM_TASK_MAX_RETRIES = 3
+_LLM_RETRY_SCHEMA_VERSION = "memory-benchmark-llm-retry-v1"
 
 ManifestRunnerFn = Callable[..., ManifestBenchmarkResult]
 
@@ -168,36 +170,80 @@ def run_memory_benchmark_stream(
     stream_failure: BaseException | None = None
     try:
         for task in ordered_tasks:
-            task_dir = task_root / f"{task.order_index:04d}_{_safe_id(task.task_id)}"
-            task_dir.mkdir()
-            try:
-                prepared = adapter.prepare_task(task, task_dir=task_dir, seed=seed)
-            except Exception as exc:  # noqa: BLE001 - adapter owns partial-resource cleanup.
-                raise MemoryBenchmarkInfrastructureError(
-                    task,
-                    (("adapter_prepare", exc),),
-                ) from exc
-            execution = _execute_prepared_task(
-                expected_task=task,
-                prepared=prepared,
-                adapter=adapter,
-                backend=backend,
-                base_config=base_config,
-                task_dir=task_dir,
-                stream_memory_dir=memory_dir,
-                stream_project_key=stream_project_key,
-                protocol_hash=protocol_hash,
-                run_id=run_id,
-                seed=seed,
-                actor_identity_hash=actor_identity_hash,
-                tools_hash=tools_hash,
-                backend_config_hash=backend_config_hash,
-                actor_sampling_seed_supported=actor_sampling_seed_supported,
-                actor_sampling_seed_effective=actor_sampling_seed_effective,
-                max_steps=max_steps,
-                command_timeout=command_timeout,
-                manifest_runner=manifest_runner,
-            )
+            task_name = f"{task.order_index:04d}_{_safe_id(task.task_id)}"
+            task_dir = task_root / task_name
+            llm_attempt_failures: list[MemoryBenchmarkInfrastructureError] = []
+            llm_attempt_dirs: list[Path] = []
+            execution: MemoryBenchmarkTaskExecution | None = None
+            for attempt in range(1, _LLM_TASK_MAX_RETRIES + 2):
+                attempt_dir = (
+                    task_dir
+                    if attempt == 1
+                    else task_root / f"{task_name}_retry_{attempt - 1:02d}"
+                )
+                attempt_dir.mkdir()
+                try:
+                    prepared = adapter.prepare_task(
+                        task,
+                        task_dir=attempt_dir,
+                        seed=seed,
+                    )
+                except Exception as exc:  # noqa: BLE001 - adapter owns partial cleanup.
+                    raise MemoryBenchmarkInfrastructureError(
+                        task,
+                        (("adapter_prepare", exc),),
+                    ) from exc
+                try:
+                    execution = _execute_prepared_task(
+                        expected_task=task,
+                        prepared=prepared,
+                        adapter=adapter,
+                        backend=backend,
+                        base_config=base_config,
+                        task_dir=attempt_dir,
+                        stream_memory_dir=memory_dir,
+                        stream_project_key=stream_project_key,
+                        protocol_hash=protocol_hash,
+                        run_id=run_id,
+                        seed=seed,
+                        actor_identity_hash=actor_identity_hash,
+                        tools_hash=tools_hash,
+                        backend_config_hash=backend_config_hash,
+                        actor_sampling_seed_supported=actor_sampling_seed_supported,
+                        actor_sampling_seed_effective=actor_sampling_seed_effective,
+                        max_steps=max_steps,
+                        command_timeout=command_timeout,
+                        manifest_runner=manifest_runner,
+                    )
+                except MemoryBenchmarkInfrastructureError as exc:
+                    if not _is_retryable_llm_failure(exc):
+                        raise
+                    llm_attempt_failures.append(exc)
+                    llm_attempt_dirs.append(attempt_dir)
+                    will_retry = attempt <= _LLM_TASK_MAX_RETRIES
+                    _write_llm_retry_history(
+                        task_dir / "llm_retry_history.json",
+                        task=task,
+                        failures=llm_attempt_failures,
+                        artifact_dirs=llm_attempt_dirs,
+                        will_retry=will_retry,
+                    )
+                    if will_retry:
+                        continue
+                    raise MemoryBenchmarkInfrastructureError(
+                        task,
+                        tuple(
+                            (f"llm_attempt_{index}", failure)
+                            for index, failure in enumerate(
+                                llm_attempt_failures,
+                                start=1,
+                            )
+                        ),
+                        manifest_result=exc.manifest_result,
+                    ) from exc
+                break
+            if execution is None:  # pragma: no cover - retry loop invariant.
+                raise RuntimeError("LLM retry loop completed without a task result")
             try:
                 _append_task_result(results_path, execution.task_result)
             except Exception as exc:  # noqa: BLE001 - result persistence is infrastructure.
@@ -693,6 +739,54 @@ def _required_spec_string(spec: Mapping[str, Any], key: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"evaluator_spec requires non-empty {key}")
     return value.strip()
+
+
+def _is_retryable_llm_failure(error: MemoryBenchmarkInfrastructureError) -> bool:
+    result = error.manifest_result
+    return (
+        tuple(stage for stage, _failure in error.failures) == ("task_execution",)
+        and result is not None
+        and result.failure_type == "agent_infrastructure_failed"
+        and result.agent_stop_reason == "llm_failed"
+    )
+
+
+def _write_llm_retry_history(
+    path: Path,
+    *,
+    task: BenchmarkTask,
+    failures: Sequence[MemoryBenchmarkInfrastructureError],
+    artifact_dirs: Sequence[Path],
+    will_retry: bool,
+) -> None:
+    attempts: list[dict[str, Any]] = []
+    for attempt, (failure, artifact_dir) in enumerate(
+        zip(failures, artifact_dirs, strict=True),
+        start=1,
+    ):
+        result = failure.manifest_result
+        if result is None:  # pragma: no cover - guarded by retry classification.
+            raise ValueError("LLM retry failure requires a manifest result")
+        attempts.append(
+            {
+                "attempt": attempt,
+                "failure_type": result.failure_type,
+                "agent_stop_reason": result.agent_stop_reason,
+                "error": result.error,
+                "artifact_dir": str(artifact_dir),
+                "will_retry": will_retry if attempt == len(failures) else True,
+            }
+        )
+    _write_json_atomic(
+        path,
+        {
+            "schema_version": _LLM_RETRY_SCHEMA_VERSION,
+            "task_id": task.task_id,
+            "max_retries": _LLM_TASK_MAX_RETRIES,
+            "max_attempts": _LLM_TASK_MAX_RETRIES + 1,
+            "attempts": attempts,
+        },
+    )
 
 
 def _safe_id(value: str) -> str:
