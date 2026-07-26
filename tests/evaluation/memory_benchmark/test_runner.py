@@ -466,6 +466,7 @@ def _run(
     adapter: FakeAdapter,
     manifest_runner: Callable[..., ManifestBenchmarkResult],
     tasks: list[BenchmarkTask] | None = None,
+    progress: Callable[[str], None] | None = None,
 ):
     output = tmp_path / "stream"
     return run_memory_benchmark_stream(
@@ -483,6 +484,7 @@ def _run(
         tools_hash=HASH,
         backend_config_hash=HASH,
         manifest_runner=manifest_runner,
+        progress=progress,
     )
 
 
@@ -788,6 +790,7 @@ def test_four_tier_llm_retry_aborts_pending_session_before_retry(
         formal=False,
         llm_failures_before_success={"task-1": 1},
     )
+    progress: list[str] = []
 
     result = _run(
         tmp_path,
@@ -795,12 +798,21 @@ def test_four_tier_llm_retry_aborts_pending_session_before_retry(
         adapter=FakeAdapter(),
         manifest_runner=manifest,
         tasks=[_task(1)],
+        progress=progress.append,
     )
 
     assert manifest.attempt_counts == {"task-1": 2}
     assert len(result.executions) == 1
     assert result.executions[0].manifest_result.resolved is True
     assert result.executions[0].memory_after.entry_count == 1
+    assert progress[0] == "task 1/1 task_id=task-1 attempt 1/4 started"
+    assert progress[1] == (
+        "task 1/1 task_id=task-1 attempt 1/4 llm_failed; retrying 1/3"
+    )
+    assert progress[2] == "task 1/1 task_id=task-1 attempt 2/4 started"
+    assert progress[3].startswith(
+        "task 1/1 task_id=task-1 completed resolved=true attempts=2 elapsed="
+    )
 
 
 def test_mem0_llm_retry_aborts_pending_search_before_retry(tmp_path: Path) -> None:

@@ -13,6 +13,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 from my_agent.cli.common import CliContext
@@ -162,6 +163,7 @@ def handle(args: argparse.Namespace, ctx: CliContext) -> int:
                 env=ctx.env,
                 benchmarks=args.benchmarks,
                 limit=args.limit,
+                progress=_print_memory_benchmark_progress,
             )
         else:
             result = generate_memory_benchmark_report(args.run_dir)
@@ -487,6 +489,7 @@ def run_preflighted_memory_benchmark(
     ] = MemoryBenchmarkApiEmbeddingEncoder,
     mem0_client_factory: Callable[[Path, Mapping[str, Any]], Any] | None = None,
     mem0_version_resolver: Callable[[], str] | None = None,
+    progress: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
         raise ValueError("seed must be a non-negative integer")
@@ -602,6 +605,8 @@ def run_preflighted_memory_benchmark(
     )
 
     streams: list[dict[str, Any]] = []
+    stream_count = len(requested_arms) * len(requested_benchmarks)
+    stream_position = 0
     for arm in requested_arms:
         backend_hash = _load_backend_config_hash(run_path, arm)
         if protocol.backend_config_hashes.get(arm) != backend_hash:
@@ -610,6 +615,7 @@ def run_preflighted_memory_benchmark(
         if current_backend_hash != backend_hash:
             raise ValueError(f"current backend config no longer matches preflight for arm {arm}")
         for benchmark in requested_benchmarks:
+            stream_position += 1
             target = run_path / "arms" / arm / f"seed_{seed}" / benchmark
             if target.exists():
                 raise FileExistsError(
@@ -621,6 +627,14 @@ def run_preflighted_memory_benchmark(
                 seed=seed,
                 benchmark=benchmark,
                 arm=arm,
+            )
+            stream_started = perf_counter()
+            _emit_progress(
+                progress,
+                (
+                    f"stream {stream_position}/{stream_count} seed={seed} arm={arm} "
+                    f"benchmark={benchmark} tasks={len(tasks_by_benchmark[benchmark])} started"
+                ),
             )
             backend = _build_backend(
                 arm,
@@ -643,30 +657,52 @@ def run_preflighted_memory_benchmark(
                 runtime_root=run_path / ".runtime",
             )
             adapter.load_tasks(limit=requested_limits[benchmark])
-            result = stream_runner(
-                tasks=tasks_by_benchmark[benchmark],
-                adapter=adapter,
-                backend=backend,
-                base_config=configured_agent,
-                output_dir=target,
-                run_id=str(preflight["run_id"]),
-                seed=seed,
-                stream_memory_dir=stream_memory_dir,
-                stream_project_key=stream_project_key,
-                protocol_hash=protocol.protocol_hash,
-                actor_identity_hash=protocol.actor_identity_hash,
-                tools_hash=protocol.tools_hash,
-                backend_config_hash=backend_hash,
-                actor_sampling_seed_supported=protocol.actor_sampling_seed_supported,
-                actor_sampling_seed_effective=(
-                    seed if protocol.actor_sampling_seed_supported else None
-                ),
-                max_steps=protocol.max_steps,
-                command_timeout=protocol.command_timeout,
-            )
+            try:
+                result = stream_runner(
+                    tasks=tasks_by_benchmark[benchmark],
+                    adapter=adapter,
+                    backend=backend,
+                    base_config=configured_agent,
+                    output_dir=target,
+                    run_id=str(preflight["run_id"]),
+                    seed=seed,
+                    stream_memory_dir=stream_memory_dir,
+                    stream_project_key=stream_project_key,
+                    protocol_hash=protocol.protocol_hash,
+                    actor_identity_hash=protocol.actor_identity_hash,
+                    tools_hash=protocol.tools_hash,
+                    backend_config_hash=backend_hash,
+                    actor_sampling_seed_supported=protocol.actor_sampling_seed_supported,
+                    actor_sampling_seed_effective=(
+                        seed if protocol.actor_sampling_seed_supported else None
+                    ),
+                    max_steps=protocol.max_steps,
+                    command_timeout=protocol.command_timeout,
+                    progress=progress,
+                )
+            except Exception as exc:
+                _emit_progress(
+                    progress,
+                    (
+                        f"stream {stream_position}/{stream_count} seed={seed} arm={arm} "
+                        f"benchmark={benchmark} failed "
+                        f"elapsed={max(0.0, perf_counter() - stream_started):.1f}s "
+                        f"error={type(exc).__name__}: {exc}"
+                    ),
+                )
+                raise
             summary = _stream_summary(result, protocol_hash=protocol.protocol_hash)
             _write_json_atomic(target / "summary.json", summary)
             streams.append(summary)
+            _emit_progress(
+                progress,
+                (
+                    f"stream {stream_position}/{stream_count} seed={seed} arm={arm} "
+                    f"benchmark={benchmark} completed "
+                    f"resolved={summary['resolved']}/{summary['task_count']} "
+                    f"elapsed={max(0.0, perf_counter() - stream_started):.1f}s"
+                ),
+            )
     return {
         "status": "completed",
         "config": str(config_file),
@@ -1410,6 +1446,15 @@ def _stream_summary(
         "protocol_hash": protocol_hash,
         "results_path": str(result.results_path),
     }
+
+
+def _print_memory_benchmark_progress(message: str) -> None:
+    print(f"[memory-benchmark] {message}", file=sys.stderr, flush=True)
+
+
+def _emit_progress(reporter: Callable[[str], None] | None, message: str) -> None:
+    if reporter is not None:
+        reporter(message)
 
 
 def _task_manifest_hash(tasks: Sequence[BenchmarkTask]) -> str:

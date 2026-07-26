@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 from uuid import uuid4
 import os
@@ -55,6 +56,7 @@ _LLM_TASK_MAX_RETRIES = 3
 _LLM_RETRY_SCHEMA_VERSION = "memory-benchmark-llm-retry-v1"
 
 ManifestRunnerFn = Callable[..., ManifestBenchmarkResult]
+ProgressReporterFn = Callable[[str], None]
 
 
 @dataclass(frozen=True)
@@ -117,6 +119,7 @@ def run_memory_benchmark_stream(
     max_steps: int | None = None,
     command_timeout: int | None = None,
     manifest_runner: ManifestRunnerFn = run_manifest_benchmark,
+    progress: ProgressReporterFn | None = None,
 ) -> MemoryBenchmarkStreamResult:
     ordered_tasks = _validate_ordered_tasks(tasks)
     if not ordered_tasks:
@@ -169,13 +172,22 @@ def run_memory_benchmark_stream(
     executions: list[MemoryBenchmarkTaskExecution] = []
     stream_failure: BaseException | None = None
     try:
-        for task in ordered_tasks:
+        task_count = len(ordered_tasks)
+        for task_position, task in enumerate(ordered_tasks, start=1):
+            task_started = perf_counter()
             task_name = f"{task.order_index:04d}_{_safe_id(task.task_id)}"
             task_dir = task_root / task_name
             llm_attempt_failures: list[MemoryBenchmarkInfrastructureError] = []
             llm_attempt_dirs: list[Path] = []
             execution: MemoryBenchmarkTaskExecution | None = None
             for attempt in range(1, _LLM_TASK_MAX_RETRIES + 2):
+                _emit_progress(
+                    progress,
+                    (
+                        f"task {task_position}/{task_count} task_id={task.task_id} "
+                        f"attempt {attempt}/{_LLM_TASK_MAX_RETRIES + 1} started"
+                    ),
+                )
                 attempt_dir = (
                     task_dir
                     if attempt == 1
@@ -240,6 +252,18 @@ def run_memory_benchmark_stream(
                                 ),
                                 manifest_result=exc.manifest_result,
                             ) from abort_exc
+                    _emit_progress(
+                        progress,
+                        (
+                            f"task {task_position}/{task_count} task_id={task.task_id} "
+                            f"attempt {attempt}/{_LLM_TASK_MAX_RETRIES + 1} llm_failed; "
+                            + (
+                                f"retrying {attempt}/{_LLM_TASK_MAX_RETRIES}"
+                                if will_retry
+                                else "retries exhausted"
+                            )
+                        ),
+                    )
                     _write_llm_retry_history(
                         task_dir / "llm_retry_history.json",
                         task=task,
@@ -272,6 +296,14 @@ def run_memory_benchmark_stream(
                     manifest_result=execution.manifest_result,
                 ) from exc
             executions.append(execution)
+            _emit_progress(
+                progress,
+                (
+                    f"task {task_position}/{task_count} task_id={task.task_id} completed "
+                    f"resolved={str(execution.task_result.resolved).lower()} "
+                    f"attempts={attempt} elapsed={max(0.0, perf_counter() - task_started):.1f}s"
+                ),
+            )
     except BaseException as exc:  # preserve the primary cause while still closing the backend.
         stream_failure = exc
     finally:
@@ -811,6 +843,11 @@ def _write_llm_retry_history(
 def _safe_id(value: str) -> str:
     normalized = _SAFE_ID_RE.sub("_", str(value)).strip("_.-")
     return normalized[:120] or "task"
+
+
+def _emit_progress(reporter: ProgressReporterFn | None, message: str) -> None:
+    if reporter is not None:
+        reporter(message)
 
 
 def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:

@@ -313,6 +313,7 @@ def _run(
     embedding_dimension: int = 3,
     mem0_version: str = "2.0.13",
     stream_runner: Callable[..., Any] | None = None,
+    progress: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     return run_preflighted_memory_benchmark(
         config_path=fixture["config"],
@@ -327,6 +328,7 @@ def _run(
         api_policy_factory=_policy_factory,
         embedding_encoder_factory=_embedding_factory(embedding_dimension),
         mem0_version_resolver=lambda: mem0_version,
+        progress=progress,
     )
 
 
@@ -419,6 +421,44 @@ def test_smoke_cli_passes_memory_generation_config(
     assert captured["generation_top_p"] == 1.0
 
 
+def test_run_cli_prints_progress_to_stderr_and_json_to_stdout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def fake_run(**kwargs: Any) -> dict[str, Any]:
+        kwargs["progress"]("task 1/1 task_id=0 attempt 1/4 started")
+        return {"status": "completed", "streams": []}
+
+    monkeypatch.setattr(
+        memory_benchmark_command,
+        "run_preflighted_memory_benchmark",
+        fake_run,
+    )
+    ctx = SimpleNamespace(
+        env={},
+        config_from_env=lambda **_kwargs: _base_config(tmp_path),
+        close_mcp_servers=lambda: None,
+    )
+    args = SimpleNamespace(
+        memory_benchmark_command="run",
+        config="config.json",
+        run_dir="run",
+        seed=42,
+        arms="no_memory",
+        benchmarks=None,
+        limit=None,
+    )
+
+    assert memory_benchmark_command.handle(args, ctx) == 0
+
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["status"] == "completed"
+    assert captured.err == (
+        "[memory-benchmark] task 1/1 task_id=0 attempt 1/4 started\n"
+    )
+
+
 def test_preflight_probe_failure_does_not_write_protocol(tmp_path: Path) -> None:
     fixture = _fixture_workspace(tmp_path)
     prepare_memory_benchmark_data(config_path=fixture["config"], env=fixture["env"])
@@ -437,12 +477,14 @@ def test_run_rejects_selection_drift_and_existing_stream(tmp_path: Path) -> None
     run_dir = fixture["repo"] / "evaluationResults" / "pilot"
     _preflight(fixture, run_dir)
     calls: list[dict[str, Any]] = []
+    progress: list[str] = []
 
     result = _run(
         fixture,
         run_dir,
         arms="no_memory,agentcli_four_tier,mem0",
         stream_runner=_fake_stream_runner(calls),
+        progress=progress.append,
     )
 
     assert result["status"] == "completed"
@@ -450,6 +492,12 @@ def test_run_rejects_selection_drift_and_existing_stream(tmp_path: Path) -> None
     assert len({call["protocol_hash"] for call in calls}) == 1
     assert all(call["max_steps"] == 40 for call in calls)
     assert all(call["command_timeout"] == 120 for call in calls)
+    assert progress[0].startswith(
+        "stream 1/3 seed=42 arm=agentcli_four_tier benchmark=intercode_bash tasks=1 started"
+    )
+    assert progress[-1].startswith(
+        "stream 3/3 seed=42 arm=no_memory benchmark=intercode_bash completed resolved=1/1 elapsed="
+    )
     with pytest.raises(FileExistsError, match="already exists"):
         _run(fixture, run_dir, arms="no_memory")
     with pytest.raises(ValueError, match="selection does not match preflight"):
