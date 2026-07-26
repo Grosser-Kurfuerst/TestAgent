@@ -779,6 +779,57 @@ def test_llm_failure_retries_three_times_from_clean_task_environments(
     assert all(item["agent_stop_reason"] == "llm_failed" for item in history["attempts"])
 
 
+def test_four_tier_llm_retry_aborts_pending_session_before_retry(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "stream"
+    backend = _four_tier_backend(output / "memory")
+    manifest = FakeManifestRunner(
+        formal=False,
+        llm_failures_before_success={"task-1": 1},
+    )
+
+    result = _run(
+        tmp_path,
+        backend=backend,
+        adapter=FakeAdapter(),
+        manifest_runner=manifest,
+        tasks=[_task(1)],
+    )
+
+    assert manifest.attempt_counts == {"task-1": 2}
+    assert len(result.executions) == 1
+    assert result.executions[0].manifest_result.resolved is True
+    assert result.executions[0].memory_after.entry_count == 1
+
+
+def test_mem0_llm_retry_aborts_pending_search_before_retry(tmp_path: Path) -> None:
+    output = tmp_path / "stream"
+    client = FakeMem0StreamClient(output / "memory" / "mem0")
+    backend = Mem0Backend(
+        stream_memory_dir=output / "memory",
+        stream_project_key=_project_key("mem0"),
+        client=client,
+    )
+    manifest = FakeManifestRunner(
+        formal=False,
+        llm_failures_before_success={"task-1": 1},
+    )
+
+    result = _run(
+        tmp_path,
+        backend=backend,
+        adapter=FakeAdapter(),
+        manifest_runner=manifest,
+        tasks=[_task(1)],
+    )
+
+    assert manifest.attempt_counts == {"task-1": 2}
+    assert client.search_calls == 2
+    assert client.add_calls == 1
+    assert len(result.executions) == 1
+
+
 def test_llm_failure_after_three_retries_records_all_attempts_and_aborts(
     tmp_path: Path,
 ) -> None:

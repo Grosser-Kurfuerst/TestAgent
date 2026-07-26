@@ -77,6 +77,8 @@ class MemoryBenchmarkBackend(Protocol):
         result: ManifestEvalResult,
     ) -> BackendFinalizeResult: ...
 
+    def abort_task(self, task: BenchmarkTask) -> None: ...
+
     def snapshot(self) -> MemoryRepositorySnapshot: ...
 
     def close(self) -> None: ...
@@ -182,6 +184,10 @@ class NoMemoryBackend(_LocalExperienceBackend):
             status="not_applicable",
             llm_usage=ProviderUsage(prompt_tokens=0, completion_tokens=0, total_tokens=0),
         )
+
+    def abort_task(self, task: BenchmarkTask) -> None:
+        if not isinstance(task, BenchmarkTask):
+            raise ValueError("task must be a BenchmarkTask")
 
 
 class AgentCliFourTierBackend(_LocalExperienceBackend):
@@ -415,6 +421,16 @@ class AgentCliFourTierBackend(_LocalExperienceBackend):
         finally:
             self._clear_pending()
 
+    def abort_task(self, task: BenchmarkTask) -> None:
+        if not isinstance(task, BenchmarkTask):
+            raise ValueError("task must be a BenchmarkTask")
+        session = self._pending_session
+        if session is not None and (
+            session.task_id != task.task_id or session.task_group != task.task_group
+        ):
+            raise RuntimeError("four-tier abort task does not match pending session")
+        self._clear_pending()
+
     def close(self) -> None:
         self.coordinator.set_trace_sink(None)
         self._clear_pending()
@@ -567,6 +583,11 @@ class Mem0Backend:
             ),
             elapsed_sec=search.elapsed_sec + write.elapsed_sec,
         )
+
+    def abort_task(self, task: BenchmarkTask) -> None:
+        if not isinstance(task, BenchmarkTask):
+            raise ValueError("task must be a BenchmarkTask")
+        self._pending_search = None
 
     def snapshot(self) -> MemoryRepositorySnapshot:
         count = self._client().count(stream_key=self.stream_project_key)

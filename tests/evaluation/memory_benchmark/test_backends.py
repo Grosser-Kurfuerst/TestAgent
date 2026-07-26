@@ -303,6 +303,18 @@ def test_four_tier_prepares_context_once_and_requires_finalize(tmp_path: Path) -
         backend.prepare_context(_task())
 
 
+def test_four_tier_abort_discards_pending_session_without_writing(tmp_path: Path) -> None:
+    backend = _four_tier_backend(tmp_path)
+    task = _task()
+    backend.prepare_context(task)
+
+    backend.abort_task(task)
+    context = backend.prepare_context(task)
+
+    assert context.candidate_count == 0
+    assert backend.snapshot().entry_count == 0
+
+
 def test_four_tier_finalize_writes_only_after_authoritative_result(tmp_path: Path) -> None:
     backend = _four_tier_backend(tmp_path)
     backend.prepare_context(_task())
@@ -592,6 +604,25 @@ def test_mem0_backend_caps_candidates_items_and_selected_content(tmp_path: Path)
     assert context.selected_content_tokens <= 1_800
     assert context.injected_text.startswith("Relevant selected external memory:")
     assert "memory-50" not in context.injected_text
+
+
+def test_mem0_abort_discards_pending_search_without_writing(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "stream" / "memory"
+    client = _FakeMem0Client(memory_dir / "mem0")
+    backend = Mem0Backend(
+        stream_memory_dir=memory_dir,
+        stream_project_key="memory-benchmark:run-1:42:lifelong_os:mem0",
+        client=client,
+    )
+    task = _task()
+    backend.prepare_context(task)
+
+    backend.abort_task(task)
+    backend.prepare_context(task)
+
+    assert client.search_limits == [50, 50]
+    assert client.added == []
+    assert backend.snapshot().entry_count == 0
 
 
 def test_mem0_backend_writes_failure_episode_and_preserves_unknown_usage(tmp_path: Path) -> None:

@@ -221,6 +221,25 @@ def run_memory_benchmark_stream(
                     llm_attempt_failures.append(exc)
                     llm_attempt_dirs.append(attempt_dir)
                     will_retry = attempt <= _LLM_TASK_MAX_RETRIES
+                    if will_retry:
+                        try:
+                            backend.abort_task(task)
+                        except Exception as abort_exc:  # noqa: BLE001 - abort is infrastructure.
+                            _write_llm_retry_history(
+                                task_dir / "llm_retry_history.json",
+                                task=task,
+                                failures=llm_attempt_failures,
+                                artifact_dirs=llm_attempt_dirs,
+                                will_retry=False,
+                            )
+                            raise MemoryBenchmarkInfrastructureError(
+                                task,
+                                (
+                                    (f"llm_attempt_{attempt}", exc),
+                                    ("backend_abort", abort_exc),
+                                ),
+                                manifest_result=exc.manifest_result,
+                            ) from abort_exc
                     _write_llm_retry_history(
                         task_dir / "llm_retry_history.json",
                         task=task,
