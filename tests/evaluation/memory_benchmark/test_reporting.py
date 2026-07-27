@@ -25,6 +25,7 @@ from my_agent.policy.identity import canonical_json_bytes, canonical_sha256
 _ARMS = ("no_memory", "agentcli_four_tier", "mem0")
 _SEEDS = (42, 43, 44)
 _BENCHMARKS = {"lifelong_os": "os", "intercode_bash": "bash"}
+_TASK_SUBSETS = {"lifelong_os": "os", "intercode_bash": "nl2bash_fs_1"}
 
 
 def _write_fake_run(root: Path) -> Path:
@@ -32,10 +33,10 @@ def _write_fake_run(root: Path) -> Path:
     source_lock = {"schema_version": "fixture-source-lock-v1", "sources": {}}
     tasks_by_benchmark = {
         benchmark: tuple(
-            _task(benchmark, subset, index)
+            _task(benchmark, _TASK_SUBSETS[benchmark], index)
             for index in range(1, 41)
         )
-        for benchmark, subset in _BENCHMARKS.items()
+        for benchmark in _BENCHMARKS
     }
     backend_configs = {
         arm: {
@@ -375,6 +376,15 @@ def test_report_rejects_identity_and_task_order_mismatch(tmp_path: Path) -> None
     lines = path.read_text(encoding="utf-8").splitlines()
     path.write_text("\n".join(lines[:-1]) + "\n", encoding="utf-8")
     with pytest.raises(ValueError, match="task order"):
+        generate_memory_benchmark_report(run_dir)
+
+    run_dir = _write_fake_run(tmp_path / "third")
+    _mutate_result(
+        run_dir,
+        arm="no_memory",
+        mutate=lambda row: row.__setitem__("subset", "wrong-subset"),
+    )
+    with pytest.raises(ValueError, match="result identity mismatch.*subset"):
         generate_memory_benchmark_report(run_dir)
 
 

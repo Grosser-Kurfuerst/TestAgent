@@ -145,6 +145,7 @@ def _validate_suite_manifest(
     metadata: dict[str, dict[str, Any]] = {}
     for benchmark, expected_ids in protocol.ordered_task_ids_by_benchmark.items():
         payload = _mapping(benchmarks.get(benchmark), f"suite benchmark {benchmark}")
+        _required_string(payload.get("subset"), f"{benchmark} subset")
         task_ids = _string_sequence(payload.get("task_ids"), f"{benchmark} task_ids")
         if task_ids != expected_ids:
             raise ValueError(f"suite task order does not match protocol for {benchmark}")
@@ -161,11 +162,17 @@ def _validate_suite_manifest(
         ]:
             raise ValueError(f"suite task payload hash mismatch for {benchmark}")
         metadata[benchmark] = {
-            "subset": _required_string(payload.get("subset"), f"{benchmark} subset"),
             "task_hashes": {
                 str(task["task_id"]): _required_string(
                     task.get("content_hash"),
                     f"{benchmark} task content_hash",
+                )
+                for task in tasks
+            },
+            "task_subsets": {
+                str(task["task_id"]): _required_string(
+                    task.get("subset"),
+                    f"{benchmark} task subset",
                 )
                 for task in tasks
             },
@@ -210,6 +217,7 @@ def _validate_result_stream(
     if tuple(row.order_index for row in rows) != tuple(range(1, len(rows) + 1)):
         raise ValueError(f"result order_index is invalid for {arm}/{seed}/{benchmark}")
     task_hashes = _mapping(task_metadata.get("task_hashes"), "task hashes")
+    task_subsets = _mapping(task_metadata.get("task_subsets"), "task subsets")
     expected_effective_seed = seed if protocol.actor_sampling_seed_supported else None
     for row in rows:
         checks = {
@@ -217,7 +225,7 @@ def _validate_result_stream(
             "arm": (row.arm, arm),
             "seed": (row.seed, seed),
             "benchmark": (row.benchmark, benchmark),
-            "subset": (row.subset, task_metadata["subset"]),
+            "subset": (row.subset, task_subsets[row.task_id]),
             "protocol_hash": (row.protocol_hash, protocol.protocol_hash),
             "backend_config_hash": (
                 row.backend_config_hash,
