@@ -23,4 +23,5 @@ tests/data/**/*.py[cod]
 models/
 docs/*
 runs/
+benchmarks/
 AGENTS.md
