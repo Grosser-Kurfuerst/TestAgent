@@ -38,10 +38,12 @@ class OPDCollator:
             require_matching_policy_identity(identity, sample.policy_identity)
             student_request = _request(sample, teacher=False)
             teacher_request = _request(sample, teacher=True)
+            # 检查student和teacher prompt hash，防止工具schema、message等被修改
             if self.policy.render_prompt_hash(student_request) != sample.student_prompt_hash:
                 raise ValueError("student prompt hash does not match learner sample")
             if self.policy.render_prompt_hash(teacher_request) != sample.teacher_prompt_hash:
                 raise ValueError("teacher prompt hash does not match learner sample")
+            
             student_prompt = _first_row_ids(self.policy.tokenize(student_request))
             teacher_prompt = _first_row_ids(self.policy.tokenize(teacher_request))
             if student_prompt != sample.student_prompt_token_ids:

@@ -97,6 +97,7 @@ def main() -> int:
         policy_dtype=str(policy_data.get("dtype", "bfloat16")),
         policy_device=policy_device,
     )
+    # 加载模型运行对象
     policy = TransformersPolicy.from_config(agent_config)
     require_matching_policy_identity(expected_identity, policy.identity())
     policy.model = attach_or_validate_shared_adapter(

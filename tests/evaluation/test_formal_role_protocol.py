@@ -133,6 +133,46 @@ def _selection_events() -> list[DecisionEvent]:
 
 
 class FormalRoleProtocolTests(unittest.TestCase):
+    def test_writing_smoke_threshold_allows_one_failure_out_of_sixteen(self) -> None:
+        valid_tip = [{
+            "tier": "tip",
+            "content": "Run focused tests before the full suite.",
+            "payload": {
+                "category": "testing",
+                "severity": "info",
+                "trigger": "after a focused code change",
+            },
+            "confidence": 0.9,
+            "reason": "reusable verification guidance",
+        }]
+        prompt = (CanonicalMessage(
+            "user",
+            json.dumps({"min_confidence": 0.7, "max_records": 6}),
+        ),)
+        valid = _event(
+            decision_id="writing-valid-smoke",
+            role="writing",
+            raw_completion=json.dumps(valid_tip),
+            parsed_output={"proposals": valid_tip},
+            messages=prompt,
+        )
+        invalid = _event(
+            decision_id="writing-invalid-smoke",
+            role="writing",
+            raw_completion="not-json",
+            parsed_output={"error": "writer output must be valid JSON"},
+            status="invalid_output",
+            messages=prompt,
+        )
+
+        one_failure, _details = evaluate_formal_role_events([valid] * 15 + [invalid])
+        two_failures, _details = evaluate_formal_role_events([valid] * 14 + [invalid] * 2)
+
+        self.assertTrue(one_failure["checks"]["writing.decision_success_rate"])
+        self.assertTrue(one_failure["checks"]["writing.json_array_rate"])
+        self.assertFalse(two_failures["checks"]["writing.decision_success_rate"])
+        self.assertFalse(two_failures["checks"]["writing.json_array_rate"])
+
     def test_selection_accepts_terminal_special_tokens(self) -> None:
         selection = _selection_events()[0]
         with_terminal_tokens = replace(
