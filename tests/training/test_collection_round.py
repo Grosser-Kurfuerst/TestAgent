@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import io
 import json
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
+from my_agent.cli.commands import opd as opd_command
 from my_agent.cli.commands.opd import _verify_run
+from my_agent.cli.common import CliContext
 from my_agent.cli.main import build_parser
 from my_agent.opd_data.export import load_learner_samples
 from my_agent.training.collection_round import build_collection_round
@@ -99,6 +105,26 @@ class CollectionRoundTests(unittest.TestCase):
         ])
 
         self.assertEqual(build.max_new_tokens, 1_024)
+
+    def test_build_round_uses_cli_environment_config(self) -> None:
+        ctx = CliContext(
+            run_agent=lambda *args, **kwargs: None,
+            agent_repl_cls=object,
+            env={"AGENTCLI_POLICY_CHAT_TEMPLATE": "qwen3_5_nothink"},
+        )
+        args = SimpleNamespace(opd_command="build-round")
+
+        with (
+            patch.object(opd_command, "_build_round", return_value={"status": "ok"}) as build,
+            redirect_stdout(io.StringIO()),
+        ):
+            return_code = opd_command.handle(args, ctx)
+
+        self.assertEqual(return_code, 0)
+        self.assertEqual(
+            build.call_args.kwargs["config"].policy_chat_template,
+            "qwen3_5_nothink",
+        )
 
     def test_empty_completion_is_rejected_from_formal_dataset(self) -> None:
         fixture = round_fixture()

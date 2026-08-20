@@ -83,10 +83,12 @@ def add_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) 
 
 
 def handle(args: argparse.Namespace, ctx: CliContext) -> int:
-    del ctx
     try:
         if args.opd_command == "build-round":
-            payload = _build_round(args)
+            payload = _build_round(
+                args,
+                config=ctx.config_from_env(require_env_file=False),
+            )
         elif args.opd_command == "build-replay-ablation":
             result = build_replay_ablation_dataset(
                 d0_dir=args.d0,
@@ -110,7 +112,11 @@ def handle(args: argparse.Namespace, ctx: CliContext) -> int:
     return 0
 
 
-def _build_round(args: argparse.Namespace) -> dict[str, object]:
+def _build_round(
+    args: argparse.Namespace,
+    *,
+    config: AgentConfig,
+) -> dict[str, object]:
     checkpoint = Path(args.checkpoint).expanduser().resolve()
     identity_manifest = (
         Path(args.identity_manifest).expanduser().resolve()
@@ -119,7 +125,7 @@ def _build_round(args: argparse.Namespace) -> dict[str, object]:
     )
     expected_identity = load_policy_identity_manifest(identity_manifest)
     config = replace(
-        AgentConfig.from_env(),
+        config,
         policy_backend="transformers",
         policy_base_model=expected_identity.base_model,
         policy_base_revision=expected_identity.base_revision,
