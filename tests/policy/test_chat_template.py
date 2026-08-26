@@ -6,10 +6,12 @@ import unittest
 from my_agent.policy.chat_template import (
     CanonicalChatTemplate,
     QWEN35_NOTHINK_TEMPLATE,
+    canonical_messages_to_hf,
     canonicalize_messages,
     canonicalize_tools,
 )
 from my_agent.policy.identity import canonical_sha256
+from my_agent.training.role_views import CanonicalMessage
 
 
 class _RecordingTokenizer:
@@ -28,6 +30,21 @@ class _RecordingTokenizer:
             sort_keys=True,
             separators=(",", ":"),
         )
+
+    def decode(self, token_ids: list[int], *, skip_special_tokens: bool) -> str:
+        del skip_special_tokens
+        return " ".join(str(token_id) for token_id in token_ids)
+
+
+class _QwenLikeTokenizer(_RecordingTokenizer):
+    def apply_chat_template(self, messages: list[dict[str, object]], **kwargs: object) -> object:
+        for index, message in enumerate(messages):
+            if message["role"] == "system" and index != 0:
+                raise ValueError("System message must be at the beginning.")
+        if kwargs["tokenize"] and not kwargs.get("add_generation_prompt", True):
+            self.calls.append((messages, dict(kwargs)))
+            return [11, 12, 13]
+        return super().apply_chat_template(messages, **kwargs)
 
 
 class ChatTemplateTests(unittest.TestCase):
@@ -73,6 +90,64 @@ class ChatTemplateTests(unittest.TestCase):
         self.assertEqual(template.template_hash, canonical_sha256(tokenizer.chat_template))
         self.assertEqual(tokenizer.calls[0][0], tokenizer.calls[1][0])
         self.assertEqual(tokenizer.calls[0][1]["tools"], tokenizer.calls[1][1]["tools"])
+
+    def test_leading_system_contexts_are_merged_before_qwen_rendering(self) -> None:
+        tokenizer = _QwenLikeTokenizer()
+        template = CanonicalChatTemplate(
+            tokenizer,
+            configured_template=QWEN35_NOTHINK_TEMPLATE,
+        )
+        messages = canonicalize_messages([
+            {"role": "system", "content": "coding agent instructions"},
+            {
+                "role": "system",
+                "content": "[Selected evolver memory - frozen for this task]\nuse focused tests",
+            },
+            {"role": "user", "content": "fix the task"},
+        ])
+
+        rendered = template.render(messages, ())
+        token_ids = template.tokenize(messages, ())
+
+        self.assertEqual(token_ids, [11, 12])
+        self.assertEqual(rendered.prompt_hash, canonical_sha256(rendered.text))
+        self.assertEqual(
+            [message["role"] for message in tokenizer.calls[0][0]],
+            ["system", "user"],
+        )
+        self.assertEqual(
+            tokenizer.calls[0][0][0]["content"],
+            "coding agent instructions\n\n"
+            "[Selected evolver memory - frozen for this task]\nuse focused tests",
+        )
+        self.assertEqual(tokenizer.calls[0][0], tokenizer.calls[1][0])
+
+    def test_training_turn_hash_uses_the_same_merged_system_context(self) -> None:
+        tokenizer = _QwenLikeTokenizer()
+        template = CanonicalChatTemplate(tokenizer)
+        messages = canonicalize_messages([
+            {"role": "system", "content": "coding agent instructions"},
+            {"role": "system", "content": "selected memory"},
+            {"role": "user", "content": "fix the task"},
+        ])
+        target = CanonicalMessage("assistant", "done")
+
+        turn = template.render_training_turn(messages, (), target)
+
+        expected_messages = [
+            {"role": "system", "content": "coding agent instructions\n\nselected memory"},
+            {"role": "user", "content": "fix the task"},
+        ]
+        self.assertEqual(tokenizer.calls[0][0], expected_messages)
+        self.assertEqual(tokenizer.calls[1][0][:-1], expected_messages)
+        self.assertEqual(
+            turn.normalized_template_input_hash,
+            canonical_sha256({
+                "messages": expected_messages,
+                "target": canonical_messages_to_hf((target,))[0],
+                "tools": [],
+            }),
+        )
 
     def test_tool_arguments_are_canonicalized_before_template_rendering(self) -> None:
         messages = canonicalize_messages([

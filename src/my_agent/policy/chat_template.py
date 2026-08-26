@@ -109,8 +109,9 @@ class CanonicalChatTemplate:
         )
         if not isinstance(raw_completion, str):
             raise TypeError("tokenizer.decode must return SFT completion text")
+        normalized_messages = _merge_leading_system_messages(messages)
         normalized_input = {
-            "messages": canonical_messages_to_hf(messages),
+            "messages": canonical_messages_to_hf(normalized_messages),
             "target": canonical_messages_to_hf((target,))[0],
             "tools": canonical_tools_to_hf(tools),
         }
@@ -143,8 +144,9 @@ class CanonicalChatTemplate:
             kwargs["enable_thinking"] = self.enable_thinking
         if return_tensors is not None:
             kwargs["return_tensors"] = return_tensors
+        normalized_messages = _merge_leading_system_messages(messages)
         return self.tokenizer.apply_chat_template(
-            canonical_messages_to_hf(messages),
+            canonical_messages_to_hf(normalized_messages),
             **kwargs,
         )
 
@@ -240,6 +242,29 @@ def canonical_messages_to_hf(messages: tuple[CanonicalMessage, ...]) -> list[dic
             ]
         rendered.append(payload)
     return rendered
+
+
+def _merge_leading_system_messages(
+    messages: tuple[CanonicalMessage, ...],
+) -> tuple[CanonicalMessage, ...]:
+    """Render leading system contexts as the single system turn required by Qwen."""
+    system_count = 0
+    for message in messages:
+        if message.role != "system":
+            break
+        system_count += 1
+    if system_count <= 1:
+        return messages
+
+    first = messages[0]
+    merged = CanonicalMessage(
+        role="system",
+        content="\n\n".join(message.content for message in messages[:system_count]),
+        name=first.name,
+        tool_call_id=first.tool_call_id,
+        tool_calls=first.tool_calls,
+    )
+    return (merged, *messages[system_count:])
 
 
 def canonical_tools_to_hf(tools: tuple[CanonicalTool, ...]) -> list[dict[str, Any]]:
